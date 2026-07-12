@@ -3,8 +3,22 @@
 //! `ippoan/ble-medical-gateway` からの移植:
 //! - スキャン → 接続 → notify/indicate 購読の骨組み:
 //!   `firmware-rust/src/main.rs` (esp32-nimble PoC, PR #2-#5)
-//! - 値のデコード (IEEE 11073 FLOAT/SFLOAT)・JSON 出力・データ受信後の
-//!   自動リセット運用: `src/main.cpp` (Arduino/NimBLE 版, ATOM Lite 実機実績)
+//! - 値のデコード (IEEE 11073 FLOAT/SFLOAT)・JSON 出力:
+//!   `src/main.cpp` (Arduino/NimBLE 版, ATOM Lite 実機実績)
+//!
+//! 送信済み機器の扱い (NT-100B は送信後も電源断まで約 2 分広告を続け、広告
+//! 内容は完全に静的で新規測定の有無を判別できない — 実機で確認):
+//!
+//! - 広告が見えたら常に接続する。一度正常に届いた測定は機器が再送しない
+//!   (実機で確認) ため、送信済み機器への再接続はデータなしタイムアウトで
+//!   数秒後に切れるだけ。新しい測定はいつでも次の接続で届く
+//! - 万一同一測定が再送されても、recorder の機器タイムスタンプ重複排除が
+//!   破棄する (画面・ログに二重反映しない)
+//! - 接続保持 (パーク) で広告を止める案は不可: ESP32-S3 NimBLE は接続中の
+//!   スキャンで広告レポートが届かない既知問題がある (esp-idf issue #15258,
+//!   実機でも確認)。接続は受信後すみやかに切断し、スキャンを空ける
+//! - 点呼画面のスピナーは「未取得の項目」のみ回す (hub-ui 側) — 空接続で
+//!   サークルが回りっぱなしに見えないようにする
 //!
 //! ホストへの出力は ble-medical-gateway のシリアル JSON 互換
 //! (alc-app 側 `useBleGateway` の置き換え想定):
@@ -19,7 +33,7 @@
 //! {"type":"error","message":"..."}
 //! ```
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
@@ -31,13 +45,14 @@ use anyhow::{Context, Result};
 use esp32_nimble::{
     enums::{AuthReq, SecurityIOCap},
     utilities::BleUuid,
-    BLEAdvertisedData, BLEAdvertisedDevice, BLEClient, BLEDevice, BLEScan,
+    BLEAddress, BLEAdvertisedData, BLEAdvertisedDevice, BLEClient, BLEDevice, BLEScan,
 };
 use esp_idf_svc::hal::{delay::FreeRtos, task::block_on};
 
 use alc_hub_common::control::PairFlag;
 use alc_hub_common::measurement::Measurement;
 use alc_hub_common::status::{now_ms, SharedStatus};
+use alc_hub_common::ui_api::UiCommand;
 use alc_hub_core::coex::RadioCoex;
 
 /// on_notify クロージャ (Send + Sync 要求) から使うため Mutex で包む。
@@ -57,12 +72,25 @@ const SCAN_DURATION_MS: i32 = 5_000;
 const SCAN_COOLDOWN_MS: u32 = 0;
 const MIN_RSSI: i8 = -80;
 const CONNECT_RETRIES: u32 = 3;
-/// データ受信後、次の測定に備えて切断・再スキャンするまでの猶予 (Arduino 版準拠)
-const RESET_DELAY_MS: u32 = 2_000;
+/// データ受信後、続報が「途切れた」とみなして切断・転送するまでの静穏時間。
+/// 体温計は 1 件のみなので短く、血圧計は過去分ダンプの間隔を見込んで長めに取る
+fn data_quiet_ms(kind: DeviceKind) -> u64 {
+    match kind {
+        DeviceKind::Thermometer => 300,
+        DeviceKind::BloodPressure => 1_000,
+    }
+}
+
 /// 接続後この時間データが来なければ諦めて切断・再スキャンする。
 /// 無い場合、無言の機器に繋がると supervision timeout (~99秒) まで BLE ループ
 /// 全体がブロックされ、体温も血圧も取れなくなる (実機ログで確認)。
-const DATA_WAIT_TIMEOUT_MS: u64 = 5_000;
+/// データがある機器は購読後 1 秒以内に送ってくる実績のため短めでよい
+const DATA_WAIT_TIMEOUT_MS: u64 = 3_000;
+
+/// データなしで終わった機器への再接続を控える時間。送信済み機器へ数秒周期で
+/// 接続し続けると機器側がふさがり、測り直しのトリガーや新データの引き渡しが
+/// 遅れる (実機で確認)。短いバックオフで機器に空き時間を作る
+const EMPTY_BACKOFF_MS: u64 = 10_000;
 
 fn service_uuid(kind: DeviceKind) -> BleUuid {
     match kind {
@@ -81,6 +109,7 @@ fn measurement_uuid(kind: DeviceKind) -> BleUuid {
 pub fn start(
     status: SharedStatus,
     meas_tx: Sender<Measurement>,
+    ui_tx: Sender<UiCommand>,
     coex: Arc<RadioCoex>,
     pair_flag: PairFlag,
 ) -> Result<()> {
@@ -89,7 +118,7 @@ pub fn start(
         .name("ble".into())
         .stack_size(16 * 1024)
         .spawn(move || {
-            if let Err(e) = block_on(task(status, meas_tx, coex, pair_flag)) {
+            if let Err(e) = block_on(task(status, meas_tx, ui_tx, coex, pair_flag)) {
                 log::error!("ble: タスク異常終了: {e:?}");
                 println!("{{\"type\":\"error\",\"message\":\"BLE task terminated\"}}");
             }
@@ -100,6 +129,7 @@ pub fn start(
 async fn task(
     status: SharedStatus,
     meas_tx: MeasTx,
+    ui_tx: Sender<UiCommand>,
     coex: Arc<RadioCoex>,
     pair_flag: PairFlag,
 ) -> Result<()> {
@@ -112,6 +142,9 @@ async fn task(
         .set_io_cap(SecurityIOCap::NoInputNoOutput);
 
     let mut scan = BLEScan::new();
+    // データなしで終わった機器 (アドレス, 終了時刻)。EMPTY_BACKOFF_MS の間は
+    // 再接続せず、機器を空けて測り直しを受け付けやすくする
+    let mut empty_backoff: Vec<(BLEAddress, u64)> = Vec::new();
     loop {
         // 再ペアリング要求: 保存済みボンドを全消去する。壊れた/古いボンドが
         // 血圧計の暗号化接続を妨げている場合の復旧手段 (Pages のペアリングボタン)
@@ -137,14 +170,23 @@ async fn task(
             FreeRtos::delay_ms(200);
         }
 
+        // バックオフ期限切れの機器を解放
+        empty_backoff.retain(|(_, at)| now_ms().saturating_sub(*at) < EMPTY_BACKOFF_MS);
+
         // ニプロ機器は測定時にアドバタイズを開始するため、短いスキャンを
-        // 繰り返して発見次第すぐ接続する (Arduino 版 loop() と同じ運用)
+        // 繰り返して発見次第すぐ接続する (Arduino 版 loop() と同じ運用)。
+        // 送信済み機器の広告にも接続する — 一度届いた測定は再送されず
+        // 数秒の空接続で終わり、万一の再送は recorder の重複排除が破棄する
         let target = scan
             .active_scan(true)
             .interval(100)
             .window(99)
             .start(device, SCAN_DURATION_MS, |dev, data| {
-                match_target(dev, data).map(|kind| (*dev, kind))
+                // 直近の接続がデータなしだった機器はバックオフ中 — 接続しない
+                if empty_backoff.iter().any(|(a, _)| *a == dev.addr()) {
+                    return None;
+                }
+                match_target(dev, &data).map(|kind| (*dev, kind))
             })
             .await
             .context("BLE スキャン失敗")?;
@@ -155,14 +197,23 @@ async fn task(
         };
 
         println!("{{\"type\":\"found\",\"device\":\"{}\"}}", kind.json_name());
+        // 接続開始を UI へ通知 → 点呼画面のラベル横に取得中スピナーを表示
+        let _ = ui_tx.send(UiCommand::BleAcquiring { device: kind });
 
         let mut client = device.new_client();
-        if let Err(e) = handle_device(&mut client, &adv, kind, &status, &meas_tx).await {
-            log::warn!("ble: {} 処理失敗: {e:?}", kind.json_name());
-            println!(
-                "{{\"type\":\"error\",\"message\":\"{}: connection failed\"}}",
-                kind.json_name()
-            );
+        match handle_device(&mut client, &adv, kind, &status, &meas_tx).await {
+            // データなし: しばらくこの機器への再接続を控える (機器を空ける)。
+            // 接続失敗 (Err) はバックオフしない — 新規測定の広告での一時的な
+            // 接続失敗もあり、その場合は即リトライで拾いたい
+            Ok(false) => empty_backoff.push((adv.addr(), now_ms())),
+            Ok(true) => {}
+            Err(e) => {
+                log::warn!("ble: {} 処理失敗: {e:?}", kind.json_name());
+                println!(
+                    "{{\"type\":\"error\",\"message\":\"{}: connection failed\"}}",
+                    kind.json_name()
+                );
+            }
         }
         drop(client);
 
@@ -170,6 +221,8 @@ async fn task(
             st.ble_connected = false;
             st.ble_device.clear();
         }
+        // 取得シーケンス終了 (測定値は転送済み or 失敗) → スピナー消去
+        let _ = ui_tx.send(UiCommand::BleIdle);
         println!("{{\"type\":\"reset\",\"message\":\"Scan restarted\"}}");
     }
 }
@@ -177,7 +230,7 @@ async fn task(
 /// 広告が対象サービス (体温計/血圧計) を含み RSSI が閾値以上なら種別を返す。
 /// Arduino 版と同様、標準サービス UUID に加えてデバイス名でも判定する
 /// (ニプロ機器が独自名を使う場合の対策)。
-fn match_target(dev: &BLEAdvertisedDevice, data: BLEAdvertisedData<&[u8]>) -> Option<DeviceKind> {
+fn match_target(dev: &BLEAdvertisedDevice, data: &BLEAdvertisedData<&[u8]>) -> Option<DeviceKind> {
     if dev.rssi() < MIN_RSSI {
         return None;
     }
@@ -196,13 +249,15 @@ fn match_target(dev: &BLEAdvertisedDevice, data: BLEAdvertisedData<&[u8]>) -> Op
     None
 }
 
+/// 接続 → 購読 → 測定値の受信 → 切断。データを受信したかを返す
+/// (false なら呼び出し側が短いバックオフを掛けて機器を空ける)
 async fn handle_device(
     client: &mut BLEClient,
     adv: &BLEAdvertisedDevice,
     kind: DeviceKind,
     status: &SharedStatus,
     meas_tx: &MeasTx,
-) -> Result<()> {
+) -> Result<bool> {
     let disconnected = Arc::new(AtomicBool::new(false));
     {
         let disconnected = Arc::clone(&disconnected);
@@ -248,20 +303,27 @@ async fn handle_device(
     // すべて貯め、最後に「最新 (タイムスタンプ最大) の 1 件」だけを recorder へ
     // 送る。これで過去分が大量に記録されるのを防ぐ。
     let got_data = Arc::new(AtomicBool::new(false));
+    // 最終受信時刻 [ms, u32 切り詰め]。静穏時間の判定に使う (wrapping_sub で
+    // 差分を取るため 49 日周期の折り返しは問題にならない)。
+    // ESP32-S3 (Xtensa) はネイティブ 64bit アトミックが無いため u32
+    let last_rx = Arc::new(AtomicU32::new(0));
     let buffer: Arc<Mutex<Vec<(Measurement, u64)>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let got_data = Arc::clone(&got_data);
+        let last_rx = Arc::clone(&last_rx);
         let buffer = Arc::clone(&buffer);
         // このクロージャは nimble_host タスク上で呼ばれる (スタック小)。
         // パースしてバッファに積むだけに留める — println!/format!/NVS 等の
         // 重い処理は recorder スレッドで行う (以前ここで直接やって血圧受信時に
         // スタックオーバーフロー→再起動していた)。
         characteristic.on_notify(move |raw| {
-            if let Some(pair) = parse_measurement(kind, raw, now_ms()) {
+            let now = now_ms();
+            if let Some(pair) = parse_measurement(kind, raw, now) {
                 if let Ok(mut buf) = buffer.lock() {
                     buf.push(pair);
                 }
             }
+            last_rx.store(now as u32, Ordering::SeqCst);
             got_data.store(true, Ordering::SeqCst);
         });
     }
@@ -293,16 +355,12 @@ async fn handle_device(
         st.ble_device = kind.json_name().to_string();
     }
 
-    // データ受信 (最初の受信から 2 秒 = 過去分の送信を受け切る猶予) か、
-    // 機器側の切断、または無データのままタイムアウトするまで待つ。
-    // ニプロ機器は測定送信後に自分から切断することが多い。
+    // データ受信を待つ:
+    // - 受信あり: 続報 (血圧計の過去分ダンプ) が静穏時間途切れたら切断して転送
+    // - 機器の自発切断: 受信済み分を転送して終了
+    // - 無データのままタイムアウト: 張り付き防止のためこちらから切断
     let wait_start = now_ms();
     loop {
-        if got_data.load(Ordering::SeqCst) {
-            FreeRtos::delay_ms(RESET_DELAY_MS);
-            let _ = client.disconnect();
-            break;
-        }
         if disconnected.load(Ordering::SeqCst) {
             println!(
                 "{{\"type\":\"disconnected\",\"device\":\"{}\"}}",
@@ -310,9 +368,14 @@ async fn handle_device(
             );
             break;
         }
-        // 接続したがデータが来ない機器に張り付いて BLE ループを固めないよう、
-        // タイムアウトしたら切断して再スキャンへ戻る (体温計/血圧計の両方を救う)
-        if now_ms().saturating_sub(wait_start) > DATA_WAIT_TIMEOUT_MS {
+        if got_data.load(Ordering::SeqCst) {
+            let quiet =
+                u64::from((now_ms() as u32).wrapping_sub(last_rx.load(Ordering::SeqCst)));
+            if quiet >= data_quiet_ms(kind) {
+                let _ = client.disconnect();
+                break;
+            }
+        } else if now_ms().saturating_sub(wait_start) > DATA_WAIT_TIMEOUT_MS {
             let _ = client.disconnect();
             println!(
                 "{{\"type\":\"disconnected\",\"device\":\"{}\",\"reason\":\"timeout\"}}",
@@ -334,17 +397,26 @@ async fn handle_device(
             let _ = tx.send(m);
         }
     }
-    Ok(())
+    Ok(got_data.load(Ordering::SeqCst))
 }
 
 /// notify コールバック用の軽量パース: raw → (Measurement, 並び順キー)。
-/// 並び順キーは「最新の 1 件」を選ぶための比較値。血圧は機器タイムスタンプが
+/// 並び順キーは「最新の 1 件」を選ぶための比較値。機器タイムスタンプが
 /// あればそれ (過去分より今の測定が大きくなる)、無ければ受信時刻 (last-wins)。
-/// 体温は 1 件のみなので受信時刻。重い処理は recorder 側で行う。
+/// タイムスタンプは recorder の重複排除にも渡す。重い処理は recorder 側で行う。
 fn parse_measurement(kind: DeviceKind, raw: &[u8], at_ms: u64) -> Option<(Measurement, u64)> {
     match kind {
-        DeviceKind::Thermometer => parse_temperature(raw)
-            .map(|celsius| (Measurement::Temperature { celsius, at_ms }, at_ms)),
+        DeviceKind::Thermometer => parse_temperature(raw).map(|t| {
+            let order = t.timestamp.unwrap_or(at_ms);
+            (
+                Measurement::Temperature {
+                    celsius: t.celsius,
+                    timestamp: t.timestamp,
+                    at_ms,
+                },
+                order,
+            )
+        }),
         DeviceKind::BloodPressure => parse_blood_pressure(raw).map(|bp| {
             let order = bp.timestamp.unwrap_or(at_ms);
             (
@@ -352,6 +424,7 @@ fn parse_measurement(kind: DeviceKind, raw: &[u8], at_ms: u64) -> Option<(Measur
                     systolic: bp.systolic,
                     diastolic: bp.diastolic,
                     pulse: bp.pulse,
+                    timestamp: bp.timestamp,
                     at_ms,
                 },
                 order,

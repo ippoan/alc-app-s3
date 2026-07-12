@@ -4,14 +4,24 @@
 //! parseBloodPressure) を移植。Temperature Measurement (0x2A1C) /
 //! Blood Pressure Measurement (0x2A35) のペイロードを解釈する。
 
+/// Temperature Measurement (0x2A1C) のデコード結果 (摂氏)
+#[derive(Debug, Clone, PartialEq)]
+pub struct Temperature {
+    pub celsius: f32,
+    /// 測定時刻 (機器内蔵時計)。YYYYMMDDHHMMSS を u64 に詰めた比較用の値。
+    /// 同一測定の再送を見分ける重複排除に使う。タイムスタンプ非搭載の機器は None
+    pub timestamp: Option<u64>,
+}
+
 /// Temperature Measurement (0x2A1C): IEEE 11073 FLOAT (32bit)。
 /// 摂氏に正規化して返す。ペイロード不足時は None。
-pub fn parse_temperature(data: &[u8]) -> Option<f32> {
+pub fn parse_temperature(data: &[u8]) -> Option<Temperature> {
     if data.len() < 5 {
         return None;
     }
     let flags = data[0];
     let fahrenheit = flags & 0x01 != 0;
+    let has_timestamp = flags & 0x02 != 0;
 
     let mut mantissa = i32::from(data[1]) | (i32::from(data[2]) << 8) | (i32::from(data[3]) << 16);
     if mantissa & 0x0080_0000 != 0 {
@@ -19,11 +29,31 @@ pub fn parse_temperature(data: &[u8]) -> Option<f32> {
     }
     let exponent = data[4] as i8;
 
-    let mut t = mantissa as f32 * 10f32.powi(i32::from(exponent));
+    let mut celsius = mantissa as f32 * 10f32.powi(i32::from(exponent));
     if fahrenheit {
-        t = (t - 32.0) * 5.0 / 9.0;
+        celsius = (celsius - 32.0) * 5.0 / 9.0;
     }
-    Some(t)
+    let timestamp = if has_timestamp {
+        parse_timestamp(data, 5)
+    } else {
+        None
+    };
+    Some(Temperature { celsius, timestamp })
+}
+
+/// 7 バイトのタイムスタンプ (年 LE 2, 月, 日, 時, 分, 秒) を
+/// YYYYMMDDHHMMSS 形式の u64 (比較用) に詰める。バイト不足は None
+fn parse_timestamp(data: &[u8], offset: usize) -> Option<u64> {
+    let b = data.get(offset..offset + 7)?;
+    let year = u64::from(b[0]) | (u64::from(b[1]) << 8);
+    Some(
+        year * 10_000_000_000
+            + u64::from(b[2]) * 100_000_000
+            + u64::from(b[3]) * 1_000_000
+            + u64::from(b[4]) * 10_000
+            + u64::from(b[5]) * 100
+            + u64::from(b[6]),
+    )
 }
 
 /// Blood Pressure Measurement (0x2A35) のデコード結果 (mmHg)
@@ -66,21 +96,8 @@ pub fn parse_blood_pressure(data: &[u8]) -> Option<BloodPressure> {
     // data[5..7] は Mean Arterial Pressure (未使用)
 
     // タイムスタンプ (7 バイト: 年 LE 2, 月, 日, 時, 分, 秒) を data[7..14] から読む
-    let timestamp = if has_timestamp && data.len() >= 14 {
-        let year = u64::from(data[7]) | (u64::from(data[8]) << 8);
-        let month = u64::from(data[9]);
-        let day = u64::from(data[10]);
-        let hour = u64::from(data[11]);
-        let min = u64::from(data[12]);
-        let sec = u64::from(data[13]);
-        Some(
-            year * 10_000_000_000
-                + month * 100_000_000
-                + day * 1_000_000
-                + hour * 10_000
-                + min * 100
-                + sec,
-        )
+    let timestamp = if has_timestamp {
+        parse_timestamp(data, 7)
     } else {
         None
     };
@@ -141,21 +158,38 @@ mod tests {
     fn temperature_celsius() {
         // mantissa 365, exponent -1 → 36.5°C
         let t = parse_temperature(&[0x00, 0x6D, 0x01, 0x00, 0xFF]).unwrap();
-        assert!(approx(t, 36.5));
+        assert!(approx(t.celsius, 36.5));
+        assert_eq!(t.timestamp, None); // タイムスタンプフラグなし
     }
 
     #[test]
     fn temperature_fahrenheit_converted() {
         // mantissa 986, exponent -1 → 98.6°F → 37.0°C
         let t = parse_temperature(&[0x01, 0xDA, 0x03, 0x00, 0xFF]).unwrap();
-        assert!(approx(t, 37.0));
+        assert!(approx(t.celsius, 37.0));
     }
 
     #[test]
     fn temperature_negative_mantissa_sign_extended() {
         // mantissa 0x800000 → 符号拡張で負値
         let t = parse_temperature(&[0x00, 0x00, 0x00, 0x80, 0x00]).unwrap();
-        assert!(t < 0.0);
+        assert!(t.celsius < 0.0);
+    }
+
+    #[test]
+    fn temperature_with_timestamp() {
+        // flags 0x02 = タイムスタンプあり。年 0x07EA=2026, 7/12 16:30:05
+        let data = [0x02, 0x6D, 0x01, 0x00, 0xFF, 0xEA, 0x07, 7, 12, 16, 30, 5];
+        let t = parse_temperature(&data).unwrap();
+        assert!(approx(t.celsius, 36.5));
+        assert_eq!(t.timestamp, Some(20_260_712_163_005));
+    }
+
+    #[test]
+    fn temperature_timestamp_flag_but_truncated() {
+        // タイムスタンプフラグは立つがバイトが足りない → timestamp None
+        let t = parse_temperature(&[0x02, 0x6D, 0x01, 0x00, 0xFF]).unwrap();
+        assert_eq!(t.timestamp, None);
     }
 
     #[test]

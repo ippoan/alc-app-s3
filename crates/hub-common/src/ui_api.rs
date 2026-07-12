@@ -3,6 +3,8 @@
 //! UI 本体 (状態機械・描画) はバイナリ側 (src/ui) にあり、本クレートは
 //! この enum を送るだけ。UI 側の Screen 遷移規則は src/ui/mod.rs を参照。
 
+use alc_hub_core::device::DeviceKind;
+
 /// ホスト / BLE からの画面操作コマンド
 pub enum UiCommand {
     ShowQr {
@@ -30,4 +32,8 @@ pub enum UiCommand {
         diastolic: f32,
         pulse: Option<f32>,
     },
+    /// BLE 機器への接続開始 (点呼画面のラベル横に取得中スピナーを表示)
+    BleAcquiring { device: DeviceKind },
+    /// BLE 接続の終了 — 切断/再スキャン (スピナー消去)
+    BleIdle,
 }

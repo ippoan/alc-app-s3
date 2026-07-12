@@ -29,12 +29,35 @@ pub fn start(
         .name("recorder".into())
         .stack_size(8 * 1024)
         .spawn(move || {
+            // 直近に記録した測定の (機器タイムスタンプ, 測定値)。同一測定の
+            // 再送 (送信済み機器への再接続時など) を二重記録しないための比較値。
+            // NT-100B のタイムスタンプは分単位 (秒は常に 00 — 実機で確認) の
+            // ため、時刻だけで判定すると同じ分内の測り直しまで捨ててしまう。
+            // 値も含めて完全一致した場合のみ再送とみなす
+            let mut last_temp: Option<(u64, f32)> = None;
+            let mut last_bp: Option<(u64, f32, f32, Option<f32>)> = None;
             for m in meas_rx {
                 match m {
-                    Measurement::Temperature { celsius, at_ms } => {
-                        println!(
-                            "{{\"type\":\"temperature\",\"value\":{celsius:.1},\"unit\":\"celsius\"}}"
-                        );
+                    Measurement::Temperature {
+                        celsius,
+                        timestamp,
+                        at_ms,
+                    } => {
+                        if let Some(ts) = timestamp {
+                            if last_temp == Some((ts, celsius)) {
+                                log::info!("recorder: 体温の再送を無視 ({ts} {celsius:.1})");
+                                continue;
+                            }
+                            last_temp = Some((ts, celsius));
+                        }
+                        match timestamp {
+                            Some(ts) => println!(
+                                "{{\"type\":\"temperature\",\"value\":{celsius:.1},\"unit\":\"celsius\",\"measured_at\":{ts}}}"
+                            ),
+                            None => println!(
+                                "{{\"type\":\"temperature\",\"value\":{celsius:.1},\"unit\":\"celsius\"}}"
+                            ),
+                        }
                         record(&status, &settings, at_ms, &vitals::temp_event(celsius));
                         let _ = ui_tx.send(UiCommand::Temperature { celsius });
                     }
@@ -42,16 +65,29 @@ pub fn start(
                         systolic,
                         diastolic,
                         pulse,
+                        timestamp,
                         at_ms,
                     } => {
-                        match pulse {
-                            Some(p) if p > 0.0 => println!(
-                                "{{\"type\":\"blood_pressure\",\"systolic\":{systolic:.0},\"diastolic\":{diastolic:.0},\"pulse\":{p:.0},\"unit\":\"mmHg\"}}"
-                            ),
-                            _ => println!(
-                                "{{\"type\":\"blood_pressure\",\"systolic\":{systolic:.0},\"diastolic\":{diastolic:.0},\"unit\":\"mmHg\"}}"
-                            ),
+                        if let Some(ts) = timestamp {
+                            if last_bp == Some((ts, systolic, diastolic, pulse)) {
+                                log::info!(
+                                    "recorder: 血圧の再送を無視 ({ts} {systolic:.0}/{diastolic:.0})"
+                                );
+                                continue;
+                            }
+                            last_bp = Some((ts, systolic, diastolic, pulse));
                         }
+                        let pulse_part = match pulse {
+                            Some(p) if p > 0.0 => format!(",\"pulse\":{p:.0}"),
+                            _ => String::new(),
+                        };
+                        let ts_part = match timestamp {
+                            Some(ts) => format!(",\"measured_at\":{ts}"),
+                            None => String::new(),
+                        };
+                        println!(
+                            "{{\"type\":\"blood_pressure\",\"systolic\":{systolic:.0},\"diastolic\":{diastolic:.0}{pulse_part},\"unit\":\"mmHg\"{ts_part}}}"
+                        );
                         record(&status, &settings, at_ms, &vitals::bp_event(systolic, diastolic, pulse));
                         let _ = ui_tx.send(UiCommand::BloodPressure {
                             systolic,
