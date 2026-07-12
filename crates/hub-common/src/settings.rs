@@ -5,6 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use alc_hub_core::cfg::{DeviceConfig, WifiConfig};
 use alc_hub_core::protocol::valid_rotation;
 use anyhow::Result;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
@@ -68,6 +69,28 @@ impl Settings {
         let mut nvs = self.nvs.lock().expect("settings nvs lock");
         nvs.set_str(KEY_WIFI_SSID, ssid)?;
         nvs.set_str(KEY_WIFI_PASS, password)?;
+        Ok(())
+    }
+
+    /// 現在の設定を DeviceConfig にまとめる (CFG GET / エクスポート用)
+    pub fn export(&self) -> DeviceConfig {
+        DeviceConfig {
+            rotation: Some(self.rotation()),
+            wifi: self
+                .wifi_credentials()
+                .map(|(ssid, password)| WifiConfig { ssid, password }),
+        }
+    }
+
+    /// DeviceConfig を適用する (CFG SET / インポート用)。
+    /// 指定されたフィールドだけを更新する。
+    pub fn apply(&self, cfg: &DeviceConfig) -> Result<()> {
+        if let Some(deg) = cfg.rotation {
+            self.set_rotation(deg)?;
+        }
+        if let Some(w) = &cfg.wifi {
+            self.set_wifi_credentials(&w.ssid, &w.password)?;
+        }
         Ok(())
     }
 }

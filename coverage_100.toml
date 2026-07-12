@@ -3,6 +3,10 @@
 # 新しい純粋ロジックを crates/hub-core に追加したら、ここにも登録すること。
 
 [[file]]
+path = "crates/hub-core/src/cfg.rs"
+type = "unit"
+
+[[file]]
 path = "crates/hub-core/src/coex.rs"
 type = "unit"
 

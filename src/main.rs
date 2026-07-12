@@ -89,9 +89,10 @@ fn main() -> Result<()> {
                 }
             })?;
     }
-    let improv = improv::Improv::new(settings.clone(), wifi, Arc::clone(&status), provisioned);
+    let improv =
+        improv::Improv::new(settings.clone(), wifi.clone(), Arc::clone(&status), provisioned);
 
-    host_link::start(tx.clone(), Arc::clone(&status), settings, improv)?;
+    host_link::start(tx.clone(), Arc::clone(&status), settings, wifi, improv)?;
     rs232::start(p.uart1, p.pins.gpio17, p.pins.gpio18, Arc::clone(&status))?;
     lan::start(Arc::clone(&status)); // TODO: W5500 実装 (lan.rs 参照)
     // NT-100B / NBP-1BLE 読み取り。Wi-Fi 接続/Improv セッション中は

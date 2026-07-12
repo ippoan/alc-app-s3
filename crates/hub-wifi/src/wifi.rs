@@ -156,6 +156,30 @@ impl Wifi {
             .collect())
     }
 
+    /// 接続テスト: 失敗時はその場でスキャンして原因を切り分けたメッセージを返す
+    /// (SSID が見えない = 2.4GHz/SSID 間違い、見える = パスワード/認証の可能性)
+    pub fn connect_with_diagnosis(&self, ssid: &str, password: &str) -> Result<String, String> {
+        match self.connect(ssid, password) {
+            Ok(ip) => Ok(ip),
+            Err(e) => {
+                let base = format!("{e:#}");
+                let Ok(aps) = self.scan() else {
+                    return Err(base);
+                };
+                match aps.iter().find(|(s, _, _)| s == ssid) {
+                    Some((_, rssi, auth)) => Err(format!(
+                        "AP は検出 (RSSI {rssi}dBm, 認証{}) — パスワード/認証方式を確認: {base}",
+                        if *auth { "あり" } else { "なし" }
+                    )),
+                    None => Err(format!(
+                        "SSID '{ssid}' が見つからない (検出 {} 件) — 2.4GHz 帯か・SSID を確認: {base}",
+                        aps.len()
+                    )),
+                }
+            }
+        }
+    }
+
     /// 接続断を状態へ反映 (失敗時のクリーンアップ)
     pub fn mark_disconnected(&self) {
         if let Ok(mut st) = self.status.lock() {
