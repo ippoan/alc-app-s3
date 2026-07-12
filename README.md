@@ -94,13 +94,26 @@ Chrome/Edge からブラウザだけで書き込める。
   `ROTATE` コマンドを送信して設定 (0/90/180/270°、NVS 保存)。設置向きに合わせて
   書き込み直後にブラウザだけで完結する
 
-## クレート構成 (再コンパイル範囲の最小化)
+## クレート構成 (再コンパイル範囲の最小化 + 並列ビルド)
+
+```
+hub-core (純粋) → hub-common (状態/設定/UIコマンド)
+                    ├→ hub-ble   (体温計/血圧計)        ┐
+                    ├→ hub-wifi  (Wi-Fi + Improv)       ├ 互いに独立 = 並列ビルド
+                    ├→ hub-drivers (ホストリンク/RS232)  ┘ (drivers は wifi にも依存)
+                    └→ hub-ui    (画面。hub-board にも依存)
+hub-board (ボード初期化, 独立葉)   ルート = main の配線のみ
+```
 
 | クレート | 内容 | 変更頻度 |
 |---|---|---|
 | [crates/hub-core](crates/hub-core) | 純粋ロジック (ホストでテスト・coverage 100%) | 低 |
-| [crates/hub-drivers](crates/hub-drivers) | デバイス I/O 層 (BLE / Wi-Fi / Improv / RS232 / ホストリンク / ボード初期化 / 設定) | 低 |
-| ルート (alc-hub-cores3) | main の配線 + 画面 (src/ui) のみ | **高 (画面遷移の変更はここだけ)** |
+| [crates/hub-common](crates/hub-common) | 共有基盤 (状態 / NVS 設定 / 定数 / UI コマンド定義) | 低 |
+| [crates/hub-board](crates/hub-board) | CoreS3 ボード初期化 (LCD / 電源 / タッチ) | 低 |
+| [crates/hub-ble](crates/hub-ble) | BLE central (NT-100B / NBP-1BLE) | 低 |
+| [crates/hub-wifi](crates/hub-wifi) | Wi-Fi STA + Improv Wi-Fi Serial | 低 |
+| [crates/hub-drivers](crates/hub-drivers) | ホストリンク / RS232 / LAN スタブ | 低 |
+| [crates/hub-ui](crates/hub-ui) | 画面処理 (状態機械 + 描画) | **高 (画面遷移の変更はここだけ)** |
 
 CI ではワークスペース内クレートが checkout の mtime 変化で毎回再コンパイル
 されるため、内容ベースの **sccache** (GHA バックエンド) で吸収している

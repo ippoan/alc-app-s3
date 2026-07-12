@@ -1,5 +1,13 @@
 [workspace]
-members = ["crates/hub-core", "crates/hub-drivers"]
+members = [
+    "crates/hub-ble",
+    "crates/hub-board",
+    "crates/hub-common",
+    "crates/hub-core",
+    "crates/hub-drivers",
+    "crates/hub-ui",
+    "crates/hub-wifi",
+]
 
 [package]
 name = "alc-hub-cores3"
@@ -21,8 +29,12 @@ debug = true
 opt-level = "z"
 
 [dependencies]
-alc-hub-core = { path = "crates/hub-core" }
+alc-hub-ble = { path = "crates/hub-ble" }
+alc-hub-board = { path = "crates/hub-board" }
+alc-hub-common = { path = "crates/hub-common" }
 alc-hub-drivers = { path = "crates/hub-drivers" }
+alc-hub-ui = { path = "crates/hub-ui" }
+alc-hub-wifi = { path = "crates/hub-wifi" }
 anyhow = "1"
 log = "0.4"
 # ble-medical-gateway firmware-rust (esp32-nimble 0.12) とバージョンを揃える
@@ -32,9 +44,6 @@ esp-idf-svc = { version = "0.52", default-features = false, features = [
     "alloc",
     "binstart",
 ] }
-embedded-graphics = "0.8"
-qrcodegen = "1.8"
-u8g2-fonts = { version = "0.7", features = ["embedded_graphics_textstyle"] }
 
 [build-dependencies]
 embuild = "0.33"

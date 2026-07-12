@@ -9,11 +9,10 @@ use std::io::Write;
 
 use alc_hub_core::improv as proto;
 
-use crate::{
-    settings::Settings,
-    status::{now_ms, SharedStatus},
-    wifi::Wifi,
-};
+use alc_hub_common::settings::Settings;
+use alc_hub_common::status::{now_ms, SharedStatus};
+
+use crate::wifi::Wifi;
 
 pub struct Improv {
     settings: Settings,
@@ -62,7 +61,7 @@ impl Improv {
                     cmd,
                     &[
                         "alc-hub-cores3",
-                        crate::config::FIRMWARE_VERSION,
+                        alc_hub_common::config::FIRMWARE_VERSION,
                         "ESP32-S3",
                         "M5Stack CoreS3",
                     ],

@@ -1,0 +1,20 @@
+[package]
+name = "alc-hub-ui"
+version = "0.1.0"
+edition = "2021"
+description = "alc-hub-cores3 の画面処理 (状態機械 + 描画)。画面遷移の変更はこのクレートだけの再コンパイルで済む"
+
+[dependencies]
+alc-hub-core = { path = "../hub-core" }
+alc-hub-board = { path = "../hub-board" }
+alc-hub-common = { path = "../hub-common" }
+log = "0.4"
+esp-idf-svc = { version = "0.52", default-features = false, features = [
+    "native",
+    "std",
+    "alloc",
+    "binstart",
+] }
+embedded-graphics = "0.8"
+qrcodegen = "1.8"
+u8g2-fonts = { version = "0.7", features = ["embedded_graphics_textstyle"] }

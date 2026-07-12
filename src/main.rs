@@ -3,23 +3,30 @@
 //! `ippoan/alc-app` の plan/cores3-hub-consolidation.md (issues #100 / #102 の
 //! 参照元) に基づく、点呼キオスク向け CoreS3 統合ハブの画面処理実装。
 //!
-//! クレート構成 (再コンパイル範囲を狭めるための分割):
-//! - `alc-hub-core`    … 純粋ロジック (ホストでテスト・coverage 100%)
-//! - `alc-hub-drivers` … デバイス I/O 層 (BLE / Wi-Fi / Improv / RS232 /
-//!   ホストリンク / ボード初期化 / 設定 / 状態)
-//! - 本クレート        … main の配線と画面 (src/ui) のみ。画面遷移の変更では
-//!   ここだけが再コンパイルされる
-
-mod ui;
+//! クレート構成 (再コンパイル範囲の最小化と並列ビルドのための枝分かれ):
+//!
+//! ```text
+//! hub-core (純粋) → hub-common (状態/設定/UIコマンド)
+//!                     ├→ hub-ble   (体温計/血圧計)      ┐
+//!                     ├→ hub-wifi  (Wi-Fi + Improv)     ├ 互いに独立 = 並列
+//!                     ├→ hub-drivers (ホストリンク/RS232) ┘ (drivers→wifi)
+//!                     └→ hub-ui    (画面。hub-board にも依存)
+//! hub-board (ボード初期化, 独立葉)
+//! 本クレート = main の配線のみ (ほぼ変更されない)
+//! ```
 
 use std::sync::{mpsc, Arc, Mutex};
 
-use alc_hub_drivers::{
-    ble, board, config, host_link, improv, lan, rs232,
+use alc_hub_ble as ble;
+use alc_hub_board as board;
+use alc_hub_common::{
+    config,
     settings::Settings,
     status::{now_ms, HubStatus, SharedStatus},
-    wifi,
 };
+use alc_hub_drivers::{host_link, lan, rs232};
+use alc_hub_ui as ui;
+use alc_hub_wifi::{improv, wifi};
 use anyhow::Result;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::{
