@@ -239,7 +239,7 @@ fn draw_idle(d: &mut Cs3Display) {
     clear(d);
     jp_center(d, "NFC 待機中", BAR_H + 6, C_MUTED);
     jp2x_lines(d, "カードをかざしてください", 66, C_TEXT, C_BG, 8);
-    jp_center(d, "タップ: メニュー", h - 24, C_MUTED);
+    jp_center(d, "タップでメニュー", h - 24, C_MUTED);
 }
 
 /// メニュー: 上半分 = 点呼 / 下半分 = ログ確認
