@@ -26,9 +26,13 @@ permissions:
   pages: write
   id-token: write
 
+# PR は最新コミット優先で実行中 run をキャンセルする。main はキャンセルしない:
+# 連続マージで実行中の main ビルドを中断するとキャッシュ (rust-cache 等) が
+# 保存されず、次のビルドが差分を丸ごと再コンパイルして遅くなるため、
+# 実行中の run は完走させる (待機中の run は同グループ内で最新のみ残る)
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # cache key と install コマンドの二重管理を避けるため一箇所にまとめる

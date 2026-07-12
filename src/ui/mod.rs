@@ -8,7 +8,7 @@
 //! (NFC待機)  └─(下半分タップ)→ Log ─タップ→ Idle                      │
 //!   ↑  ↑                                                              │
 //!   │  └──────────────────────────────────────────────────────────────┘
-//!   ├─ BLE 測定受信 (待機中のみ) → Temperature / BloodPressure ─タップ/30秒→ Idle
+//!   ├─ BLE 測定受信 (待機中/点呼中のみ) → Temperature / BloodPressure ─タップ/30秒→ Idle
 //!   └─ ホストコマンド: QR / MEASURE / RESULT / ERROR / RESET は従来どおり
 //! ```
 //!
@@ -247,11 +247,18 @@ pub fn run(
 }
 
 /// バイタル (体温/血圧) の自動表示を許可する画面か。
-/// 操作中の画面 (QR / 点呼 / メニュー / 結果 / エラー / ログ) は奪わない
+///
+/// - 待機中・バイタル表示中: 表示する (連続測定は表示を更新)
+/// - 点呼の測定待ち (Measuring): 表示する — 点呼中のバイタル測定は業務フロー
+///   の一部で、アルコールチェッカーが無い運用では点呼 = 体温/血圧測定になる
+/// - QR / メニュー / ログ / 結果 / エラー: 奪わない (不意の遷移防止)
 fn vitals_display_allowed(screen: &Screen) -> bool {
     matches!(
         screen,
-        Screen::Idle | Screen::Temperature { .. } | Screen::BloodPressure { .. }
+        Screen::Idle
+            | Screen::Measuring
+            | Screen::Temperature { .. }
+            | Screen::BloodPressure { .. }
     )
 }
 
