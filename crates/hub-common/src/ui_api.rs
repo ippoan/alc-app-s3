@@ -36,13 +36,4 @@ pub enum UiCommand {
     BleAcquiring { device: DeviceKind },
     /// BLE 接続の終了 — 切断/再スキャン (スピナー消去)
     BleIdle,
-    /// auth-worker ペアリング承認待ち画面 (user_code + 承認 URL の QR)
-    ShowPairing {
-        user_code: String,
-        /// 承認ページ URL (QR 表示用、user_code プリフィル付き)
-        url: String,
-        timeout_ms: u64,
-    },
-    /// auth-worker ペアリングの結果表示 (成功/失敗)
-    PairingResult { ok: bool, message: String },
 }

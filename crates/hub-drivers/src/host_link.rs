@@ -18,7 +18,7 @@
 //! | `RESET` | 待機画面へ戻す |
 //! | `ROTATE <0\|90\|180\|270>` | 画面向きを変更 (NVS 保存、次回起動も維持) |
 //! | `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0` を返す |
-//! | `AUTH PAIR` | auth-worker デバイス登録を開始 (承認 QR を画面表示) |
+//! | `AUTH SET <id> <secret> <tenant>` | device credential を注入 (USB provisioning) |
 //! | `AUTH UNPAIR` | 保存済み device credential を破棄 (ローカルのみ) |
 //! | `AUTH STATUS` | `AUTH PAIRED <tenant> <id>` / `AUTH UNPAIRED` を返す |
 //! | `AUTH URL <url>` | auth-worker ベース URL を上書き (staging テスト用) |
@@ -258,12 +258,21 @@ fn handle_line(
             pair_flag.store(true, core::sync::atomic::Ordering::SeqCst);
             println!("OK PAIR");
         }
-        // auth-worker デバイス登録: HTTP を伴う処理は auth_link スレッドへ依頼し、
-        // 結果は EVT AUTH_* 行と画面遷移で非同期に届く
-        HostCommand::AuthPair => match auth_tx.send(AuthCommand::Pair) {
-            Ok(()) => println!("OK AUTH PAIR"),
-            Err(_) => println!("ERR AUTH: auth_link が停止しています"),
+        // device credential の注入 (USB provisioning — ホストが auth-worker
+        // /device/pair 系で取得した credential をそのまま渡す)。secret は
+        // 応答に echo しない
+        HostCommand::AuthSet {
+            device_id,
+            device_secret,
+            tenant_id,
+        } => match settings.set_device_credential(&device_id, &device_secret, &tenant_id) {
+            Ok(()) => println!("OK AUTH SET"),
+            Err(e) => {
+                log::error!("host_link: credential 保存失敗: {e:?}");
+                println!("ERR AUTH: credential の保存に失敗しました");
+            }
         },
+        // JWT mint (HTTP) は auth_link スレッドへ依頼し、結果は EVT AUTH_* で届く
         HostCommand::AuthToken => match auth_tx.send(AuthCommand::MintTest) {
             Ok(()) => println!("OK AUTH TOKEN"),
             Err(_) => println!("ERR AUTH: auth_link が停止しています"),

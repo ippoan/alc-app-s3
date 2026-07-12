@@ -111,10 +111,11 @@ fn main() -> Result<()> {
         ws_tx,
     )?;
 
-    // auth-worker デバイス登録 (AUTH PAIR / AUTH TOKEN)。HTTP + TLS を伴う処理を
-    // host_link から切り離した専用スレッドで実行する
+    // auth-worker device JWT 交換 (AUTH TOKEN 自己診断)。HTTP + TLS を伴う処理を
+    // host_link から切り離した専用スレッドで実行する。credential の provisioning
+    // は USB (AUTH SET) で行う
     let (auth_tx, auth_rx) = mpsc::channel();
-    auth_link::start(auth_rx, tx.clone(), Arc::clone(&status), settings.clone())?;
+    auth_link::start(auth_rx, settings.clone())?;
 
     host_link::start(
         tx.clone(),

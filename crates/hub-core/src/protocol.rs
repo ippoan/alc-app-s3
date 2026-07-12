@@ -22,8 +22,13 @@ pub enum HostCommand {
     WifiTest,
     /// BLE の全ボンド消去 → 次接続で再ペアリング (血圧計の暗号化接続復旧)
     BlePair,
-    /// auth-worker とのデバイスペアリング開始 (headless pairing、auth_link)
-    AuthPair,
+    /// device credential の直接注入 (USB 前提の provisioning — ホストが
+    /// auth-worker `/device/pair` 系で取得した credential をシリアルで渡す)
+    AuthSet {
+        device_id: String,
+        device_secret: String,
+        tenant_id: String,
+    },
     /// 保存済み device credential の破棄 (ローカルのみ。サーバ側 revoke は
     /// operator が auth-worker で行う)
     AuthUnpair,
@@ -135,7 +140,18 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
         },
         // auth-worker デバイス登録 (BLE の PAIR とは別系統)
         "AUTH" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
-            Some("PAIR") => HostCommand::AuthPair,
+            Some("SET") => match (it.next(), it.next(), it.next()) {
+                (Some(id), Some(secret), Some(tenant)) => HostCommand::AuthSet {
+                    device_id: id.to_string(),
+                    device_secret: secret.to_string(),
+                    tenant_id: tenant.to_string(),
+                },
+                _ => {
+                    return Err(
+                        "ERR AUTH: SET には device_id device_secret tenant_id が必要です".into(),
+                    )
+                }
+            },
             Some("UNPAIR") => HostCommand::AuthUnpair,
             Some("STATUS") => HostCommand::AuthStatus,
             Some("TOKEN") => HostCommand::AuthToken,
@@ -147,7 +163,7 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                 }
                 _ => return Err("ERR AUTH: URL には http(s):// で始まる URL が必要です".into()),
             },
-            _ => return Err("ERR AUTH: PAIR|UNPAIR|STATUS|TOKEN|URL が必要です".into()),
+            _ => return Err("ERR AUTH: SET|UNPAIR|STATUS|TOKEN|URL が必要です".into()),
         },
         _ => return Err(format!("ERR 不明なコマンド: {cmd}")),
     };
@@ -320,7 +336,6 @@ mod tests {
 
     #[test]
     fn auth_subcommands() {
-        assert_eq!(parse_line("AUTH PAIR", T), Ok(Some(HostCommand::AuthPair)));
         assert_eq!(
             parse_line("auth unpair", T),
             Ok(Some(HostCommand::AuthUnpair))
@@ -333,6 +348,23 @@ mod tests {
             parse_line("AUTH TOKEN", T),
             Ok(Some(HostCommand::AuthToken))
         );
+    }
+
+    #[test]
+    fn auth_set_takes_three_args_case_preserved() {
+        assert_eq!(
+            parse_line("AUTH SET dev_AbC s3crET-xyz 11111111-2222-3333-4444-555555555555", T),
+            Ok(Some(HostCommand::AuthSet {
+                device_id: "dev_AbC".into(),
+                device_secret: "s3crET-xyz".into(),
+                tenant_id: "11111111-2222-3333-4444-555555555555".into(),
+            }))
+        );
+        assert!(parse_line("AUTH SET", T).is_err());
+        assert!(parse_line("AUTH SET id", T).is_err());
+        assert!(parse_line("AUTH SET id secret", T).is_err());
+        // 旧 QR ペアリングの PAIR は廃止 (USB provisioning に一本化)
+        assert!(parse_line("AUTH PAIR", T).is_err());
     }
 
     #[test]
