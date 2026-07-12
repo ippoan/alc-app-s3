@@ -53,6 +53,12 @@ const RESEND_INTERVAL_MS: u64 = 15_000;
 const RECONNECT_BACKOFF_MS: u64 = 20_000;
 /// device JWT の残り有効期間がこれを切ったら再 mint
 const TOKEN_REFRESH_MARGIN_S: u64 = 120;
+/// TLS ハンドシェイク (mint + WSS) を始めるのに必要な空きヒープ。
+/// BLE (NimBLE) と同時にヒープを食い合うと BLE 側が Malloc failed で
+/// 測定不能になる (実機で確認) ため、余裕がない間は接続を延期する。
+/// 実測: Wi-Fi + BLE + UI 起動後の定常空きは約 70KB (バッファ削減後)、
+/// TLS ハンドシェイクのピークは DYNAMIC_BUFFER 有効で約 30KB
+const MIN_FREE_HEAP_FOR_TLS: u32 = 60 * 1024;
 
 /// WS イベントコールバック → 送信スレッドへの通知
 enum WsEvent {
@@ -104,6 +110,8 @@ fn run(
     let mut last_flush: u64 = 0;
     // 接続不能の連続ログを抑制する (1 回目だけ warn)
     let mut connect_warned = false;
+    // ヒープ不足ログの最終出力時刻
+    let mut heap_log_at: u64 = 0;
 
     loop {
         // --- 1. 測定の受け取り (500ms でタイムアウトしループを回す) ---
@@ -161,8 +169,15 @@ fn run(
 
         // --- 3. 接続管理 ---
         // BLE 測定中は 2.4GHz を医療機器に譲る (新規接続もハンドシェイク分の
-        // 電波を使うため控える)。切断は行わず既存接続は維持する
-        if conn.is_none() && !queue.is_empty() && wifi_up && !ble_busy && now >= backoff_until {
+        // 電波を使うため控える)。切断は行わず既存接続は維持する。
+        // 空きヒープが少ない間も延期する (TLS と BLE のヒープ食い合い対策)
+        if conn.is_none()
+            && !queue.is_empty()
+            && wifi_up
+            && !ble_busy
+            && now >= backoff_until
+            && heap_headroom_ok(now, &mut heap_log_at)
+        {
             match connect(&settings, &mut token, ev_tx.clone(), now) {
                 Ok(c) => conn = Some(c),
                 Err(e) => {
@@ -222,6 +237,20 @@ fn run(
             last_ping = now;
         }
     }
+}
+
+/// TLS ハンドシェイクを始められるだけの空きヒープがあるか。
+/// 不足ログは 30 秒に 1 回に抑える (500ms ループから毎回出さない)
+fn heap_headroom_ok(now: u64, last_log: &mut u64) -> bool {
+    let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+    if free < MIN_FREE_HEAP_FOR_TLS {
+        if now.saturating_sub(*last_log) >= 30_000 {
+            log::warn!("ws_uplink: 空きヒープ不足のため接続延期 ({free} bytes)");
+            *last_log = now;
+        }
+        return false;
+    }
+    true
 }
 
 /// 測定をキューへ積み NVS へ永続化する

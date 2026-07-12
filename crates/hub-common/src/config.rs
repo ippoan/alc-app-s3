@@ -35,16 +35,10 @@ pub const TENKO_TIMEOUT_MS: u64 = 180_000;
 /// 点呼画面で体温・血圧の両方が揃ってから待機画面へ戻るまでの時間
 pub const TENKO_DONE_CLOSE_MS: u64 = 5_000;
 
-/// auth-worker の既定ベース URL (`AUTH URL` コマンドで NVS 上書き可)
+/// auth-worker の既定ベース URL (`AUTH URL` コマンドで NVS 上書き可)。
+/// provisioning は USB 前提: credential はホストが `/device/pair` 系で取得し
+/// `AUTH SET` で注入する (role は host 側で `device-hub` を指定)
 pub const AUTH_WORKER_URL_DEFAULT: &str = "https://auth.ippoan.org";
-
-/// device credential の role (auth-worker 側 allowlist に登録済みであること。
-/// 未知 role はサーバが `device-uploader` へ silent fallback するため、
-/// ippoan/auth-worker#363 マージ前の実ペアリングは意図しない role になる)
-pub const DEVICE_ROLE: &str = "device-hub";
-
-/// ペアリング結果画面の自動クローズまでの時間
-pub const PAIRING_RESULT_CLOSE_MS: u64 = 10_000;
 
 /// cf-alc-recorder の既定 WS URL (`WS URL` コマンドで NVS 上書き可。
 /// staging は wss://alc-recorder-staging.m-tama-ramu.workers.dev/ws)
