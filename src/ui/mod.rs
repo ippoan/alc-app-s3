@@ -8,7 +8,7 @@
 //! (NFC待機)  └─(下半分タップ)→ Log ─タップ→ Idle                      │
 //!   ↑  ↑                                                              │
 //!   │  └──────────────────────────────────────────────────────────────┘
-//!   ├─ BLE 測定受信 → Temperature / BloodPressure ─タップ/30秒→ Idle
+//!   ├─ BLE 測定受信 (待機中のみ) → Temperature / BloodPressure ─タップ/30秒→ Idle
 //!   └─ ホストコマンド: QR / MEASURE / RESULT / ERROR / RESET は従来どおり
 //! ```
 //!
@@ -121,6 +121,36 @@ pub fn run(
                         log::warn!("ui: 画面向き変更失敗: {e:?}");
                     }
                     rotation = deg;
+                    dirty = true;
+                }
+                // バイタルの自動表示は待機画面 (または既にバイタル表示中) のみ。
+                // QR・点呼・メニュー等の操作中に不意の画面遷移をさせない
+                // (測定値はイベントログとホストへの JSON 出力には常に残る)
+                UiCommand::Temperature { celsius } => {
+                    if vitals_display_allowed(&screen) {
+                        screen = Screen::Temperature { celsius };
+                        entered = now;
+                        dirty = true;
+                    } else {
+                        log::info!("ui: 体温表示を抑制 (操作中の画面を優先)");
+                    }
+                }
+                UiCommand::BloodPressure {
+                    systolic,
+                    diastolic,
+                    pulse,
+                } => {
+                    if vitals_display_allowed(&screen) {
+                        screen = Screen::BloodPressure {
+                            systolic,
+                            diastolic,
+                            pulse,
+                        };
+                        entered = now;
+                        dirty = true;
+                    } else {
+                        log::info!("ui: 血圧表示を抑制 (操作中の画面を優先)");
+                    }
                 }
                 cmd => {
                     screen = match cmd {
@@ -135,22 +165,14 @@ pub fn run(
                         UiCommand::Result { ok, value } => Screen::Result { ok, value },
                         UiCommand::Error { message } => Screen::Error { message },
                         UiCommand::Reset => Screen::Idle,
-                        UiCommand::Temperature { celsius } => Screen::Temperature { celsius },
-                        UiCommand::BloodPressure {
-                            systolic,
-                            diastolic,
-                            pulse,
-                        } => Screen::BloodPressure {
-                            systolic,
-                            diastolic,
-                            pulse,
-                        },
-                        UiCommand::Rotate(_) => unreachable!(),
+                        UiCommand::Rotate(_)
+                        | UiCommand::Temperature { .. }
+                        | UiCommand::BloodPressure { .. } => unreachable!(),
                     };
                     entered = now;
+                    dirty = true;
                 }
             }
-            dirty = true;
         }
 
         // --- 自動遷移 ---
@@ -222,6 +244,15 @@ pub fn run(
 
         FreeRtos::delay_ms(20);
     }
+}
+
+/// バイタル (体温/血圧) の自動表示を許可する画面か。
+/// 操作中の画面 (QR / 点呼 / メニュー / 結果 / エラー / ログ) は奪わない
+fn vitals_display_allowed(screen: &Screen) -> bool {
+    matches!(
+        screen,
+        Screen::Idle | Screen::Temperature { .. } | Screen::BloodPressure { .. }
+    )
 }
 
 /// タップ時の画面遷移先 (None = 変化なし)。y は回転補正済みの論理座標。
