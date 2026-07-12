@@ -330,10 +330,14 @@ pub fn draw_qr_countdown(d: &mut Cs3Display, remain_s: u64) {
 }
 
 fn draw_measuring(d: &mut Cs3Display) {
+    let (_, h) = dims(d);
     clear(d);
     jp2x_center(d, "測定中...", BAR_H + 6, C_TEXT, C_BG);
     draw_spinner(d, 0);
-    jp2x_lines(d, "息を吹き込んでください", 158, C_MUTED, C_BG, 7);
+    // アルコールチェッカー / 体温計 / 血圧計 のどれでも受け付ける
+    // (体温・血圧は BLE 受信で自動的に結果画面へ遷移する)
+    jp2x_center(d, "測定してください", 158, C_MUTED, C_BG);
+    jp_center(d, "アルコール / 体温 / 血圧", h - 24, C_MUTED);
 }
 
 /// 測定中スピナー (部分更新)。8 ドット。
