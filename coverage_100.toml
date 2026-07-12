@@ -39,5 +39,9 @@ path = "crates/hub-core/src/protocol.rs"
 type = "unit"
 
 [[file]]
+path = "crates/hub-core/src/uplink.rs"
+type = "unit"
+
+[[file]]
 path = "crates/hub-core/src/vitals.rs"
 type = "unit"

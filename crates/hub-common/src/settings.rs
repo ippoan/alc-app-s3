@@ -25,6 +25,13 @@ const KEY_DEV_SECRET: &str = "dev_secret";
 const KEY_DEV_TENANT: &str = "dev_tenant";
 /// auth-worker ベース URL の上書き (staging テスト用、`AUTH URL` コマンド)
 const KEY_AUTH_URL: &str = "auth_url";
+// WS 送信 (cf-alc-recorder、ippoan/alc-app-s3#21)
+/// 未 ack の送信キュー (uplink::UplinkQueue::serialize の改行区切り)
+const KEY_WS_QUEUE: &str = "ws_queue";
+/// seq 採番カウンタ。ack 後も再利用しない (サーバ側 UNIQUE 冪等化のため)
+const KEY_WS_SEQ: &str = "ws_seq";
+/// cf-alc-recorder WS URL の上書き (`WS URL` コマンド)
+const KEY_WS_URL: &str = "ws_url";
 
 #[derive(Clone)]
 pub struct Settings {
@@ -179,6 +186,61 @@ impl Settings {
         );
         let nvs = self.nvs.lock().expect("settings nvs lock");
         nvs.set_str(KEY_AUTH_URL, url.trim_end_matches('/'))?;
+        Ok(())
+    }
+
+    /// 未 ack の WS 送信キュー (uplink::UplinkQueue::restore へ渡す)
+    pub fn ws_queue(&self) -> String {
+        let Ok(nvs) = self.nvs.lock() else {
+            return String::new();
+        };
+        let mut buf = [0u8; 4096];
+        match nvs.get_str(KEY_WS_QUEUE, &mut buf) {
+            Ok(Some(s)) => s.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    pub fn set_ws_queue(&self, lines: &str) {
+        let nvs = self.nvs.lock().expect("settings nvs lock");
+        if let Err(e) = nvs.set_str(KEY_WS_QUEUE, lines) {
+            log::warn!("settings: WS キュー保存失敗: {e:?}");
+        }
+    }
+
+    /// WS 送信の seq 採番カウンタ (未保存は 0)
+    pub fn ws_last_seq(&self) -> u64 {
+        let Ok(nvs) = self.nvs.lock() else { return 0 };
+        nvs.get_u64(KEY_WS_SEQ).ok().flatten().unwrap_or(0)
+    }
+
+    pub fn set_ws_last_seq(&self, seq: u64) {
+        let nvs = self.nvs.lock().expect("settings nvs lock");
+        if let Err(e) = nvs.set_u64(KEY_WS_SEQ, seq) {
+            log::warn!("settings: WS seq 保存失敗: {e:?}");
+        }
+    }
+
+    /// cf-alc-recorder の WS URL (`WS URL` で上書き、既定は config 定数)
+    pub fn ws_url(&self) -> String {
+        let fallback = || crate::config::RECORDER_WS_URL_DEFAULT.to_string();
+        let Ok(nvs) = self.nvs.lock() else {
+            return fallback();
+        };
+        let mut buf = [0u8; 160];
+        match nvs.get_str(KEY_WS_URL, &mut buf) {
+            Ok(Some(s)) if !s.is_empty() => s.to_string(),
+            _ => fallback(),
+        }
+    }
+
+    pub fn set_ws_url(&self, url: &str) -> Result<()> {
+        anyhow::ensure!(
+            (url.starts_with("wss://") || url.starts_with("ws://")) && url.len() < 160,
+            "URL が不正です"
+        );
+        let nvs = self.nvs.lock().expect("settings nvs lock");
+        nvs.set_str(KEY_WS_URL, url)?;
         Ok(())
     }
 

@@ -40,6 +40,13 @@ pub struct HubStatus {
     pub wifi_connected: bool,
     /// Wi-Fi 接続時の IP アドレス
     pub wifi_ip: String,
+
+    /// cf-alc-recorder への WS 接続状態 (ws_uplink.rs が更新)
+    pub ws_connected: bool,
+    /// WS 送信キューの未 ack 件数 (`WS STATUS` 応答用)
+    pub ws_queue_len: usize,
+    /// WS 送信の最終採番 seq
+    pub ws_last_seq: u64,
 }
 
 impl HubStatus {

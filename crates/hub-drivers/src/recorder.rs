@@ -9,9 +9,10 @@
 //! 測定値は NVS にも追記され、リブートしても「ログ確認」画面に残る。
 
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use alc_hub_common::{
-    measurement::Measurement,
+    measurement::{Measurement, UplinkRecord},
     settings::Settings,
     status::{event_timestamp, SharedStatus},
     ui_api::UiCommand,
@@ -19,11 +20,21 @@ use alc_hub_common::{
 use alc_hub_core::vitals;
 use anyhow::Result;
 
+/// 現在の epoch ms (NTP 未同期時は 1970 起点の稼働時間になる — サーバ側は
+/// recorded_at_ms をそのまま保存するだけなので許容し、受信時刻で補完する)
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub fn start(
     meas_rx: Receiver<Measurement>,
     ui_tx: Sender<UiCommand>,
     status: SharedStatus,
     settings: Settings,
+    ws_tx: Sender<UplinkRecord>,
 ) -> Result<()> {
     std::thread::Builder::new()
         .name("recorder".into())
@@ -50,14 +61,21 @@ pub fn start(
                             }
                             last_temp = Some((ts, celsius));
                         }
-                        match timestamp {
-                            Some(ts) => println!(
+                        let json = match timestamp {
+                            Some(ts) => format!(
                                 "{{\"type\":\"temperature\",\"value\":{celsius:.1},\"unit\":\"celsius\",\"measured_at\":{ts}}}"
                             ),
-                            None => println!(
+                            None => format!(
                                 "{{\"type\":\"temperature\",\"value\":{celsius:.1},\"unit\":\"celsius\"}}"
                             ),
-                        }
+                        };
+                        println!("{json}");
+                        // WS 送信 (cf-alc-recorder) へも同じ payload を fan-out
+                        let _ = ws_tx.send(UplinkRecord {
+                            kind: "temperature",
+                            payload: json,
+                            recorded_at_ms: epoch_ms(),
+                        });
                         record(&status, &settings, at_ms, &vitals::temp_event(celsius));
                         let _ = ui_tx.send(UiCommand::Temperature { celsius });
                     }
@@ -85,9 +103,15 @@ pub fn start(
                             Some(ts) => format!(",\"measured_at\":{ts}"),
                             None => String::new(),
                         };
-                        println!(
+                        let json = format!(
                             "{{\"type\":\"blood_pressure\",\"systolic\":{systolic:.0},\"diastolic\":{diastolic:.0}{pulse_part},\"unit\":\"mmHg\"{ts_part}}}"
                         );
+                        println!("{json}");
+                        let _ = ws_tx.send(UplinkRecord {
+                            kind: "blood_pressure",
+                            payload: json,
+                            recorded_at_ms: epoch_ms(),
+                        });
                         record(&status, &settings, at_ms, &vitals::bp_event(systolic, diastolic, pulse));
                         let _ = ui_tx.send(UiCommand::BloodPressure {
                             systolic,
