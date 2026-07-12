@@ -656,12 +656,19 @@ fn draw_log(d: &mut Cs3Display, st: &HubStatus, now: u64) {
     clear(d);
 
     let flag = |b: bool| if b { "○" } else { "×" };
+    // WS は未送信キュー件数を優先表示 (溜まっていれば n、空なら ○/×)
+    let ws = if st.ws_queue_len > 0 {
+        format!("WS{}", st.ws_queue_len)
+    } else {
+        format!("WS{}", flag(st.ws_connected))
+    };
     let summary = format!(
-        "LAN{} 232{} BLE{} WiFi{}  v{}",
+        "LAN{} 232{} BLE{} WiFi{} {}  v{}",
         flag(st.lan_link),
         flag(st.rs232_active(now, config::RS232_ACTIVE_WINDOW_MS)),
         flag(st.ble_connected),
         flag(st.wifi_connected),
+        ws,
         config::FIRMWARE_VERSION,
     );
     text(d, &JP16, &summary, 6, BAR_H + 2, C_ACCENT, HorizontalAlignment::Left);
@@ -697,20 +704,36 @@ fn draw_log(d: &mut Cs3Display, st: &HubStatus, now: u64) {
 // ステータスバー (全画面共通)
 // ---------------------------------------------------------------------------
 
-const BAR_ITEMS_X: [i32; 4] = [6, 50, 94, 138];
+const BAR_ITEMS_X: [i32; 5] = [6, 50, 94, 138, 182];
 
-fn bar_items(st: &HubStatus, now: u64) -> [(&'static str, bool); 4] {
+/// WS 送信ドットの色:
+/// - キューに未送信あり → 黄 (溜まっている警告)
+/// - キュー空 + 接続中   → 緑 (捌けている・ライブ)
+/// - キュー空 + 未接続   → 灰 (アイドル・送信待ちなし)
+fn ws_dot_color(st: &HubStatus) -> Rgb565 {
+    if st.ws_queue_len > 0 {
+        Rgb565::CSS_GOLD
+    } else if st.ws_connected {
+        C_OK
+    } else {
+        C_MUTED
+    }
+}
+
+/// (ラベル, ドット色) の一覧。LAN/232/BLE/WiFi は緑/赤の 2 値、WS は 3 値。
+fn bar_items(st: &HubStatus, now: u64) -> [(&'static str, Rgb565); 5] {
+    let dot = |on: bool| if on { C_OK } else { Rgb565::CSS_DARK_RED };
     [
-        ("LAN", st.lan_link),
-        ("232", st.rs232_active(now, config::RS232_ACTIVE_WINDOW_MS)),
-        ("BLE", st.ble_connected),
-        ("WiFi", st.wifi_connected),
+        ("LAN", dot(st.lan_link)),
+        ("232", dot(st.rs232_active(now, config::RS232_ACTIVE_WINDOW_MS))),
+        ("BLE", dot(st.ble_connected)),
+        ("WiFi", dot(st.wifi_connected)),
+        ("WS", ws_dot_color(st)),
     ]
 }
 
 fn draw_bar_dots(d: &mut Cs3Display, st: &HubStatus, now: u64) {
-    for (x, (_, on)) in BAR_ITEMS_X.iter().zip(bar_items(st, now)) {
-        let color = if on { C_OK } else { Rgb565::CSS_DARK_RED };
+    for (x, (_, color)) in BAR_ITEMS_X.iter().zip(bar_items(st, now)) {
         let _ = Circle::with_center(Point::new(x + 3, BAR_H / 2), 6)
             .into_styled(PrimitiveStyle::with_fill(color))
             .draw(d);
