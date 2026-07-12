@@ -10,6 +10,9 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
 CONFIG_FREERTOS_HZ=1000
 
+# Wi-Fi (Improv で設定) と BLE の同時使用のため SW コエグジストを明示的に有効化
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
 # BLE central のみ (ble-medical-gateway firmware-rust の設定を踏襲)
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y

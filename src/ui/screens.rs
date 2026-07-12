@@ -25,7 +25,7 @@ use u8g2_fonts::{
 };
 
 use super::Screen;
-use crate::{board::display::Cs3Display, config, status::HubStatus};
+use alc_hub_drivers::{board::display::Cs3Display, config, status::HubStatus};
 
 const BAR_H: i32 = 18;
 

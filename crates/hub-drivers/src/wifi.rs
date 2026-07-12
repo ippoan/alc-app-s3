@@ -4,9 +4,14 @@
 //! 代替経路として Wi-Fi STA を持つ (plan/cores3-hub-consolidation.md の
 //! セルラー検討と同じ位置付け)。ESP32-S3 は 2.4GHz (11b/g/n) のみ対応。
 //!
-//! 注意: BLE (NimBLE) と Wi-Fi の同時使用はコエグジスト動作になる。
-//! メモリ・スループットの実機確認は TODO (README 参照)。
+//! 実装メモ:
+//! - 接続待ちは自前のタイムアウト付きポーリング。esp-idf-svc の BlockingWifi
+//!   は接続失敗時 (パスワード不一致等) に無期限ブロックし得るため使わない
+//! - BLE (NimBLE) とのコエグジスト対策として、接続/スキャン中は busy フラグを
+//!   立て、ble.rs 側が BLE スキャンを一時停止する
 
+use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
@@ -14,10 +19,13 @@ use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     hal::{delay::FreeRtos, modem::Modem},
     nvs::EspDefaultNvsPartition,
-    wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi},
+    wifi::{AuthMethod, ClientConfiguration, Configuration, EspWifi},
 };
 
 use crate::status::{now_ms, SharedStatus};
+
+/// 接続 (アソシエーション + DHCP) の待ち時間上限
+const CONNECT_TIMEOUT_MS: u64 = 20_000;
 
 /// スキャン結果 1 件: (SSID, RSSI, 認証あり)
 pub type ScanEntry = (String, i8, bool);
@@ -25,8 +33,9 @@ pub type ScanEntry = (String, i8, bool);
 #[derive(Clone)]
 pub struct Wifi {
     inner: Arc<Mutex<EspWifi<'static>>>,
-    sysloop: EspSystemEventLoop,
     status: SharedStatus,
+    /// 接続/スキャン中フラグ (ble.rs が見て BLE スキャンを止める)
+    busy: Arc<AtomicBool>,
 }
 
 impl Wifi {
@@ -36,17 +45,29 @@ impl Wifi {
         nvs: EspDefaultNvsPartition,
         status: SharedStatus,
     ) -> Result<Self> {
-        let wifi = EspWifi::new(modem, sysloop.clone(), Some(nvs))?;
+        let wifi = EspWifi::new(modem, sysloop, Some(nvs))?;
         Ok(Self {
             inner: Arc::new(Mutex::new(wifi)),
-            sysloop,
             status,
+            busy: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    /// STA として接続 (ブロッキング)。成功時は IP アドレス文字列を返す。
+    /// BLE 側が参照する busy フラグ
+    pub fn busy_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.busy)
+    }
+
+    /// STA として接続 (最大 20 秒ブロック)。成功時は IP アドレス文字列を返す。
     pub fn connect(&self, ssid: &str, password: &str) -> Result<String> {
-        let mut guard = self.inner.lock().expect("wifi lock");
+        self.busy.store(true, Ordering::SeqCst);
+        let result = self.connect_inner(ssid, password);
+        self.busy.store(false, Ordering::SeqCst);
+        result
+    }
+
+    fn connect_inner(&self, ssid: &str, password: &str) -> Result<String> {
+        let mut wifi = self.inner.lock().expect("wifi lock");
 
         let auth_method = if password.is_empty() {
             AuthMethod::None
@@ -64,22 +85,35 @@ impl Wifi {
             ..Default::default()
         });
 
-        let mut wifi = BlockingWifi::wrap(&mut *guard, self.sysloop.clone())
-            .context("BlockingWifi 初期化失敗")?;
-        wifi.set_configuration(&config)?;
+        wifi.set_configuration(&config)
+            .context("Wi-Fi 設定の適用失敗")?;
         if !wifi.is_started().unwrap_or(false) {
             wifi.start().context("Wi-Fi start 失敗")?;
         }
         // 再接続時は一旦切断してから
         let _ = wifi.disconnect();
-        wifi.connect().context("Wi-Fi 接続失敗")?;
-        wifi.wait_netif_up().context("IP アドレス取得失敗")?;
+        FreeRtos::delay_ms(200);
+        wifi.connect().context("Wi-Fi 接続開始失敗")?;
 
-        let ip = guard
-            .sta_netif()
-            .get_ip_info()
-            .map(|i| i.ip.to_string())
-            .unwrap_or_default();
+        // アソシエーション + DHCP をポーリング (タイムアウト付き)
+        let deadline = now_ms() + CONNECT_TIMEOUT_MS;
+        let ip = loop {
+            if wifi.is_connected().unwrap_or(false) {
+                if let Ok(info) = wifi.sta_netif().get_ip_info() {
+                    if info.ip != Ipv4Addr::UNSPECIFIED {
+                        break info.ip.to_string();
+                    }
+                }
+            }
+            if now_ms() >= deadline {
+                let _ = wifi.disconnect(); // 接続試行を止めておく
+                anyhow::bail!(
+                    "接続タイムアウト ({}s) — SSID/パスワード/電波状況を確認",
+                    CONNECT_TIMEOUT_MS / 1000
+                );
+            }
+            FreeRtos::delay_ms(250);
+        };
 
         if let Ok(mut st) = self.status.lock() {
             st.wifi_connected = true;
@@ -91,13 +125,20 @@ impl Wifi {
 
     /// 周辺ネットワークのスキャン (Improv の REQUEST_SCAN 用)
     pub fn scan(&self) -> Result<Vec<ScanEntry>> {
-        let mut guard = self.inner.lock().expect("wifi lock");
-        if !guard.is_started().unwrap_or(false) {
-            guard.start().context("Wi-Fi start 失敗")?;
+        self.busy.store(true, Ordering::SeqCst);
+        let result = self.scan_inner();
+        self.busy.store(false, Ordering::SeqCst);
+        result
+    }
+
+    fn scan_inner(&self) -> Result<Vec<ScanEntry>> {
+        let mut wifi = self.inner.lock().expect("wifi lock");
+        if !wifi.is_started().unwrap_or(false) {
+            wifi.start().context("Wi-Fi start 失敗")?;
             // ドライバ起動直後のスキャンは失敗しやすい
             FreeRtos::delay_ms(100);
         }
-        let aps = guard.scan().context("スキャン失敗")?;
+        let aps = wifi.scan().context("スキャン失敗")?;
         Ok(aps
             .into_iter()
             .map(|ap| {

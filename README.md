@@ -94,6 +94,20 @@ Chrome/Edge からブラウザだけで書き込める。
   `ROTATE` コマンドを送信して設定 (0/90/180/270°、NVS 保存)。設置向きに合わせて
   書き込み直後にブラウザだけで完結する
 
+## クレート構成 (再コンパイル範囲の最小化)
+
+| クレート | 内容 | 変更頻度 |
+|---|---|---|
+| [crates/hub-core](crates/hub-core) | 純粋ロジック (ホストでテスト・coverage 100%) | 低 |
+| [crates/hub-drivers](crates/hub-drivers) | デバイス I/O 層 (BLE / Wi-Fi / Improv / RS232 / ホストリンク / ボード初期化 / 設定) | 低 |
+| ルート (alc-hub-cores3) | main の配線 + 画面 (src/ui) のみ | **高 (画面遷移の変更はここだけ)** |
+
+CI ではワークスペース内クレートが checkout の mtime 変化で毎回再コンパイル
+されるため、内容ベースの **sccache** (GHA バックエンド) で吸収している
+(rust-alc-api と同方式)。xtensa クロスビルド (esp-idf-sys/embuild) は Cargo に
+深く結合しており、rust-alc-api のような Bazel 化はホスト側テスト以外では
+割に合わないと判断 — Bazel の利点 (内容ベースキャッシュ) は sccache で取る。
+
 ## テスト / カバレッジ 100% (ippoan/rust-alc-api と同方式)
 
 ESP-IDF に依存しない純粋ロジック (IEEE 11073 デコード・ホストプロトコル解析・
@@ -147,8 +161,13 @@ STATUS
 
 ## Wi-Fi (Improv Wi-Fi Serial)
 
-ESP Web Tools のインストールダイアログから SSID/パスワードを設定できる
-(書き込み直後に「Wi-Fi 設定」が出る)。設定は NVS 保存され起動時に自動接続。
+設定方法は 2 つ (どちらも NVS 保存され起動時に自動接続):
+
+1. **Pages の「Wi-Fi 設定 (いつでも)」フォーム** — ページの JS が Web Serial で
+   Improv プロトコルを直接話す。説明文を読みながらいつでも設定できる
+2. ESP Web Tools のインストールダイアログ (書き込み直後の「Wi-Fi 設定」、
+   周辺ネットワークのスキャン選択が可能)
+
 2.4GHz (11b/g/n) のみ・WPA/WPA2/WPA3-Personal 対応。主経路はあくまで
 LAN Module 13.2 (PoE) で、Wi-Fi は LAN 配線が無い拠点向けの代替経路。
 

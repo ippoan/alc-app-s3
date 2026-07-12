@@ -37,7 +37,7 @@ use esp32_nimble::{
 use esp_idf_svc::hal::{delay::FreeRtos, task::block_on};
 
 use crate::status::{now_ms, SharedStatus};
-use crate::ui::UiCommand;
+use crate::ui_api::UiCommand;
 
 /// on_notify クロージャ (Send + Sync 要求) から使うため Mutex で包む
 type SharedTx = Arc<Mutex<Sender<UiCommand>>>;
@@ -68,13 +68,17 @@ fn measurement_uuid(kind: DeviceKind) -> BleUuid {
     }
 }
 
-pub fn start(status: SharedStatus, tx: Sender<UiCommand>) -> Result<()> {
+pub fn start(
+    status: SharedStatus,
+    tx: Sender<UiCommand>,
+    wifi_busy: Arc<AtomicBool>,
+) -> Result<()> {
     let tx: SharedTx = Arc::new(Mutex::new(tx));
     std::thread::Builder::new()
         .name("ble".into())
         .stack_size(16 * 1024)
         .spawn(move || {
-            if let Err(e) = block_on(task(status, tx)) {
+            if let Err(e) = block_on(task(status, tx, wifi_busy)) {
                 log::error!("ble: タスク異常終了: {e:?}");
                 println!("{{\"type\":\"error\",\"message\":\"BLE task terminated\"}}");
             }
@@ -82,7 +86,7 @@ pub fn start(status: SharedStatus, tx: Sender<UiCommand>) -> Result<()> {
     Ok(())
 }
 
-async fn task(status: SharedStatus, tx: SharedTx) -> Result<()> {
+async fn task(status: SharedStatus, tx: SharedTx, wifi_busy: Arc<AtomicBool>) -> Result<()> {
     let device = BLEDevice::take();
 
     // Arduino 版と同等の Just Works ボンディング設定
@@ -93,6 +97,12 @@ async fn task(status: SharedStatus, tx: SharedTx) -> Result<()> {
 
     let mut scan = BLEScan::new();
     loop {
+        // Wi-Fi の接続/スキャン中は BLE スキャンを止め、コエグジストの
+        // 電波取り合いで Wi-Fi 側が失敗しないようにする (wifi.rs 参照)
+        while wifi_busy.load(Ordering::SeqCst) {
+            FreeRtos::delay_ms(200);
+        }
+
         // ニプロ機器は測定時にアドバタイズを開始するため、短いスキャンを
         // 繰り返して発見次第すぐ接続する (Arduino 版 loop() と同じ運用)
         let target = scan

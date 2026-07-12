@@ -20,9 +20,7 @@ mod screens;
 use std::sync::mpsc::Receiver;
 
 use alc_hub_core::layout::map_touch;
-use esp_idf_svc::hal::{delay::FreeRtos, i2c::I2cDriver};
-
-use crate::{
+use alc_hub_drivers::{
     board::{
         display::{self, Cs3Display, LCD_H, LCD_W},
         touch,
@@ -30,35 +28,10 @@ use crate::{
     config,
     status::{now_ms, SharedStatus},
 };
+use esp_idf_svc::hal::{delay::FreeRtos, i2c::I2cDriver};
 
-/// ホスト / BLE からの画面操作コマンド
-pub enum UiCommand {
-    ShowQr {
-        payload: String,
-        timeout_ms: u64,
-    },
-    Measure,
-    Result {
-        ok: bool,
-        value: String,
-    },
-    Error {
-        message: String,
-    },
-    Reset,
-    /// 画面向き変更 (0/90/180/270 度)。NVS への保存は host_link 側で実施済み
-    Rotate(u16),
-    /// BLE 体温計の測定値 (℃)
-    Temperature {
-        celsius: f32,
-    },
-    /// BLE 血圧計の測定値 (mmHg)
-    BloodPressure {
-        systolic: f32,
-        diastolic: f32,
-        pulse: Option<f32>,
-    },
-}
+// コマンド定義は I/O 層 (host_link / ble が送信側) と共有
+pub use alc_hub_drivers::ui_api::UiCommand;
 
 pub(crate) enum Screen {
     /// 待機画面 (NFC カード待ち)
