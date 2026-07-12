@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>alc-hub CoreS3 - Firmware Writer</title>
+    <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+            color: #333;
+        }
+        h1 {
+            color: #1a73e8;
+            border-bottom: 2px solid #1a73e8;
+            padding-bottom: 10px;
+        }
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            margin: 20px 0;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        .card h2 {
+            margin-top: 0;
+            color: #333;
+        }
+        .requirements {
+            background: #e8f5e9;
+            border-left: 4px solid #4caf50;
+            padding: 16px;
+            margin: 16px 0;
+        }
+        .requirements h3 {
+            margin-top: 0;
+            color: #2e7d32;
+        }
+        .warning {
+            background: #fff3e0;
+            border-left: 4px solid #ff9800;
+            padding: 16px;
+            margin: 16px 0;
+        }
+        .warning h3 {
+            margin-top: 0;
+            color: #e65100;
+        }
+        .install-section {
+            text-align: center;
+            padding: 40px 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 12px;
+            color: white;
+        }
+        .install-section h2 {
+            color: white;
+            margin-bottom: 20px;
+        }
+        esp-web-install-button {
+            --esp-tools-button-color: #4caf50;
+            --esp-tools-button-text-color: white;
+        }
+        .steps {
+            counter-reset: step;
+        }
+        .steps li {
+            list-style: none;
+            margin: 16px 0;
+            padding-left: 50px;
+            position: relative;
+        }
+        .steps li::before {
+            counter-increment: step;
+            content: counter(step);
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 32px;
+            height: 32px;
+            background: #1a73e8;
+            color: white;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+        }
+        .device-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-top: 16px;
+        }
+        .device-info div {
+            background: #f8f9fa;
+            padding: 12px;
+            border-radius: 8px;
+        }
+        .device-info strong {
+            display: block;
+            color: #666;
+            font-size: 12px;
+            margin-bottom: 4px;
+        }
+        footer {
+            text-align: center;
+            margin-top: 40px;
+            color: #666;
+            font-size: 14px;
+        }
+        footer a {
+            color: #1a73e8;
+        }
+    </style>
+</head>
+<body>
+    <h1>alc-hub CoreS3</h1>
+    <p>M5Stack CoreS3 用 点呼キオスク統合ハブ ファームウェア書き込みツール</p>
+
+    <div class="card">
+        <h2>対応機器</h2>
+        <div class="device-info">
+            <div>
+                <strong>マイコン</strong>
+                M5Stack CoreS3
+            </div>
+            <div>
+                <strong>アルコールチェッカー</strong>
+                FC-1200 (RS232M Module 経由)
+            </div>
+            <div>
+                <strong>体温計</strong>
+                ニプロ NT-100B (BLE)
+            </div>
+            <div>
+                <strong>血圧計</strong>
+                ニプロ NBP-1BLE (BLE)
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>書き込み手順</h2>
+        <ol class="steps">
+            <li>CoreS3 を USB-C ケーブルで PC に接続</li>
+            <li>下の「Install」ボタンをクリック</li>
+            <li>シリアルポートを選択（COM○ または /dev/ttyACM○）</li>
+            <li>書き込み完了を待つ（1〜2分）</li>
+        </ol>
+    </div>
+
+    <div class="requirements">
+        <h3>動作要件</h3>
+        <ul>
+            <li>Chrome, Edge, Opera のいずれか（Web Serial API 対応ブラウザ）</li>
+            <li>CoreS3 は USB Serial/JTAG 内蔵のため、通常は追加ドライバ不要（Windows 10 以降 / macOS / Linux）</li>
+        </ul>
+    </div>
+
+    <div class="warning">
+        <h3>注意事項</h3>
+        <ul>
+            <li>書き込み中は USB ケーブルを抜かないでください</li>
+            <li>ポートが認識されない・書き込みが始まらない場合は、リセットボタンを約2秒長押しして書き込みモード（ダウンロードモード）に入れてから再試行してください</li>
+            <li>書き込み後、CoreS3 は自動的に再起動し、起動画面 → 待機画面（アルコールチェック）が表示されます</li>
+        </ul>
+    </div>
+
+    <div class="card install-section">
+        <h2>ファームウェアをインストール</h2>
+        <esp-web-install-button manifest="manifest.json">
+            <button slot="activate">Install alc-hub CoreS3</button>
+            <span slot="unsupported">
+                お使いのブラウザは Web Serial API に対応していません。<br>
+                Chrome, Edge, または Opera をお使いください。
+            </span>
+            <span slot="not-allowed">
+                シリアルポートへのアクセスが許可されていません。
+            </span>
+        </esp-web-install-button>
+    </div>
+
+    <div class="card">
+        <h2>書き込み後の動作確認</h2>
+        <ul>
+            <li><strong>画面</strong>: 起動画面の後、待機画面「アルコールチェック」とステータスバー (LAN / 232 / BLE) が表示されます</li>
+            <li><strong>タッチ</strong>: 待機画面をタップすると機器ステータス詳細が表示されます</li>
+            <li><strong>シリアル (115200bps)</strong>: <code>PING</code> 送信 → <code>PONG</code> 応答、<code>QR https://example.com 30</code> で QR 表示をテストできます</li>
+            <li><strong>BLE</strong>: 体温計/血圧計で測定すると <code>{"type":"temperature",...}</code> 形式の JSON が出力されます (ble-medical-gateway 互換)</li>
+        </ul>
+    </div>
+
+    <footer>
+        <p>
+            <a href="https://github.com/ippoan/alc-app-s3" target="_blank">GitHub Repository</a>
+        </p>
+    </footer>
+</body>
+</html>

@@ -1,0 +1,9 @@
+# CoreS3 (16MB flash) 用パーティションテーブル。
+# ESP-IDF 既定レイアウト互換 (nvs/phy_init のオフセット維持) + factory を 8MB に拡大
+# (NimBLE + 画面処理 + std で既定 1MB では不足するため)。
+# espflash save-image --partition-table で merged イメージに焼き込まれ、
+# 実行時の ESP-IDF はフラッシュ上のこのテーブルを参照する。
+# Name,   Type, SubType, Offset,  Size,   Flags
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 8M,

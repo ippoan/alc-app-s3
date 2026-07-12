@@ -1,0 +1,38 @@
+[package]
+name = "alc-hub-cores3"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+description = "M5Stack CoreS3 統合ハブ ファームウェア (画面処理) — alc-app 点呼キオスク向け"
+
+[[bin]]
+name = "alc-hub-cores3"
+harness = false
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[dependencies]
+anyhow = "1"
+log = "0.4"
+# ble-medical-gateway firmware-rust (esp32-nimble 0.12) とバージョンを揃える
+esp-idf-svc = { version = "0.52", default-features = false, features = [
+    "native",
+    "std",
+    "alloc",
+    "binstart",
+] }
+esp32-nimble = "0.12"
+embedded-hal = "1"
+embedded-graphics = "0.8"
+mipidsi = "0.9"
+qrcodegen = "1.8"
+u8g2-fonts = { version = "0.7", features = ["embedded_graphics_textstyle"] }
+
+[build-dependencies]
+embuild = "0.33"

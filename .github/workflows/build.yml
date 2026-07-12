@@ -1,0 +1,132 @@
+# ファームウェアをビルドし、GitHub Pages に ESP Web Tools 書き込みページとして
+# デプロイする。CI レシピ (キャッシュ戦略含む) は ippoan/ble-medical-gateway の
+# .github/workflows/build.yml を踏襲 (あちらは Rust が実験扱いだが、本リポジトリ
+# では Rust ファームウェアが本番のため、ビルド失敗はデプロイをブロックする)。
+name: Build and Deploy Firmware
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # cache key と install コマンドの二重管理を避けるため一箇所にまとめる
+  ESPFLASH_VERSION: '4.5.0'
+
+jobs:
+  build:
+    name: Build firmware & assemble Pages site
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ESP-IDF 本体 (git clone) + xtensa-esp32s3-elf-gcc/cmake/ninja 等のツール一式。
+      # .cargo/config.toml の ESP_IDF_VERSION が変わらない限り毎回同じものなので
+      # キャッシュが効く。
+      - name: Cache ESP-IDF tools/checkout
+        uses: actions/cache@v4
+        with:
+          path: .embuild
+          key: esp-idf-tools-${{ runner.os }}-${{ hashFiles('.cargo/config.toml') }}
+          restore-keys: |
+            esp-idf-tools-${{ runner.os }}-
+
+      - name: Install Xtensa Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.7.0
+        with:
+          default: true
+          buildtargets: esp32s3
+          ldproxy: true
+
+      # key に ESP_IDF_VERSION (.cargo/config.toml) のハッシュを明示的に足す:
+      # esp-idf-sys の CMake ビルドディレクトリは ninja 等の絶対パスを記憶するため、
+      # ESP_IDF_VERSION 変更時に古いキャッシュを prefix fallback で復元すると
+      # CMake configure が壊れる (ble-medical-gateway で実測)。
+      - name: Cache cargo registry/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ hashFiles('.cargo/config.toml') }}
+          cache-on-failure: true
+
+      - name: Cache espflash binary
+        id: cache-espflash
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/espflash
+          key: espflash-${{ env.ESPFLASH_VERSION }}-${{ runner.os }}
+
+      - name: Install espflash
+        if: steps.cache-espflash.outputs.cache-hit != 'true'
+        run: cargo install espflash --version "$ESPFLASH_VERSION" --locked
+
+      # バージョン切替初回に古い restore-key が刺さる問題の根本対策:
+      # 絶対パスを記憶する esp-idf-sys の CMake 中間生成物だけを毎回消し、
+      # CMake configure を素の状態からやり直させる。
+      - name: Clear stale esp-idf-sys CMake build dir
+        run: rm -rf target/xtensa-esp32s3-espidf/*/build/esp-idf-sys-*/out/build
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version *= *"\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Save merged flashable image
+        run: |
+          espflash save-image --chip esp32s3 --merge \
+            --flash-size 16mb \
+            --partition-table partitions.csv \
+            target/xtensa-esp32s3-espidf/release/alc-hub-cores3 \
+            alc-hub-cores3-merged.bin
+
+      - name: Assemble Pages site
+        run: |
+          mkdir -p _site/firmware
+          cp docs/index.html _site/
+          cp alc-hub-cores3-merged.bin _site/firmware/
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.version }}+$SHORT_SHA\"/" \
+            docs/manifest.json > _site/manifest.json
+          cat _site/manifest.json
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: alc-hub-cores3-merged.bin
+          if-no-files-found: error
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

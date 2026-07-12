@@ -1,0 +1,6 @@
+/target/
+/.embuild/
+/.vscode/
+sdkconfig
+*.bin
+*.elf

@@ -1,0 +1,15 @@
+{
+  "name": "alc-hub CoreS3",
+  "version": "0.1.0",
+  "home_assistant_domain": "",
+  "funding_url": "",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "firmware/alc-hub-cores3-merged.bin", "offset": 0 }
+      ]
+    }
+  ]
+}
