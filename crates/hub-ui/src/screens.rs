@@ -8,6 +8,7 @@
 //!   (時計の blink 防止)。
 //! - 画面向き (ROTATE) に追従するため、幅・高さは実行時に取得する。
 
+use alc_hub_core::device::DeviceKind;
 use alc_hub_core::layout::{fmt_uptime, qr_scale, wrap_chars};
 use alc_hub_core::vitals;
 use embedded_graphics::{
@@ -144,6 +145,47 @@ fn jp2x_center(d: &mut Cs3Display, s: &str, y: i32, fg: Rgb565, bg: Rgb565) {
     }
 }
 
+/// 左寄せの 2 倍拡大テキスト 1 行 (実効 32px)
+fn jp2x_left(d: &mut Cs3Display, s: &str, x: i32, y: i32, fg: Rgb565, bg: Rgb565) {
+    let (w, _) = dims(d);
+    let mut strip = Strip::new(bg);
+    let _ = JP16.render_aligned(
+        s,
+        Point::new(0, STRIP_HEADROOM as i32),
+        VerticalPosition::Top,
+        HorizontalAlignment::Left,
+        FontColor::Transparent(fg),
+        &mut strip,
+    );
+
+    let dest_w = (w - x).min((STRIP_W * 2) as i32);
+    if dest_w <= 0 {
+        return;
+    }
+    let src_w = (dest_w / 2) as usize;
+    let mut row = vec![bg; dest_w as usize];
+    for sy in 0..STRIP_H {
+        let src_row = &strip.buf[sy * STRIP_W..sy * STRIP_W + src_w];
+        if src_row.iter().all(|c| *c == strip.bg) {
+            continue;
+        }
+        let dy_base = y + ((sy as i32) - (STRIP_HEADROOM as i32)) * 2;
+        if dy_base < 0 {
+            continue;
+        }
+        for (sx, c) in src_row.iter().enumerate() {
+            row[sx * 2] = *c;
+            row[sx * 2 + 1] = *c;
+        }
+        for dy in 0..2 {
+            let _ = d.fill_contiguous(
+                &Rectangle::new(Point::new(x, dy_base + dy), Size::new(dest_w as u32, 1)),
+                row.iter().copied(),
+            );
+        }
+    }
+}
+
 /// 2 倍拡大テキストを max_chars で折り返して描画。次の y を返す
 fn jp2x_lines(d: &mut Cs3Display, s: &str, y: i32, fg: Rgb565, bg: Rgb565, max_chars: usize) -> i32 {
     let mut y = y;
@@ -208,7 +250,9 @@ pub fn draw_full(d: &mut Cs3Display, screen: &Screen, st: &HubStatus, now: u64, 
             let remain_s = timeout_ms.saturating_sub(now.saturating_sub(entered)) / 1000;
             draw_qr(d, payload, remain_s);
         }
-        Screen::Measuring => draw_measuring(d),
+        Screen::Measuring {
+            temp, bp, alcohol, ..
+        } => draw_tenko(d, *temp, *bp, alcohol),
         Screen::Result { ok, value } => draw_result(d, *ok, value),
         Screen::Error { message } => draw_error(d, message),
         Screen::Temperature { celsius } => draw_temperature(d, *celsius),
@@ -337,29 +381,163 @@ pub fn draw_qr_countdown(d: &mut Cs3Display, remain_s: u64) {
     );
 }
 
-fn draw_measuring(d: &mut Cs3Display) {
-    let (_, h) = dims(d);
-    clear(d);
-    jp2x_center(d, "測定中...", BAR_H + 6, C_TEXT, C_BG);
-    draw_spinner(d, 0);
-    // アルコールチェッカー / 体温計 / 血圧計 のどれでも受け付ける
-    // (体温・血圧は BLE 受信で自動的に結果画面へ遷移する)
-    jp2x_center(d, "測定してください", 158, C_MUTED, C_BG);
-    jp_center(d, "アルコール / 体温 / 血圧", h - 24, C_MUTED);
+// --- 点呼画面レイアウト (基準 320x240) ---
+// 3 段構成 (上から 体温 / 血圧 / アルコール)。ラベルは左寄せ、値は右寄せ。
+// 各段 74px (= (240 - ステータスバー 18) / 3)
+const TENKO_ROW_H: i32 = 74;
+const TENKO_TEMP_Y: i32 = BAR_H;
+const TENKO_BP_Y: i32 = BAR_H + TENKO_ROW_H;
+const TENKO_ALC_Y: i32 = BAR_H + TENKO_ROW_H * 2;
+const TENKO_LABEL_X: i32 = 4;
+/// スピナー中心 X (ラベル 2 文字 = 64px の右外側)
+const TENKO_SPIN_X: i32 = 92;
+
+/// 未計測欄の「計測待ち」(4 文字 = 128px) を右寄せで描く
+fn tenko_waiting(d: &mut Cs3Display, row_y: i32) {
+    let (w, _) = dims(d);
+    jp2x_left(d, "計測待ち", w - 136, row_y + 20, C_MUTED, C_BG);
 }
 
-/// 測定中スピナー (部分更新)。8 ドット。
-pub fn draw_spinner(d: &mut Cs3Display, phase: u8) {
+/// 点呼画面: 体温 / 血圧 / アルコールを同一画面で計測・確認する (3 段)。
+/// 未計測の欄は「計測待ち」。取得中スピナーは draw_tenko_spinner (部分更新)
+fn draw_tenko(
+    d: &mut Cs3Display,
+    temp: Option<f32>,
+    bp: Option<(f32, f32, Option<f32>)>,
+    alcohol: &Option<(bool, String)>,
+) {
     let (w, _) = dims(d);
-    let cx = (w / 2) as f32;
-    let cy = 112.0f32;
-    const R: f32 = 26.0;
+    clear(d);
+
+    // 段の区切り線
+    fill(d, 8, TENKO_BP_Y - 1, (w - 16) as u32, 2, C_BAR_BG);
+    fill(d, 8, TENKO_ALC_Y - 1, (w - 16) as u32, 2, C_BAR_BG);
+
+    // --- 上段: 体温 ---
+    jp2x_left(d, "体温", TENKO_LABEL_X, TENKO_TEMP_Y + 20, C_ACCENT, C_BG);
+    match temp {
+        Some(celsius) => {
+            // ℃ の幅の分だけ左に寄せて右端を揃える
+            let rect = text(
+                d,
+                &BIG42,
+                &vitals::temp_value(celsius),
+                w - 40,
+                TENKO_TEMP_Y + 14,
+                C_TEXT,
+                HorizontalAlignment::Right,
+            );
+            if let Some(r) = rect {
+                let ux = r.top_left.x + r.size.width as i32 + 8;
+                text(d, &JP16, "℃", ux, TENKO_TEMP_Y + 36, C_TEXT, HorizontalAlignment::Left);
+            }
+        }
+        None => tenko_waiting(d, TENKO_TEMP_Y),
+    }
+
+    // --- 中段: 血圧 ---
+    jp2x_left(d, "血圧", TENKO_LABEL_X, TENKO_BP_Y + 8, C_ACCENT, C_BG);
+    match bp {
+        Some((systolic, diastolic, pulse)) => {
+            // 収縮期 / 拡張期 は別々に描き '/' は線で手描き (draw_blood_pressure
+            // と同じ理由: BIG42 に無いグリフ混在で全体が消えるのを回避)
+            let y = TENKO_BP_Y + 14;
+            let pivot = w - 96;
+            text(
+                d,
+                &BIG42,
+                &format!("{systolic:.0}"),
+                pivot - 12,
+                y,
+                C_TEXT,
+                HorizontalAlignment::Right,
+            );
+            text(
+                d,
+                &BIG42,
+                &format!("{diastolic:.0}"),
+                pivot + 12,
+                y,
+                C_TEXT,
+                HorizontalAlignment::Left,
+            );
+            let _ = Line::new(Point::new(pivot - 7, y + 44), Point::new(pivot + 7, y))
+                .into_styled(PrimitiveStyle::with_stroke(C_TEXT, 4))
+                .draw(d);
+            // 脈拍はラベルの下 (左列) に小さく
+            if let Some(p) = pulse {
+                if p > 0.0 {
+                    text(
+                        d,
+                        &JP16,
+                        &vitals::pulse_value(p),
+                        TENKO_LABEL_X + 4,
+                        TENKO_BP_Y + 50,
+                        C_MUTED,
+                        HorizontalAlignment::Left,
+                    );
+                }
+            }
+        }
+        None => tenko_waiting(d, TENKO_BP_Y),
+    }
+
+    // --- 最下段: アルコール (ホストの RESULT で更新。表示のみ) ---
+    jp2x_left(d, "アルコール", TENKO_LABEL_X, TENKO_ALC_Y + 20, C_ACCENT, C_BG);
+    match alcohol {
+        Some((ok, value)) => {
+            let color = if *ok { C_OK } else { C_NG };
+            if value.is_empty() {
+                // 値なし (RESULT OK/NG のみ) → 判定だけ表示
+                jp2x_left(
+                    d,
+                    if *ok { "OK" } else { "NG" },
+                    w - 72,
+                    TENKO_ALC_Y + 20,
+                    color,
+                    C_BG,
+                );
+            } else {
+                text(
+                    d,
+                    &BIG42,
+                    value,
+                    w - 8,
+                    TENKO_ALC_Y + 8,
+                    color,
+                    HorizontalAlignment::Right,
+                );
+                text(
+                    d,
+                    &JP16,
+                    "mg/L",
+                    w - 8,
+                    TENKO_ALC_Y + 54,
+                    C_MUTED,
+                    HorizontalAlignment::Right,
+                );
+            }
+        }
+        None => tenko_waiting(d, TENKO_ALC_Y),
+    }
+}
+
+/// 点呼画面: 取得中機器のラベル横ミニスピナー (部分更新)。8 ドット。
+/// BLE 接続開始 (BleAcquiring) 中のみ UI ループが 150ms ごとに呼ぶ
+pub fn draw_tenko_spinner(d: &mut Cs3Display, kind: DeviceKind, phase: u8) {
+    let cx = TENKO_SPIN_X as f32;
+    // ラベル (32px 高) の縦中央に合わせる
+    let cy = match kind {
+        DeviceKind::Thermometer => TENKO_TEMP_Y + 36,
+        DeviceKind::BloodPressure => TENKO_BP_Y + 24,
+    } as f32;
+    const R: f32 = 11.0;
     for i in 0..8u8 {
         let ang = core::f32::consts::TAU * f32::from(i) / 8.0;
         let x = cx + R * ang.cos();
         let y = cy + R * ang.sin();
         let color = if i == phase { C_ACCENT } else { C_BAR_BG };
-        let _ = Circle::with_center(Point::new(x as i32, y as i32), 10)
+        let _ = Circle::with_center(Point::new(x as i32, y as i32), 5)
             .into_styled(PrimitiveStyle::with_fill(color))
             .draw(d);
     }

@@ -120,8 +120,9 @@ fn main() -> Result<()> {
     // 生かし続ける。
     let _sntp = ntp::start()?;
     // NT-100B / NBP-1BLE 読み取り。測定値は meas_tx で recorder へ送る。
+    // 接続開始/終了は tx で UI へ通知 (点呼画面の取得中スピナー)。
     // Wi-Fi 接続/Improv セッション中は BLE スキャンを一時停止する (RadioCoex)
-    ble::start(Arc::clone(&status), meas_tx, coex, pair_flag)?;
+    ble::start(Arc::clone(&status), meas_tx, tx, coex, pair_flag)?;
 
     // UI ループ (メインタスクを占有, 戻らない)
     ui::run(display, i2c, rx, status, rotation)

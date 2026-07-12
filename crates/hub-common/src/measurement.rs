@@ -10,6 +10,9 @@
 pub enum Measurement {
     Temperature {
         celsius: f32,
+        /// 機器内蔵時計の測定時刻 (YYYYMMDDHHMMSS)。同一測定の再送を
+        /// 見分ける重複排除に使う。タイムスタンプ非搭載の機器は None
+        timestamp: Option<u64>,
         /// 受信時刻 (稼働 ms)
         at_ms: u64,
     },
@@ -17,6 +20,8 @@ pub enum Measurement {
         systolic: f32,
         diastolic: f32,
         pulse: Option<f32>,
+        /// 機器内蔵時計の測定時刻 (YYYYMMDDHHMMSS)。重複排除に使う
+        timestamp: Option<u64>,
         at_ms: u64,
     },
 }

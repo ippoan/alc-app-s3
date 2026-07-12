@@ -8,8 +8,15 @@
 //! (NFC待機)  └─(下半分タップ)→ Log ─タップ→ Idle                      │
 //!   ↑  ↑                                                              │
 //!   │  └──────────────────────────────────────────────────────────────┘
-//!   ├─ BLE 測定受信 (待機中/点呼中のみ) → Temperature / BloodPressure ─タップ/30秒→ Idle
+//!   ├─ BLE 測定受信 (待機中のみ) → Temperature / BloodPressure ─タップ/30秒→ Idle
 //!   └─ ホストコマンド: QR / MEASURE / RESULT / ERROR / RESET は従来どおり
+//!
+//! 点呼 (Measuring) 中の BLE 測定・ホスト RESULT は画面遷移せず、同一画面の
+//! 体温 (上段) / 血圧 (中段) / アルコール (最下段) の欄を直接更新する。
+//! BLE 接続開始 (BleAcquiring) でラベル横にスピナーを表示し、どちらを
+//! 取得中かを示す。体温+血圧が揃ってから TENKO_DONE_CLOSE_MS (5秒) で
+//! 待機画面へ戻る (アルコールは表示のみ — 完了条件は運用ごとに異なるため
+//! 今後実装)。無操作時は TENKO_TIMEOUT_MS (長め) で待機画面へ戻る。
 //! ```
 //!
 //! コマンドは host_link (USB CDC) と ble から mpsc 経由で届く。描画は状態
@@ -19,6 +26,7 @@ mod screens;
 
 use std::sync::mpsc::Receiver;
 
+use alc_hub_core::device::DeviceKind;
 use alc_hub_core::layout::map_touch;
 use alc_hub_board::{
     display::{self, Cs3Display, LCD_H, LCD_W},
@@ -42,7 +50,19 @@ pub(crate) enum Screen {
         payload: String,
         timeout_ms: u64,
     },
-    Measuring,
+    /// 点呼: 体温 / 血圧 / アルコールを同一画面で計測・確認する (3 段表示)
+    Measuring {
+        /// 体温 (℃)。None = 未計測
+        temp: Option<f32>,
+        /// 血圧 (収縮期, 拡張期, 脈拍)。None = 未計測
+        bp: Option<(f32, f32, Option<f32>)>,
+        /// アルコール測定結果 (ok, 表示値)。ホストの RESULT で更新。
+        /// 表示のみで点呼完了条件には含めない (対面点呼など運用により
+        /// アルコールチェッカーの扱いが異なるため — 今後実装)
+        alcohol: Option<(bool, String)>,
+        /// 体温+血圧が揃った時刻 [ms]。TENKO_DONE_CLOSE_MS 経過で待機画面へ
+        done_at: Option<u64>,
+    },
     Result {
         ok: bool,
         value: String,
@@ -81,6 +101,9 @@ pub fn run(
     let mut last_spin = 0u64;
     let mut spin_phase = 0u8;
     let mut last_touch: Option<touch::TouchPoint> = None;
+    // BLE で取得中の機器 (点呼画面のラベル横スピナー表示)。
+    // 接続開始 (BleAcquiring) で設定し、切断/再スキャン (BleIdle) で解除
+    let mut acquiring: Option<DeviceKind> = None;
 
     loop {
         let now = now_ms();
@@ -96,11 +119,24 @@ pub fn run(
                     rotation = deg;
                     dirty = true;
                 }
-                // バイタルの自動表示は待機画面 (または既にバイタル表示中) のみ。
-                // QR・点呼・メニュー等の操作中に不意の画面遷移をさせない
-                // (測定値はイベントログとホストへの JSON 出力には常に残る)
+                // 点呼中は画面遷移せず、点呼画面の体温/血圧欄を直接更新する。
+                // それ以外のバイタル自動表示は待機画面 (または既にバイタル
+                // 表示中) のみ。QR・メニュー等の操作中に不意の画面遷移を
+                // させない (測定値はログとホストへの JSON 出力には常に残る)
                 UiCommand::Temperature { celsius } => {
-                    if vitals_display_allowed(&screen) {
+                    if let Screen::Measuring {
+                        temp, bp, done_at, ..
+                    } = &mut screen
+                    {
+                        *temp = Some(celsius);
+                        if bp.is_some() && done_at.is_none() {
+                            *done_at = Some(now);
+                        }
+                        if acquiring == Some(DeviceKind::Thermometer) {
+                            acquiring = None;
+                        }
+                        dirty = true;
+                    } else if vitals_display_allowed(&screen) {
                         screen = Screen::Temperature { celsius };
                         entered = now;
                         dirty = true;
@@ -113,7 +149,19 @@ pub fn run(
                     diastolic,
                     pulse,
                 } => {
-                    if vitals_display_allowed(&screen) {
+                    if let Screen::Measuring {
+                        temp, bp, done_at, ..
+                    } = &mut screen
+                    {
+                        *bp = Some((systolic, diastolic, pulse));
+                        if temp.is_some() && done_at.is_none() {
+                            *done_at = Some(now);
+                        }
+                        if acquiring == Some(DeviceKind::BloodPressure) {
+                            acquiring = None;
+                        }
+                        dirty = true;
+                    } else if vitals_display_allowed(&screen) {
                         screen = Screen::BloodPressure {
                             systolic,
                             diastolic,
@@ -125,6 +173,35 @@ pub fn run(
                         log::info!("ui: 血圧表示を抑制 (操作中の画面を優先)");
                     }
                 }
+                // BLE 接続開始/終了: 点呼画面のスピナー表示状態のみ更新。
+                // 再描画はスピナーを実際に描く/消す場合のみ — 値が入って
+                // いる項目は回さないため、送信済み機器への空接続 (hub-ble
+                // 参照) では画面を触らず、ちらつきを防ぐ
+                UiCommand::BleAcquiring { device } => {
+                    acquiring = Some(device);
+                    if tenko_spinner_visible(&screen, device) {
+                        dirty = true;
+                    }
+                }
+                UiCommand::BleIdle => {
+                    if let Some(kind) = acquiring.take() {
+                        if tenko_spinner_visible(&screen, kind) {
+                            dirty = true;
+                        }
+                    }
+                }
+                // 点呼中の RESULT はアルコール欄の更新のみ (画面遷移しない)。
+                // それ以外は従来どおり結果画面へ
+                UiCommand::Result { ok, value } => {
+                    if let Screen::Measuring { alcohol, .. } = &mut screen {
+                        *alcohol = Some((ok, value));
+                        dirty = true;
+                    } else {
+                        screen = Screen::Result { ok, value };
+                        entered = now;
+                        dirty = true;
+                    }
+                }
                 cmd => {
                     screen = match cmd {
                         UiCommand::ShowQr {
@@ -134,13 +211,20 @@ pub fn run(
                             payload,
                             timeout_ms,
                         },
-                        UiCommand::Measure => Screen::Measuring,
-                        UiCommand::Result { ok, value } => Screen::Result { ok, value },
+                        UiCommand::Measure => Screen::Measuring {
+                            temp: None,
+                            bp: None,
+                            alcohol: None,
+                            done_at: None,
+                        },
                         UiCommand::Error { message } => Screen::Error { message },
                         UiCommand::Reset => Screen::Idle,
                         UiCommand::Rotate(_)
                         | UiCommand::Temperature { .. }
-                        | UiCommand::BloodPressure { .. } => unreachable!(),
+                        | UiCommand::BloodPressure { .. }
+                        | UiCommand::BleAcquiring { .. }
+                        | UiCommand::BleIdle
+                        | UiCommand::Result { .. } => unreachable!(),
                     };
                     entered = now;
                     dirty = true;
@@ -157,6 +241,19 @@ pub fn run(
             }
             Screen::Result { .. } if elapsed > config::RESULT_AUTO_CLOSE_MS => {
                 println!("EVT RESULT_CLOSED");
+                true
+            }
+            // 点呼: 体温・血圧の両方が揃ったら 5 秒表示して待機画面へ
+            Screen::Measuring {
+                done_at: Some(done),
+                ..
+            } if now.saturating_sub(*done) > config::TENKO_DONE_CLOSE_MS => {
+                println!("EVT TENKO_DONE");
+                true
+            }
+            // 点呼: 測定が揃わないまま長時間経過したら待機画面へ (長め)
+            Screen::Measuring { .. } if elapsed > config::TENKO_TIMEOUT_MS => {
+                println!("EVT TENKO_TIMEOUT");
                 true
             }
             Screen::Temperature { .. } | Screen::BloodPressure { .. }
@@ -208,10 +305,16 @@ pub fn run(
                 }
                 last_bar = now;
             }
-            if matches!(screen, Screen::Measuring) && now.saturating_sub(last_spin) >= 150 {
-                spin_phase = (spin_phase + 1) % 8;
-                screens::draw_spinner(&mut display, spin_phase);
-                last_spin = now;
+            // 点呼画面: BLE 取得中の機器ラベル横スピナーをアニメーション
+            // (未取得の項目のみ — tenko_spinner_visible 参照)
+            if let Some(kind) = acquiring {
+                if tenko_spinner_visible(&screen, kind)
+                    && now.saturating_sub(last_spin) >= 150
+                {
+                    spin_phase = (spin_phase + 1) % 8;
+                    screens::draw_tenko_spinner(&mut display, kind, spin_phase);
+                    last_spin = now;
+                }
             }
         }
 
@@ -219,19 +322,29 @@ pub fn run(
     }
 }
 
-/// バイタル (体温/血圧) の自動表示を許可する画面か。
+/// 点呼画面で kind のスピナーを描くべきか — 未取得の項目のみ。
+/// 値が入っている項目で回すと、送信済み機器へのデータなし空接続 (hub-ble
+/// 参照) のたびに「取得中」に見えてしまう。測り直しの値は表示だけ更新される
+fn tenko_spinner_visible(screen: &Screen, kind: DeviceKind) -> bool {
+    match screen {
+        Screen::Measuring { temp, bp, .. } => match kind {
+            DeviceKind::Thermometer => temp.is_none(),
+            DeviceKind::BloodPressure => bp.is_none(),
+        },
+        _ => false,
+    }
+}
+
+/// バイタル (体温/血圧) の自動表示 (画面遷移) を許可する画面か。
 ///
 /// - 待機中・バイタル表示中: 表示する (連続測定は表示を更新)
-/// - 点呼の測定待ち (Measuring): 表示する — 点呼中のバイタル測定は業務フロー
-///   の一部で、アルコールチェッカーが無い運用では点呼 = 体温/血圧測定になる
+/// - 点呼の測定待ち (Measuring): ここには来ない — 画面遷移せず点呼画面内の
+///   体温/血圧欄を直接更新する (コマンド処理側で分岐)
 /// - QR / メニュー / ログ / 結果 / エラー: 奪わない (不意の遷移防止)
 fn vitals_display_allowed(screen: &Screen) -> bool {
     matches!(
         screen,
-        Screen::Idle
-            | Screen::Measuring
-            | Screen::Temperature { .. }
-            | Screen::BloodPressure { .. }
+        Screen::Idle | Screen::Temperature { .. } | Screen::BloodPressure { .. }
     )
 }
 
@@ -241,15 +354,20 @@ fn on_click(screen: &Screen, y: i32, logical_h: i32) -> Option<Screen> {
         Screen::Idle => Some(Screen::Menu),
         Screen::Menu => {
             if y < logical_h / 2 {
-                // 点呼開始をホストへ通知し、FC-1200 の測定待ちへ
+                // 点呼開始をホストへ通知し、体温/血圧/アルコールの測定待ちへ
                 println!("EVT TENKO_START");
-                Some(Screen::Measuring)
+                Some(Screen::Measuring {
+                    temp: None,
+                    bp: None,
+                    alcohol: None,
+                    done_at: None,
+                })
             } else {
                 Some(Screen::Log)
             }
         }
         Screen::Log
-        | Screen::Measuring
+        | Screen::Measuring { .. }
         | Screen::Result { .. }
         | Screen::Error { .. }
         | Screen::Temperature { .. }

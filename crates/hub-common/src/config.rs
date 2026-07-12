@@ -27,3 +27,10 @@ pub const RS232_ACTIVE_WINDOW_MS: u64 = 5_000;
 
 /// 体温/血圧表示画面の自動クローズまでの時間
 pub const VITALS_AUTO_CLOSE_MS: u64 = 30_000;
+
+/// 点呼画面の測定待ちタイムアウト。体温→血圧と続けて測る時間を確保する
+/// ため長めに取る (超過で待機画面へ戻る)
+pub const TENKO_TIMEOUT_MS: u64 = 180_000;
+
+/// 点呼画面で体温・血圧の両方が揃ってから待機画面へ戻るまでの時間
+pub const TENKO_DONE_CLOSE_MS: u64 = 5_000;
