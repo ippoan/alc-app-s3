@@ -47,7 +47,7 @@ use crate::{
     improv::Improv,
     settings::Settings,
     status::{now_ms, SharedStatus},
-    ui::UiCommand,
+    ui_api::UiCommand,
 };
 
 /// 行としてバッファする最大長 (超えたら読み捨て — バイナリノイズ対策)

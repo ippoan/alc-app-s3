@@ -142,7 +142,16 @@ jobs:
           key: ${{ hashFiles('.cargo/config.toml') }}
           save-if: 'false'
 
+      # ワークスペース内クレートは checkout で mtime が変わるため、変更が
+      # 無くても毎回再コンパイルされる (docs のみのマージでも Build 142s を
+      # 実測。rust-cache も自作クレートの成果物は保存しない)。sccache は
+      # 内容ベースの rustc キャッシュなので、この再コンパイルをヒットに変える
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Check
+        env:
+          SCCACHE_GHA_ENABLED: 'true'
+          RUSTC_WRAPPER: sccache
         run: cargo check --release --locked
 
   # ------------------------------------------------------------------
@@ -237,7 +246,14 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $VERSION"
 
+      # ワークスペース内クレートの mtime 起因の再コンパイルを内容ベースの
+      # rustc キャッシュでヒットに変える (check job のコメント参照)
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Build
+        env:
+          SCCACHE_GHA_ENABLED: 'true'
+          RUSTC_WRAPPER: sccache
         run: cargo build --release --locked
 
       - name: Save merged flashable image

@@ -1,0 +1,20 @@
+[package]
+name = "alc-hub-drivers"
+# FIRMWARE_VERSION (config.rs の env!) はこのクレートのバージョンを参照するため、
+# ルート (alc-hub-cores3) とバージョンを揃えて更新すること
+version = "0.1.0"
+edition = "2021"
+description = "alc-hub-cores3 のデバイス I/O 層 (BLE / Wi-Fi / RS232 / ホストリンク / ボード初期化)。画面コードから分離して再コンパイル範囲を狭める"
+
+[dependencies]
+alc-hub-core = { path = "../hub-core" }
+anyhow = "1"
+log = "0.4"
+esp-idf-svc = { version = "0.52", default-features = false, features = [
+    "native",
+    "std",
+    "alloc",
+    "binstart",
+] }
+esp32-nimble = "0.12"
+mipidsi = "0.9"
