@@ -189,13 +189,17 @@
     </div>
 
     <div class="card">
-        <h2>Wi-Fi 設定（インストール直後に同じダイアログで）</h2>
+        <h2>Wi-Fi 設定</h2>
         <p>
             本ファームウェアは <strong>Improv Wi-Fi Serial</strong> に対応しています。
-            書き込み完了後、そのままインストールダイアログに表示される
-            「<strong>Wi-Fi 設定 (Configure Wi-Fi)</strong>」から、周辺ネットワークの選択
-            （または SSID の手入力）とパスワード入力で設定できます。
-            設定は本体（NVS）に保存され、以後は起動時に自動接続します。
+            設定方法は 2 つ（どちらも結果は同じ。NVS に保存され、以後は起動時に自動接続）:
+        </p>
+        <ul>
+            <li><strong>下の「Wi-Fi 設定（いつでも）」フォーム</strong> — この説明を読みながら設定できます</li>
+            <li>インストールダイアログの「Wi-Fi 設定 (Configure Wi-Fi)」 — 書き込み完了後に表示（周辺ネットワークの選択も可能）</li>
+        </ul>
+        <p style="font-size: 13px; color: #999;">
+            ※ ダイアログに Wi-Fi 項目が出ない場合は、ファームウェアが Improv 対応前の版です。先に「Install」で最新版に更新してください。
         </p>
         <div class="requirements">
             <h3>設定できるネットワークの条件</h3>
@@ -209,6 +213,28 @@
         <p style="font-size: 13px; color: #999; margin-bottom: 0;">
             ※ Wi-Fi は LAN 配線が無い拠点向けの代替経路です（主経路は LAN Module 13.2 / PoE）。
             設定状態は本体の「ログ確認」画面（WiFi インジケータ・IP アドレス）で確認できます。
+        </p>
+    </div>
+
+    <div class="card">
+        <h2>Wi-Fi 設定（いつでも）</h2>
+        <p>
+            SSID とパスワードを入力して「接続して設定」を押し、CoreS3 のシリアルポートを選択してください。
+            接続確認まで最大 30 秒ほどかかります。
+        </p>
+        <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+            <input id="wifi-ssid" type="text" placeholder="SSID（2.4GHz）" maxlength="32"
+                   style="padding: 10px 12px; border-radius: 8px; border: 1px solid #ccc; font-size: 15px; width: 200px;">
+            <input id="wifi-pass" type="password" placeholder="パスワード（空欄=オープン）" maxlength="64"
+                   style="padding: 10px 12px; border-radius: 8px; border: 1px solid #ccc; font-size: 15px; width: 220px;">
+            <button id="apply-wifi" style="padding: 10px 20px; border-radius: 8px; border: none; background: #1a73e8; color: white; font-size: 15px; cursor: pointer;">
+                接続して設定
+            </button>
+        </div>
+        <p id="wifi-result" style="margin-bottom: 0; color: #666;"></p>
+        <p style="font-size: 13px; color: #999; margin-bottom: 0;">
+            ※ 上の「設定できるネットワークの条件」を満たすネットワークのみ接続できます。
+            インストールダイアログや他のシリアルモニタが同じポートを開いていると失敗します（先に閉じてください）。
         </p>
     </div>
 
@@ -253,6 +279,123 @@
     </footer>
 
     <script>
+        // ------------------------------------------------------------------
+        // Wi-Fi 設定: Web Serial で Improv Wi-Fi Serial プロトコルを直接話す
+        // (ファームウェアの src/improv.rs / crates/hub-core/src/improv.rs と対)
+        // ------------------------------------------------------------------
+        const IMPROV_HEADER = [0x49, 0x4D, 0x50, 0x52, 0x4F, 0x56]; // "IMPROV"
+
+        function improvChecksum(bytes) {
+            let s = 0;
+            for (const b of bytes) s = (s + b) & 0xFF;
+            return s;
+        }
+
+        function improvPacket(type, data) {
+            const p = [...IMPROV_HEADER, 0x01, type, data.length, ...data];
+            p.push(improvChecksum(p));
+            return new Uint8Array(p);
+        }
+
+        function wifiSettingsPacket(ssid, pass) {
+            const enc = new TextEncoder();
+            const s = [...enc.encode(ssid)];
+            const p = [...enc.encode(pass)];
+            if (s.length === 0 || s.length > 32) throw new Error('SSID は 1〜32 バイトで入力してください');
+            if (p.length > 64) throw new Error('パスワードは 64 バイト以下で入力してください');
+            const payload = [s.length, ...s, p.length, ...p];
+            return improvPacket(0x03, [0x01, payload.length, ...payload]); // RPC: Send Wi-Fi settings
+        }
+
+        // バッファ先頭から IMPROV フレームを 1 つ取り出す (ログ行等のノイズは読み飛ばす)
+        function extractImprovPacket(buf) {
+            for (let i = 0; i + 10 <= buf.length; i++) {
+                if (IMPROV_HEADER.some((h, j) => buf[i + j] !== h)) continue;
+                const total = 10 + buf[i + 8];
+                if (i + total > buf.length) { buf.splice(0, i); return null; } // 続き待ち
+                const pkt = buf.slice(i, i + total);
+                buf.splice(0, i + total);
+                if (pkt[6] !== 0x01 || improvChecksum(pkt.slice(0, total - 1)) !== pkt[total - 1]) {
+                    return { corrupt: true };
+                }
+                return { type: pkt[7], data: pkt.slice(9, total - 1) };
+            }
+            if (buf.length > 9) buf.splice(0, buf.length - 9);
+            return null;
+        }
+
+        document.getElementById('apply-wifi').addEventListener('click', async () => {
+            const out = document.getElementById('wifi-result');
+            if (!('serial' in navigator)) {
+                out.textContent = 'このブラウザは Web Serial API に対応していません (Chrome/Edge/Opera を使用してください)';
+                return;
+            }
+            let port;
+            try {
+                const packet = wifiSettingsPacket(
+                    document.getElementById('wifi-ssid').value.trim(),
+                    document.getElementById('wifi-pass').value
+                );
+                out.textContent = 'ポート選択中...';
+                port = await navigator.serial.requestPort();
+                await port.open({ baudRate: 115200 });
+
+                const writer = port.writable.getWriter();
+                await writer.write(packet);
+                writer.releaseLock();
+
+                out.textContent = '設定送信 → 接続待ち (最大30秒)...';
+                const reader = port.readable.getReader();
+                let deadline = Date.now() + 30000;
+                const timer = setInterval(() => {
+                    if (Date.now() >= deadline) reader.cancel().catch(() => {});
+                }, 200);
+                const buf = [];
+                let failed = false, success = false;
+                try {
+                    while (!failed && Date.now() < deadline) {
+                        const { value, done: eof } = await reader.read();
+                        if (eof) break;
+                        buf.push(...value);
+                        let pkt;
+                        while ((pkt = extractImprovPacket(buf)) !== null) {
+                            if (pkt.corrupt) continue;
+                            if (pkt.type === 0x01) { // Current State
+                                if (pkt.data[0] === 0x03) out.textContent = 'アクセスポイントへ接続中...';
+                                if (pkt.data[0] === 0x04 && !success) {
+                                    success = true;
+                                    out.textContent = 'Wi-Fi 設定完了 (本体に保存済み)';
+                                    // 続けて届く IP アドレス通知を少しだけ待つ
+                                    deadline = Math.min(deadline, Date.now() + 1500);
+                                }
+                            } else if (pkt.type === 0x02 && pkt.data[0] !== 0x00) { // Error State
+                                out.textContent = pkt.data[0] === 0x03
+                                    ? '接続失敗: SSID / パスワード / 周波数帯 (2.4GHz か) を確認してください'
+                                    : 'エラー (code ' + pkt.data[0] + ')';
+                                failed = true;
+                            } else if (pkt.type === 0x04 && pkt.data[0] === 0x01) { // RPC Result
+                                // 文字列リストの先頭 = デバイス URL (http://<ip>/)
+                                const len = pkt.data[2];
+                                if (len) {
+                                    const url = new TextDecoder().decode(new Uint8Array(pkt.data.slice(3, 3 + len)));
+                                    out.textContent = 'Wi-Fi 設定完了 — IP: ' + url.replace(/^https?:\/\/|\/$/g, '');
+                                }
+                            }
+                        }
+                    }
+                    if (!success && !failed) {
+                        out.textContent = '応答がありません。ケーブル接続とファームウェアの版 (Improv 対応) を確認してください';
+                    }
+                } catch (e) { /* cancel によるタイムアウト */ }
+                clearInterval(timer);
+                reader.releaseLock();
+            } catch (e) {
+                out.textContent = '失敗: ' + e.message;
+            } finally {
+                try { if (port) await port.close(); } catch (e) { /* noop */ }
+            }
+        });
+
         // 画面向き設定: Web Serial で ROTATE コマンドを送信する
         // (ファームウェアの host_link.rs 行指向プロトコル)
         document.getElementById('apply-rotation').addEventListener('click', async () => {
