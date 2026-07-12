@@ -10,3 +10,4 @@ pub mod lan;
 pub mod ntp;
 pub mod recorder;
 pub mod rs232;
+pub mod ws_uplink;
