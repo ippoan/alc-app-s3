@@ -107,6 +107,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # restore-mtime が履歴からファイル時刻を復元するため
+
+      # 再コンパイルの根本原因対策: checkout はファイル mtime を現在時刻にする
+      # ため、Cargo のフィンガープリントが毎回無効になり、変更が無くても
+      # ワークスペース内クレートが再コンパイルされていた (sccache ヒットでも
+      # 1 コンパイルごとに GHA キャッシュへのネットワーク往復が残る)。
+      # コミット履歴から mtime を復元すると、未変更ファイルは前回 run と同じ
+      # 時刻になり、Cargo が「ビルド済み」と判定してコンパイル自体を省略する。
+      # rust-cache の cache-workspace-crates: true (自作クレート成果物も保存)
+      # とセットで機能する
+      - name: Restore file mtimes (cargo fingerprint 安定化)
+        uses: chetan/git-restore-mtime-action@v2
 
       # main で保存されたキャッシュを restore (key 完全一致なら再保存も無い)
       - name: Cache ESP-IDF tools/checkout
@@ -157,6 +170,9 @@ jobs:
           shared-key: build
           key: ${{ hashFiles('.cargo/config.toml') }}
           save-if: 'false'
+          # 自作クレートの成果物も復元する (restore-mtime とセットで
+          # 「未変更クレートはコンパイル自体をスキップ」を成立させる)
+          cache-workspace-crates: 'true'
 
       # ワークスペース内クレートは checkout で mtime が変わるため、変更が
       # 無くても毎回再コンパイルされる (docs のみのマージでも Build 142s を
@@ -183,6 +199,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # restore-mtime が履歴からファイル時刻を復元するため
+
+      # 再コンパイルの根本原因対策: checkout はファイル mtime を現在時刻にする
+      # ため、Cargo のフィンガープリントが毎回無効になり、変更が無くても
+      # ワークスペース内クレートが再コンパイルされていた (sccache ヒットでも
+      # 1 コンパイルごとに GHA キャッシュへのネットワーク往復が残る)。
+      # コミット履歴から mtime を復元すると、未変更ファイルは前回 run と同じ
+      # 時刻になり、Cargo が「ビルド済み」と判定してコンパイル自体を省略する。
+      # rust-cache の cache-workspace-crates: true (自作クレート成果物も保存)
+      # とセットで機能する
+      - name: Restore file mtimes (cargo fingerprint 安定化)
+        uses: chetan/git-restore-mtime-action@v2
 
       # ESP-IDF 本体 (git clone) + xtensa-esp32s3-elf-gcc/cmake/ninja 等のツール一式。
       # .cargo/config.toml の ESP_IDF_VERSION が変わらない限り毎回同じものなので
@@ -239,6 +268,9 @@ jobs:
           shared-key: build
           key: ${{ hashFiles('.cargo/config.toml') }}
           cache-on-failure: true
+          # 自作クレートの成果物も保存する (restore-mtime とセットで
+          # 「未変更クレートはコンパイル自体をスキップ」を成立させる)
+          cache-workspace-crates: 'true'
 
       - name: Cache espflash binary
         id: cache-espflash
