@@ -14,6 +14,12 @@ pub enum HostCommand {
     Reset,
     Rotate(u16),
     Status,
+    /// 設定のエクスポート (`CFG <json>` を応答)
+    CfgGet,
+    /// 設定のインポート (JSON は cfg::DeviceConfig::from_json で解釈)
+    CfgSet { json: String },
+    /// 保存済み Wi-Fi 設定での接続テスト (結果は `EVT WIFI_TEST ...`)
+    WifiTest,
 }
 
 /// 画面向きとして有効な角度か
@@ -70,6 +76,27 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
             _ => return Err("ERR ROTATE: 0|90|180|270 が必要です".into()),
         },
         "STATUS" => HostCommand::Status,
+        "CFG" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+            Some("GET") => HostCommand::CfgGet,
+            Some("SET") => {
+                // JSON は空白を含み得るため 3 トークン目以降を丸ごと取る
+                let json = line
+                    .splitn(3, char::is_whitespace)
+                    .nth(2)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if json.is_empty() {
+                    return Err("ERR CFG: SET に JSON がありません".into());
+                }
+                HostCommand::CfgSet { json }
+            }
+            _ => return Err("ERR CFG: GET|SET が必要です".into()),
+        },
+        "WIFI" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+            Some("TEST") => HostCommand::WifiTest,
+            _ => return Err("ERR WIFI: TEST が必要です".into()),
+        },
         _ => return Err(format!("ERR 不明なコマンド: {cmd}")),
     };
     Ok(Some(command))
@@ -203,5 +230,31 @@ mod tests {
             parse_line("FOO bar", T),
             Err("ERR 不明なコマンド: FOO".to_string())
         );
+    }
+
+    #[test]
+    fn cfg_get_and_set() {
+        assert_eq!(parse_line("CFG GET", T), Ok(Some(HostCommand::CfgGet)));
+        assert_eq!(
+            parse_line(r#"CFG SET {"rotation": 90, "wifi": null}"#, T),
+            Ok(Some(HostCommand::CfgSet {
+                json: r#"{"rotation": 90, "wifi": null}"#.into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn cfg_errors() {
+        assert!(parse_line("CFG", T).is_err());
+        assert!(parse_line("CFG PUT", T).is_err());
+        assert!(parse_line("CFG SET", T).is_err());
+        assert!(parse_line("CFG SET   ", T).is_err());
+    }
+
+    #[test]
+    fn wifi_test() {
+        assert_eq!(parse_line("WIFI TEST", T), Ok(Some(HostCommand::WifiTest)));
+        assert!(parse_line("WIFI", T).is_err());
+        assert!(parse_line("WIFI CONNECT", T).is_err());
     }
 }

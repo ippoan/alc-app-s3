@@ -263,6 +263,31 @@
     </div>
 
     <div class="card">
+        <h2>設定のエクスポート / インポート / 接続テスト</h2>
+        <p>
+            画面向きと Wi-Fi 設定をまとめて JSON でバックアップ・復元できます。
+            複数台に同じ設定を配る時や、接続がうまくいかない時の切り分けに使います。
+        </p>
+        <div style="display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px;">
+            <button id="cfg-read" style="padding: 10px 16px; border-radius: 8px; border: none; background: #1a73e8; color: white; font-size: 15px; cursor: pointer;">本体から読み込み</button>
+            <button id="cfg-write" style="padding: 10px 16px; border-radius: 8px; border: none; background: #1a73e8; color: white; font-size: 15px; cursor: pointer;">本体へ書き込み</button>
+            <button id="cfg-export" style="padding: 10px 16px; border-radius: 8px; border: 1px solid #1a73e8; background: white; color: #1a73e8; font-size: 15px; cursor: pointer;">ファイルに保存</button>
+            <label style="padding: 10px 16px; border-radius: 8px; border: 1px solid #1a73e8; background: white; color: #1a73e8; font-size: 15px; cursor: pointer;">
+                ファイルから読込<input id="cfg-import" type="file" accept="application/json,.json" style="display: none;">
+            </label>
+            <button id="wifi-test" style="padding: 10px 16px; border-radius: 8px; border: none; background: #2e7d32; color: white; font-size: 15px; cursor: pointer;">Wi-Fi 接続テスト</button>
+        </div>
+        <textarea id="cfg-json" rows="7" spellcheck="false"
+                  style="width: 100%; font-family: monospace; font-size: 13px; padding: 10px; border-radius: 8px; border: 1px solid #ccc; box-sizing: border-box;"
+                  placeholder='{"version":1,"rotation":0,"wifi":{"ssid":"...","password":"..."}}'></textarea>
+        <p id="cfg-result" style="margin-bottom: 0; color: #666;"></p>
+        <p style="font-size: 13px; color: #999; margin-bottom: 0;">
+            ※ 「Wi-Fi 接続テスト」は保存済み設定で実際に接続を試し、失敗時は原因（SSID が見えない＝2.4GHz/SSID 違い、
+            見える＝パスワード/認証違い）を切り分けて表示します。パスワードは JSON に平文で入るため取り扱いに注意してください。
+        </p>
+    </div>
+
+    <div class="card">
         <h2>書き込み後の動作確認</h2>
         <ul>
             <li><strong>画面</strong>: 起動画面の後、待機画面「カードをかざしてください」とステータスバー (LAN / 232 / BLE / WiFi + 稼働時間) が表示されます</li>
@@ -394,6 +419,107 @@
             } finally {
                 try { if (port) await port.close(); } catch (e) { /* noop */ }
             }
+        });
+
+        // ------------------------------------------------------------------
+        // 設定 エクスポート/インポート/接続テスト: 行プロトコル (CFG / WIFI TEST)
+        // ------------------------------------------------------------------
+        // 1 行コマンドを送り、prefixes のいずれかで始まる応答行を返す (最大 timeoutMs)。
+        // ESP-IDF ログが混在するため既知プレフィックスだけを拾う。
+        async function serialCommand(line, prefixes, timeoutMs) {
+            if (!('serial' in navigator)) throw new Error('このブラウザは Web Serial API 非対応 (Chrome/Edge/Opera)');
+            const port = await navigator.serial.requestPort();
+            await port.open({ baudRate: 115200 });
+            try {
+                const writer = port.writable.getWriter();
+                await writer.write(new TextEncoder().encode(line + '\n'));
+                writer.releaseLock();
+
+                const reader = port.readable.getReader();
+                const deadline = Date.now() + timeoutMs;
+                const timer = setInterval(() => { if (Date.now() >= deadline) reader.cancel().catch(() => {}); }, 200);
+                let buf = '';
+                try {
+                    while (Date.now() < deadline) {
+                        const { value, done } = await reader.read();
+                        if (done) break;
+                        buf += new TextDecoder().decode(value);
+                        let nl;
+                        while ((nl = buf.indexOf('\n')) >= 0) {
+                            const row = buf.slice(0, nl).trim();
+                            buf = buf.slice(nl + 1);
+                            if (prefixes.some((p) => row.startsWith(p))) { return row; }
+                        }
+                    }
+                } catch (e) { /* timeout cancel */ }
+                finally { clearInterval(timer); reader.releaseLock(); }
+                return null;
+            } finally {
+                try { await port.close(); } catch (e) { /* noop */ }
+            }
+        }
+
+        const cfgOut = document.getElementById('cfg-result');
+        const cfgJson = document.getElementById('cfg-json');
+
+        document.getElementById('cfg-read').addEventListener('click', async () => {
+            try {
+                cfgOut.textContent = 'ポート選択 → 本体から読み込み中...';
+                const row = await serialCommand('CFG GET', ['CFG ', 'ERR CFG'], 3000);
+                if (row && row.startsWith('CFG ')) {
+                    cfgJson.value = JSON.stringify(JSON.parse(row.slice(4)), null, 2);
+                    cfgOut.textContent = '本体の設定を読み込みました (パスワードも含みます)';
+                } else {
+                    cfgOut.textContent = row || '応答なし。ファーム版・ポートを確認してください';
+                }
+            } catch (e) { cfgOut.textContent = '失敗: ' + e.message; }
+        });
+
+        document.getElementById('cfg-write').addEventListener('click', async () => {
+            let compact;
+            try { compact = JSON.stringify(JSON.parse(cfgJson.value)); }
+            catch (e) { cfgOut.textContent = 'JSON が不正です: ' + e.message; return; }
+            try {
+                cfgOut.textContent = 'ポート選択 → 本体へ書き込み中...';
+                const row = await serialCommand('CFG SET ' + compact, ['OK CFG', 'ERR CFG'], 4000);
+                cfgOut.textContent = row === 'OK CFG' ? '本体に保存しました (NVS)' : (row || '応答なし');
+            } catch (e) { cfgOut.textContent = '失敗: ' + e.message; }
+        });
+
+        document.getElementById('cfg-export').addEventListener('click', () => {
+            const blob = new Blob([cfgJson.value || '{}'], { type: 'application/json' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'alc-hub-config.json';
+            a.click();
+            URL.revokeObjectURL(a.href);
+            cfgOut.textContent = 'alc-hub-config.json を保存しました';
+        });
+
+        document.getElementById('cfg-import').addEventListener('change', (ev) => {
+            const file = ev.target.files[0];
+            if (!file) return;
+            const fr = new FileReader();
+            fr.onload = () => {
+                try {
+                    cfgJson.value = JSON.stringify(JSON.parse(fr.result), null, 2);
+                    cfgOut.textContent = file.name + ' を読み込みました。「本体へ書き込み」で反映します';
+                } catch (e) { cfgOut.textContent = 'ファイルの JSON が不正です: ' + e.message; }
+            };
+            fr.readAsText(file);
+            ev.target.value = '';
+        });
+
+        document.getElementById('wifi-test').addEventListener('click', async () => {
+            try {
+                cfgOut.textContent = 'ポート選択 → 接続テスト中 (最大30秒)...';
+                const row = await serialCommand('WIFI TEST', ['EVT WIFI_TEST'], 30000);
+                if (!row) { cfgOut.textContent = '応答なし。ポート・ファーム版を確認してください'; return; }
+                const rest = row.slice('EVT WIFI_TEST '.length);
+                cfgOut.textContent = rest.startsWith('OK')
+                    ? '接続成功 — IP: ' + rest.slice(3).trim()
+                    : '接続失敗: ' + rest.replace(/^NG\s*/, '');
+            } catch (e) { cfgOut.textContent = '失敗: ' + e.message; }
         });
 
         // 画面向き設定: Web Serial で ROTATE コマンドを送信する

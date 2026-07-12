@@ -5,6 +5,7 @@
 //! 本クレートのファイルは `coverage_100.toml` に登録され、PR CI で
 //! ラインカバレッジ 100% が強制される。
 
+pub mod cfg;
 pub mod coex;
 pub mod device;
 pub mod ieee11073;

@@ -37,6 +37,7 @@ use std::io::Read;
 use std::sync::mpsc::Sender;
 
 use alc_hub_core::improv as improv_proto;
+use alc_hub_core::cfg::DeviceConfig;
 use alc_hub_core::protocol::{parse_line, HostCommand};
 use anyhow::Result;
 use esp_idf_svc::hal::delay::FreeRtos;
@@ -48,7 +49,7 @@ use alc_hub_common::{
     status::{now_ms, SharedStatus},
     ui_api::UiCommand,
 };
-use alc_hub_wifi::improv::Improv;
+use alc_hub_wifi::{improv::Improv, wifi::Wifi};
 
 /// 行としてバッファする最大長 (超えたら読み捨て — バイナリノイズ対策)
 const MAX_LINE: usize = 512;
@@ -57,6 +58,7 @@ pub fn start(
     tx: Sender<UiCommand>,
     status: SharedStatus,
     settings: Settings,
+    wifi: Wifi,
     mut improv: Improv,
 ) -> Result<()> {
     // USB Serial/JTAG ドライバを VFS に接続し、stdin のブロッキング読み出しを
@@ -81,7 +83,7 @@ pub fn start(
                     Ok(0) => FreeRtos::delay_ms(20),
                     Ok(n) => {
                         acc.extend_from_slice(&chunk[..n]);
-                        drain_buffer(&mut acc, &tx, &status, &settings, &mut improv);
+                        drain_buffer(&mut acc, &tx, &status, &settings, &wifi, &mut improv);
                     }
                     Err(_) => FreeRtos::delay_ms(100),
                 }
@@ -96,6 +98,7 @@ fn drain_buffer(
     tx: &Sender<UiCommand>,
     status: &SharedStatus,
     settings: &Settings,
+    wifi: &Wifi,
     improv: &mut Improv,
 ) {
     loop {
@@ -125,7 +128,7 @@ fn drain_buffer(
                 };
                 let line_bytes: Vec<u8> = acc.drain(..=pos).collect();
                 let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
-                handle_line(line.trim(), tx, status, settings);
+                handle_line(line.trim(), tx, status, settings, wifi);
             }
         }
     }
@@ -133,7 +136,13 @@ fn drain_buffer(
 
 /// 1 行を処理する。解析は alc-hub-core::protocol (純粋・テスト済み)、
 /// 副作用 (画面遷移・NVS 保存・応答出力) はここで行う。
-fn handle_line(line: &str, tx: &Sender<UiCommand>, status: &SharedStatus, settings: &Settings) {
+fn handle_line(
+    line: &str,
+    tx: &Sender<UiCommand>,
+    status: &SharedStatus,
+    settings: &Settings,
+    wifi: &Wifi,
+) {
     let command = match parse_line(line, config::QR_DEFAULT_TIMEOUT_MS) {
         Ok(Some(command)) => command,
         Ok(None) => return, // 空行
@@ -192,5 +201,37 @@ fn handle_line(line: &str, tx: &Sender<UiCommand>, status: &SharedStatus, settin
                 settings.rotation(),
             );
         }
+        // 設定エクスポート: 1 行 JSON を CFG プレフィックスで返す
+        HostCommand::CfgGet => println!("CFG {}", settings.export().to_json()),
+        // 設定インポート: パスワードは伏せて応答
+        HostCommand::CfgSet { json } => match DeviceConfig::from_json(&json) {
+            Ok(cfg) => match settings.apply(&cfg) {
+                Ok(()) => {
+                    if let Some(deg) = cfg.rotation {
+                        let _ = tx.send(UiCommand::Rotate(deg));
+                    }
+                    println!("OK CFG");
+                }
+                Err(e) => {
+                    log::error!("host_link: CFG 適用失敗: {e:?}");
+                    println!("ERR CFG: 保存に失敗しました");
+                }
+            },
+            Err(msg) => println!("ERR CFG: {msg}"),
+        },
+        // 保存済み Wi-Fi 設定での接続テスト。失敗時は原因を切り分けて返す
+        HostCommand::WifiTest => match settings.wifi_credentials() {
+            Some((ssid, pass)) => match wifi.connect_with_diagnosis(&ssid, &pass) {
+                Ok(ip) => println!("EVT WIFI_TEST OK {ip}"),
+                Err(reason) => {
+                    wifi.mark_disconnected();
+                    if let Ok(mut st) = status.lock() {
+                        st.push_event(now_ms(), "WiFi テスト失敗");
+                    }
+                    println!("EVT WIFI_TEST NG {reason}");
+                }
+            },
+            None => println!("EVT WIFI_TEST NG 保存済み Wi-Fi 設定がありません"),
+        },
     }
 }
