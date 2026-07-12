@@ -80,13 +80,29 @@ jobs:
         run: bash scripts/check_coverage_100.sh /tmp/llvm-cov-summary.txt
 
   # ------------------------------------------------------------------
-  # check: xtensa 向け cargo check (PR のみ)。リンク・イメージ生成は行わず、
+  # check: クレートごとの並列ジョブ (rust-alc-api の per-crate shard と同方式)。
+  # 各 leg は自分のクレートを xtensa 向けに codegen 付きでビルドする
+  # (metadata-only の cargo check は sccache の対象外のため build を使う。
+  #  依存クレートのコンパイルは sccache ヒットで実質スキップされる)。
+  # bin (main 配線のみ) はリンクを避けて check に留める。
   # main で warm された build キャッシュを restore 専用で使う
   # ------------------------------------------------------------------
   check:
-    name: Check firmware (PR)
+    name: "Check (${{ matrix.name }})"
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: core,    cmd: "cargo build --release --locked -p alc-hub-core" }
+          - { name: common,  cmd: "cargo build --release --locked -p alc-hub-common" }
+          - { name: board,   cmd: "cargo build --release --locked -p alc-hub-board" }
+          - { name: ble,     cmd: "cargo build --release --locked -p alc-hub-ble" }
+          - { name: wifi,    cmd: "cargo build --release --locked -p alc-hub-wifi" }
+          - { name: drivers, cmd: "cargo build --release --locked -p alc-hub-drivers" }
+          - { name: ui,      cmd: "cargo build --release --locked -p alc-hub-ui" }
+          - { name: bin,     cmd: "cargo check --release --locked -p alc-hub-cores3" }
 
     steps:
       - name: Checkout
@@ -148,11 +164,13 @@ jobs:
       # 内容ベースの rustc キャッシュなので、この再コンパイルをヒットに変える
       - uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Check
+      - name: Check (${{ matrix.name }})
         env:
           SCCACHE_GHA_ENABLED: 'true'
           RUSTC_WRAPPER: sccache
-        run: cargo check --release --locked
+        run: |
+          ${{ matrix.cmd }}
+          sccache --show-stats
 
   # ------------------------------------------------------------------
   # build: フルビルド + 書き込みイメージ + Pages サイト組み立て (main のみ)
