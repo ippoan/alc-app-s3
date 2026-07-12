@@ -97,7 +97,19 @@ jobs:
           restore-keys: |
             esp-idf-tools-${{ runner.os }}-
 
+      # esp ツールチェーン (数百MB) のダウンロードを毎回やらない。
+      # 新しい Rust ESP リリースに上げたい時は key の -v1 を上げて invalidate
+      - name: Cache Xtensa Rust toolchain
+        id: cache-xtensa
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains/esp
+            ~/.cargo/bin/ldproxy
+          key: xtensa-rust-${{ runner.os }}-v1
+
       - name: Install Xtensa Rust toolchain
+        if: steps.cache-xtensa.outputs.cache-hit != 'true'
         uses: esp-rs/xtensa-toolchain@v1.7.0
         with:
           default: true
@@ -137,7 +149,19 @@ jobs:
           restore-keys: |
             esp-idf-tools-${{ runner.os }}-
 
+      # esp ツールチェーン (数百MB) のダウンロードを毎回やらない。
+      # 新しい Rust ESP リリースに上げたい時は key の -v1 を上げて invalidate
+      - name: Cache Xtensa Rust toolchain
+        id: cache-xtensa
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains/esp
+            ~/.cargo/bin/ldproxy
+          key: xtensa-rust-${{ runner.os }}-v1
+
       - name: Install Xtensa Rust toolchain
+        if: steps.cache-xtensa.outputs.cache-hit != 'true'
         uses: esp-rs/xtensa-toolchain@v1.7.0
         with:
           default: true
