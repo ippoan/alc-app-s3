@@ -24,7 +24,7 @@ use alc_hub_common::{
     settings::Settings,
     status::{HubStatus, SharedStatus},
 };
-use alc_hub_drivers::{auth_link, host_link, lan, ntp, recorder, rs232, ws_uplink};
+use alc_hub_drivers::{host_link, lan, ntp, recorder, rs232, ws_uplink};
 use alc_hub_ui as ui;
 use alc_hub_wifi::{improv, wifi};
 use anyhow::Result;
@@ -111,12 +111,9 @@ fn main() -> Result<()> {
         ws_tx,
     )?;
 
-    // auth-worker device JWT 交換 (AUTH TOKEN 自己診断)。HTTP + TLS を伴う処理を
-    // host_link から切り離した専用スレッドで実行する。credential の provisioning
-    // は USB (AUTH SET) で行う
-    let (auth_tx, auth_rx) = mpsc::channel();
-    auth_link::start(auth_rx, settings.clone())?;
-
+    // auth-worker device JWT 交換 (AUTH TOKEN 自己診断) は host_link が
+    // auth_link::spawn_mint_test で一時スレッド起動する (常駐させない —
+    // TLS 用 20KB スタックは診断中だけ確保。credential は AUTH SET で注入)
     host_link::start(
         tx.clone(),
         Arc::clone(&status),
@@ -124,7 +121,6 @@ fn main() -> Result<()> {
         wifi,
         pair_flag.clone(),
         improv,
-        auth_tx,
     )?;
     rs232::start(p.uart1, p.pins.gpio17, p.pins.gpio18, Arc::clone(&status))?;
     lan::start(Arc::clone(&status)); // TODO: W5500 実装 (lan.rs 参照)

@@ -17,10 +17,26 @@ CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 # esp_crt_bundle_attach で公開 CA バンドルを使いサーバ証明書を検証する
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 
+# TLS (WSS + HTTPS) と BLE の同時使用でヒープが枯渇し BLE_INIT: Malloc failed
+# になる (実機で確認) ため、mbedTLS のバッファを動的確保にして idle 時は解放し、
+# 送信バッファを縮める (上りフレームは小さい。受信は Cloudflare のレコードサイズ
+# に合わせ既定 16KB のまま)
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_PEER_CERT=y
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+
+# Wi-Fi バッファ削減 (既定 static rx 10 / dynamic rx·tx 32)。スループットより
+# ヒープ優先 — 実測で定常空きヒープ 41KB しかなく TLS (WSS) が入らないため
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+
 # BLE central のみ (ble-medical-gateway firmware-rust の設定を踏襲)
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+# 同時接続は 1 台 (体温計/血圧計を順に読む)。ヒープ節約 (WS の TLS と共存)
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
 CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=n

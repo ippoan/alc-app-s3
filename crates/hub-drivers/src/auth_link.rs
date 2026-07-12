@@ -15,8 +15,6 @@
 //! | `EVT AUTH_TOKEN OK <expires_in_s>` | `AUTH TOKEN` 自己診断成功 |
 //! | `EVT AUTH_TOKEN NG <理由>` | 同 失敗 |
 
-use std::sync::mpsc::Receiver;
-
 use alc_hub_core::pairing::{parse_token_response, token_request_body, DeviceToken};
 use anyhow::{Context, Result};
 use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
@@ -24,42 +22,31 @@ use esp_idf_svc::http::Method;
 
 use alc_hub_common::settings::Settings;
 
-/// auth_link スレッドへの依頼 (host_link から送られる)
-pub enum AuthCommand {
-    /// 保存済み credential で device JWT を取得する自己診断 (`AUTH TOKEN`)
-    MintTest,
-}
-
 /// 応答本文の最大サイズ (JWT を含む /device/token 応答でも十分)
 const MAX_BODY: usize = 8 * 1024;
 /// HTTP タイムアウト
 const HTTP_TIMEOUT_S: u64 = 15;
 
-pub fn start(rx: Receiver<AuthCommand>, settings: Settings) -> Result<()> {
-    // mbedTLS ハンドシェイクが呼び出しスレッドのスタックを使うため大きめ
-    std::thread::Builder::new()
-        .name("auth_link".into())
+/// `AUTH TOKEN` 自己診断を一時スレッドで実行する。TLS ハンドシェイクの
+/// スタック (20KB) は診断中だけ確保し、終わったら返す (定常ヒープ節約 —
+/// 実測で空きヒープ 41KB の機体に常駐 20KB は重すぎる)。
+/// token 自体はホストへ出力しない (シリアルログに残さない)。
+pub fn spawn_mint_test(settings: Settings) {
+    let spawned = std::thread::Builder::new()
+        .name("auth_mint".into())
         .stack_size(20 * 1024)
         .spawn(move || {
-            for cmd in rx {
-                match cmd {
-                    AuthCommand::MintTest => run_mint_test(&settings),
-                }
+            let Some((id, secret)) = settings.device_credential() else {
+                println!("EVT AUTH_TOKEN NG 未登録 (AUTH SET で credential を注入してください)");
+                return;
+            };
+            match mint_token(&settings.auth_url(), &id, &secret) {
+                Ok(t) => println!("EVT AUTH_TOKEN OK {}", t.expires_in_s),
+                Err(e) => println!("EVT AUTH_TOKEN NG {e}"),
             }
-        })?;
-    Ok(())
-}
-
-/// `AUTH TOKEN` 自己診断: 保存済み credential で JWT を mint できるか確認する。
-/// token 自体はホストへ出力しない (シリアルログに残さない)。
-fn run_mint_test(settings: &Settings) {
-    let Some((id, secret)) = settings.device_credential() else {
-        println!("EVT AUTH_TOKEN NG 未登録 (AUTH SET で credential を注入してください)");
-        return;
-    };
-    match mint_token(&settings.auth_url(), &id, &secret) {
-        Ok(t) => println!("EVT AUTH_TOKEN OK {}", t.expires_in_s),
-        Err(e) => println!("EVT AUTH_TOKEN NG {e}"),
+        });
+    if spawned.is_err() {
+        println!("EVT AUTH_TOKEN NG スレッド起動失敗 (メモリ不足)");
     }
 }
 
