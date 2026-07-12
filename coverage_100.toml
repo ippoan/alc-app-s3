@@ -1,0 +1,27 @@
+# 100% ラインカバレッジを維持するファイルの登録簿 (ippoan/rust-alc-api と同方式)。
+# PR CI (coverage job) が cargo llvm-cov の結果と突き合わせ、割れたら fail する。
+# 新しい純粋ロジックを crates/hub-core に追加したら、ここにも登録すること。
+
+[[file]]
+path = "crates/hub-core/src/device.rs"
+type = "unit"
+
+[[file]]
+path = "crates/hub-core/src/ieee11073.rs"
+type = "unit"
+
+[[file]]
+path = "crates/hub-core/src/improv.rs"
+type = "unit"
+
+[[file]]
+path = "crates/hub-core/src/layout.rs"
+type = "unit"
+
+[[file]]
+path = "crates/hub-core/src/protocol.rs"
+type = "unit"
+
+[[file]]
+path = "crates/hub-core/src/vitals.rs"
+type = "unit"

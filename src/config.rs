@@ -24,3 +24,6 @@ pub const RESULT_AUTO_CLOSE_MS: u64 = 10_000;
 
 /// RS232 を「受信あり」とみなす直近受信ウィンドウ
 pub const RS232_ACTIVE_WINDOW_MS: u64 = 5_000;
+
+/// 体温/血圧表示画面の自動クローズまでの時間
+pub const VITALS_AUTO_CLOSE_MS: u64 = 30_000;
