@@ -17,21 +17,30 @@
 
 use alc_hub_core::pairing::{parse_token_response, token_request_body, DeviceToken};
 use anyhow::{Context, Result};
+use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
 use esp_idf_svc::http::Method;
 
 use alc_hub_common::settings::Settings;
+use alc_hub_common::status::SharedStatus;
 
 /// 応答本文の最大サイズ (JWT を含む /device/token 応答でも十分)
 const MAX_BODY: usize = 8 * 1024;
 /// HTTP タイムアウト
 const HTTP_TIMEOUT_S: u64 = 15;
+/// AUTH TOKEN 自己診断で Wi-Fi 接続を待つ上限。ポート open のリセット後は
+/// Wi-Fi 再接続に ~30 秒かかるため長めに取る
+const WIFI_WAIT_MS: u64 = 45_000;
 
 /// `AUTH TOKEN` 自己診断を一時スレッドで実行する。TLS ハンドシェイクの
 /// スタック (20KB) は診断中だけ確保し、終わったら返す (定常ヒープ節約 —
 /// 実測で空きヒープ 41KB の機体に常駐 20KB は重すぎる)。
 /// token 自体はホストへ出力しない (シリアルログに残さない)。
-pub fn spawn_mint_test(settings: Settings) {
+///
+/// HTTPS を叩く前に Wi-Fi 接続を待つ (ポート open のリセット直後は Wi-Fi が
+/// 未接続で、待たずに叩くと「リクエスト送信に失敗」になる。待機はデバイスの
+/// 責務 — ホスト側にポーリングさせない)。
+pub fn spawn_mint_test(settings: Settings, status: SharedStatus) {
     let spawned = std::thread::Builder::new()
         .name("auth_mint".into())
         .stack_size(20 * 1024)
@@ -40,6 +49,10 @@ pub fn spawn_mint_test(settings: Settings) {
                 println!("EVT AUTH_TOKEN NG 未登録 (AUTH SET で credential を注入してください)");
                 return;
             };
+            if !wait_for_wifi(&status, WIFI_WAIT_MS) {
+                println!("EVT AUTH_TOKEN NG Wi-Fi 未接続 (Improv で Wi-Fi 設定を確認してください)");
+                return;
+            }
             match mint_token(&settings.auth_url(), &id, &secret) {
                 Ok(t) => println!("EVT AUTH_TOKEN OK {}", t.expires_in_s),
                 Err(e) => println!("EVT AUTH_TOKEN NG {e}"),
@@ -47,6 +60,21 @@ pub fn spawn_mint_test(settings: Settings) {
         });
     if spawned.is_err() {
         println!("EVT AUTH_TOKEN NG スレッド起動失敗 (メモリ不足)");
+    }
+}
+
+/// Wi-Fi が接続されるまで最大 `timeout_ms` 待つ。接続できたら true。
+fn wait_for_wifi(status: &SharedStatus, timeout_ms: u64) -> bool {
+    let mut waited = 0u64;
+    loop {
+        if status.lock().map(|s| s.wifi_connected).unwrap_or(false) {
+            return true;
+        }
+        if waited >= timeout_ms {
+            return false;
+        }
+        FreeRtos::delay_ms(500);
+        waited += 500;
     }
 }
 

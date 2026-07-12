@@ -266,9 +266,10 @@ fn handle_line(
                 println!("ERR AUTH: credential の保存に失敗しました");
             }
         },
-        // JWT mint (HTTP) は一時スレッドで実行し、結果は EVT AUTH_* で届く
+        // JWT mint (HTTP) は一時スレッドで実行し、結果は EVT AUTH_* で届く。
+        // スレッド内で Wi-Fi 接続を待つため status を渡す
         HostCommand::AuthToken => {
-            auth_link::spawn_mint_test(settings.clone());
+            auth_link::spawn_mint_test(settings.clone(), status.clone());
             println!("OK AUTH TOKEN");
         }
         HostCommand::AuthUnpair => match settings.clear_device_credential() {
