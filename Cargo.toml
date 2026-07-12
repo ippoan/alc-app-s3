@@ -47,3 +47,9 @@ esp-idf-svc = { version = "0.52", default-features = false, features = [
 
 [build-dependencies]
 embuild = "0.33"
+
+# WS 送信 (#21): ESP-IDF の managed component (esp_websocket_client) を追加する。
+# esp-idf-svc の ws::client はこの component が有効な場合のみコンパイルされる
+# (cfg: esp_idf_comp_espressif__esp_websocket_client_enabled)
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp_websocket_client", version = "^1.5" }

@@ -24,7 +24,7 @@ use alc_hub_common::{
     settings::Settings,
     status::{HubStatus, SharedStatus},
 };
-use alc_hub_drivers::{auth_link, host_link, lan, ntp, recorder, rs232};
+use alc_hub_drivers::{auth_link, host_link, lan, ntp, recorder, rs232, ws_uplink};
 use alc_hub_ui as ui;
 use alc_hub_wifi::{improv, wifi};
 use anyhow::Result;
@@ -96,13 +96,19 @@ fn main() -> Result<()> {
     // BLE 再ペアリング要求フラグ (host_link の PAIR → ble タスクがボンド消去)
     let pair_flag = alc_hub_common::control::new_pair_flag();
 
+    // 測定データの WS 送信 (cf-alc-recorder)。recorder が fan-out した測定を
+    // NVS 永続キュー経由で送る (未ペアリング・圏外でも測定は失わない)
+    let (ws_tx, ws_rx) = mpsc::channel();
+    ws_uplink::start(ws_rx, tx.clone(), Arc::clone(&status), settings.clone())?;
+
     // 測定値レコーダ (BLE コールバックを軽量に保つための専用スレッド):
-    // JSON 出力 + NVS 記録 + 画面通知 を担う
+    // JSON 出力 + NVS 記録 + 画面通知 + WS fan-out を担う
     recorder::start(
         meas_rx,
         tx.clone(),
         Arc::clone(&status),
         settings.clone(),
+        ws_tx,
     )?;
 
     // auth-worker デバイス登録 (AUTH PAIR / AUTH TOKEN)。HTTP + TLS を伴う処理を

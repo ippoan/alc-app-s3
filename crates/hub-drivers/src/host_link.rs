@@ -23,6 +23,8 @@
 //! | `AUTH STATUS` | `AUTH PAIRED <tenant> <id>` / `AUTH UNPAIRED` を返す |
 //! | `AUTH URL <url>` | auth-worker ベース URL を上書き (staging テスト用) |
 //! | `AUTH TOKEN` | device JWT 取得の自己診断 (`EVT AUTH_TOKEN ...`) |
+//! | `WS URL <url>` | cf-alc-recorder WS URL を上書き (staging テスト用) |
+//! | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` を返す |
 //!
 //! # 送信イベント (CoreS3 → ホスト)
 //!
@@ -288,5 +290,22 @@ fn handle_line(
                 println!("ERR AUTH: URL の保存に失敗しました");
             }
         },
+        // 測定データの WS 送信 (cf-alc-recorder、ws_uplink.rs)
+        HostCommand::WsUrl { url } => match settings.set_ws_url(&url) {
+            Ok(()) => println!("OK WS URL"),
+            Err(e) => {
+                log::error!("host_link: WS URL 保存失敗: {e:?}");
+                println!("ERR WS: URL の保存に失敗しました");
+            }
+        },
+        HostCommand::WsStatus => {
+            let st = status.lock().map(|s| s.clone()).unwrap_or_default();
+            println!(
+                "WS CONNECTED={} QUEUE={} SEQ={}",
+                u8::from(st.ws_connected),
+                st.ws_queue_len,
+                st.ws_last_seq,
+            );
+        }
     }
 }

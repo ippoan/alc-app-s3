@@ -14,4 +14,5 @@ pub mod improv;
 pub mod layout;
 pub mod pairing;
 pub mod protocol;
+pub mod uplink;
 pub mod vitals;

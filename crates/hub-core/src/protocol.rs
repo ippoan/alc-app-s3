@@ -33,6 +33,10 @@ pub enum HostCommand {
     AuthUrl { url: String },
     /// 保存済み credential で device JWT を取得する自己診断
     AuthToken,
+    /// cf-alc-recorder WS URL の上書き (staging テスト用。NVS 保存)
+    WsUrl { url: String },
+    /// WS 送信の状態問い合わせ (`WS CONNECTED=1 QUEUE=3 SEQ=42` を応答)
+    WsStatus,
 }
 
 /// 画面向きとして有効な角度か
@@ -109,6 +113,19 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
         "WIFI" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
             Some("TEST") => HostCommand::WifiTest,
             _ => return Err("ERR WIFI: TEST が必要です".into()),
+        },
+        // 測定データの WS 送信 (cf-alc-recorder)
+        "WS" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+            Some("STATUS") => HostCommand::WsStatus,
+            Some("URL") => match it.next() {
+                Some(url) if url.starts_with("wss://") || url.starts_with("ws://") => {
+                    HostCommand::WsUrl {
+                        url: url.to_string(),
+                    }
+                }
+                _ => return Err("ERR WS: URL には ws(s):// で始まる URL が必要です".into()),
+            },
+            _ => return Err("ERR WS: URL|STATUS が必要です".into()),
         },
         // `PAIR` または `BLE PAIR`
         "PAIR" => HostCommand::BlePair,
@@ -341,5 +358,30 @@ mod tests {
         assert!(parse_line("AUTH URL", T).is_err());
         assert!(parse_line("AUTH URL ftp://x", T).is_err());
         assert!(parse_line("AUTH URL auth.ippoan.org", T).is_err());
+    }
+
+    #[test]
+    fn ws_subcommands() {
+        assert_eq!(parse_line("WS STATUS", T), Ok(Some(HostCommand::WsStatus)));
+        assert_eq!(
+            parse_line("ws url wss://alc-recorder-staging.m-tama-ramu.workers.dev/ws", T),
+            Ok(Some(HostCommand::WsUrl {
+                url: "wss://alc-recorder-staging.m-tama-ramu.workers.dev/ws".into(),
+            }))
+        );
+        assert_eq!(
+            parse_line("WS URL ws://192.168.1.10:8787/ws", T),
+            Ok(Some(HostCommand::WsUrl {
+                url: "ws://192.168.1.10:8787/ws".into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn ws_errors() {
+        assert!(parse_line("WS", T).is_err());
+        assert!(parse_line("WS SEND", T).is_err());
+        assert!(parse_line("WS URL", T).is_err());
+        assert!(parse_line("WS URL https://x/ws", T).is_err());
     }
 }

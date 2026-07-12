@@ -45,3 +45,7 @@ pub const DEVICE_ROLE: &str = "device-hub";
 
 /// ペアリング結果画面の自動クローズまでの時間
 pub const PAIRING_RESULT_CLOSE_MS: u64 = 10_000;
+
+/// cf-alc-recorder の既定 WS URL (`WS URL` コマンドで NVS 上書き可。
+/// staging は wss://alc-recorder-staging.m-tama-ramu.workers.dev/ws)
+pub const RECORDER_WS_URL_DEFAULT: &str = "wss://alc-recorder.m-tama-ramu.workers.dev/ws";
