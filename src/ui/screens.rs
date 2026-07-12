@@ -56,7 +56,12 @@ fn dims(d: &Cs3Display) -> (i32, i32) {
 // ---------------------------------------------------------------------------
 
 const STRIP_W: usize = 160;
-const STRIP_H: usize = 20;
+const STRIP_H: usize = 24;
+/// 描画基準位置の上に確保するヘッドルーム (ソース px)。
+/// u8g2 の VerticalPosition::Top はフォントのアセント値基準のため、
+/// 濁点・半濁点や一部グリフはその上にはみ出すことがある。ヘッドルーム無しだと
+/// ストリップ上端でクリップされ「日本語の上が少し見切れる」症状になる
+const STRIP_HEADROOM: usize = 4;
 
 /// JP16 を一旦描くオフスクリーンの小バッファ
 struct Strip {
@@ -102,7 +107,7 @@ fn jp2x_center(d: &mut Cs3Display, s: &str, y: i32, fg: Rgb565, bg: Rgb565) {
     let mut strip = Strip::new(bg);
     let _ = JP16.render_aligned(
         s,
-        Point::new((STRIP_W as i32) / 2, 1),
+        Point::new((STRIP_W as i32) / 2, STRIP_HEADROOM as i32),
         VerticalPosition::Top,
         HorizontalAlignment::Center,
         FontColor::Transparent(fg),
@@ -120,16 +125,18 @@ fn jp2x_center(d: &mut Cs3Display, s: &str, y: i32, fg: Rgb565, bg: Rgb565) {
         if src_row.iter().all(|c| *c == strip.bg) {
             continue;
         }
+        // ヘッドルーム行は呼び出し側の y (= 文字の上端想定) より上へ描く
+        let dy_base = y + ((sy as i32) - (STRIP_HEADROOM as i32)) * 2;
+        if dy_base < 0 {
+            continue;
+        }
         for (sx, c) in src_row.iter().enumerate() {
             row[sx * 2] = *c;
             row[sx * 2 + 1] = *c;
         }
         for dy in 0..2 {
             let _ = d.fill_contiguous(
-                &Rectangle::new(
-                    Point::new(x0, y + (sy as i32) * 2 + dy),
-                    Size::new(dest_w as u32, 1),
-                ),
+                &Rectangle::new(Point::new(x0, dy_base + dy), Size::new(dest_w as u32, 1)),
                 row.iter().copied(),
             );
         }
