@@ -4,6 +4,7 @@
 //! alc-hub-board、共有基盤 (状態/設定/UI コマンド) は alc-hub-common に分離
 //! されている (依存を枝分かれさせて並列ビルドを可能にするため)。
 
+pub mod auth_link;
 pub mod host_link;
 pub mod lan;
 pub mod ntp;

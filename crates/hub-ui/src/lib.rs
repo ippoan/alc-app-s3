@@ -82,6 +82,17 @@ pub(crate) enum Screen {
     },
     /// イベントログ + 機器ステータス
     Log,
+    /// auth-worker デバイス登録の承認待ち (user_code + 承認 URL の QR)
+    Pairing {
+        user_code: String,
+        url: String,
+        timeout_ms: u64,
+    },
+    /// auth-worker デバイス登録の結果
+    PairingResult {
+        ok: bool,
+        message: String,
+    },
 }
 
 pub fn run(
@@ -219,6 +230,18 @@ pub fn run(
                         },
                         UiCommand::Error { message } => Screen::Error { message },
                         UiCommand::Reset => Screen::Idle,
+                        UiCommand::ShowPairing {
+                            user_code,
+                            url,
+                            timeout_ms,
+                        } => Screen::Pairing {
+                            user_code,
+                            url,
+                            timeout_ms,
+                        },
+                        UiCommand::PairingResult { ok, message } => {
+                            Screen::PairingResult { ok, message }
+                        }
                         UiCommand::Rotate(_)
                         | UiCommand::Temperature { .. }
                         | UiCommand::BloodPressure { .. }
@@ -261,6 +284,10 @@ pub fn run(
             {
                 true
             }
+            // 登録承認待ち: pairing の有効期限で閉じる (結果は auth_link が
+            // PairingResult で別途通知するため、ここでは画面を畳むだけ)
+            Screen::Pairing { timeout_ms, .. } if elapsed > *timeout_ms => true,
+            Screen::PairingResult { .. } if elapsed > config::PAIRING_RESULT_CLOSE_MS => true,
             _ => false,
         };
         if auto_close {
@@ -299,7 +326,9 @@ pub fn run(
                 let st = status.lock().map(|s| s.clone()).unwrap_or_default();
                 // 時計・インジケータのみの部分更新 (全面クリアしない — blink 防止)
                 screens::update_status_bar(&mut display, &st, now);
-                if let Screen::Qr { timeout_ms, .. } = &screen {
+                if let Screen::Qr { timeout_ms, .. } | Screen::Pairing { timeout_ms, .. } =
+                    &screen
+                {
                     let remain_s = timeout_ms.saturating_sub(now.saturating_sub(entered)) / 1000;
                     screens::draw_qr_countdown(&mut display, remain_s);
                 }
@@ -371,8 +400,9 @@ fn on_click(screen: &Screen, y: i32, logical_h: i32) -> Option<Screen> {
         | Screen::Result { .. }
         | Screen::Error { .. }
         | Screen::Temperature { .. }
-        | Screen::BloodPressure { .. } => Some(Screen::Idle),
-        // QR は誤タップで閉じない (ホストの RESET / タイムアウトのみ)
-        Screen::Qr { .. } => None,
+        | Screen::BloodPressure { .. }
+        | Screen::PairingResult { .. } => Some(Screen::Idle),
+        // QR / 登録承認待ちは誤タップで閉じない (タイムアウト・結果通知のみ)
+        Screen::Qr { .. } | Screen::Pairing { .. } => None,
     }
 }

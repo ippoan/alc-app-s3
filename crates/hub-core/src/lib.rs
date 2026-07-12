@@ -12,5 +12,6 @@ pub mod device;
 pub mod ieee11073;
 pub mod improv;
 pub mod layout;
+pub mod pairing;
 pub mod protocol;
 pub mod vitals;

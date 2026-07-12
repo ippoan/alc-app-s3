@@ -22,6 +22,17 @@ pub enum HostCommand {
     WifiTest,
     /// BLE の全ボンド消去 → 次接続で再ペアリング (血圧計の暗号化接続復旧)
     BlePair,
+    /// auth-worker とのデバイスペアリング開始 (headless pairing、auth_link)
+    AuthPair,
+    /// 保存済み device credential の破棄 (ローカルのみ。サーバ側 revoke は
+    /// operator が auth-worker で行う)
+    AuthUnpair,
+    /// ペアリング状態の問い合わせ (`AUTH PAIRED ...` / `AUTH UNPAIRED` を応答)
+    AuthStatus,
+    /// auth-worker ベース URL の上書き (staging テスト用。NVS 保存)
+    AuthUrl { url: String },
+    /// 保存済み credential で device JWT を取得する自己診断
+    AuthToken,
 }
 
 /// 画面向きとして有効な角度か
@@ -104,6 +115,22 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
         "BLE" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
             Some("PAIR") => HostCommand::BlePair,
             _ => return Err("ERR BLE: PAIR が必要です".into()),
+        },
+        // auth-worker デバイス登録 (BLE の PAIR とは別系統)
+        "AUTH" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+            Some("PAIR") => HostCommand::AuthPair,
+            Some("UNPAIR") => HostCommand::AuthUnpair,
+            Some("STATUS") => HostCommand::AuthStatus,
+            Some("TOKEN") => HostCommand::AuthToken,
+            Some("URL") => match it.next() {
+                Some(url) if url.starts_with("https://") || url.starts_with("http://") => {
+                    HostCommand::AuthUrl {
+                        url: url.to_string(),
+                    }
+                }
+                _ => return Err("ERR AUTH: URL には http(s):// で始まる URL が必要です".into()),
+            },
+            _ => return Err("ERR AUTH: PAIR|UNPAIR|STATUS|TOKEN|URL が必要です".into()),
         },
         _ => return Err(format!("ERR 不明なコマンド: {cmd}")),
     };
@@ -272,5 +299,47 @@ mod tests {
         assert_eq!(parse_line("ble pair", T), Ok(Some(HostCommand::BlePair)));
         assert!(parse_line("BLE", T).is_err());
         assert!(parse_line("BLE SCAN", T).is_err());
+    }
+
+    #[test]
+    fn auth_subcommands() {
+        assert_eq!(parse_line("AUTH PAIR", T), Ok(Some(HostCommand::AuthPair)));
+        assert_eq!(
+            parse_line("auth unpair", T),
+            Ok(Some(HostCommand::AuthUnpair))
+        );
+        assert_eq!(
+            parse_line("AUTH STATUS", T),
+            Ok(Some(HostCommand::AuthStatus))
+        );
+        assert_eq!(
+            parse_line("AUTH TOKEN", T),
+            Ok(Some(HostCommand::AuthToken))
+        );
+    }
+
+    #[test]
+    fn auth_url_preserves_case() {
+        assert_eq!(
+            parse_line("AUTH URL https://Auth-Staging.ippoan.org", T),
+            Ok(Some(HostCommand::AuthUrl {
+                url: "https://Auth-Staging.ippoan.org".into(),
+            }))
+        );
+        assert_eq!(
+            parse_line("AUTH URL http://192.168.1.10:8787", T),
+            Ok(Some(HostCommand::AuthUrl {
+                url: "http://192.168.1.10:8787".into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn auth_errors() {
+        assert!(parse_line("AUTH", T).is_err());
+        assert!(parse_line("AUTH REVOKE", T).is_err());
+        assert!(parse_line("AUTH URL", T).is_err());
+        assert!(parse_line("AUTH URL ftp://x", T).is_err());
+        assert!(parse_line("AUTH URL auth.ippoan.org", T).is_err());
     }
 }

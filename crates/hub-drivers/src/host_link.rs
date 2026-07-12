@@ -18,6 +18,11 @@
 //! | `RESET` | 待機画面へ戻す |
 //! | `ROTATE <0\|90\|180\|270>` | 画面向きを変更 (NVS 保存、次回起動も維持) |
 //! | `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0` を返す |
+//! | `AUTH PAIR` | auth-worker デバイス登録を開始 (承認 QR を画面表示) |
+//! | `AUTH UNPAIR` | 保存済み device credential を破棄 (ローカルのみ) |
+//! | `AUTH STATUS` | `AUTH PAIRED <tenant> <id>` / `AUTH UNPAIRED` を返す |
+//! | `AUTH URL <url>` | auth-worker ベース URL を上書き (staging テスト用) |
+//! | `AUTH TOKEN` | device JWT 取得の自己診断 (`EVT AUTH_TOKEN ...`) |
 //!
 //! # 送信イベント (CoreS3 → ホスト)
 //!
@@ -52,6 +57,8 @@ use alc_hub_common::{
 };
 use alc_hub_wifi::{improv::Improv, wifi::Wifi};
 
+use crate::auth_link::AuthCommand;
+
 /// 行としてバッファする最大長 (超えたら読み捨て — バイナリノイズ対策)
 const MAX_LINE: usize = 512;
 
@@ -62,6 +69,7 @@ pub fn start(
     wifi: Wifi,
     pair_flag: PairFlag,
     mut improv: Improv,
+    auth_tx: Sender<AuthCommand>,
 ) -> Result<()> {
     // USB Serial/JTAG ドライバを VFS に接続し、stdin のブロッキング読み出しを
     // 可能にする (CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y 前提)
@@ -85,7 +93,10 @@ pub fn start(
                     Ok(0) => FreeRtos::delay_ms(20),
                     Ok(n) => {
                         acc.extend_from_slice(&chunk[..n]);
-                        drain_buffer(&mut acc, &tx, &status, &settings, &wifi, &pair_flag, &mut improv);
+                        drain_buffer(
+                            &mut acc, &tx, &status, &settings, &wifi, &pair_flag, &mut improv,
+                            &auth_tx,
+                        );
                     }
                     Err(_) => FreeRtos::delay_ms(100),
                 }
@@ -103,6 +114,7 @@ fn drain_buffer(
     wifi: &Wifi,
     pair_flag: &PairFlag,
     improv: &mut Improv,
+    auth_tx: &Sender<AuthCommand>,
 ) {
     loop {
         if acc.is_empty() {
@@ -131,7 +143,7 @@ fn drain_buffer(
                 };
                 let line_bytes: Vec<u8> = acc.drain(..=pos).collect();
                 let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
-                handle_line(line.trim(), tx, status, settings, wifi, pair_flag);
+                handle_line(line.trim(), tx, status, settings, wifi, pair_flag, auth_tx);
             }
         }
     }
@@ -146,6 +158,7 @@ fn handle_line(
     settings: &Settings,
     wifi: &Wifi,
     pair_flag: &PairFlag,
+    auth_tx: &Sender<AuthCommand>,
 ) {
     let command = match parse_line(line, config::QR_DEFAULT_TIMEOUT_MS) {
         Ok(Some(command)) => command,
@@ -243,5 +256,37 @@ fn handle_line(
             pair_flag.store(true, core::sync::atomic::Ordering::SeqCst);
             println!("OK PAIR");
         }
+        // auth-worker デバイス登録: HTTP を伴う処理は auth_link スレッドへ依頼し、
+        // 結果は EVT AUTH_* 行と画面遷移で非同期に届く
+        HostCommand::AuthPair => match auth_tx.send(AuthCommand::Pair) {
+            Ok(()) => println!("OK AUTH PAIR"),
+            Err(_) => println!("ERR AUTH: auth_link が停止しています"),
+        },
+        HostCommand::AuthToken => match auth_tx.send(AuthCommand::MintTest) {
+            Ok(()) => println!("OK AUTH TOKEN"),
+            Err(_) => println!("ERR AUTH: auth_link が停止しています"),
+        },
+        HostCommand::AuthUnpair => match settings.clear_device_credential() {
+            Ok(()) => println!("OK AUTH UNPAIR"),
+            Err(e) => {
+                log::error!("host_link: credential 破棄失敗: {e:?}");
+                println!("ERR AUTH: 破棄に失敗しました");
+            }
+        },
+        HostCommand::AuthStatus => match settings.device_credential() {
+            Some((id, _)) => println!(
+                "AUTH PAIRED {} {}",
+                settings.device_tenant().unwrap_or_default(),
+                id,
+            ),
+            None => println!("AUTH UNPAIRED"),
+        },
+        HostCommand::AuthUrl { url } => match settings.set_auth_url(&url) {
+            Ok(()) => println!("OK AUTH URL"),
+            Err(e) => {
+                log::error!("host_link: auth URL 保存失敗: {e:?}");
+                println!("ERR AUTH: URL の保存に失敗しました");
+            }
+        },
     }
 }

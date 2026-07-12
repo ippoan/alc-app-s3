@@ -24,7 +24,7 @@ use alc_hub_common::{
     settings::Settings,
     status::{HubStatus, SharedStatus},
 };
-use alc_hub_drivers::{host_link, lan, ntp, recorder, rs232};
+use alc_hub_drivers::{auth_link, host_link, lan, ntp, recorder, rs232};
 use alc_hub_ui as ui;
 use alc_hub_wifi::{improv, wifi};
 use anyhow::Result;
@@ -105,6 +105,11 @@ fn main() -> Result<()> {
         settings.clone(),
     )?;
 
+    // auth-worker デバイス登録 (AUTH PAIR / AUTH TOKEN)。HTTP + TLS を伴う処理を
+    // host_link から切り離した専用スレッドで実行する
+    let (auth_tx, auth_rx) = mpsc::channel();
+    auth_link::start(auth_rx, tx.clone(), Arc::clone(&status), settings.clone())?;
+
     host_link::start(
         tx.clone(),
         Arc::clone(&status),
@@ -112,6 +117,7 @@ fn main() -> Result<()> {
         wifi,
         pair_flag.clone(),
         improv,
+        auth_tx,
     )?;
     rs232::start(p.uart1, p.pins.gpio17, p.pins.gpio18, Arc::clone(&status))?;
     lan::start(Arc::clone(&status)); // TODO: W5500 実装 (lan.rs 参照)
