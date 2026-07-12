@@ -38,6 +38,7 @@ use esp_idf_svc::hal::{delay::FreeRtos, task::block_on};
 
 use alc_hub_common::status::{now_ms, SharedStatus};
 use alc_hub_common::ui_api::UiCommand;
+use alc_hub_core::coex::RadioCoex;
 
 /// on_notify クロージャ (Send + Sync 要求) から使うため Mutex で包む
 type SharedTx = Arc<Mutex<Sender<UiCommand>>>;
@@ -47,7 +48,8 @@ const BLOOD_PRESSURE_SERVICE: u16 = 0x1810;
 const TEMPERATURE_MEASUREMENT: u16 = 0x2A1C;
 const BLOOD_PRESSURE_MEASUREMENT: u16 = 0x2A35;
 
-const SCAN_DURATION_MS: i32 = 3_000;
+// 1 スキャンを短くして、Wi-Fi 側の停止要求 (RadioCoex) に速く応じる
+const SCAN_DURATION_MS: i32 = 1_000;
 const SCAN_COOLDOWN_MS: u32 = 500;
 const MIN_RSSI: i8 = -80;
 const CONNECT_RETRIES: u32 = 3;
@@ -71,14 +73,14 @@ fn measurement_uuid(kind: DeviceKind) -> BleUuid {
 pub fn start(
     status: SharedStatus,
     tx: Sender<UiCommand>,
-    wifi_busy: Arc<AtomicBool>,
+    coex: Arc<RadioCoex>,
 ) -> Result<()> {
     let tx: SharedTx = Arc::new(Mutex::new(tx));
     std::thread::Builder::new()
         .name("ble".into())
         .stack_size(16 * 1024)
         .spawn(move || {
-            if let Err(e) = block_on(task(status, tx, wifi_busy)) {
+            if let Err(e) = block_on(task(status, tx, coex)) {
                 log::error!("ble: タスク異常終了: {e:?}");
                 println!("{{\"type\":\"error\",\"message\":\"BLE task terminated\"}}");
             }
@@ -86,7 +88,7 @@ pub fn start(
     Ok(())
 }
 
-async fn task(status: SharedStatus, tx: SharedTx, wifi_busy: Arc<AtomicBool>) -> Result<()> {
+async fn task(status: SharedStatus, tx: SharedTx, coex: Arc<RadioCoex>) -> Result<()> {
     let device = BLEDevice::take();
 
     // Arduino 版と同等の Just Works ボンディング設定
@@ -97,9 +99,9 @@ async fn task(status: SharedStatus, tx: SharedTx, wifi_busy: Arc<AtomicBool>) ->
 
     let mut scan = BLEScan::new();
     loop {
-        // Wi-Fi の接続/スキャン中は BLE スキャンを止め、コエグジストの
-        // 電波取り合いで Wi-Fi 側が失敗しないようにする (wifi.rs 参照)
-        while wifi_busy.load(Ordering::SeqCst) {
+        // Wi-Fi の接続/スキャン中 + Improv セッション中は BLE スキャンを
+        // 止め、コエグジストの電波取り合いで Wi-Fi 側が失敗しないようにする
+        while coex.ble_should_pause(now_ms()) {
             FreeRtos::delay_ms(200);
         }
 

@@ -69,7 +69,7 @@ fn main() -> Result<()> {
 
     // Wi-Fi (Improv Wi-Fi Serial で設定。保存済みなら起動時に自動接続)
     let wifi = wifi::Wifi::new(p.modem, sysloop, nvs_partition, Arc::clone(&status))?;
-    let wifi_busy = wifi.busy_handle();
+    let coex = wifi.coex_handle();
     let saved_credentials = settings.wifi_credentials();
     let provisioned = saved_credentials.is_some();
     if let Some((ssid, pass)) = saved_credentials {
@@ -94,8 +94,9 @@ fn main() -> Result<()> {
     host_link::start(tx.clone(), Arc::clone(&status), settings, improv)?;
     rs232::start(p.uart1, p.pins.gpio17, p.pins.gpio18, Arc::clone(&status))?;
     lan::start(Arc::clone(&status)); // TODO: W5500 実装 (lan.rs 参照)
-    // NT-100B / NBP-1BLE 読み取り。Wi-Fi 接続中は BLE スキャンを一時停止する
-    ble::start(Arc::clone(&status), tx, wifi_busy)?;
+    // NT-100B / NBP-1BLE 読み取り。Wi-Fi 接続/Improv セッション中は
+    // BLE スキャンを一時停止する (RadioCoex)
+    ble::start(Arc::clone(&status), tx, coex)?;
 
     // UI ループ (メインタスクを占有, 戻らない)
     ui::run(display, i2c, rx, status, rotation)

@@ -11,7 +11,6 @@
 //!   立て、ble.rs 側が BLE スキャンを一時停止する
 
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
@@ -23,6 +22,7 @@ use esp_idf_svc::{
 };
 
 use alc_hub_common::status::{now_ms, SharedStatus};
+use alc_hub_core::coex::RadioCoex;
 
 /// 接続 (アソシエーション + DHCP) の待ち時間上限
 const CONNECT_TIMEOUT_MS: u64 = 20_000;
@@ -34,8 +34,8 @@ pub type ScanEntry = (String, i8, bool);
 pub struct Wifi {
     inner: Arc<Mutex<EspWifi<'static>>>,
     status: SharedStatus,
-    /// 接続/スキャン中フラグ (ble.rs が見て BLE スキャンを止める)
-    busy: Arc<AtomicBool>,
+    /// BLE とのコエグジスト調停 (hub-ble がスキャン前に参照)
+    coex: Arc<RadioCoex>,
 }
 
 impl Wifi {
@@ -49,20 +49,25 @@ impl Wifi {
         Ok(Self {
             inner: Arc::new(Mutex::new(wifi)),
             status,
-            busy: Arc::new(AtomicBool::new(false)),
+            coex: Arc::new(RadioCoex::new()),
         })
     }
 
-    /// BLE 側が参照する busy フラグ
-    pub fn busy_handle(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.busy)
+    /// BLE 側が参照するコエグジスト調停ハンドル
+    pub fn coex_handle(&self) -> Arc<RadioCoex> {
+        Arc::clone(&self.coex)
+    }
+
+    /// Improv セッション中など、一定時間 BLE スキャンを止めておく
+    pub fn pause_ble_for(&self, ms: u64) {
+        self.coex.pause_ble_for(now_ms(), ms);
     }
 
     /// STA として接続 (最大 20 秒ブロック)。成功時は IP アドレス文字列を返す。
     pub fn connect(&self, ssid: &str, password: &str) -> Result<String> {
-        self.busy.store(true, Ordering::SeqCst);
+        self.coex.set_wifi_busy(true);
         let result = self.connect_inner(ssid, password);
-        self.busy.store(false, Ordering::SeqCst);
+        self.coex.set_wifi_busy(false);
         result
     }
 
@@ -125,9 +130,9 @@ impl Wifi {
 
     /// 周辺ネットワークのスキャン (Improv の REQUEST_SCAN 用)
     pub fn scan(&self) -> Result<Vec<ScanEntry>> {
-        self.busy.store(true, Ordering::SeqCst);
+        self.coex.set_wifi_busy(true);
         let result = self.scan_inner();
-        self.busy.store(false, Ordering::SeqCst);
+        self.coex.set_wifi_busy(false);
         result
     }
 
