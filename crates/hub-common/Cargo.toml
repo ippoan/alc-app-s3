@@ -9,6 +9,7 @@ description = "alc-hub-cores3 の共有基盤 (状態 / 設定 / 定数 / UI コ
 [dependencies]
 alc-hub-core = { path = "../hub-core" }
 anyhow = "1"
+log = "0.4"
 esp-idf-svc = { version = "0.52", default-features = false, features = [
     "native",
     "std",

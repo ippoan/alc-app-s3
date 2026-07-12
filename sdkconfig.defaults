@@ -21,3 +21,16 @@ CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
 CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+# ボンディング: 血圧計 (NBP-1BLE) は暗号化リンクを要求するため、Just Works で
+# ペアリングしボンド情報を NVS に永続化する (次回接続で再ペアリング不要)。
+# 体温計は非暗号化で動くが、血圧計の Measurement indication は暗号化後に届く。
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+CONFIG_BT_NIMBLE_SM_SC=y
+CONFIG_BT_NIMBLE_SM_LEGACY=y
+CONFIG_BT_NIMBLE_MAX_BONDS=8
+
+# notify コールバック (emit_measurement) が nimble_host タスク上で println!/format!/
+# ロック/イベント追加を行うため、既定 4KB ではスタックオーバーフローする
+# (実機で血圧受信直後にクラッシュを確認)。ホストタスクのスタックを拡張する。
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192

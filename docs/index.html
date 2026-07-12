@@ -276,7 +276,13 @@
                 ファイルから読込<input id="cfg-import" type="file" accept="application/json,.json" style="display: none;">
             </label>
             <button id="wifi-test" style="padding: 10px 16px; border-radius: 8px; border: none; background: #2e7d32; color: white; font-size: 15px; cursor: pointer;">Wi-Fi 接続テスト</button>
+            <button id="ble-pair" style="padding: 10px 16px; border-radius: 8px; border: none; background: #6a1b9a; color: white; font-size: 15px; cursor: pointer;">血圧計を再ペアリング</button>
         </div>
+        <p style="font-size: 13px; color: #666; margin-top: 4px;">
+            血圧計 (NBP-1BLE) は暗号化リンク（ボンディング）が必要です。測定値が画面に出ない時は
+            「血圧計を再ペアリング」を押して本体のボンド情報を消去し、血圧計側もペアリング待ち
+            （ペアリングボタン長押し等）にして測り直してください。
+        </p>
         <textarea id="cfg-json" rows="7" spellcheck="false"
                   style="width: 100%; font-family: monospace; font-size: 13px; padding: 10px; border-radius: 8px; border: 1px solid #ccc; box-sizing: border-box;"
                   placeholder='{"version":1,"rotation":0,"wifi":{"ssid":"...","password":"..."}}'></textarea>
@@ -508,6 +514,18 @@
             };
             fr.readAsText(file);
             ev.target.value = '';
+        });
+
+        document.getElementById('ble-pair').addEventListener('click', async () => {
+            try {
+                cfgOut.textContent = 'ポート選択 → ペアリング情報を消去中...';
+                const row = await serialCommand('PAIR', ['OK PAIR', 'EVT PAIR_CLEARED', 'EVT PAIR_ERR', 'ERR'], 5000);
+                if (row === 'OK PAIR' || row === 'EVT PAIR_CLEARED') {
+                    cfgOut.textContent = 'ボンド情報を消去しました。血圧計をペアリング待ちにして測定してください';
+                } else {
+                    cfgOut.textContent = row || 'コマンド送信済み (応答未確認)';
+                }
+            } catch (e) { cfgOut.textContent = '失敗: ' + e.message; }
         });
 
         document.getElementById('wifi-test').addEventListener('click', async () => {

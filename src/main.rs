@@ -22,9 +22,9 @@ use alc_hub_board as board;
 use alc_hub_common::{
     config,
     settings::Settings,
-    status::{now_ms, HubStatus, SharedStatus},
+    status::{HubStatus, SharedStatus},
 };
-use alc_hub_drivers::{host_link, lan, rs232};
+use alc_hub_drivers::{host_link, lan, ntp, recorder, rs232};
 use alc_hub_ui as ui;
 use alc_hub_wifi::{improv, wifi};
 use anyhow::Result;
@@ -65,7 +65,16 @@ fn main() -> Result<()> {
     )?;
 
     let status: SharedStatus = Arc::new(Mutex::new(HubStatus::default()));
-    let (tx, rx) = mpsc::channel();
+    // 永続化された測定ログを起動時に読み戻し、「ログ確認」画面に前回までの
+    // 記録を表示する (リブートで測定記録が消えないようにする)
+    if let Ok(mut st) = status.lock() {
+        for line in settings.measurement_log() {
+            st.events.push_back(line);
+        }
+    }
+
+    let (tx, rx) = mpsc::channel(); // UiCommand: 各種 → UI ループ
+    let (meas_tx, meas_rx) = mpsc::channel(); // Measurement: BLE → recorder
 
     // Wi-Fi (Improv Wi-Fi Serial で設定。保存済みなら起動時に自動接続)
     let wifi = wifi::Wifi::new(p.modem, sysloop, nvs_partition, Arc::clone(&status))?;
@@ -73,31 +82,46 @@ fn main() -> Result<()> {
     let saved_credentials = settings.wifi_credentials();
     let provisioned = saved_credentials.is_some();
     if let Some((ssid, pass)) = saved_credentials {
+        // 起動時接続 + 切断検出時の自動再接続を常駐スレッドで維持する。
+        // (単発接続だと BLE との電波競合や AP 瞬断で一度切れると復帰しない)
         let wifi = wifi.clone();
-        let status_c = Arc::clone(&status);
         std::thread::Builder::new()
-            .name("wifi_boot".into())
+            .name("wifi_keepalive".into())
             .stack_size(8 * 1024)
-            .spawn(move || match wifi.connect(&ssid, &pass) {
-                Ok(ip) => log::info!("wifi: 起動時接続成功 {ip}"),
-                Err(e) => {
-                    log::warn!("wifi: 起動時接続失敗: {e:?}");
-                    wifi.mark_disconnected();
-                    if let Ok(mut st) = status_c.lock() {
-                        st.push_event(now_ms(), "WiFi 接続失敗");
-                    }
-                }
-            })?;
+            .spawn(move || wifi.keepalive(ssid, pass))?;
     }
     let improv =
         improv::Improv::new(settings.clone(), wifi.clone(), Arc::clone(&status), provisioned);
 
-    host_link::start(tx.clone(), Arc::clone(&status), settings, wifi, improv)?;
+    // BLE 再ペアリング要求フラグ (host_link の PAIR → ble タスクがボンド消去)
+    let pair_flag = alc_hub_common::control::new_pair_flag();
+
+    // 測定値レコーダ (BLE コールバックを軽量に保つための専用スレッド):
+    // JSON 出力 + NVS 記録 + 画面通知 を担う
+    recorder::start(
+        meas_rx,
+        tx.clone(),
+        Arc::clone(&status),
+        settings.clone(),
+    )?;
+
+    host_link::start(
+        tx.clone(),
+        Arc::clone(&status),
+        settings,
+        wifi,
+        pair_flag.clone(),
+        improv,
+    )?;
     rs232::start(p.uart1, p.pins.gpio17, p.pins.gpio18, Arc::clone(&status))?;
     lan::start(Arc::clone(&status)); // TODO: W5500 実装 (lan.rs 参照)
-    // NT-100B / NBP-1BLE 読み取り。Wi-Fi 接続/Improv セッション中は
-    // BLE スキャンを一時停止する (RadioCoex)
-    ble::start(Arc::clone(&status), tx, coex)?;
+    // NTP: ネットワーク接続後に時刻同期し、測定ログを日本時間で記録する。
+    // EspSntp は drop すると同期が止まるため、UI ループ (戻らない) の間
+    // 生かし続ける。
+    let _sntp = ntp::start()?;
+    // NT-100B / NBP-1BLE 読み取り。測定値は meas_tx で recorder へ送る。
+    // Wi-Fi 接続/Improv セッション中は BLE スキャンを一時停止する (RadioCoex)
+    ble::start(Arc::clone(&status), meas_tx, coex, pair_flag)?;
 
     // UI ループ (メインタスクを占有, 戻らない)
     ui::run(display, i2c, rx, status, rotation)

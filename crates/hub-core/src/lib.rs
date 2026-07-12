@@ -6,6 +6,7 @@
 //! ラインカバレッジ 100% が強制される。
 
 pub mod cfg;
+pub mod clock;
 pub mod coex;
 pub mod device;
 pub mod ieee11073;

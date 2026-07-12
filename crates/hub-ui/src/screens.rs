@@ -14,7 +14,7 @@ use embedded_graphics::{
     mono_font::{ascii::FONT_6X10, MonoTextStyle, MonoTextStyleBuilder},
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{Circle, PrimitiveStyle, Rectangle},
+    primitives::{Circle, Line, PrimitiveStyle, Rectangle},
     text::Text,
 };
 use qrcodegen::{QrCode, QrCodeEcc};
@@ -433,19 +433,38 @@ fn draw_blood_pressure(d: &mut Cs3Display, systolic: f32, diastolic: f32, pulse:
     let (w, h) = dims(d);
     clear(d);
     jp2x_center(d, "血圧", BAR_H + 6, C_ACCENT, C_BG);
-    let rect = text(
+
+    // 収縮期 / 拡張期 を別々の BIG42 描画にし、区切りは線で手描きする。
+    // u8g2 の render は文字列中に 1 文字でも欠けたグリフがあると全体が
+    // 描画されないため、'/' がフォントに無い場合に数字ごと消える問題を回避
+    // (体温は数字+'.' のみで表示できていた)。
+    let y = 78;
+    let cx = w / 2;
+    // 収縮期: 中央やや左に右揃え / 拡張期: 中央やや右に左揃え
+    text(
         d,
         &BIG42,
-        &vitals::bp_value(systolic, diastolic),
-        w / 2,
-        86,
+        &format!("{systolic:.0}"),
+        cx - 16,
+        y,
         C_TEXT,
-        HorizontalAlignment::Center,
+        HorizontalAlignment::Right,
     );
-    if let Some(r) = rect {
-        let ux = r.top_left.x + r.size.width as i32 + 6;
-        text(d, &JP16, "mmHg", ux, 108, C_MUTED, HorizontalAlignment::Left);
-    }
+    text(
+        d,
+        &BIG42,
+        &format!("{diastolic:.0}"),
+        cx + 16,
+        y,
+        C_TEXT,
+        HorizontalAlignment::Left,
+    );
+    // 区切りスラッシュ (線)
+    let _ = Line::new(Point::new(cx - 7, y + 44), Point::new(cx + 7, y))
+        .into_styled(PrimitiveStyle::with_stroke(C_TEXT, 4))
+        .draw(d);
+    jp_center(d, "mmHg", y + 52, C_MUTED);
+
     match pulse {
         Some(p) if p > 0.0 => jp2x_center(d, &vitals::pulse_value(p), 150, C_TEXT, C_BG),
         _ => {}

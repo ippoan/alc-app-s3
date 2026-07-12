@@ -26,7 +26,6 @@ use std::sync::{Arc, Mutex};
 use alc_hub_core::{
     device::{match_device_name, DeviceKind},
     ieee11073::{parse_blood_pressure, parse_temperature},
-    vitals,
 };
 use anyhow::{Context, Result};
 use esp32_nimble::{
@@ -36,25 +35,34 @@ use esp32_nimble::{
 };
 use esp_idf_svc::hal::{delay::FreeRtos, task::block_on};
 
+use alc_hub_common::control::PairFlag;
+use alc_hub_common::measurement::Measurement;
 use alc_hub_common::status::{now_ms, SharedStatus};
-use alc_hub_common::ui_api::UiCommand;
 use alc_hub_core::coex::RadioCoex;
 
-/// on_notify クロージャ (Send + Sync 要求) から使うため Mutex で包む
-type SharedTx = Arc<Mutex<Sender<UiCommand>>>;
+/// on_notify クロージャ (Send + Sync 要求) から使うため Mutex で包む。
+/// notify コールバックは nimble_host タスク上で走りスタックが小さいため、
+/// ここでは「パースして Measurement を送るだけ」に留める (重い処理は recorder)。
+type MeasTx = Arc<Mutex<Sender<Measurement>>>;
 
 const HEALTH_THERMOMETER_SERVICE: u16 = 0x1809;
 const BLOOD_PRESSURE_SERVICE: u16 = 0x1810;
 const TEMPERATURE_MEASUREMENT: u16 = 0x2A1C;
 const BLOOD_PRESSURE_MEASUREMENT: u16 = 0x2A35;
 
-// 1 スキャンを短くして、Wi-Fi 側の停止要求 (RadioCoex) に速く応じる
-const SCAN_DURATION_MS: i32 = 1_000;
-const SCAN_COOLDOWN_MS: u32 = 500;
+// スキャンを連続化して隙間を無くす。ニプロ機器は測定後の短時間しか広告
+// しないため、隙間があると取り逃す。5 秒ごとに coex/再ペアリング要求を確認し、
+// 機器発見時はコールバックが Some を返して即座にスキャンを抜ける。
+const SCAN_DURATION_MS: i32 = 5_000;
+const SCAN_COOLDOWN_MS: u32 = 0;
 const MIN_RSSI: i8 = -80;
 const CONNECT_RETRIES: u32 = 3;
 /// データ受信後、次の測定に備えて切断・再スキャンするまでの猶予 (Arduino 版準拠)
 const RESET_DELAY_MS: u32 = 2_000;
+/// 接続後この時間データが来なければ諦めて切断・再スキャンする。
+/// 無い場合、無言の機器に繋がると supervision timeout (~99秒) まで BLE ループ
+/// 全体がブロックされ、体温も血圧も取れなくなる (実機ログで確認)。
+const DATA_WAIT_TIMEOUT_MS: u64 = 5_000;
 
 fn service_uuid(kind: DeviceKind) -> BleUuid {
     match kind {
@@ -72,15 +80,16 @@ fn measurement_uuid(kind: DeviceKind) -> BleUuid {
 
 pub fn start(
     status: SharedStatus,
-    tx: Sender<UiCommand>,
+    meas_tx: Sender<Measurement>,
     coex: Arc<RadioCoex>,
+    pair_flag: PairFlag,
 ) -> Result<()> {
-    let tx: SharedTx = Arc::new(Mutex::new(tx));
+    let meas_tx: MeasTx = Arc::new(Mutex::new(meas_tx));
     std::thread::Builder::new()
         .name("ble".into())
         .stack_size(16 * 1024)
         .spawn(move || {
-            if let Err(e) = block_on(task(status, tx, coex)) {
+            if let Err(e) = block_on(task(status, meas_tx, coex, pair_flag)) {
                 log::error!("ble: タスク異常終了: {e:?}");
                 println!("{{\"type\":\"error\",\"message\":\"BLE task terminated\"}}");
             }
@@ -88,7 +97,12 @@ pub fn start(
     Ok(())
 }
 
-async fn task(status: SharedStatus, tx: SharedTx, coex: Arc<RadioCoex>) -> Result<()> {
+async fn task(
+    status: SharedStatus,
+    meas_tx: MeasTx,
+    coex: Arc<RadioCoex>,
+    pair_flag: PairFlag,
+) -> Result<()> {
     let device = BLEDevice::take();
 
     // Arduino 版と同等の Just Works ボンディング設定
@@ -99,6 +113,24 @@ async fn task(status: SharedStatus, tx: SharedTx, coex: Arc<RadioCoex>) -> Resul
 
     let mut scan = BLEScan::new();
     loop {
+        // 再ペアリング要求: 保存済みボンドを全消去する。壊れた/古いボンドが
+        // 血圧計の暗号化接続を妨げている場合の復旧手段 (Pages のペアリングボタン)
+        if pair_flag.swap(false, Ordering::SeqCst) {
+            match device.delete_all_bonds() {
+                Ok(()) => {
+                    log::info!("ble: 全ボンドを消去 (再ペアリング)");
+                    if let Ok(mut st) = status.lock() {
+                        st.push_event(now_ms(), "ペアリング情報を消去");
+                    }
+                    println!("EVT PAIR_CLEARED");
+                }
+                Err(e) => {
+                    log::warn!("ble: ボンド消去失敗: {e:?}");
+                    println!("EVT PAIR_ERR ボンド消去に失敗");
+                }
+            }
+        }
+
         // Wi-Fi の接続/スキャン中 + Improv セッション中は BLE スキャンを
         // 止め、コエグジストの電波取り合いで Wi-Fi 側が失敗しないようにする
         while coex.ble_should_pause(now_ms()) {
@@ -125,7 +157,7 @@ async fn task(status: SharedStatus, tx: SharedTx, coex: Arc<RadioCoex>) -> Resul
         println!("{{\"type\":\"found\",\"device\":\"{}\"}}", kind.json_name());
 
         let mut client = device.new_client();
-        if let Err(e) = handle_device(&mut client, &adv, kind, &status, &tx).await {
+        if let Err(e) = handle_device(&mut client, &adv, kind, &status, &meas_tx).await {
             log::warn!("ble: {} 処理失敗: {e:?}", kind.json_name());
             println!(
                 "{{\"type\":\"error\",\"message\":\"{}: connection failed\"}}",
@@ -169,7 +201,7 @@ async fn handle_device(
     adv: &BLEAdvertisedDevice,
     kind: DeviceKind,
     status: &SharedStatus,
-    tx: &SharedTx,
+    meas_tx: &MeasTx,
 ) -> Result<()> {
     let disconnected = Arc::new(AtomicBool::new(false));
     {
@@ -197,6 +229,12 @@ async fn handle_device(
         }
     }
 
+    // 明示的な secure_connection は行わない。血圧計 (NBP-1BLE) は
+    // 「接続 → 測定値 indication → 即切断」を非常に短時間で行うため、
+    // ペアリングの往復待ちを挟むと購読前に切断され indication を取り逃す
+    // (実機ログで確認: secure_connection 成功直後に Remote User Terminated)。
+    // Arduino 版と同様に接続後すぐ購読し、暗号化が要求される場合は NimBLE が
+    // 購読時 (CCCD 書き込み) に自動ネゴする。ボンドは NVS に永続化される。
     let service = client
         .get_service(service_uuid(kind))
         .await
@@ -206,13 +244,24 @@ async fn handle_device(
         .await
         .context("キャラクタリスティックが見つからない")?;
 
+    // 血圧計は保存済みの過去測定をまとめて送ってくる。セッション中の測定を
+    // すべて貯め、最後に「最新 (タイムスタンプ最大) の 1 件」だけを recorder へ
+    // 送る。これで過去分が大量に記録されるのを防ぐ。
     let got_data = Arc::new(AtomicBool::new(false));
+    let buffer: Arc<Mutex<Vec<(Measurement, u64)>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let got_data = Arc::clone(&got_data);
-        let tx = Arc::clone(tx);
-        let status = Arc::clone(status);
+        let buffer = Arc::clone(&buffer);
+        // このクロージャは nimble_host タスク上で呼ばれる (スタック小)。
+        // パースしてバッファに積むだけに留める — println!/format!/NVS 等の
+        // 重い処理は recorder スレッドで行う (以前ここで直接やって血圧受信時に
+        // スタックオーバーフロー→再起動していた)。
         characteristic.on_notify(move |raw| {
-            emit_measurement(kind, raw, &tx, &status);
+            if let Some(pair) = parse_measurement(kind, raw, now_ms()) {
+                if let Ok(mut buf) = buffer.lock() {
+                    buf.push(pair);
+                }
+            }
             got_data.store(true, Ordering::SeqCst);
         });
     }
@@ -244,8 +293,10 @@ async fn handle_device(
         st.ble_device = kind.json_name().to_string();
     }
 
-    // データ受信 (2 秒後に切断して再スキャン) か、機器側の切断まで待つ。
+    // データ受信 (最初の受信から 2 秒 = 過去分の送信を受け切る猶予) か、
+    // 機器側の切断、または無データのままタイムアウトするまで待つ。
     // ニプロ機器は測定送信後に自分から切断することが多い。
+    let wait_start = now_ms();
     loop {
         if got_data.load(Ordering::SeqCst) {
             FreeRtos::delay_ms(RESET_DELAY_MS);
@@ -259,51 +310,53 @@ async fn handle_device(
             );
             break;
         }
+        // 接続したがデータが来ない機器に張り付いて BLE ループを固めないよう、
+        // タイムアウトしたら切断して再スキャンへ戻る (体温計/血圧計の両方を救う)
+        if now_ms().saturating_sub(wait_start) > DATA_WAIT_TIMEOUT_MS {
+            let _ = client.disconnect();
+            println!(
+                "{{\"type\":\"disconnected\",\"device\":\"{}\",\"reason\":\"timeout\"}}",
+                kind.json_name()
+            );
+            break;
+        }
         FreeRtos::delay_ms(100);
+    }
+
+    // 貯めた測定のうち最新 (order 最大) の 1 件だけを recorder へ送る。
+    // 血圧計の過去分ダンプから「今測った 1 件」を選ぶ。
+    let latest = buffer
+        .lock()
+        .ok()
+        .and_then(|buf| buf.iter().max_by_key(|(_, order)| *order).map(|(m, _)| *m));
+    if let Some(m) = latest {
+        if let Ok(tx) = meas_tx.lock() {
+            let _ = tx.send(m);
+        }
     }
     Ok(())
 }
 
-/// 測定値の処理: ホストへ JSON 出力 + イベントログ + 画面表示 (UiCommand)
-fn emit_measurement(kind: DeviceKind, raw: &[u8], tx: &SharedTx, status: &SharedStatus) {
+/// notify コールバック用の軽量パース: raw → (Measurement, 並び順キー)。
+/// 並び順キーは「最新の 1 件」を選ぶための比較値。血圧は機器タイムスタンプが
+/// あればそれ (過去分より今の測定が大きくなる)、無ければ受信時刻 (last-wins)。
+/// 体温は 1 件のみなので受信時刻。重い処理は recorder 側で行う。
+fn parse_measurement(kind: DeviceKind, raw: &[u8], at_ms: u64) -> Option<(Measurement, u64)> {
     match kind {
-        DeviceKind::Thermometer => match parse_temperature(raw) {
-            Some(t) => {
-                println!("{{\"type\":\"temperature\",\"value\":{t:.1},\"unit\":\"celsius\"}}");
-                if let Ok(mut st) = status.lock() {
-                    st.push_event(now_ms(), &vitals::temp_event(t));
-                }
-                if let Ok(tx) = tx.lock() {
-                    let _ = tx.send(UiCommand::Temperature { celsius: t });
-                }
-            }
-            None => println!("{{\"type\":\"error\",\"message\":\"temperature parse failed\"}}"),
-        },
-        DeviceKind::BloodPressure => match parse_blood_pressure(raw) {
-            Some(bp) => {
-                match bp.pulse {
-                    Some(p) if p > 0.0 => println!(
-                        "{{\"type\":\"blood_pressure\",\"systolic\":{:.0},\"diastolic\":{:.0},\"pulse\":{:.0},\"unit\":\"mmHg\"}}",
-                        bp.systolic, bp.diastolic, p
-                    ),
-                    _ => println!(
-                        "{{\"type\":\"blood_pressure\",\"systolic\":{:.0},\"diastolic\":{:.0},\"unit\":\"mmHg\"}}",
-                        bp.systolic, bp.diastolic
-                    ),
-                }
-                if let Ok(mut st) = status.lock() {
-                    st.push_event(now_ms(), &vitals::bp_event(bp.systolic, bp.diastolic, bp.pulse));
-                }
-                if let Ok(tx) = tx.lock() {
-                    let _ = tx.send(UiCommand::BloodPressure {
-                        systolic: bp.systolic,
-                        diastolic: bp.diastolic,
-                        pulse: bp.pulse,
-                    });
-                }
-            }
-            None => println!("{{\"type\":\"error\",\"message\":\"blood_pressure parse failed\"}}"),
-        },
+        DeviceKind::Thermometer => parse_temperature(raw)
+            .map(|celsius| (Measurement::Temperature { celsius, at_ms }, at_ms)),
+        DeviceKind::BloodPressure => parse_blood_pressure(raw).map(|bp| {
+            let order = bp.timestamp.unwrap_or(at_ms);
+            (
+                Measurement::BloodPressure {
+                    systolic: bp.systolic,
+                    diastolic: bp.diastolic,
+                    pulse: bp.pulse,
+                    at_ms,
+                },
+                order,
+            )
+        }),
     }
 }
 
