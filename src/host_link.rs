@@ -15,7 +15,8 @@
 //! | `RESULT OK\|NG [value]` | 測定結果画面を表示 (value 例: `0.000`) |
 //! | `ERROR <message>` | エラー画面を表示 |
 //! | `RESET` | 待機画面へ戻す |
-//! | `STATUS` | `STATUS LAN=0 RS232=1 BLE=0` を返す |
+//! | `ROTATE <0\|90\|180\|270>` | 画面向きを変更 (NVS 保存、次回起動も維持) |
+//! | `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 ROT=0` を返す |
 //!
 //! # 送信イベント (CoreS3 → ホスト)
 //!
@@ -39,11 +40,12 @@ use esp_idf_svc::sys;
 
 use crate::{
     config,
+    settings::Settings,
     status::{now_ms, SharedStatus},
     ui::UiCommand,
 };
 
-pub fn start(tx: Sender<UiCommand>, status: SharedStatus) -> Result<()> {
+pub fn start(tx: Sender<UiCommand>, status: SharedStatus, settings: Settings) -> Result<()> {
     // USB Serial/JTAG ドライバを VFS に接続し、stdin のブロッキング読み出しを
     // 可能にする (CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y 前提)
     unsafe {
@@ -65,7 +67,7 @@ pub fn start(tx: Sender<UiCommand>, status: SharedStatus) -> Result<()> {
                 line.clear();
                 match stdin.lock().read_line(&mut line) {
                     Ok(0) => FreeRtos::delay_ms(50),
-                    Ok(_) => handle_line(line.trim(), &tx, &status),
+                    Ok(_) => handle_line(line.trim(), &tx, &status, &settings),
                     Err(_) => FreeRtos::delay_ms(100),
                 }
             }
@@ -73,7 +75,7 @@ pub fn start(tx: Sender<UiCommand>, status: SharedStatus) -> Result<()> {
     Ok(())
 }
 
-fn handle_line(line: &str, tx: &Sender<UiCommand>, status: &SharedStatus) {
+fn handle_line(line: &str, tx: &Sender<UiCommand>, status: &SharedStatus, settings: &Settings) {
     if line.is_empty() {
         return;
     }
@@ -124,13 +126,27 @@ fn handle_line(line: &str, tx: &Sender<UiCommand>, status: &SharedStatus) {
             let _ = tx.send(UiCommand::Reset);
             println!("OK RESET");
         }
+        "ROTATE" => match it.next().and_then(|s| s.parse::<u16>().ok()) {
+            Some(deg @ (0 | 90 | 180 | 270)) => match settings.set_rotation(deg) {
+                Ok(()) => {
+                    let _ = tx.send(UiCommand::Rotate(deg));
+                    println!("OK ROTATE {deg}");
+                }
+                Err(e) => {
+                    log::error!("host_link: rotation 保存失敗: {e:?}");
+                    println!("ERR ROTATE: 保存に失敗しました");
+                }
+            },
+            _ => println!("ERR ROTATE: 0|90|180|270 が必要です"),
+        },
         "STATUS" => {
             let st = status.lock().map(|s| s.clone()).unwrap_or_default();
             println!(
-                "STATUS LAN={} RS232={} BLE={}",
+                "STATUS LAN={} RS232={} BLE={} ROT={}",
                 u8::from(st.lan_link),
                 u8::from(st.rs232_active(now_ms(), config::RS232_ACTIVE_WINDOW_MS)),
                 u8::from(st.ble_connected),
+                settings.rotation(),
             );
         }
         _ => println!("ERR 不明なコマンド: {cmd}"),
