@@ -41,6 +41,9 @@ impl Improv {
 
     /// IMPROV パケット 1 つを処理する
     pub fn handle_packet(&mut self, ptype: u8, data: &[u8]) {
+        // ダイアログ操作中 (パケットが届いている間 + 入力時間) は BLE スキャンを
+        // 止め、Wi-Fi 接続がコエグジストの電波取り合いで遅れないようにする
+        self.wifi.pause_ble_for(60_000);
         if ptype != proto::TYPE_RPC_COMMAND {
             return; // ホスト側からは RPC コマンドのみ受ける
         }
