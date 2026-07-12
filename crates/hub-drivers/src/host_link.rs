@@ -42,13 +42,13 @@ use anyhow::Result;
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::sys;
 
-use crate::{
+use alc_hub_common::{
     config,
-    improv::Improv,
     settings::Settings,
     status::{now_ms, SharedStatus},
     ui_api::UiCommand,
 };
+use alc_hub_wifi::improv::Improv;
 
 /// 行としてバッファする最大長 (超えたら読み捨て — バイナリノイズ対策)
 const MAX_LINE: usize = 512;

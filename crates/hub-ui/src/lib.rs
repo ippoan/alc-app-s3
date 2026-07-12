@@ -20,18 +20,18 @@ mod screens;
 use std::sync::mpsc::Receiver;
 
 use alc_hub_core::layout::map_touch;
-use alc_hub_drivers::{
-    board::{
-        display::{self, Cs3Display, LCD_H, LCD_W},
-        touch,
-    },
+use alc_hub_board::{
+    display::{self, Cs3Display, LCD_H, LCD_W},
+    touch,
+};
+use alc_hub_common::{
     config,
     status::{now_ms, SharedStatus},
 };
 use esp_idf_svc::hal::{delay::FreeRtos, i2c::I2cDriver};
 
 // コマンド定義は I/O 層 (host_link / ble が送信側) と共有
-pub use alc_hub_drivers::ui_api::UiCommand;
+pub use alc_hub_common::ui_api::UiCommand;
 
 pub(crate) enum Screen {
     /// 待機画面 (NFC カード待ち)

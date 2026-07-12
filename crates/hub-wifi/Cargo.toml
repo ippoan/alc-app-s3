@@ -1,13 +1,12 @@
 [package]
-name = "alc-hub-drivers"
+name = "alc-hub-wifi"
 version = "0.1.0"
 edition = "2021"
-description = "ホストリンク (USB CDC 行プロトコル + Improv 振り分け) / RS232 (FC-1200) / LAN スタブ"
+description = "Wi-Fi STA 管理 + Improv Wi-Fi Serial ハンドラ"
 
 [dependencies]
 alc-hub-core = { path = "../hub-core" }
 alc-hub-common = { path = "../hub-common" }
-alc-hub-wifi = { path = "../hub-wifi" }
 anyhow = "1"
 log = "0.4"
 esp-idf-svc = { version = "0.52", default-features = false, features = [

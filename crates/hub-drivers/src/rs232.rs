@@ -12,7 +12,7 @@ use esp_idf_svc::hal::{
     units::Hertz,
 };
 
-use crate::{
+use alc_hub_common::{
     config,
     status::{now_ms, SharedStatus},
 };

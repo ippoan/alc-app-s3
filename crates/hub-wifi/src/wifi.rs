@@ -22,7 +22,7 @@ use esp_idf_svc::{
     wifi::{AuthMethod, ClientConfiguration, Configuration, EspWifi},
 };
 
-use crate::status::{now_ms, SharedStatus};
+use alc_hub_common::status::{now_ms, SharedStatus};
 
 /// 接続 (アソシエーション + DHCP) の待ち時間上限
 const CONNECT_TIMEOUT_MS: u64 = 20_000;

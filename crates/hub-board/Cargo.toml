@@ -1,0 +1,15 @@
+[package]
+name = "alc-hub-board"
+version = "0.1.0"
+edition = "2021"
+description = "M5Stack CoreS3 ボード固有の初期化・ドライバ (LCD / 電源 / タッチ)"
+
+[dependencies]
+anyhow = "1"
+esp-idf-svc = { version = "0.52", default-features = false, features = [
+    "native",
+    "std",
+    "alloc",
+    "binstart",
+] }
+mipidsi = "0.9"

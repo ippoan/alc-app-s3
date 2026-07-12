@@ -36,8 +36,8 @@ use esp32_nimble::{
 };
 use esp_idf_svc::hal::{delay::FreeRtos, task::block_on};
 
-use crate::status::{now_ms, SharedStatus};
-use crate::ui_api::UiCommand;
+use alc_hub_common::status::{now_ms, SharedStatus};
+use alc_hub_common::ui_api::UiCommand;
 
 /// on_notify クロージャ (Send + Sync 要求) から使うため Mutex で包む
 type SharedTx = Arc<Mutex<Sender<UiCommand>>>;

@@ -1,0 +1,17 @@
+[package]
+name = "alc-hub-common"
+# FIRMWARE_VERSION (config.rs の env!) はこのクレートのバージョンを参照するため、
+# ルート (alc-hub-cores3) とバージョンを揃えて更新すること
+version = "0.1.0"
+edition = "2021"
+description = "alc-hub-cores3 の共有基盤 (状態 / 設定 / 定数 / UI コマンド定義)"
+
+[dependencies]
+alc-hub-core = { path = "../hub-core" }
+anyhow = "1"
+esp-idf-svc = { version = "0.52", default-features = false, features = [
+    "native",
+    "std",
+    "alloc",
+    "binstart",
+] }

@@ -11,7 +11,7 @@
 //! リンク監視とクラウド (alc-app backend) 接続を実装し、
 //! `HubStatus::lan_link` を更新する。
 
-use crate::status::SharedStatus;
+use alc_hub_common::status::SharedStatus;
 
 pub fn start(_status: SharedStatus) {
     log::warn!("lan: LAN Module 13.2 (W5500) は未実装 — lan_link は常に false");
