@@ -5,6 +5,8 @@
 //! 依存の枝分かれ (= 並列ビルド) を壊さないこと。
 
 pub mod config;
+pub mod control;
+pub mod measurement;
 pub mod settings;
 pub mod status;
 pub mod ui_api;

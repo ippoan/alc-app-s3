@@ -39,6 +39,7 @@ dependencies = [
  "alc-hub-core",
  "anyhow",
  "esp-idf-svc",
+ "log",
 ]
 
 [[package]]

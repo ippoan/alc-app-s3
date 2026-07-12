@@ -14,6 +14,10 @@ const NAMESPACE: &str = "alcui";
 const KEY_ROTATION: &str = "rotation";
 const KEY_WIFI_SSID: &str = "wifi_ssid";
 const KEY_WIFI_PASS: &str = "wifi_pass";
+/// 測定ログ (改行区切りの直近測定) を保存する NVS キー
+const KEY_MEAS_LOG: &str = "meas_log";
+/// 永続化する測定ログの最大行数 (NVS 文字列サイズを抑える)
+const MAX_LOG_LINES: usize = 20;
 
 #[derive(Clone)]
 pub struct Settings {
@@ -70,6 +74,32 @@ impl Settings {
         nvs.set_str(KEY_WIFI_SSID, ssid)?;
         nvs.set_str(KEY_WIFI_PASS, password)?;
         Ok(())
+    }
+
+    /// 永続化された測定ログ (古い→新しい)。リブートしても残る。
+    pub fn measurement_log(&self) -> Vec<String> {
+        let Ok(nvs) = self.nvs.lock() else {
+            return Vec::new();
+        };
+        let mut buf = [0u8; 2048];
+        match nvs.get_str(KEY_MEAS_LOG, &mut buf) {
+            Ok(Some(s)) if !s.is_empty() => s.lines().map(str::to_string).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// 測定ログに 1 行追記し、直近 MAX_LOG_LINES 行だけ NVS に残す。
+    /// recorder スレッドから呼ばれる (BLE コールバックからは呼ばない)。
+    pub fn append_measurement_log(&self, line: &str) {
+        let mut lines = self.measurement_log();
+        lines.push(line.to_string());
+        let start = lines.len().saturating_sub(MAX_LOG_LINES);
+        let kept = lines[start..].join("\n");
+        if let Ok(mut nvs) = self.nvs.lock() {
+            if let Err(e) = nvs.set_str(KEY_MEAS_LOG, &kept) {
+                log::warn!("settings: 測定ログ保存失敗: {e:?}");
+            }
+        }
     }
 
     /// 現在の設定を DeviceConfig にまとめる (CFG GET / エクスポート用)

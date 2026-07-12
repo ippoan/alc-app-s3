@@ -24,8 +24,10 @@ use esp_idf_svc::{
 use alc_hub_common::status::{now_ms, SharedStatus};
 use alc_hub_core::coex::RadioCoex;
 
-/// 接続 (アソシエーション + DHCP) の待ち時間上限
-const CONNECT_TIMEOUT_MS: u64 = 20_000;
+/// 接続 (アソシエーション + DHCP) の待ち時間上限。
+/// 単一 2.4GHz 無線を BLE (医療機器・優先) と共有するため、接続失敗時に
+/// radio を長く占有しないよう短めにする (BLE スキャンへの妨害を減らす)。
+const CONNECT_TIMEOUT_MS: u64 = 8_000;
 
 /// スキャン結果 1 件: (SSID, RSSI, 認証あり)
 pub type ScanEntry = (String, i8, bool);
@@ -180,11 +182,55 @@ impl Wifi {
         }
     }
 
+    /// STA が接続中 (アソシエーション成立) か
+    pub fn is_up(&self) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|w| w.is_connected().ok())
+            .unwrap_or(false)
+    }
+
     /// 接続断を状態へ反映 (失敗時のクリーンアップ)
     pub fn mark_disconnected(&self) {
         if let Ok(mut st) = self.status.lock() {
             st.wifi_connected = false;
             st.wifi_ip.clear();
+        }
+    }
+
+    /// 保存済み認証情報で接続を維持する常駐ループ (別スレッドで回す)。
+    /// 切断を検出したら再接続する。単一 2.4GHz 無線を BLE (医療機器・優先) と
+    /// 共有するため、失敗が続く場合はバックオフを段階的に伸ばし、Wi-Fi の
+    /// 再接続試行が BLE の広告受信を妨げ続けないようにする。
+    /// (主経路は LAN Module 13.2 で Wi-Fi は補助)
+    pub fn keepalive(&self, ssid: String, password: String) {
+        const BACKOFF_MIN_MS: u32 = 15_000;
+        const BACKOFF_MAX_MS: u32 = 5 * 60_000; // 5 分
+        let mut backoff = BACKOFF_MIN_MS;
+        loop {
+            if self.is_up() {
+                backoff = BACKOFF_MIN_MS; // 接続中はバックオフをリセット
+                FreeRtos::delay_ms(10_000);
+                continue;
+            }
+            match self.connect(&ssid, &password) {
+                Ok(ip) => {
+                    log::info!("wifi: (再)接続成功 {ip}");
+                    backoff = BACKOFF_MIN_MS;
+                    FreeRtos::delay_ms(10_000);
+                }
+                Err(e) => {
+                    log::warn!("wifi: (再)接続失敗 (次回まで {}s): {e:?}", backoff / 1000);
+                    self.mark_disconnected();
+                    if let Ok(mut st) = self.status.lock() {
+                        st.push_event(now_ms(), "WiFi 再接続失敗");
+                    }
+                    // 失敗が続くほど間隔を伸ばし、BLE への妨害を最小化する
+                    FreeRtos::delay_ms(backoff);
+                    backoff = (backoff * 2).min(BACKOFF_MAX_MS);
+                }
+            }
         }
     }
 }

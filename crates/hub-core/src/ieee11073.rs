@@ -32,6 +32,10 @@ pub struct BloodPressure {
     pub systolic: f32,
     pub diastolic: f32,
     pub pulse: Option<f32>,
+    /// 測定時刻 (機器内蔵時計)。YYYYMMDDHHMMSS を u64 に詰めた比較用の値。
+    /// 血圧計は保存済みの過去測定をまとめて送るため、これで最新の 1 件を選ぶ。
+    /// タイムスタンプ非搭載の機器は None。
+    pub timestamp: Option<u64>,
 }
 
 /// IEEE 11073 SFLOAT (16bit)
@@ -61,6 +65,26 @@ pub fn parse_blood_pressure(data: &[u8]) -> Option<BloodPressure> {
     let mut diastolic = sfloat(data[3], data[4]);
     // data[5..7] は Mean Arterial Pressure (未使用)
 
+    // タイムスタンプ (7 バイト: 年 LE 2, 月, 日, 時, 分, 秒) を data[7..14] から読む
+    let timestamp = if has_timestamp && data.len() >= 14 {
+        let year = u64::from(data[7]) | (u64::from(data[8]) << 8);
+        let month = u64::from(data[9]);
+        let day = u64::from(data[10]);
+        let hour = u64::from(data[11]);
+        let min = u64::from(data[12]);
+        let sec = u64::from(data[13]);
+        Some(
+            year * 10_000_000_000
+                + month * 100_000_000
+                + day * 1_000_000
+                + hour * 10_000
+                + min * 100
+                + sec,
+        )
+    } else {
+        None
+    };
+
     let mut offset = 7;
     if has_timestamp {
         offset += 7; // タイムスタンプは 7 バイト
@@ -79,6 +103,7 @@ pub fn parse_blood_pressure(data: &[u8]) -> Option<BloodPressure> {
         systolic,
         diastolic,
         pulse,
+        timestamp,
     })
 }
 
@@ -144,6 +169,14 @@ mod tests {
         assert_eq!(bp.systolic, 120.0);
         assert_eq!(bp.diastolic, 80.0);
         assert_eq!(bp.pulse, None);
+        assert_eq!(bp.timestamp, None); // タイムスタンプ非搭載
+    }
+
+    #[test]
+    fn blood_pressure_timestamp_flag_but_truncated() {
+        // timestamp フラグは立つがデータが 14 バイト未満 → timestamp None
+        let bp = parse_blood_pressure(&[0x02, 120, 0, 80, 0, 0, 0]).unwrap();
+        assert_eq!(bp.timestamp, None);
     }
 
     #[test]
@@ -162,6 +195,8 @@ mod tests {
         ];
         let bp = parse_blood_pressure(&data).unwrap();
         assert_eq!(bp.pulse, Some(72.0));
+        // 年 0x07E9=2025, 月1, 日2, 時3, 分4, 秒5 → 20250102030405
+        assert_eq!(bp.timestamp, Some(20_250_102_030_405));
     }
 
     #[test]

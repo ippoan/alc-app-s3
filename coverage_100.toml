@@ -7,6 +7,10 @@ path = "crates/hub-core/src/cfg.rs"
 type = "unit"
 
 [[file]]
+path = "crates/hub-core/src/clock.rs"
+type = "unit"
+
+[[file]]
 path = "crates/hub-core/src/coex.rs"
 type = "unit"
 

@@ -6,4 +6,6 @@
 
 pub mod host_link;
 pub mod lan;
+pub mod ntp;
+pub mod recorder;
 pub mod rs232;

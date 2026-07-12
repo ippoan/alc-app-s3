@@ -43,6 +43,7 @@ use anyhow::Result;
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::sys;
 
+use alc_hub_common::control::PairFlag;
 use alc_hub_common::{
     config,
     settings::Settings,
@@ -59,6 +60,7 @@ pub fn start(
     status: SharedStatus,
     settings: Settings,
     wifi: Wifi,
+    pair_flag: PairFlag,
     mut improv: Improv,
 ) -> Result<()> {
     // USB Serial/JTAG ドライバを VFS に接続し、stdin のブロッキング読み出しを
@@ -83,7 +85,7 @@ pub fn start(
                     Ok(0) => FreeRtos::delay_ms(20),
                     Ok(n) => {
                         acc.extend_from_slice(&chunk[..n]);
-                        drain_buffer(&mut acc, &tx, &status, &settings, &wifi, &mut improv);
+                        drain_buffer(&mut acc, &tx, &status, &settings, &wifi, &pair_flag, &mut improv);
                     }
                     Err(_) => FreeRtos::delay_ms(100),
                 }
@@ -99,6 +101,7 @@ fn drain_buffer(
     status: &SharedStatus,
     settings: &Settings,
     wifi: &Wifi,
+    pair_flag: &PairFlag,
     improv: &mut Improv,
 ) {
     loop {
@@ -128,7 +131,7 @@ fn drain_buffer(
                 };
                 let line_bytes: Vec<u8> = acc.drain(..=pos).collect();
                 let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
-                handle_line(line.trim(), tx, status, settings, wifi);
+                handle_line(line.trim(), tx, status, settings, wifi, pair_flag);
             }
         }
     }
@@ -142,6 +145,7 @@ fn handle_line(
     status: &SharedStatus,
     settings: &Settings,
     wifi: &Wifi,
+    pair_flag: &PairFlag,
 ) {
     let command = match parse_line(line, config::QR_DEFAULT_TIMEOUT_MS) {
         Ok(Some(command)) => command,
@@ -233,5 +237,11 @@ fn handle_line(
             },
             None => println!("EVT WIFI_TEST NG 保存済み Wi-Fi 設定がありません"),
         },
+        // BLE 再ペアリング: ボンド消去を BLE スレッドへ依頼 (血圧計の暗号化復旧)。
+        // 実際の消去と EVT PAIR_CLEARED 出力は ble タスク側で行う
+        HostCommand::BlePair => {
+            pair_flag.store(true, core::sync::atomic::Ordering::SeqCst);
+            println!("OK PAIR");
+        }
     }
 }

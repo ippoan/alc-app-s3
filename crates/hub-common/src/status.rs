@@ -5,9 +5,20 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// ログ確認画面に保持する直近イベント数
 pub const MAX_EVENTS: usize = 8;
+
+/// イベント/測定ログ 1 行の時刻ラベル。NTP 同期済みなら日本時間
+/// "MM/DD HH:MM:SS"、未同期なら稼働時間 "HH:MM:SS"。全ログで共通に使う。
+pub fn event_timestamp(now_ms: u64) -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| alc_hub_core::clock::format_jst(d.as_secs() as i64))
+        .unwrap_or_else(|| alc_hub_core::layout::fmt_uptime(now_ms))
+}
 
 #[derive(Default, Clone)]
 pub struct HubStatus {
@@ -38,9 +49,16 @@ impl HubStatus {
             .map_or(false, |t| now_ms.saturating_sub(t) < window_ms)
     }
 
-    /// イベントログへ 1 行追加 (稼働時刻付き、直近 MAX_EVENTS 件を保持)
+    /// イベントログへ 1 行追加 (時刻ラベル付き、直近 MAX_EVENTS 件を保持)。
+    /// 時刻は NTP 同期済みなら日本時間、未同期なら稼働時間 (event_timestamp)。
     pub fn push_event(&mut self, now_ms: u64, msg: &str) {
-        let line = format!("{} {msg}", alc_hub_core::layout::fmt_uptime(now_ms));
+        let line = format!("{} {msg}", event_timestamp(now_ms));
+        self.push_line(line);
+    }
+
+    /// 整形済みの 1 行をイベントログへ追加 (時刻の付け方を呼び出し側が決める
+    /// 場合用。測定値は NTP 同期時に実時刻を付けるため recorder が使う)。
+    pub fn push_line(&mut self, line: String) {
         if self.events.len() >= MAX_EVENTS {
             self.events.pop_front();
         }

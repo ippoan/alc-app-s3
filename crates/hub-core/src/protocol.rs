@@ -20,6 +20,8 @@ pub enum HostCommand {
     CfgSet { json: String },
     /// 保存済み Wi-Fi 設定での接続テスト (結果は `EVT WIFI_TEST ...`)
     WifiTest,
+    /// BLE の全ボンド消去 → 次接続で再ペアリング (血圧計の暗号化接続復旧)
+    BlePair,
 }
 
 /// 画面向きとして有効な角度か
@@ -96,6 +98,12 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
         "WIFI" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
             Some("TEST") => HostCommand::WifiTest,
             _ => return Err("ERR WIFI: TEST が必要です".into()),
+        },
+        // `PAIR` または `BLE PAIR`
+        "PAIR" => HostCommand::BlePair,
+        "BLE" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+            Some("PAIR") => HostCommand::BlePair,
+            _ => return Err("ERR BLE: PAIR が必要です".into()),
         },
         _ => return Err(format!("ERR 不明なコマンド: {cmd}")),
     };
@@ -256,5 +264,13 @@ mod tests {
         assert_eq!(parse_line("WIFI TEST", T), Ok(Some(HostCommand::WifiTest)));
         assert!(parse_line("WIFI", T).is_err());
         assert!(parse_line("WIFI CONNECT", T).is_err());
+    }
+
+    #[test]
+    fn ble_pair() {
+        assert_eq!(parse_line("PAIR", T), Ok(Some(HostCommand::BlePair)));
+        assert_eq!(parse_line("ble pair", T), Ok(Some(HostCommand::BlePair)));
+        assert!(parse_line("BLE", T).is_err());
+        assert!(parse_line("BLE SCAN", T).is_err());
     }
 }
