@@ -42,8 +42,10 @@ pub fn start(
                 // 100ms タイムアウトのブロッキング読み出し
                 match driver.read(&mut buf, 100) {
                     Ok(n) if n > 0 => {
+                        let now = now_ms();
                         if let Ok(mut st) = status.lock() {
-                            st.rs232_last_rx_ms = Some(now_ms());
+                            st.rs232_last_rx_ms = Some(now);
+                            st.push_event(now, &format!("FC1200 受信 {n}B"));
                         }
                         let hex = buf[..n]
                             .iter()

@@ -1,7 +1,16 @@
-# ファームウェアをビルドし、GitHub Pages に ESP Web Tools 書き込みページとして
-# デプロイする。CI レシピ (キャッシュ戦略含む) は ippoan/ble-medical-gateway の
-# .github/workflows/build.yml を踏襲 (あちらは Rust が実験扱いだが、本リポジトリ
-# では Rust ファームウェアが本番のため、ビルド失敗はデプロイをブロックする)。
+# CI/CD 構成 (ippoan/rust-alc-api の方式を踏襲):
+#
+#   PR   = coverage (hub-core を cargo llvm-cov で 100% 回帰チェック)
+#        + check (xtensa 向け cargo check — ファームウェアのコンパイル検証)
+#   main = フルビルド + espflash イメージ生成 + GitHub Pages デプロイ
+#        + 各キャッシュの warm (PR は main で warm されたキャッシュを restore する)
+#
+# キャッシュのスコープ: PR ブランチで作られたキャッシュは他ブランチから参照
+# できないが、main で作られたキャッシュは全ブランチから参照できる (GitHub
+# Actions の branch スコープ規則)。そのため save は main 側の job に寄せる。
+#
+# ビルドレシピ (ESP-IDF キャッシュ戦略含む) は ippoan/ble-medical-gateway の
+# .github/workflows/build.yml を踏襲。
 name: Build and Deploy Firmware
 
 on:
@@ -26,8 +35,91 @@ env:
   ESPFLASH_VERSION: '4.5.0'
 
 jobs:
+  # ------------------------------------------------------------------
+  # coverage: crates/hub-core (純粋ロジック) をホストでテストし、
+  # coverage_100.toml 登録ファイルの 100% ラインカバレッジを強制する。
+  # main push でも走らせて rust-cache を warm する (save-if は main のみ)
+  # ------------------------------------------------------------------
+  coverage:
+    name: Coverage 100% (hub-core)
+    runs-on: ubuntu-latest
+    # rust-toolchain.toml (channel = "esp") を上書きしてホストの stable を使う
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo registry/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.8.4
+
+      # --target 明示でホスト向けにビルド ([build].target = xtensa の上書き)。
+      # -p alc-hub-core により esp-idf 依存の firmware クレートはビルドしない
+      - name: Run cargo llvm-cov (hub-core)
+        run: |
+          cargo llvm-cov -p alc-hub-core \
+            --target x86_64-unknown-linux-gnu \
+            --summary-only | tee /tmp/llvm-cov-summary.txt
+
+      - name: Coverage 100% regression check
+        run: bash scripts/check_coverage_100.sh /tmp/llvm-cov-summary.txt
+
+  # ------------------------------------------------------------------
+  # check: xtensa 向け cargo check (PR のみ)。リンク・イメージ生成は行わず、
+  # main で warm された build キャッシュを restore 専用で使う
+  # ------------------------------------------------------------------
+  check:
+    name: Check firmware (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # main で保存されたキャッシュを restore (key 完全一致なら再保存も無い)
+      - name: Cache ESP-IDF tools/checkout
+        uses: actions/cache@v4
+        with:
+          path: .embuild
+          key: esp-idf-tools-${{ runner.os }}-${{ hashFiles('.cargo/config.toml') }}
+          restore-keys: |
+            esp-idf-tools-${{ runner.os }}-
+
+      - name: Install Xtensa Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.7.0
+        with:
+          default: true
+          buildtargets: esp32s3
+          ldproxy: true
+
+      - name: Cache cargo registry/target (restore only)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build
+          key: ${{ hashFiles('.cargo/config.toml') }}
+          save-if: 'false'
+
+      - name: Check
+        run: cargo check --release --locked
+
+  # ------------------------------------------------------------------
+  # build: フルビルド + 書き込みイメージ + Pages サイト組み立て (main のみ)
+  # ------------------------------------------------------------------
   build:
     name: Build firmware & assemble Pages site
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
 
     steps:
@@ -36,13 +128,7 @@ jobs:
 
       # ESP-IDF 本体 (git clone) + xtensa-esp32s3-elf-gcc/cmake/ninja 等のツール一式。
       # .cargo/config.toml の ESP_IDF_VERSION が変わらない限り毎回同じものなので
-      # キャッシュが効く。
-      #
-      # キャッシュのスコープについて: PR ブランチから作られたキャッシュは他の
-      # ブランチから参照できないが、main で作られたキャッシュは全ブランチから
-      # 参照できる (GitHub Actions の branch スコープ規則)。auto-merge で main に
-      # push されるたびに本 job が走ってキャッシュが warm され続けるので、
-      # PR ビルドは常に main の warm キャッシュを引ける。
+      # キャッシュが効く。main への push ごとに warm され続ける
       - name: Cache ESP-IDF tools/checkout
         uses: actions/cache@v4
         with:
@@ -61,9 +147,7 @@ jobs:
       # key に ESP_IDF_VERSION (.cargo/config.toml) のハッシュを明示的に足す:
       # esp-idf-sys の CMake ビルドディレクトリは ninja 等の絶対パスを記憶するため、
       # ESP_IDF_VERSION 変更時に古いキャッシュを prefix fallback で復元すると
-      # CMake configure が壊れる (ble-medical-gateway で実測)。
-      # shared-key でブランチ間・job 名変更をまたいで同一キー空間にし、
-      # PR が main の warm キャッシュを確実に restore できるようにする
+      # CMake configure が壊れる (ble-medical-gateway で実測)
       - name: Cache cargo registry/target
         uses: Swatinem/rust-cache@v2
         with:
@@ -84,7 +168,7 @@ jobs:
 
       # バージョン切替初回に古い restore-key が刺さる問題の根本対策:
       # 絶対パスを記憶する esp-idf-sys の CMake 中間生成物だけを毎回消し、
-      # CMake configure を素の状態からやり直させる。
+      # CMake configure を素の状態からやり直させる
       - name: Clear stale esp-idf-sys CMake build dir
         run: rm -rf target/xtensa-esp32s3-espidf/*/build/esp-idf-sys-*/out/build
 
@@ -143,7 +227,7 @@ jobs:
 
   auto-merge:
     name: Auto Merge
-    needs: [build]
+    needs: [coverage, check]
     if: github.event_name == 'pull_request'
     uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
     with:

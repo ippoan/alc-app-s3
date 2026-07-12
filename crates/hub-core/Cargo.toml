@@ -1,0 +1,7 @@
+[package]
+name = "alc-hub-core"
+version = "0.1.0"
+edition = "2021"
+description = "alc-hub-cores3 の純粋ロジック (ホストでテスト可能・coverage 100% 対象)"
+
+[dependencies]

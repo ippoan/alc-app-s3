@@ -170,7 +170,7 @@
         <ul>
             <li>書き込み中は USB ケーブルを抜かないでください</li>
             <li>ポートが認識されない・書き込みが始まらない場合は、リセットボタンを約2秒長押しして書き込みモード（ダウンロードモード）に入れてから再試行してください</li>
-            <li>書き込み後、CoreS3 は自動的に再起動し、起動画面 → 待機画面（アルコールチェック）が表示されます</li>
+            <li>書き込み後、CoreS3 は自動的に再起動し、起動画面 → 待機画面（カードをかざしてください）が表示されます</li>
         </ul>
     </div>
 
@@ -186,6 +186,30 @@
                 シリアルポートへのアクセスが許可されていません。
             </span>
         </esp-web-install-button>
+    </div>
+
+    <div class="card">
+        <h2>Wi-Fi 設定（インストール直後に同じダイアログで）</h2>
+        <p>
+            本ファームウェアは <strong>Improv Wi-Fi Serial</strong> に対応しています。
+            書き込み完了後、そのままインストールダイアログに表示される
+            「<strong>Wi-Fi 設定 (Configure Wi-Fi)</strong>」から、周辺ネットワークの選択
+            （または SSID の手入力）とパスワード入力で設定できます。
+            設定は本体（NVS）に保存され、以後は起動時に自動接続します。
+        </p>
+        <div class="requirements">
+            <h3>設定できるネットワークの条件</h3>
+            <ul>
+                <li><strong>周波数: 2.4GHz 帯のみ</strong>（ESP32-S3 は 5GHz / 6GHz 非対応。IEEE 802.11 b/g/n）</li>
+                <li><strong>パスワード: WPA / WPA2 / WPA3-Personal（8〜63 文字の半角英数記号）</strong>、またはパスワード無しのオープンネットワーク</li>
+                <li>SSID は最大 32 バイト（日本語 SSID は非推奨）</li>
+                <li>WPA2/WPA3-<strong>Enterprise</strong>（802.1X 認証）や Web ログイン式（キャプティブポータル）は非対応</li>
+            </ul>
+        </div>
+        <p style="font-size: 13px; color: #999; margin-bottom: 0;">
+            ※ Wi-Fi は LAN 配線が無い拠点向けの代替経路です（主経路は LAN Module 13.2 / PoE）。
+            設定状態は本体の「ログ確認」画面（WiFi インジケータ・IP アドレス）で確認できます。
+        </p>
     </div>
 
     <div class="card">
@@ -215,10 +239,10 @@
     <div class="card">
         <h2>書き込み後の動作確認</h2>
         <ul>
-            <li><strong>画面</strong>: 起動画面の後、待機画面「アルコールチェック」とステータスバー (LAN / 232 / BLE) が表示されます</li>
-            <li><strong>タッチ</strong>: 待機画面をタップすると機器ステータス詳細が表示されます</li>
+            <li><strong>画面</strong>: 起動画面の後、待機画面「カードをかざしてください」とステータスバー (LAN / 232 / BLE / WiFi + 稼働時間) が表示されます</li>
+            <li><strong>タッチ</strong>: 待機画面タップ → メニュー（上: 点呼 / 下: ログ確認）。各画面はタップで待機画面に戻ります</li>
+            <li><strong>体温・血圧</strong>: ニプロ NT-100B / NBP-1BLE で測定すると、測定値が画面に大きく表示され、シリアルにも <code>{"type":"temperature",...}</code> 形式の JSON が出力されます (ble-medical-gateway 互換)</li>
             <li><strong>シリアル (115200bps)</strong>: <code>PING</code> 送信 → <code>PONG</code> 応答、<code>QR https://example.com 30</code> で QR 表示をテストできます</li>
-            <li><strong>BLE</strong>: 体温計/血圧計で測定すると <code>{"type":"temperature",...}</code> 形式の JSON が出力されます (ble-medical-gateway 互換)</li>
         </ul>
     </div>
 

@@ -20,8 +20,14 @@
 //! ```
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
+use alc_hub_core::{
+    device::{match_device_name, DeviceKind},
+    ieee11073::{parse_blood_pressure, parse_temperature},
+    vitals,
+};
 use anyhow::{Context, Result};
 use esp32_nimble::{
     enums::{AuthReq, SecurityIOCap},
@@ -30,7 +36,11 @@ use esp32_nimble::{
 };
 use esp_idf_svc::hal::{delay::FreeRtos, task::block_on};
 
-use crate::status::SharedStatus;
+use crate::status::{now_ms, SharedStatus};
+use crate::ui::UiCommand;
+
+/// on_notify クロージャ (Send + Sync 要求) から使うため Mutex で包む
+type SharedTx = Arc<Mutex<Sender<UiCommand>>>;
 
 const HEALTH_THERMOMETER_SERVICE: u16 = 0x1809;
 const BLOOD_PRESSURE_SERVICE: u16 = 0x1810;
@@ -44,41 +54,27 @@ const CONNECT_RETRIES: u32 = 3;
 /// データ受信後、次の測定に備えて切断・再スキャンするまでの猶予 (Arduino 版準拠)
 const RESET_DELAY_MS: u32 = 2_000;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DeviceKind {
-    Thermometer,
-    BloodPressure,
-}
-
-impl DeviceKind {
-    fn json_name(self) -> &'static str {
-        match self {
-            Self::Thermometer => "thermometer",
-            Self::BloodPressure => "blood_pressure",
-        }
-    }
-
-    fn service(self) -> BleUuid {
-        match self {
-            Self::Thermometer => BleUuid::from_uuid16(HEALTH_THERMOMETER_SERVICE),
-            Self::BloodPressure => BleUuid::from_uuid16(BLOOD_PRESSURE_SERVICE),
-        }
-    }
-
-    fn characteristic(self) -> BleUuid {
-        match self {
-            Self::Thermometer => BleUuid::from_uuid16(TEMPERATURE_MEASUREMENT),
-            Self::BloodPressure => BleUuid::from_uuid16(BLOOD_PRESSURE_MEASUREMENT),
-        }
+fn service_uuid(kind: DeviceKind) -> BleUuid {
+    match kind {
+        DeviceKind::Thermometer => BleUuid::from_uuid16(HEALTH_THERMOMETER_SERVICE),
+        DeviceKind::BloodPressure => BleUuid::from_uuid16(BLOOD_PRESSURE_SERVICE),
     }
 }
 
-pub fn start(status: SharedStatus) -> Result<()> {
+fn measurement_uuid(kind: DeviceKind) -> BleUuid {
+    match kind {
+        DeviceKind::Thermometer => BleUuid::from_uuid16(TEMPERATURE_MEASUREMENT),
+        DeviceKind::BloodPressure => BleUuid::from_uuid16(BLOOD_PRESSURE_MEASUREMENT),
+    }
+}
+
+pub fn start(status: SharedStatus, tx: Sender<UiCommand>) -> Result<()> {
+    let tx: SharedTx = Arc::new(Mutex::new(tx));
     std::thread::Builder::new()
         .name("ble".into())
         .stack_size(16 * 1024)
         .spawn(move || {
-            if let Err(e) = block_on(task(status)) {
+            if let Err(e) = block_on(task(status, tx)) {
                 log::error!("ble: タスク異常終了: {e:?}");
                 println!("{{\"type\":\"error\",\"message\":\"BLE task terminated\"}}");
             }
@@ -86,7 +82,7 @@ pub fn start(status: SharedStatus) -> Result<()> {
     Ok(())
 }
 
-async fn task(status: SharedStatus) -> Result<()> {
+async fn task(status: SharedStatus, tx: SharedTx) -> Result<()> {
     let device = BLEDevice::take();
 
     // Arduino 版と同等の Just Works ボンディング設定
@@ -117,7 +113,7 @@ async fn task(status: SharedStatus) -> Result<()> {
         println!("{{\"type\":\"found\",\"device\":\"{}\"}}", kind.json_name());
 
         let mut client = device.new_client();
-        if let Err(e) = handle_device(&mut client, &adv, kind, &status).await {
+        if let Err(e) = handle_device(&mut client, &adv, kind, &status, &tx).await {
             log::warn!("ble: {} 処理失敗: {e:?}", kind.json_name());
             println!(
                 "{{\"type\":\"error\",\"message\":\"{}: connection failed\"}}",
@@ -151,13 +147,7 @@ fn match_target(dev: &BLEAdvertisedDevice, data: BLEAdvertisedData<&[u8]>) -> Op
 
     if let Some(name) = data.name() {
         // name() は生バイト列 (&[u8]) を返す
-        let name = String::from_utf8_lossy(name);
-        if name.contains("NT-100") || name.contains("Thermo") {
-            return Some(DeviceKind::Thermometer);
-        }
-        if name.contains("NBP-1") || name.contains("BP") || name.contains("Blood") {
-            return Some(DeviceKind::BloodPressure);
-        }
+        return match_device_name(&String::from_utf8_lossy(name));
     }
     None
 }
@@ -167,6 +157,7 @@ async fn handle_device(
     adv: &BLEAdvertisedDevice,
     kind: DeviceKind,
     status: &SharedStatus,
+    tx: &SharedTx,
 ) -> Result<()> {
     let disconnected = Arc::new(AtomicBool::new(false));
     {
@@ -195,19 +186,21 @@ async fn handle_device(
     }
 
     let service = client
-        .get_service(kind.service())
+        .get_service(service_uuid(kind))
         .await
         .context("サービスが見つからない")?;
     let characteristic = service
-        .get_characteristic(kind.characteristic())
+        .get_characteristic(measurement_uuid(kind))
         .await
         .context("キャラクタリスティックが見つからない")?;
 
     let got_data = Arc::new(AtomicBool::new(false));
     {
         let got_data = Arc::clone(&got_data);
+        let tx = Arc::clone(tx);
+        let status = Arc::clone(status);
         characteristic.on_notify(move |raw| {
-            emit_measurement(kind, raw);
+            emit_measurement(kind, raw, &tx, &status);
             got_data.store(true, Ordering::SeqCst);
         });
     }
@@ -234,6 +227,7 @@ async fn handle_device(
         kind.json_name()
     );
     if let Ok(mut st) = status.lock() {
+        st.push_event(now_ms(), &format!("{} 接続", kind.jp_name()));
         st.ble_connected = true;
         st.ble_device = kind.json_name().to_string();
     }
@@ -258,104 +252,48 @@ async fn handle_device(
     Ok(())
 }
 
-fn emit_measurement(kind: DeviceKind, raw: &[u8]) {
+/// 測定値の処理: ホストへ JSON 出力 + イベントログ + 画面表示 (UiCommand)
+fn emit_measurement(kind: DeviceKind, raw: &[u8], tx: &SharedTx, status: &SharedStatus) {
     match kind {
         DeviceKind::Thermometer => match parse_temperature(raw) {
-            Some(t) => println!("{{\"type\":\"temperature\",\"value\":{t:.1},\"unit\":\"celsius\"}}"),
+            Some(t) => {
+                println!("{{\"type\":\"temperature\",\"value\":{t:.1},\"unit\":\"celsius\"}}");
+                if let Ok(mut st) = status.lock() {
+                    st.push_event(now_ms(), &vitals::temp_event(t));
+                }
+                if let Ok(tx) = tx.lock() {
+                    let _ = tx.send(UiCommand::Temperature { celsius: t });
+                }
+            }
             None => println!("{{\"type\":\"error\",\"message\":\"temperature parse failed\"}}"),
         },
         DeviceKind::BloodPressure => match parse_blood_pressure(raw) {
-            Some(bp) => match bp.pulse {
-                Some(p) if p > 0.0 => println!(
-                    "{{\"type\":\"blood_pressure\",\"systolic\":{:.0},\"diastolic\":{:.0},\"pulse\":{:.0},\"unit\":\"mmHg\"}}",
-                    bp.systolic, bp.diastolic, p
-                ),
-                _ => println!(
-                    "{{\"type\":\"blood_pressure\",\"systolic\":{:.0},\"diastolic\":{:.0},\"unit\":\"mmHg\"}}",
-                    bp.systolic, bp.diastolic
-                ),
-            },
+            Some(bp) => {
+                match bp.pulse {
+                    Some(p) if p > 0.0 => println!(
+                        "{{\"type\":\"blood_pressure\",\"systolic\":{:.0},\"diastolic\":{:.0},\"pulse\":{:.0},\"unit\":\"mmHg\"}}",
+                        bp.systolic, bp.diastolic, p
+                    ),
+                    _ => println!(
+                        "{{\"type\":\"blood_pressure\",\"systolic\":{:.0},\"diastolic\":{:.0},\"unit\":\"mmHg\"}}",
+                        bp.systolic, bp.diastolic
+                    ),
+                }
+                if let Ok(mut st) = status.lock() {
+                    st.push_event(now_ms(), &vitals::bp_event(bp.systolic, bp.diastolic, bp.pulse));
+                }
+                if let Ok(tx) = tx.lock() {
+                    let _ = tx.send(UiCommand::BloodPressure {
+                        systolic: bp.systolic,
+                        diastolic: bp.diastolic,
+                        pulse: bp.pulse,
+                    });
+                }
+            }
             None => println!("{{\"type\":\"error\",\"message\":\"blood_pressure parse failed\"}}"),
         },
     }
 }
 
-// ---------------------------------------------------------------------------
-// 値のデコード (Arduino 版 parseTemperature / parseBloodPressure の移植)
-// ---------------------------------------------------------------------------
-
-/// Temperature Measurement (0x2A1C): IEEE 11073 FLOAT (32bit)
-fn parse_temperature(data: &[u8]) -> Option<f32> {
-    if data.len() < 5 {
-        return None;
-    }
-    let flags = data[0];
-    let fahrenheit = flags & 0x01 != 0;
-
-    let mut mantissa =
-        i32::from(data[1]) | (i32::from(data[2]) << 8) | (i32::from(data[3]) << 16);
-    if mantissa & 0x0080_0000 != 0 {
-        mantissa |= 0xFF00_0000u32 as i32; // 符号拡張
-    }
-    let exponent = data[4] as i8;
-
-    let mut t = mantissa as f32 * 10f32.powi(i32::from(exponent));
-    if fahrenheit {
-        t = (t - 32.0) * 5.0 / 9.0;
-    }
-    Some(t)
-}
-
-struct BloodPressure {
-    systolic: f32,
-    diastolic: f32,
-    pulse: Option<f32>,
-}
-
-/// IEEE 11073 SFLOAT (16bit)
-fn sfloat(lo: u8, hi: u8) -> f32 {
-    let mut mantissa = i16::from(lo) | (i16::from(hi & 0x0F) << 8);
-    if mantissa & 0x0800 != 0 {
-        mantissa |= 0xF000u16 as i16; // 符号拡張
-    }
-    let mut exponent = (hi >> 4) as i8;
-    if exponent & 0x08 != 0 {
-        exponent |= 0xF0u8 as i8; // 符号拡張
-    }
-    f32::from(mantissa) * 10f32.powi(i32::from(exponent))
-}
-
-/// Blood Pressure Measurement (0x2A35)
-fn parse_blood_pressure(data: &[u8]) -> Option<BloodPressure> {
-    if data.len() < 7 {
-        return None;
-    }
-    let flags = data[0];
-    let is_kpa = flags & 0x01 != 0;
-    let has_timestamp = flags & 0x02 != 0;
-    let has_pulse = flags & 0x04 != 0;
-
-    let mut systolic = sfloat(data[1], data[2]);
-    let mut diastolic = sfloat(data[3], data[4]);
-    // data[5..7] は Mean Arterial Pressure (未使用)
-
-    let mut offset = 7;
-    if has_timestamp {
-        offset += 7; // タイムスタンプは 7 バイト
-    }
-    let pulse = if has_pulse && offset + 2 <= data.len() {
-        Some(sfloat(data[offset], data[offset + 1]))
-    } else {
-        None
-    };
-
-    if is_kpa {
-        systolic *= 7.50062;
-        diastolic *= 7.50062;
-    }
-    Some(BloodPressure {
-        systolic,
-        diastolic,
-        pulse,
-    })
-}
+// 値のデコード (IEEE 11073) は alc-hub-core::ieee11073 に分離
+// (ホストでの単体テスト・coverage 100% 対象)
