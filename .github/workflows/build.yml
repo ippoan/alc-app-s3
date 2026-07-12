@@ -148,11 +148,19 @@ jobs:
       # 内容ベースの rustc キャッシュなので、この再コンパイルをヒットに変える
       - uses: mozilla-actions/sccache-action@v0.0.9
 
+      # lib クレート群は codegen 付きでビルドする: sccache は metadata-only の
+      # cargo check には効かない (codegen を伴う rustc 呼び出しのみキャッシュ)。
+      # main の build job が同じクレートをコンパイルして sccache を温めるため、
+      # PR では変更していないクレートが全てキャッシュヒットになる。
+      # bin (main 配線のみ) はリンクを避けて check に留める
       - name: Check
         env:
           SCCACHE_GHA_ENABLED: 'true'
           RUSTC_WRAPPER: sccache
-        run: cargo check --release --locked
+        run: |
+          cargo build --release --locked --workspace --exclude alc-hub-cores3
+          cargo check --release --locked -p alc-hub-cores3
+          sccache --show-stats
 
   # ------------------------------------------------------------------
   # build: フルビルド + 書き込みイメージ + Pages サイト組み立て (main のみ)
