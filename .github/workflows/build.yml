@@ -116,6 +116,21 @@ jobs:
           buildtargets: esp32s3
           ldproxy: true
 
+      # cache hit で Install step をスキップすると、action が設定するはずの
+      # LIBCLANG_PATH が無く、esp-idf-sys の bindgen がシステム libclang
+      # (xtensa 非対応) を使って "unknown target triple 'xtensa'" で落ちる
+      # (PR #5-#7 で実測)。キャッシュ済みツールチェーン内の xtensa 対応
+      # libclang を探して設定する
+      - name: Export LIBCLANG_PATH (cache hit)
+        if: steps.cache-xtensa.outputs.cache-hit == 'true'
+        run: |
+          LIBCLANG_FILE=$(find "$HOME/.rustup/toolchains/esp" -name 'libclang.so*' -type f 2>/dev/null | head -1)
+          if [ -z "$LIBCLANG_FILE" ]; then
+            echo "::error::キャッシュ済み esp ツールチェーンに libclang が見つかりません。cache key (-v1) を上げて再インストールしてください"
+            exit 1
+          fi
+          echo "LIBCLANG_PATH=$(dirname "$LIBCLANG_FILE")" >> "$GITHUB_ENV"
+
       - name: Cache cargo registry/target (restore only)
         uses: Swatinem/rust-cache@v2
         with:
@@ -167,6 +182,21 @@ jobs:
           default: true
           buildtargets: esp32s3
           ldproxy: true
+
+      # cache hit で Install step をスキップすると、action が設定するはずの
+      # LIBCLANG_PATH が無く、esp-idf-sys の bindgen がシステム libclang
+      # (xtensa 非対応) を使って "unknown target triple 'xtensa'" で落ちる
+      # (PR #5-#7 で実測)。キャッシュ済みツールチェーン内の xtensa 対応
+      # libclang を探して設定する
+      - name: Export LIBCLANG_PATH (cache hit)
+        if: steps.cache-xtensa.outputs.cache-hit == 'true'
+        run: |
+          LIBCLANG_FILE=$(find "$HOME/.rustup/toolchains/esp" -name 'libclang.so*' -type f 2>/dev/null | head -1)
+          if [ -z "$LIBCLANG_FILE" ]; then
+            echo "::error::キャッシュ済み esp ツールチェーンに libclang が見つかりません。cache key (-v1) を上げて再インストールしてください"
+            exit 1
+          fi
+          echo "LIBCLANG_PATH=$(dirname "$LIBCLANG_FILE")" >> "$GITHUB_ENV"
 
       # key に ESP_IDF_VERSION (.cargo/config.toml) のハッシュを明示的に足す:
       # esp-idf-sys の CMake ビルドディレクトリは ninja 等の絶対パスを記憶するため、
