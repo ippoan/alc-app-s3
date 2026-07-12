@@ -20,7 +20,10 @@ use std::sync::mpsc::Receiver;
 use esp_idf_svc::hal::{delay::FreeRtos, i2c::I2cDriver};
 
 use crate::{
-    board::{display::Cs3Display, touch},
+    board::{
+        display::{self, Cs3Display},
+        touch,
+    },
     config,
     status::{now_ms, SharedStatus},
 };
@@ -32,6 +35,8 @@ pub enum UiCommand {
     Result { ok: bool, value: String },
     Error { message: String },
     Reset,
+    /// 画面向き変更 (0/90/180/270 度)。NVS への保存は host_link 側で実施済み
+    Rotate(u16),
 }
 
 enum Screen {
@@ -64,20 +69,33 @@ pub fn run(
 
         // --- ホストコマンド ---
         while let Ok(cmd) = rx.try_recv() {
-            screen = match cmd {
-                UiCommand::ShowQr {
-                    payload,
-                    timeout_ms,
-                } => Screen::Qr {
-                    payload,
-                    timeout_ms,
-                },
-                UiCommand::Measure => Screen::Measuring,
-                UiCommand::Result { ok, value } => Screen::Result { ok, value },
-                UiCommand::Error { message } => Screen::Error { message },
-                UiCommand::Reset => Screen::Idle,
-            };
-            entered = now;
+            match cmd {
+                // 画面向き変更は現在の画面を維持したまま再描画のみ
+                UiCommand::Rotate(deg) => {
+                    if let Err(e) =
+                        display.set_orientation(display::orientation_from_deg(deg))
+                    {
+                        log::warn!("ui: 画面向き変更失敗: {e:?}");
+                    }
+                }
+                cmd => {
+                    screen = match cmd {
+                        UiCommand::ShowQr {
+                            payload,
+                            timeout_ms,
+                        } => Screen::Qr {
+                            payload,
+                            timeout_ms,
+                        },
+                        UiCommand::Measure => Screen::Measuring,
+                        UiCommand::Result { ok, value } => Screen::Result { ok, value },
+                        UiCommand::Error { message } => Screen::Error { message },
+                        UiCommand::Reset => Screen::Idle,
+                        UiCommand::Rotate(_) => unreachable!(),
+                    };
+                    entered = now;
+                }
+            }
             dirty = true;
         }
 

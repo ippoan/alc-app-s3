@@ -1,4 +1,8 @@
-//! 各画面の描画。320x240 (上部 24px はステータスバー)。
+//! 各画面の描画。基準レイアウトは 320x240 横向き (上部 24px はステータスバー)。
+//!
+//! 画面向き (ROTATE コマンド) に追従できるよう、幅・高さはディスプレイから
+//! 実行時に取得する。90/270 度 (240x320 縦) では中央揃え・下端揃えの要素は
+//! そのまま追従し、上端基準の絶対 Y 座標はレイアウトが上に寄る (許容)。
 //!
 //! 日本語は u8g2 の JIS 収録フォント (b16, 16px)、大きな英数字は
 //! Logisoso32 で描画する。フレームバッファを持たず LCD へ直接描画するため、
@@ -19,11 +23,7 @@ use u8g2_fonts::{
 };
 
 use super::Screen;
-use crate::{
-    board::display::{Cs3Display, LCD_H as H, LCD_W as W},
-    config,
-    status::HubStatus,
-};
+use crate::{board::display::Cs3Display, config, status::HubStatus};
 
 const BAR_H: i32 = 24;
 
@@ -37,6 +37,12 @@ const C_NG: Rgb565 = Rgb565::CSS_ORANGE_RED;
 
 const JP16: FontRenderer = FontRenderer::new::<fonts::u8g2_font_b16_b_t_japanese2>();
 const BIG32: FontRenderer = FontRenderer::new::<fonts::u8g2_font_logisoso32_tr>();
+
+/// 現在の画面向きでの (幅, 高さ)
+fn dims(d: &Cs3Display) -> (i32, i32) {
+    let size = d.bounding_box().size;
+    (size.width as i32, size.height as i32)
+}
 
 /// テキスト描画 (エラーは無視 — SPI 書き込み失敗時に UI を止めない)
 fn text(
@@ -59,7 +65,8 @@ fn text(
 }
 
 fn jp_center(d: &mut Cs3Display, s: &str, y: i32, color: Rgb565) {
-    text(d, &JP16, s, W / 2, y, color, HorizontalAlignment::Center);
+    let (w, _) = dims(d);
+    text(d, &JP16, s, w / 2, y, color, HorizontalAlignment::Center);
 }
 
 fn fill(d: &mut Cs3Display, x: i32, y: i32, w: u32, h: u32, color: Rgb565) {
@@ -109,24 +116,26 @@ pub fn draw_boot(d: &mut Cs3Display) {
 }
 
 fn draw_idle(d: &mut Cs3Display) {
+    let (_, h) = dims(d);
     clear(d);
     jp_center(d, "アルコールチェック", 76, C_TEXT);
     jp_center(d, "タブレットで顔認証をしてください", 122, C_ACCENT);
-    jp_center(d, "画面タップ: 機器ステータス", 204, C_MUTED);
+    jp_center(d, "画面タップ: 機器ステータス", h - 36, C_MUTED);
 }
 
 fn draw_qr(d: &mut Cs3Display, payload: &str, remain_s: u64) {
+    let (w, h) = dims(d);
     clear(d);
     // QR は白背景必須 (クワイエットゾーン確保)
-    fill(d, 0, BAR_H, W as u32, (H - BAR_H) as u32, Rgb565::WHITE);
+    fill(d, 0, BAR_H, w as u32, (h - BAR_H) as u32, Rgb565::WHITE);
 
     match QrCode::encode_text(payload, QrCodeEcc::Medium) {
         Ok(qr) => {
             let size = qr.size(); // モジュール数 (正方形)
-            let avail = H - BAR_H - 44; // 下部の案内文スペースを除く
+            let avail = (h - BAR_H - 44).min(w - 16); // 下部の案内文スペースを除く
             let scale = (avail / (size + 2)).clamp(2, 8);
             let px = size * scale;
-            let x0 = (W - px) / 2;
+            let x0 = (w - px) / 2;
             let y0 = BAR_H + 8;
             for y in 0..size {
                 for x in 0..size {
@@ -149,7 +158,7 @@ fn draw_qr(d: &mut Cs3Display, payload: &str, remain_s: u64) {
                 d,
                 &JP16,
                 "QRコードを生成できませんでした",
-                W / 2,
+                w / 2,
                 110,
                 Rgb565::BLACK,
                 HorizontalAlignment::Center,
@@ -161,8 +170,8 @@ fn draw_qr(d: &mut Cs3Display, payload: &str, remain_s: u64) {
         d,
         &JP16,
         "読み取り機にかざしてください",
-        W / 2,
-        H - 30,
+        w / 2,
+        h - 30,
         Rgb565::BLACK,
         HorizontalAlignment::Center,
     );
@@ -171,12 +180,13 @@ fn draw_qr(d: &mut Cs3Display, payload: &str, remain_s: u64) {
 
 /// QR 画面右上の残り秒数 (毎秒の部分更新)
 pub fn draw_qr_countdown(d: &mut Cs3Display, remain_s: u64) {
-    fill(d, W - 100, BAR_H + 2, 98, 20, Rgb565::WHITE);
+    let (w, _) = dims(d);
+    fill(d, w - 100, BAR_H + 2, 98, 20, Rgb565::WHITE);
     text(
         d,
         &JP16,
         &format!("残り {remain_s}秒"),
-        W - 4,
+        w - 4,
         BAR_H + 4,
         Rgb565::BLACK,
         HorizontalAlignment::Right,
@@ -184,21 +194,23 @@ pub fn draw_qr_countdown(d: &mut Cs3Display, remain_s: u64) {
 }
 
 fn draw_measuring(d: &mut Cs3Display) {
+    let (_, h) = dims(d);
     clear(d);
     jp_center(d, "測定中...", 56, C_TEXT);
     draw_spinner(d, 0);
-    jp_center(d, "FC-1200 に息を吹き込んでください", 196, C_MUTED);
+    jp_center(d, "FC-1200 に息を吹き込んでください", h - 44, C_MUTED);
 }
 
-/// 測定中スピナー (部分更新)。中心 (W/2, 130)、8 ドット。
+/// 測定中スピナー (部分更新)。8 ドット。
 pub fn draw_spinner(d: &mut Cs3Display, phase: u8) {
-    const CX: f32 = 160.0;
-    const CY: f32 = 132.0;
+    let (w, _) = dims(d);
+    let cx = (w / 2) as f32;
+    let cy = 132.0f32;
     const R: f32 = 34.0;
     for i in 0..8u8 {
         let ang = core::f32::consts::TAU * f32::from(i) / 8.0;
-        let x = CX + R * ang.cos();
-        let y = CY + R * ang.sin();
+        let x = cx + R * ang.cos();
+        let y = cy + R * ang.sin();
         let color = if i == phase { C_ACCENT } else { C_BAR_BG };
         let _ = Circle::with_center(Point::new(x as i32, y as i32), 12)
             .into_styled(PrimitiveStyle::with_fill(color))
@@ -207,31 +219,33 @@ pub fn draw_spinner(d: &mut Cs3Display, phase: u8) {
 }
 
 fn draw_result(d: &mut Cs3Display, ok: bool, value: &str) {
+    let (w, h) = dims(d);
     clear(d);
     let (label, color, note) = if ok {
         ("OK", C_OK, "測定完了 おつかれさまでした")
     } else {
         ("NG", C_NG, "検知しました 再測定してください")
     };
-    text(d, &BIG32, label, W / 2, 44, color, HorizontalAlignment::Center);
+    text(d, &BIG32, label, w / 2, 44, color, HorizontalAlignment::Center);
     if !value.is_empty() {
         text(
             d,
             &BIG32,
             &format!("{value} mg/L"),
-            W / 2,
+            w / 2,
             100,
             C_TEXT,
             HorizontalAlignment::Center,
         );
     }
     jp_center(d, note, 160, C_TEXT);
-    jp_center(d, "タップで待機画面へ", 204, C_MUTED);
+    jp_center(d, "タップで待機画面へ", h - 36, C_MUTED);
 }
 
 fn draw_error(d: &mut Cs3Display, message: &str) {
+    let (w, h) = dims(d);
     clear(d);
-    fill(d, 0, BAR_H, W as u32, 34, C_NG);
+    fill(d, 0, BAR_H, w as u32, 34, C_NG);
     jp_center(d, "エラー", BAR_H + 8, C_TEXT);
     let msg = if message.is_empty() {
         "不明なエラー"
@@ -239,10 +253,11 @@ fn draw_error(d: &mut Cs3Display, message: &str) {
         message
     };
     jp_center(d, msg, 116, C_TEXT);
-    jp_center(d, "タップで戻る", 204, C_MUTED);
+    jp_center(d, "タップで戻る", h - 36, C_MUTED);
 }
 
 fn draw_status_detail(d: &mut Cs3Display, st: &HubStatus, now: u64) {
+    let (_, h) = dims(d);
     clear(d);
     jp_center(d, "機器ステータス", BAR_H + 8, C_ACCENT);
 
@@ -253,18 +268,14 @@ fn draw_status_detail(d: &mut Cs3Display, st: &HubStatus, now: u64) {
     let ble = if st.ble_connected {
         format!("BLE: 接続 ({})", st.ble_device)
     } else {
-        "BLE: 未接続 (未実装)".to_string()
+        "BLE: 未接続".to_string()
     };
     let lan = format!(
         "LAN リンク: {}",
         if st.lan_link { "あり" } else { "なし (未実装)" }
     );
 
-    let rows = [
-        lan.as_str(),
-        rs232.as_str(),
-        ble.as_str(),
-    ];
+    let rows = [lan.as_str(), rs232.as_str(), ble.as_str()];
     let mut y = 78;
     for row in rows {
         text(d, &JP16, row, 16, y, C_TEXT, HorizontalAlignment::Left);
@@ -279,7 +290,7 @@ fn draw_status_detail(d: &mut Cs3Display, st: &HubStatus, now: u64) {
         C_MUTED,
         HorizontalAlignment::Left,
     );
-    jp_center(d, "タップで戻る", 204, C_MUTED);
+    jp_center(d, "タップで戻る", h - 36, C_MUTED);
 }
 
 // ---------------------------------------------------------------------------
@@ -287,7 +298,8 @@ fn draw_status_detail(d: &mut Cs3Display, st: &HubStatus, now: u64) {
 // ---------------------------------------------------------------------------
 
 pub fn draw_status_bar(d: &mut Cs3Display, st: &HubStatus, now: u64) {
-    fill(d, 0, 0, W as u32, BAR_H as u32, C_BAR_BG);
+    let (w, _) = dims(d);
+    fill(d, 0, 0, w as u32, BAR_H as u32, C_BAR_BG);
     let style = MonoTextStyle::new(&FONT_6X10, C_TEXT);
 
     let items = [
@@ -306,10 +318,5 @@ pub fn draw_status_bar(d: &mut Cs3Display, st: &HubStatus, now: u64) {
     }
 
     let up = fmt_uptime(now);
-    let _ = Text::new(
-        &up,
-        Point::new(W - 6 - up.len() as i32 * 6, 16),
-        style,
-    )
-    .draw(d);
+    let _ = Text::new(&up, Point::new(w - 6 - up.len() as i32 * 6, 16), style).draw(d);
 }

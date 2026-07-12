@@ -17,7 +17,12 @@ use crate::{
     status::{now_ms, SharedStatus},
 };
 
-pub fn start(uart: UART1, tx_pin: Gpio17, rx_pin: Gpio18, status: SharedStatus) -> Result<()> {
+pub fn start(
+    uart: UART1<'static>,
+    tx_pin: Gpio17<'static>,
+    rx_pin: Gpio18<'static>,
+    status: SharedStatus,
+) -> Result<()> {
     let cfg = UartConfig::new().baudrate(Hertz(config::RS232_BAUD));
     let driver = UartDriver::new(
         uart,

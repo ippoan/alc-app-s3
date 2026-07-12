@@ -150,6 +150,8 @@ fn match_target(dev: &BLEAdvertisedDevice, data: BLEAdvertisedData<&[u8]>) -> Op
     }
 
     if let Some(name) = data.name() {
+        // name() は生バイト列 (&[u8]) を返す
+        let name = String::from_utf8_lossy(name);
         if name.contains("NT-100") || name.contains("Thermo") {
             return Some(DeviceKind::Thermometer);
         }

@@ -10,16 +10,16 @@ use anyhow::{anyhow, Result};
 use esp_idf_svc::hal::{
     delay::Delay,
     gpio::{AnyIOPin, Gpio3, Gpio35, Gpio36, Gpio37, Output, PinDriver},
-    prelude::*,
     spi::{
-        config::Config as SpiConfig, config::DriverConfig as SpiDriverConfig, SpiDeviceDriver,
-        SpiDriver, SPI2,
+        config::Config as SpiConfig, config::DriverConfig as SpiDriverConfig, config::MODE_0,
+        SpiDeviceDriver, SpiDriver, SPI2,
     },
+    units::Hertz,
 };
 use mipidsi::{
     interface::SpiInterface,
     models::ILI9342CRgb565,
-    options::{ColorInversion, ColorOrder},
+    options::{ColorInversion, ColorOrder, Orientation, Rotation},
     Builder, Display, NoResetPin,
 };
 
@@ -30,18 +30,30 @@ pub type Cs3Display = Display<
     SpiInterface<
         'static,
         SpiDeviceDriver<'static, SpiDriver<'static>>,
-        PinDriver<'static, Gpio35, Output>,
+        PinDriver<'static, Output>,
     >,
     ILI9342CRgb565,
     NoResetPin,
 >;
 
+/// 設定値 (度) を mipidsi の Orientation へ変換
+pub fn orientation_from_deg(deg: u16) -> Orientation {
+    let rotation = match deg {
+        90 => Rotation::Deg90,
+        180 => Rotation::Deg180,
+        270 => Rotation::Deg270,
+        _ => Rotation::Deg0,
+    };
+    Orientation::new().rotate(rotation)
+}
+
 pub fn init(
-    spi: SPI2,
-    sclk: Gpio36,
-    mosi: Gpio37,
-    cs: Gpio3,
-    dc: Gpio35,
+    spi: SPI2<'static>,
+    sclk: Gpio36<'static>,
+    mosi: Gpio37<'static>,
+    cs: Gpio3<'static>,
+    dc: Gpio35<'static>,
+    rotation_deg: u16,
 ) -> Result<Cs3Display> {
     let driver = SpiDriver::new(
         spi,
@@ -51,8 +63,8 @@ pub fn init(
         &SpiDriverConfig::new(),
     )?;
     let spi_cfg = SpiConfig::new()
-        .baudrate(40.MHz().into())
-        .data_mode(embedded_hal::spi::MODE_0);
+        .baudrate(Hertz(40_000_000))
+        .data_mode(MODE_0);
     let device = SpiDeviceDriver::new(driver, Some(cs), &spi_cfg)?;
     let dc = PinDriver::output(dc)?;
 
@@ -65,6 +77,7 @@ pub fn init(
         .display_size(LCD_W as u16, LCD_H as u16)
         .color_order(ColorOrder::Bgr)
         .invert_colors(ColorInversion::Inverted)
+        .orientation(orientation_from_deg(rotation_deg))
         .init(&mut delay)
         .map_err(|e| anyhow!("LCD 初期化失敗: {e:?}"))
 }

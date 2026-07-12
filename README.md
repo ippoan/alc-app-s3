@@ -45,7 +45,8 @@ Boot ─→ Idle ─(QR)─→ Qr ─(MEASURE)─→ Measuring ─(RESULT)─→
 | `RESULT OK\|NG [value]` | 結果画面 (10 秒で自動クローズ) |
 | `ERROR <message>` | エラー画面 |
 | `RESET` | 待機画面へ |
-| `STATUS` | `STATUS LAN=0 RS232=1 BLE=0` 応答 |
+| `ROTATE <0\|90\|180\|270>` | 画面向き変更 (NVS 保存、再起動後も維持) |
+| `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 ROT=0` 応答 |
 
 | CoreS3 → ホスト | 説明 |
 |---|---|
@@ -75,8 +76,13 @@ main への push で GitHub Actions がファームウェアをビルドし、
 Chrome/Edge からブラウザだけで書き込める。
 
 - ワークフロー: [.github/workflows/build.yml](.github/workflows/build.yml)
+  (PR は `ippoan/ci-workflows` の reusable auto-merge で自動マージ。
+  キャッシュは main への push で warm され、PR ビルドが参照する)
 - 書き込みイメージ: `espflash save-image --merge` によるオフセット 0 の単一 bin
   ([partitions.csv](partitions.csv): factory 8MB / 16MB flash)
+- **画面向き設定**: インストールページ上の「画面向き設定」から Web Serial 経由で
+  `ROTATE` コマンドを送信して設定 (0/90/180/270°、NVS 保存)。設置向きに合わせて
+  書き込み直後にブラウザだけで完結する
 
 ## ビルド
 

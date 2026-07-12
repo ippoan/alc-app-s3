@@ -12,7 +12,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
   pages: write
   id-token: write
 
@@ -36,6 +37,12 @@ jobs:
       # ESP-IDF 本体 (git clone) + xtensa-esp32s3-elf-gcc/cmake/ninja 等のツール一式。
       # .cargo/config.toml の ESP_IDF_VERSION が変わらない限り毎回同じものなので
       # キャッシュが効く。
+      #
+      # キャッシュのスコープについて: PR ブランチから作られたキャッシュは他の
+      # ブランチから参照できないが、main で作られたキャッシュは全ブランチから
+      # 参照できる (GitHub Actions の branch スコープ規則)。auto-merge で main に
+      # push されるたびに本 job が走ってキャッシュが warm され続けるので、
+      # PR ビルドは常に main の warm キャッシュを引ける。
       - name: Cache ESP-IDF tools/checkout
         uses: actions/cache@v4
         with:
@@ -55,9 +62,12 @@ jobs:
       # esp-idf-sys の CMake ビルドディレクトリは ninja 等の絶対パスを記憶するため、
       # ESP_IDF_VERSION 変更時に古いキャッシュを prefix fallback で復元すると
       # CMake configure が壊れる (ble-medical-gateway で実測)。
+      # shared-key でブランチ間・job 名変更をまたいで同一キー空間にし、
+      # PR が main の warm キャッシュを確実に restore できるようにする
       - name: Cache cargo registry/target
         uses: Swatinem/rust-cache@v2
         with:
+          shared-key: build
           key: ${{ hashFiles('.cargo/config.toml') }}
           cache-on-failure: true
 
@@ -130,3 +140,16 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+  auto-merge:
+    name: Auto Merge
+    needs: [build]
+    if: github.event_name == 'pull_request'
+    uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
+    with:
+      # "deploy" job は push:main のみで走り、PR run (auto-merge) と同時に
+      # 走ることが無いため gate 対象から除外する (ble-medical-gateway と
+      # 同じ判断。走行中 deploy が merge で無音 cancel される事故
+      # ippoan/rust-alc-api#405 の対象パターンとは異なる)
+      deploy_gate_ignore: 'deploy'
+    secrets: inherit
