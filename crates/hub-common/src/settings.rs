@@ -18,6 +18,13 @@ const KEY_WIFI_PASS: &str = "wifi_pass";
 const KEY_MEAS_LOG: &str = "meas_log";
 /// 永続化する測定ログの最大行数 (NVS 文字列サイズを抑える)
 const MAX_LOG_LINES: usize = 20;
+// auth-worker device credential (ippoan/alc-app-s3#20)。
+// device_secret は秘密のため DeviceConfig (CFG GET) には決して含めない。
+const KEY_DEV_ID: &str = "dev_id";
+const KEY_DEV_SECRET: &str = "dev_secret";
+const KEY_DEV_TENANT: &str = "dev_tenant";
+/// auth-worker ベース URL の上書き (staging テスト用、`AUTH URL` コマンド)
+const KEY_AUTH_URL: &str = "auth_url";
 
 #[derive(Clone)]
 pub struct Settings {
@@ -43,7 +50,7 @@ impl Settings {
 
     pub fn set_rotation(&self, deg: u16) -> Result<()> {
         anyhow::ensure!(valid_rotation(deg), "不正な角度: {deg}");
-        let mut nvs = self.nvs.lock().expect("settings nvs lock");
+        let nvs = self.nvs.lock().expect("settings nvs lock");
         nvs.set_u16(KEY_ROTATION, deg)?;
         Ok(())
     }
@@ -70,7 +77,7 @@ impl Settings {
     pub fn set_wifi_credentials(&self, ssid: &str, password: &str) -> Result<()> {
         anyhow::ensure!(!ssid.is_empty() && ssid.len() <= 32, "SSID は 1〜32 バイト");
         anyhow::ensure!(password.len() <= 64, "パスワードは 64 バイト以下");
-        let mut nvs = self.nvs.lock().expect("settings nvs lock");
+        let nvs = self.nvs.lock().expect("settings nvs lock");
         nvs.set_str(KEY_WIFI_SSID, ssid)?;
         nvs.set_str(KEY_WIFI_PASS, password)?;
         Ok(())
@@ -95,11 +102,84 @@ impl Settings {
         lines.push(line.to_string());
         let start = lines.len().saturating_sub(MAX_LOG_LINES);
         let kept = lines[start..].join("\n");
-        if let Ok(mut nvs) = self.nvs.lock() {
+        if let Ok(nvs) = self.nvs.lock() {
             if let Err(e) = nvs.set_str(KEY_MEAS_LOG, &kept) {
                 log::warn!("settings: 測定ログ保存失敗: {e:?}");
             }
         }
+    }
+
+    /// auth-worker device credential (device_id, device_secret)。未登録は None。
+    /// secret はホストへ出力しないこと (CFG GET にも含めない)
+    pub fn device_credential(&self) -> Option<(String, String)> {
+        let nvs = self.nvs.lock().ok()?;
+        let mut id_buf = [0u8; 64];
+        let id = nvs.get_str(KEY_DEV_ID, &mut id_buf).ok()??.to_string();
+        if id.is_empty() {
+            return None;
+        }
+        let mut sec_buf = [0u8; 128];
+        let secret = nvs.get_str(KEY_DEV_SECRET, &mut sec_buf).ok()??.to_string();
+        if secret.is_empty() {
+            return None;
+        }
+        Some((id, secret))
+    }
+
+    /// credential に紐づく tenant_id (AUTH STATUS / WS 送信用)。未登録は None
+    pub fn device_tenant(&self) -> Option<String> {
+        let nvs = self.nvs.lock().ok()?;
+        let mut buf = [0u8; 64];
+        let t = nvs.get_str(KEY_DEV_TENANT, &mut buf).ok()??.to_string();
+        (!t.is_empty()).then_some(t)
+    }
+
+    /// ペアリング承認後に 1 回だけ受け取れる credential を保存する
+    pub fn set_device_credential(&self, id: &str, secret: &str, tenant: &str) -> Result<()> {
+        anyhow::ensure!(!id.is_empty() && id.len() < 64, "device_id が不正です");
+        anyhow::ensure!(
+            !secret.is_empty() && secret.len() < 128,
+            "device_secret が不正です"
+        );
+        anyhow::ensure!(tenant.len() < 64, "tenant_id が不正です");
+        let nvs = self.nvs.lock().expect("settings nvs lock");
+        nvs.set_str(KEY_DEV_ID, id)?;
+        nvs.set_str(KEY_DEV_SECRET, secret)?;
+        nvs.set_str(KEY_DEV_TENANT, tenant)?;
+        Ok(())
+    }
+
+    /// 保存済み credential を破棄する (`AUTH UNPAIR`)。サーバ側の revoke は
+    /// operator が auth-worker 側で行う
+    pub fn clear_device_credential(&self) -> Result<()> {
+        let nvs = self.nvs.lock().expect("settings nvs lock");
+        nvs.remove(KEY_DEV_ID)?;
+        nvs.remove(KEY_DEV_SECRET)?;
+        nvs.remove(KEY_DEV_TENANT)?;
+        Ok(())
+    }
+
+    /// auth-worker ベース URL (`AUTH URL` で上書き、既定は config 定数)
+    pub fn auth_url(&self) -> String {
+        let fallback = || crate::config::AUTH_WORKER_URL_DEFAULT.to_string();
+        let Ok(nvs) = self.nvs.lock() else {
+            return fallback();
+        };
+        let mut buf = [0u8; 128];
+        match nvs.get_str(KEY_AUTH_URL, &mut buf) {
+            Ok(Some(s)) if !s.is_empty() => s.to_string(),
+            _ => fallback(),
+        }
+    }
+
+    pub fn set_auth_url(&self, url: &str) -> Result<()> {
+        anyhow::ensure!(
+            (url.starts_with("https://") || url.starts_with("http://")) && url.len() < 128,
+            "URL が不正です"
+        );
+        let nvs = self.nvs.lock().expect("settings nvs lock");
+        nvs.set_str(KEY_AUTH_URL, url.trim_end_matches('/'))?;
+        Ok(())
     }
 
     /// 現在の設定を DeviceConfig にまとめる (CFG GET / エクスポート用)

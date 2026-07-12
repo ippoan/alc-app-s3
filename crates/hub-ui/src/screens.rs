@@ -262,6 +262,15 @@ pub fn draw_full(d: &mut Cs3Display, screen: &Screen, st: &HubStatus, now: u64, 
             pulse,
         } => draw_blood_pressure(d, *systolic, *diastolic, *pulse),
         Screen::Log => draw_log(d, st, now),
+        Screen::Pairing {
+            user_code,
+            url,
+            timeout_ms,
+        } => {
+            let remain_s = timeout_ms.saturating_sub(now.saturating_sub(entered)) / 1000;
+            draw_pairing(d, user_code, url, remain_s);
+        }
+        Screen::PairingResult { ok, message } => draw_pairing_result(d, *ok, message),
     }
     draw_status_bar(d, st, now);
 }
@@ -379,6 +388,95 @@ pub fn draw_qr_countdown(d: &mut Cs3Display, remain_s: u64) {
         Rgb565::BLACK,
         HorizontalAlignment::Right,
     );
+}
+
+/// auth-worker デバイス登録の承認待ち: 承認 URL の QR (左) + user_code (右)。
+/// 管理者はスマホで QR を読み、端末のコードと承認ページのコードを照合する。
+/// QR と同じく白背景 (クワイエットゾーン確保)
+fn draw_pairing(d: &mut Cs3Display, user_code: &str, url: &str, remain_s: u64) {
+    let (w, h) = dims(d);
+    clear(d);
+    fill(d, 0, BAR_H, w as u32, (h - BAR_H) as u32, Rgb565::WHITE);
+
+    // 左半分: 承認 URL の QR
+    let avail = (h - BAR_H - 34).min(w / 2 - 12);
+    match QrCode::encode_text(url, QrCodeEcc::Medium) {
+        Ok(qr) => {
+            let size = qr.size();
+            let scale = qr_scale(avail, size);
+            let px = size * scale;
+            let x0 = (w / 2 - px) / 2;
+            let y0 = BAR_H + (h - BAR_H - 34 - px) / 2;
+            for y in 0..size {
+                for x in 0..size {
+                    if qr.get_module(x, y) {
+                        fill(
+                            d,
+                            x0 + x * scale,
+                            y0 + y * scale,
+                            scale as u32,
+                            scale as u32,
+                            Rgb565::BLACK,
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            log::error!("登録 QR 生成失敗: {e:?}");
+            text(
+                d,
+                &JP16,
+                "QR 生成失敗",
+                w / 4,
+                110,
+                Rgb565::BLACK,
+                HorizontalAlignment::Center,
+            );
+        }
+    }
+
+    // 右半分: 確認コード (XXXX-XXXX を 2 行で大きく)
+    let cx = w * 3 / 4;
+    text(
+        d,
+        &JP16,
+        "確認コード",
+        cx,
+        BAR_H + 14,
+        Rgb565::BLACK,
+        HorizontalAlignment::Center,
+    );
+    let mut y = BAR_H + 44;
+    for part in user_code.split('-') {
+        text(d, &BIG42, part, cx, y, Rgb565::BLACK, HorizontalAlignment::Center);
+        y += 54;
+    }
+
+    text(
+        d,
+        &JP16,
+        "スマホで読み取り、コードを確認して承認",
+        w / 2,
+        h - 26,
+        Rgb565::BLACK,
+        HorizontalAlignment::Center,
+    );
+    draw_qr_countdown(d, remain_s);
+}
+
+/// auth-worker デバイス登録の結果
+fn draw_pairing_result(d: &mut Cs3Display, ok: bool, message: &str) {
+    let (_, h) = dims(d);
+    clear(d);
+    let (title, color) = if ok {
+        ("登録完了", C_OK)
+    } else {
+        ("登録失敗", C_NG)
+    };
+    jp2x_center(d, title, BAR_H + 16, color, C_BG);
+    jp2x_lines(d, message, 110, C_TEXT, C_BG, 9);
+    jp_center(d, "タップで待機画面へ", h - 24, C_MUTED);
 }
 
 // --- 点呼画面レイアウト (基準 320x240) ---
