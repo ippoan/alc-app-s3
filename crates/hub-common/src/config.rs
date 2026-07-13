@@ -13,6 +13,15 @@
 
 pub const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// ビルド時の git 短縮 SHA (build.rs が埋め込む。git 無しは "dev")。
+pub const FIRMWARE_SHA: &str = env!("FW_GIT_SHA");
+
+/// 完全なバージョン識別子 `<version>+<sha>`。CI が manifest.json に載せる形式
+/// (`<version>+<short-sha>`) と一致するので、OTA の更新要否判定に使える。
+pub fn firmware_version_full() -> String {
+    format!("{FIRMWARE_VERSION}+{FIRMWARE_SHA}")
+}
+
 /// FC-1200 側 RS232 ボーレート (M5Stack 公式 RS232.ino サンプル準拠, 8N1)
 pub const RS232_BAUD: u32 = 115_200;
 

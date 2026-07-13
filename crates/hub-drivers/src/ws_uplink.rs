@@ -359,6 +359,17 @@ fn handle_downlink(
                         );
                     }
                 },
+                // バージョン照会: 現在の firmware version + 実行スロットを返す
+                // (web の「更新必要か」判定用、config::firmware_version_full が
+                // manifest.json の version と同形)
+                Some("version") => {
+                    let payload = format!(
+                        r#"{{"version":"{}","slot":"{}"}}"#,
+                        alc_hub_common::config::firmware_version_full(),
+                        crate::ota::running_slot(),
+                    );
+                    send_command_result(conn, &id, &payload);
+                }
                 // 未知の action も従来どおり空 result で ack する
                 _ => send_command_result(conn, &id, "{}"),
             }
