@@ -757,6 +757,38 @@ fn draw_bar_clock(d: &mut Cs3Display, now: u64) {
     let _ = Text::new(&up, Point::new(w - 6 - up.len() as i32 * 6, 13), style).draw(d);
 }
 
+/// 開発用メモリ HUD (`--features mem-hud` 時のみ): 内部RAM/PSRAM の使用率を
+/// 時計の左に `R63% P2%` で表示する (Refs #27)。値は heap_mon (5s 間隔) が
+/// HubStatus に書いたもの。本番ビルド (feature 無効) には一切含まれない。
+/// 横 240px (縦持ち) ではドット列と重なり得るが、開発用途なので許容する。
+#[cfg(feature = "mem-hud")]
+fn draw_bar_mem(d: &mut Cs3Display, st: &HubStatus) {
+    fn used_pct(free: usize, total: usize) -> usize {
+        if total == 0 {
+            return 0;
+        }
+        total.saturating_sub(free) * 100 / total
+    }
+    if st.heap_total_int == 0 {
+        return; // heap_mon の初回計測前
+    }
+    let text = format!(
+        "R{}% P{}%",
+        used_pct(st.heap_free_int, st.heap_total_int),
+        used_pct(st.heap_free_psram, st.heap_total_psram),
+    );
+    let (w, _) = dims(d);
+    let style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(C_TEXT)
+        .background_color(C_BAR_BG)
+        .build();
+    // 時計 (uptime 8 桁 = 48px) の左に右詰め。桁数変化で古い描画が残らないよう
+    // 1 桁分の余白も背景色で上書きする
+    let x = w - 6 - 8 * 6 - 10 - text.len() as i32 * 6;
+    let _ = Text::new(&format!(" {text}"), Point::new(x - 6, 13), style).draw(d);
+}
+
 /// 全面描画 (画面遷移時のみ)
 pub fn draw_status_bar(d: &mut Cs3Display, st: &HubStatus, now: u64) {
     let (w, _) = dims(d);
@@ -767,10 +799,14 @@ pub fn draw_status_bar(d: &mut Cs3Display, st: &HubStatus, now: u64) {
     }
     draw_bar_dots(d, st, now);
     draw_bar_clock(d, now);
+    #[cfg(feature = "mem-hud")]
+    draw_bar_mem(d, st);
 }
 
 /// 毎秒の部分更新 (バー全面は塗らない — blink 防止)
 pub fn update_status_bar(d: &mut Cs3Display, st: &HubStatus, now: u64) {
     draw_bar_dots(d, st, now);
     draw_bar_clock(d, now);
+    #[cfg(feature = "mem-hud")]
+    draw_bar_mem(d, st);
 }

@@ -39,6 +39,10 @@ pub struct HeapStats {
     pub min_int: usize,
     /// PSRAM の現在空き (未搭載/無効なら 0)
     pub free_psram: usize,
+    /// 内部RAM のヒープ総量 (使用率計算用)
+    pub total_int: usize,
+    /// PSRAM のヒープ総量 (未搭載/無効なら 0)
+    pub total_psram: usize,
 }
 
 /// 現在のヒープ状態を読む (`HEAP` ホストコマンド・定期計測の共通部)。
@@ -48,6 +52,8 @@ pub fn stats() -> HeapStats {
             free_int: sys::heap_caps_get_free_size(sys::MALLOC_CAP_INTERNAL as _),
             min_int: sys::heap_caps_get_minimum_free_size(sys::MALLOC_CAP_INTERNAL as _),
             free_psram: sys::heap_caps_get_free_size(sys::MALLOC_CAP_SPIRAM as _),
+            total_int: sys::heap_caps_get_total_size(sys::MALLOC_CAP_INTERNAL as _),
+            total_psram: sys::heap_caps_get_total_size(sys::MALLOC_CAP_SPIRAM as _),
         }
     }
 }
@@ -118,6 +124,8 @@ fn monitor_loop(status: SharedStatus) -> ! {
             st.heap_free_int = s.free_int;
             st.heap_min_int = s.min_int;
             st.heap_free_psram = s.free_psram;
+            st.heap_total_int = s.total_int;
+            st.heap_total_psram = s.total_psram;
             // low-water 更新はイベントログにも残す (現地で経緯が追える)。
             // 初回は基準値の記録として必ず 1 行入る。NFC 追加前後の比較は
             // この min の推移で定量判断する (issue #27 受け入れ条件)。
