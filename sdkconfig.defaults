@@ -24,6 +24,8 @@ CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 # 4KB 未満の割当 (頻繁アクセスの小物・ドライバ周り) は内蔵 SRAM に残す
+# (2048 も実機で試したが削減効果は ±2KB で誤差 — 残る内部RAM 消費はタスク
+# スタック / BT controller / Wi-Fi ドライバ本体で、この閾値では動かない)
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 # DMA / 内蔵必須の割当が枯渇しないよう内蔵側に 64KB 予約
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
@@ -52,6 +54,13 @@ CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+# Wi-Fi/LWIP のバッファを可能な範囲で PSRAM に置く (内部RAM 使用率 77%→60% 台
+# を狙う削減の主レバー)
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# AMPDU 無効化: 集約バッファ ~20-30KB を返上。上りは測定データの小フレームのみ
+# なのでスループット低下は実害なし。BLE との 2.4GHz 共存スケジューリングも単純化
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
 
 # BLE central のみ (ble-medical-gateway firmware-rust の設定を踏襲)
 CONFIG_BT_ENABLED=y
