@@ -26,6 +26,7 @@
 //! | `WS URL <url>` | cf-alc-recorder WS URL を上書き (staging テスト用) |
 //! | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` を返す |
 //! | `HEAP` | `HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> TOTAL_INT=<n> TOTAL_PSRAM=<n>` を返す (Refs #27) |
+//! | `HEAP DUMP` | `HEAPDUMP ...` 複数行 (ヒープブロック概況 + タスク別スタック余裕) |
 //!
 //! # 送信イベント (CoreS3 → ホスト)
 //!
@@ -312,6 +313,8 @@ fn handle_line(
                 st.ws_last_seq,
             );
         }
+        // ヒープ詳細: ブロック概況 + タスク別スタック余裕 (heap.rs 参照)
+        HostCommand::HeapDump => crate::heap::dump(),
         // ヒープ状態の即時応答 (定期出力 EVT HEAP と同じ計測、heap.rs 参照)
         HostCommand::Heap => {
             let s = crate::heap::stats();
