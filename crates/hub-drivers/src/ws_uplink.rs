@@ -28,8 +28,8 @@
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
 use alc_hub_core::uplink::{
-    command_action, command_result_frame, measurement_frame, parse_downlink, Downlink,
-    UplinkQueue, PING_FRAME,
+    command_action, command_ota_url, command_result_frame, measurement_frame, parse_downlink,
+    Downlink, UplinkQueue, PING_FRAME,
 };
 use anyhow::Result;
 use esp_idf_svc::ws::client::{
@@ -69,6 +69,9 @@ enum WsEvent {
     Connected,
     Disconnected,
     Text(String),
+    /// 他スレッド (OTA 進捗など) から本ループ経由で送出したいフレーム。
+    /// WS client はスレッド安全でないため、送信は必ずこのループに集約する。
+    Outbound(String),
 }
 
 pub fn start(
@@ -156,8 +159,19 @@ fn run(
                     dirty = true;
                 }
                 WsEvent::Text(text) => {
-                    handle_downlink(&text, &mut queue, &settings, &mut conn, &ui_tx);
+                    handle_downlink(
+                        &text, &mut queue, &settings, &mut conn, &ui_tx, &status, &ev_tx,
+                    );
                     dirty = true;
+                }
+                WsEvent::Outbound(frame) => {
+                    // OTA 進捗などの外部フレーム。接続が生きていれば送るだけ
+                    // (失敗しても接続破棄はしない — 進捗は best-effort)
+                    if let Some(c) = conn.as_mut() {
+                        if let Err(e) = c.client.send(FrameType::Text(false), frame.as_bytes()) {
+                            log::warn!("ws_uplink: outbound 送信失敗: {e:?}");
+                        }
+                    }
                 }
             }
         }
@@ -298,6 +312,8 @@ fn handle_downlink(
     settings: &Settings,
     conn: &mut Option<Conn>,
     ui_tx: &Sender<UiCommand>,
+    status: &SharedStatus,
+    ev_tx: &mpsc::Sender<WsEvent>,
 ) {
     match parse_downlink(text) {
         Ok(Downlink::Ack { seq }) => {
@@ -311,23 +327,57 @@ fn handle_downlink(
         }
         Ok(Downlink::Command { id, payload }) => {
             println!("EVT WS_COMMAND {id} {payload}");
-            // 遠隔 MEASURE 指示は点呼画面を開く (それ以外の解釈はホスト側)
-            if command_action(&payload).as_deref() == Some("measure") {
-                let _ = ui_tx.send(UiCommand::Measure);
-            }
-            if let Some(c) = conn.as_mut() {
-                match command_result_frame(&id, "{}") {
-                    Ok(frame) => {
-                        if let Err(e) = c.client.send(FrameType::Text(false), frame.as_bytes()) {
-                            log::warn!("ws_uplink: command_result 送信失敗: {e:?}");
-                        }
-                    }
-                    Err(e) => log::error!("ws_uplink: command_result 組立失敗: {e}"),
+            // 遠隔 MEASURE 指示は点呼画面を開く。OTA 指示は firmware 更新を
+            // 開始する (web からの遠隔更新経路、ota.rs 参照)。それ以外の解釈は
+            // ホスト側
+            match command_action(&payload).as_deref() {
+                Some("measure") => {
+                    let _ = ui_tx.send(UiCommand::Measure);
+                    send_command_result(conn, &id, "{}");
                 }
+                Some("ota") => match command_ota_url(&payload) {
+                    Some(url) => {
+                        // OTA 進捗を command_result (同 id で上書き) として WS に
+                        // 送り返す → web は GET /commands/:id/result で追える。
+                        // 送信は本ループに集約するため ev_tx 経由 (WsEvent::Outbound)
+                        let ev = ev_tx.clone();
+                        let cid = id.clone();
+                        let sink: crate::ota::ProgressSink =
+                            Box::new(move |payload: String| {
+                                if let Ok(frame) = command_result_frame(&cid, &payload) {
+                                    let _ = ev.send(WsEvent::Outbound(frame));
+                                }
+                            });
+                        crate::ota::spawn_update(url, status.clone(), Some(sink));
+                    }
+                    None => {
+                        println!("EVT OTA NG 下り command に有効な url がありません");
+                        send_command_result(
+                            conn,
+                            &id,
+                            r#"{"phase":"error","message":"invalid url"}"#,
+                        );
+                    }
+                },
+                // 未知の action も従来どおり空 result で ack する
+                _ => send_command_result(conn, &id, "{}"),
             }
         }
         Ok(Downlink::Connected) | Ok(Downlink::Pong) => {}
         Err(e) => log::warn!("ws_uplink: 下りフレーム解析失敗: {e} ({text})"),
+    }
+}
+
+/// command への即時 command_result を送る (接続が生きていれば best-effort)。
+fn send_command_result(conn: &mut Option<Conn>, id: &str, payload: &str) {
+    let Some(c) = conn.as_mut() else { return };
+    match command_result_frame(id, payload) {
+        Ok(frame) => {
+            if let Err(e) = c.client.send(FrameType::Text(false), frame.as_bytes()) {
+                log::warn!("ws_uplink: command_result 送信失敗: {e:?}");
+            }
+        }
+        Err(e) => log::error!("ws_uplink: command_result 組立失敗: {e}"),
     }
 }
 

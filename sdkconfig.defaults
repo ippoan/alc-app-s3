@@ -12,6 +12,10 @@ CONFIG_FREERTOS_HZ=1000
 # HEAP DUMP (タスク別スタック余裕の列挙 = uxTaskGetSystemState) に必要 (Refs #27)
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 
+# OTA (ota.rs): 新 FW が起動完了 (mark_running_slot_valid) 前に死んだら
+# ブートローダが旧スロットへ自動で戻す
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
 # Wi-Fi (Improv で設定) と BLE の同時使用のため SW コエグジストを明示的に有効化
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 

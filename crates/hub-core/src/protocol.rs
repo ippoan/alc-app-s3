@@ -48,6 +48,9 @@ pub enum HostCommand {
     /// ヒープ詳細ダンプ: タスク別スタック余裕 + ヒープブロック概況
     /// (`HEAPDUMP ...` 複数行を応答)
     HeapDump,
+    /// OTA 更新: firmware (app 単体イメージ) の URL からダウンロードして
+    /// もう一方の OTA スロットへ書き込み、再起動する (`EVT OTA_* ...` を出力)
+    Ota { url: String },
 }
 
 /// 画面向きとして有効な角度か
@@ -108,6 +111,15 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
             None => HostCommand::Heap,
             Some("DUMP") => HostCommand::HeapDump,
             _ => return Err("ERR HEAP: 引数は DUMP のみ (無引数 = 概況)".into()),
+        },
+        // OTA 更新 (URL は大文字小文字を保持)
+        "OTA" => match it.next() {
+            Some(url) if url.starts_with("https://") || url.starts_with("http://") => {
+                HostCommand::Ota {
+                    url: url.to_string(),
+                }
+            }
+            _ => return Err("ERR OTA: http(s):// で始まる firmware URL が必要です".into()),
         },
         "CFG" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
             Some("GET") => HostCommand::CfgGet,
@@ -291,6 +303,29 @@ mod tests {
         assert_eq!(parse_line("HEAP DUMP", T), Ok(Some(HostCommand::HeapDump)));
         assert_eq!(parse_line("heap dump", T), Ok(Some(HostCommand::HeapDump)));
         assert!(parse_line("HEAP FULL", T).is_err());
+    }
+
+    #[test]
+    fn ota_url_preserves_case() {
+        assert_eq!(
+            parse_line("OTA https://Ippoan.github.io/alc-app-s3/firmware/app.bin", T),
+            Ok(Some(HostCommand::Ota {
+                url: "https://Ippoan.github.io/alc-app-s3/firmware/app.bin".into(),
+            }))
+        );
+        assert_eq!(
+            parse_line("ota http://192.168.11.2:8000/app.bin", T),
+            Ok(Some(HostCommand::Ota {
+                url: "http://192.168.11.2:8000/app.bin".into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn ota_errors() {
+        assert!(parse_line("OTA", T).is_err());
+        assert!(parse_line("OTA ftp://x/app.bin", T).is_err());
+        assert!(parse_line("OTA example.com/app.bin", T).is_err());
     }
 
     #[test]

@@ -315,6 +315,12 @@ fn handle_line(
         }
         // ヒープ詳細: ブロック概況 + タスク別スタック余裕 (heap.rs 参照)
         HostCommand::HeapDump => crate::heap::dump(),
+        // OTA 更新 (進捗・結果は EVT OTA_* で届く。シリアル経路は WS 進捗 sink
+        // 無し = None。ota.rs 参照)
+        HostCommand::Ota { url } => {
+            crate::ota::spawn_update(url, status.clone(), None);
+            println!("OK OTA");
+        }
         // ヒープ状態の即時応答 (定期出力 EVT HEAP と同じ計測、heap.rs 参照)
         HostCommand::Heap => {
             let s = crate::heap::stats();

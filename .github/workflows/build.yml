@@ -314,11 +314,20 @@ jobs:
             target/xtensa-esp32s3-espidf/release/alc-hub-cores3 \
             alc-hub-cores3-merged.bin
 
+      # OTA (`OTA <url>` / WS 下り {"action":"ota"}) 用の app 単体イメージ。
+      # merged と違い bootloader/partition table を含まない (ota.rs 参照)
+      - name: Save OTA app image
+        run: |
+          espflash save-image --chip esp32s3 \
+            target/xtensa-esp32s3-espidf/release/alc-hub-cores3 \
+            alc-hub-cores3-app.bin
+
       - name: Assemble Pages site
         run: |
           mkdir -p _site/firmware
           cp docs/index.html _site/
           cp alc-hub-cores3-merged.bin _site/firmware/
+          cp alc-hub-cores3-app.bin _site/firmware/
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.version }}+$SHORT_SHA\"/" \
             docs/manifest.json > _site/manifest.json

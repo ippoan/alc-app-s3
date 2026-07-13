@@ -125,6 +125,14 @@ pub fn command_action(payload: &str) -> Option<String> {
     Some(v.get("action")?.as_str()?.to_ascii_lowercase())
 }
 
+/// 下り command payload から OTA firmware URL を取り出す
+/// (`{"action":"ota","url":"https://..."}`)。http(s) 以外・欠落は None。
+pub fn command_ota_url(payload: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(payload).ok()?;
+    let url = v.get("url")?.as_str()?;
+    (url.starts_with("https://") || url.starts_with("http://")).then(|| url.to_string())
+}
+
 /// 送信キューの帳簿。実際の送受信・永続化は呼び出し側が行う。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UplinkQueue {
@@ -451,6 +459,22 @@ mod tests {
         assert_eq!(command_action(r#"{"action":1}"#), None);
         assert_eq!(command_action(r#"{}"#), None);
         assert_eq!(command_action("{oops"), None);
+    }
+
+    #[test]
+    fn command_ota_url_requires_http_scheme() {
+        assert_eq!(
+            command_ota_url(r#"{"action":"ota","url":"https://x/app.bin"}"#),
+            Some("https://x/app.bin".into())
+        );
+        assert_eq!(
+            command_ota_url(r#"{"action":"ota","url":"http://192.168.11.2:8000/a.bin"}"#),
+            Some("http://192.168.11.2:8000/a.bin".into())
+        );
+        assert_eq!(command_ota_url(r#"{"action":"ota","url":"ftp://x"}"#), None);
+        assert_eq!(command_ota_url(r#"{"action":"ota","url":1}"#), None);
+        assert_eq!(command_ota_url(r#"{"action":"ota"}"#), None);
+        assert_eq!(command_ota_url("{oops"), None);
     }
 
     #[test]

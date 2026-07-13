@@ -1,9 +1,15 @@
 # CoreS3 (16MB flash) 用パーティションテーブル。
-# ESP-IDF 既定レイアウト互換 (nvs/phy_init のオフセット維持) + factory を 8MB に拡大
-# (NimBLE + 画面処理 + std で既定 1MB では不足するため)。
+# ESP-IDF 既定レイアウト互換 (nvs/phy_init のオフセット維持 = 再パーティション
+# しても Wi-Fi 設定・device credential が消えない) + OTA 2 スロット構成。
 # espflash save-image --partition-table で merged イメージに焼き込まれ、
 # 実行時の ESP-IDF はフラッシュ上のこのテーブルを参照する。
-# Name,   Type, SubType, Offset,  Size,   Flags
-nvs,      data, nvs,     0x9000,  0x6000,
-phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 8M,
+# local/flash.ps1 も --partition-table でこのファイルを渡すこと (app は ota_0 =
+# 0x20000 に置かれるため、espflash 既定テーブルだとオフセットがずれる)。
+# app スロットは実測 ~1.9MB に対し各 6MB (将来の余裕 + 残り ~3.8MB は
+# 追加 data パーティション用に温存)。
+# Name,   Type, SubType, Offset,   Size,   Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+otadata,  data, ota,     0x10000,  0x2000,
+ota_0,    app,  ota_0,   0x20000,  6M,
+ota_1,    app,  ota_1,   0x620000, 6M,

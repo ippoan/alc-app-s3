@@ -136,6 +136,11 @@ fn main() -> Result<()> {
     // Wi-Fi 接続/Improv セッション中は BLE スキャンを一時停止する (RadioCoex)
     ble::start(Arc::clone(&status), meas_tx, tx, coex, pair_flag)?;
 
+    // 全サービスの起動に成功 = 正常起動として rollback を確定解除する
+    // (OTA 直後の初回起動でここまで来られなければ、ブートローダが次の
+    // リセットで旧スロットへ自動で戻す。ota.rs 参照)
+    alc_hub_drivers::ota::mark_boot_valid();
+
     // UI ループ (メインタスクを占有, 戻らない)
     ui::run(display, i2c, rx, status, rotation)
 }
