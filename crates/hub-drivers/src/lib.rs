@@ -5,6 +5,7 @@
 //! されている (依存を枝分かれさせて並列ビルドを可能にするため)。
 
 pub mod auth_link;
+pub mod heap;
 pub mod host_link;
 pub mod lan;
 pub mod ntp;
