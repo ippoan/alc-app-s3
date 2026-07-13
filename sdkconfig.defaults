@@ -13,11 +13,14 @@ CONFIG_FREERTOS_HZ=1000
 # Wi-Fi (Improv で設定) と BLE の同時使用のため SW コエグジストを明示的に有効化
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 
-# PSRAM (CoreS3 は 8MB Octal PSRAM 搭載、従来未使用)。Wi-Fi(WSS/TLS) + BLE + UI
+# PSRAM (CoreS3 は 8MB Quad PSRAM 搭載、従来未使用)。Wi-Fi(WSS/TLS) + BLE + UI
 # 同時稼働で定常空きヒープが ~41KB まで逼迫していたため、4KB 以上の malloc を
 # PSRAM に自動振り分けし、内蔵 SRAM を DMA/無線スタック用に温存する (Refs #28)
+# MODE は QUAD (実機 2026-07-13: OCT だと "octal_psram: PSRAM chip is not
+# connected, or wrong PSRAM line mode" で初期化失敗 → IGNORE_NOTFOUND により
+# 黙って PSRAM なし起動になっていた。EVT HEAP の free_psram=0 で発覚)
 CONFIG_SPIRAM=y
-CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 # 4KB 未満の割当 (頻繁アクセスの小物・ドライバ周り) は内蔵 SRAM に残す
