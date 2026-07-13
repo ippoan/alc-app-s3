@@ -25,6 +25,7 @@
 //! | `AUTH TOKEN` | device JWT 取得の自己診断 (`EVT AUTH_TOKEN ...`) |
 //! | `WS URL <url>` | cf-alc-recorder WS URL を上書き (staging テスト用) |
 //! | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` を返す |
+//! | `HEAP` | `HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n>` を返す (Refs #27) |
 //!
 //! # 送信イベント (CoreS3 → ホスト)
 //!
@@ -309,6 +310,14 @@ fn handle_line(
                 u8::from(st.ws_connected),
                 st.ws_queue_len,
                 st.ws_last_seq,
+            );
+        }
+        // ヒープ状態の即時応答 (定期出力 EVT HEAP と同じ計測、heap.rs 参照)
+        HostCommand::Heap => {
+            let s = crate::heap::stats();
+            println!(
+                "HEAP FREE_INT={} MIN_INT={} FREE_PSRAM={}",
+                s.free_int, s.min_int, s.free_psram,
             );
         }
     }

@@ -240,9 +240,14 @@ fn run(
 }
 
 /// TLS ハンドシェイクを始められるだけの空きヒープがあるか。
-/// 不足ログは 30 秒に 1 回に抑える (500ms ループから毎回出さない)
+/// 不足ログは 30 秒に 1 回に抑える (500ms ループから毎回出さない)。
+/// `esp_get_free_heap_size` は PSRAM 有効化 (#29) 後は PSRAM の空きが混ざり
+/// ガードが素通りするため、内部RAM 専用に測る (Refs #27)
 fn heap_headroom_ok(now: u64, last_log: &mut u64) -> bool {
-    let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+    let free = unsafe {
+        esp_idf_svc::sys::heap_caps_get_free_size(esp_idf_svc::sys::MALLOC_CAP_INTERNAL as _)
+            as u32
+    };
     if free < MIN_FREE_HEAP_FOR_TLS {
         if now.saturating_sub(*last_log) >= 30_000 {
             log::warn!("ws_uplink: 空きヒープ不足のため接続延期 ({free} bytes)");

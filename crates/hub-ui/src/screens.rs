@@ -672,16 +672,20 @@ fn draw_log(d: &mut Cs3Display, st: &HubStatus, now: u64) {
         config::FIRMWARE_VERSION,
     );
     text(d, &JP16, &summary, 6, BAR_H + 2, C_ACCENT, HorizontalAlignment::Left);
+    // 2 行目: IP + ヒープ low-water (min<n>K、Refs #27)。heap_min_int == 0 は
+    // 未計測 (heap_mon 初回前) なので出さない
+    let mut line2 = String::new();
     if st.wifi_connected {
-        text(
-            d,
-            &JP16,
-            &format!("IP {}", st.wifi_ip),
-            6,
-            BAR_H + 22,
-            C_MUTED,
-            HorizontalAlignment::Left,
-        );
+        line2.push_str(&format!("IP {}", st.wifi_ip));
+    }
+    if st.heap_min_int > 0 {
+        if !line2.is_empty() {
+            line2.push_str("  ");
+        }
+        line2.push_str(&format!("min{}K", st.heap_min_int / 1024));
+    }
+    if !line2.is_empty() {
+        text(d, &JP16, &line2, 6, BAR_H + 22, C_MUTED, HorizontalAlignment::Left);
     }
 
     let mut y = BAR_H + 44;

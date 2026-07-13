@@ -47,6 +47,13 @@ pub struct HubStatus {
     pub ws_queue_len: usize,
     /// WS 送信の最終採番 seq
     pub ws_last_seq: u64,
+
+    /// 内部RAM の現在空き [bytes] (heap.rs が定期更新。0 = 未計測)
+    pub heap_free_int: usize,
+    /// 内部RAM の起動以来の最低空き (low-water mark) [bytes] (Refs #27)
+    pub heap_min_int: usize,
+    /// PSRAM の現在空き [bytes] (未搭載/無効なら 0)
+    pub heap_free_psram: usize,
 }
 
 impl HubStatus {

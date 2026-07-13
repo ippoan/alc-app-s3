@@ -24,7 +24,7 @@ use alc_hub_common::{
     settings::Settings,
     status::{HubStatus, SharedStatus},
 };
-use alc_hub_drivers::{host_link, lan, ntp, recorder, rs232, ws_uplink};
+use alc_hub_drivers::{heap, host_link, lan, ntp, recorder, rs232, ws_uplink};
 use alc_hub_ui as ui;
 use alc_hub_wifi::{improv, wifi};
 use anyhow::Result;
@@ -65,6 +65,9 @@ fn main() -> Result<()> {
     )?;
 
     let status: SharedStatus = Arc::new(Mutex::new(HubStatus::default()));
+    // ヒープ監視 (OOM 捕捉 + low-water 継続計測、Refs #27)。Wi-Fi/BLE/TLS の
+    // 重いアロケーションより先に登録し、初期化中の OOM も捕まえる
+    heap::start(Arc::clone(&status))?;
     // 永続化された測定ログを起動時に読み戻し、「ログ確認」画面に前回までの
     // 記録を表示する (リブートで測定記録が消えないようにする)
     if let Ok(mut st) = status.lock() {
