@@ -58,6 +58,57 @@ pub fn stats() -> HeapStats {
     }
 }
 
+/// ヒープ詳細ダンプ (`HEAP DUMP` ホストコマンド、Refs #27)。
+///
+/// 内部RAM/PSRAM のブロック概況と、全タスクのスタック余裕 (high-water mark =
+/// 起動以来の最小残量) を `HEAPDUMP ` プレフィックスの行で出力する。
+/// 「内部RAM を誰が使っているか」「どのタスクのスタックを削れるか」の
+/// 定量判断に使う。`uxTaskGetSystemState` は CONFIG_FREERTOS_USE_TRACE_FACILITY
+/// が必要 (sdkconfig.defaults で有効化)。
+pub fn dump() {
+    // ── ヒープブロック概況 ──
+    for (label, caps) in [
+        ("INT", sys::MALLOC_CAP_INTERNAL),
+        ("PSRAM", sys::MALLOC_CAP_SPIRAM),
+    ] {
+        let mut info: sys::multi_heap_info_t = unsafe { core::mem::zeroed() };
+        unsafe { sys::heap_caps_get_info(&mut info, caps as _) };
+        println!(
+            "HEAPDUMP {label} free={} alloc={} largest_free={} min_free={} blocks={}",
+            info.total_free_bytes,
+            info.total_allocated_bytes,
+            info.largest_free_block,
+            info.minimum_free_bytes,
+            info.total_blocks,
+        );
+    }
+
+    // ── タスク別スタック余裕 ──
+    unsafe {
+        let n = sys::uxTaskGetNumberOfTasks() as usize;
+        // 呼び出しと列挙の間に生えるタスクに備えて少し多めに確保する
+        let mut tasks: Vec<sys::TaskStatus_t> = vec![core::mem::zeroed(); n + 4];
+        let filled =
+            sys::uxTaskGetSystemState(tasks.as_mut_ptr(), tasks.len() as _, core::ptr::null_mut());
+        for t in &tasks[..filled as usize] {
+            let name = core::ffi::CStr::from_ptr(t.pcTaskName as *const core::ffi::c_char)
+                .to_string_lossy();
+            // usStackHighWaterMark は残量の最小値。ESP-IDF はスタック長を byte で
+            // 扱うため byte 単位 (vanilla FreeRTOS の word 単位と違う)。
+            // Rust スレッドは FreeRTOS 名がすべて "pthread" になる点に注意
+            // (スタックサイズで判別: 20K=ws_uplink / 12K=host_link / 8K=既定)
+            println!(
+                "HEAPDUMP TASK {name} prio={} stack_min_free={}",
+                t.uxCurrentPriority, t.usStackHighWaterMark,
+            );
+            // USB Serial/JTAG の TX バッファ (1KB) を溢れさせない排出待ち
+            // (20 行前後を連続出力すると行落ちする — 実機で確認)
+            FreeRtos::delay_ms(5);
+        }
+        println!("HEAPDUMP END tasks={filled}");
+    }
+}
+
 /// malloc 失敗の瞬間に呼ばれる (ISR/任意タスク文脈)。ヒープを一切使わずに
 /// `esp_rom_printf` で 1 行残す — これで「誰が何 KB 要求して落ちたか」が確定する。
 unsafe extern "C" fn on_alloc_failed(

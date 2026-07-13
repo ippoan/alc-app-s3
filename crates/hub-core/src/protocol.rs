@@ -43,8 +43,11 @@ pub enum HostCommand {
     /// WS 送信の状態問い合わせ (`WS CONNECTED=1 QUEUE=3 SEQ=42` を応答)
     WsStatus,
     /// ヒープ状態の問い合わせ
-    /// (`HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n>` を応答、Refs #27)
+    /// (`HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> ...` を応答、Refs #27)
     Heap,
+    /// ヒープ詳細ダンプ: タスク別スタック余裕 + ヒープブロック概況
+    /// (`HEAPDUMP ...` 複数行を応答)
+    HeapDump,
 }
 
 /// 画面向きとして有効な角度か
@@ -101,7 +104,11 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
             _ => return Err("ERR ROTATE: 0|90|180|270 が必要です".into()),
         },
         "STATUS" => HostCommand::Status,
-        "HEAP" => HostCommand::Heap,
+        "HEAP" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+            None => HostCommand::Heap,
+            Some("DUMP") => HostCommand::HeapDump,
+            _ => return Err("ERR HEAP: 引数は DUMP のみ (無引数 = 概況)".into()),
+        },
         "CFG" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
             Some("GET") => HostCommand::CfgGet,
             Some("SET") => {
@@ -277,6 +284,13 @@ mod tests {
     fn heap() {
         assert_eq!(parse_line("HEAP", T), Ok(Some(HostCommand::Heap)));
         assert_eq!(parse_line("heap", T), Ok(Some(HostCommand::Heap)));
+    }
+
+    #[test]
+    fn heap_dump() {
+        assert_eq!(parse_line("HEAP DUMP", T), Ok(Some(HostCommand::HeapDump)));
+        assert_eq!(parse_line("heap dump", T), Ok(Some(HostCommand::HeapDump)));
+        assert!(parse_line("HEAP FULL", T).is_err());
     }
 
     #[test]
