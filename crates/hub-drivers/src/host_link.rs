@@ -25,7 +25,7 @@
 //! | `AUTH TOKEN` | device JWT 取得の自己診断 (`EVT AUTH_TOKEN ...`) |
 //! | `WS URL <url>` | cf-alc-recorder WS URL を上書き (staging テスト用) |
 //! | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` を返す |
-//! | `HEAP` | `HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n>` を返す (Refs #27) |
+//! | `HEAP` | `HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> TOTAL_INT=<n> TOTAL_PSRAM=<n>` を返す (Refs #27) |
 //!
 //! # 送信イベント (CoreS3 → ホスト)
 //!
@@ -316,8 +316,8 @@ fn handle_line(
         HostCommand::Heap => {
             let s = crate::heap::stats();
             println!(
-                "HEAP FREE_INT={} MIN_INT={} FREE_PSRAM={}",
-                s.free_int, s.min_int, s.free_psram,
+                "HEAP FREE_INT={} MIN_INT={} FREE_PSRAM={} TOTAL_INT={} TOTAL_PSRAM={}",
+                s.free_int, s.min_int, s.free_psram, s.total_int, s.total_psram,
             );
         }
     }

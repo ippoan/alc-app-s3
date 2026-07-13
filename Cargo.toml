@@ -21,6 +21,12 @@ description = "M5Stack CoreS3 統合ハブ ファームウェア (画面処理) 
 name = "alc-hub-cores3"
 harness = false
 
+[features]
+# 開発用メモリ HUD (ステータスバーに RAM/PSRAM 使用率、hub-ui に伝搬)。
+# 本番ビルドには入れない。有効化: cargo build --release --features mem-hud
+# (local/flash.ps1 が付与する)
+mem-hud = ["alc-hub-ui/mem-hud"]
+
 [profile.release]
 opt-level = "s"
 

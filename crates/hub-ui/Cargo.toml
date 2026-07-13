@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "alc-hub-cores3 の画面処理 (状態機械 + 描画)。画面遷移の変更はこのクレートだけの再コンパイルで済む"
 
+[features]
+# 開発用メモリ HUD: ステータスバーに 内部RAM/PSRAM の使用率 (%) を表示する。
+# 本番ファームには入れない (local/flash.ps1 が --features mem-hud で有効化)
+mem-hud = []
+
 [dependencies]
 alc-hub-core = { path = "../hub-core" }
 alc-hub-board = { path = "../hub-board" }

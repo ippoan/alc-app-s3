@@ -54,6 +54,10 @@ pub struct HubStatus {
     pub heap_min_int: usize,
     /// PSRAM の現在空き [bytes] (未搭載/無効なら 0)
     pub heap_free_psram: usize,
+    /// 内部RAM のヒープ総量 [bytes] (使用率計算用。0 = 未計測)
+    pub heap_total_int: usize,
+    /// PSRAM のヒープ総量 [bytes] (未搭載/無効なら 0)
+    pub heap_total_psram: usize,
 }
 
 impl HubStatus {
