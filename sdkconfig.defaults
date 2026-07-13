@@ -41,6 +41,11 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_DYNAMIC_FREE_PEER_CERT=y
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+# mbedTLS の割当を PSRAM に寄せる: WS 常時接続 (#31) で TLS セッション ~30-40KB
+# が内部RAM に常駐するようになったため。PSRAM (Quad 8MB、#31 で実機確認済み) へ
+# 移して内部RAM を Wi-Fi/BLE/DMA 用に温存する (実測: 常時接続時 free_int ~56KB
+# → この設定で TLS 常駐分が戻る想定。EVT HEAP / mem-hud で前後比較する)
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
 # Wi-Fi バッファ削減 (既定 static rx 10 / dynamic rx·tx 32)。スループットより
 # ヒープ優先 — 実測で定常空きヒープ 41KB しかなく TLS (WSS) が入らないため
