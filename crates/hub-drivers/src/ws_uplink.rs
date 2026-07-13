@@ -4,6 +4,10 @@
 //! 送信キューに積み、cf-alc-recorder `/ws` へ WSS で送る。フレームの
 //! 組立/解析・キュー帳簿は alc-hub-core::uplink (純粋・テスト済み)。
 //!
+//! 接続はキューが空でも張りっぱなし (常時接続、Refs #25) — WS を選んだ理由で
+//! ある下り push (timecard / 遠隔 MEASURE) をいつでも受けられるようにする。
+//! PSRAM 有効化により TLS が内蔵 SRAM を圧迫しなくなったため成立する。
+//!
 //! - 認証: auth_link::mint_token の device JWT を WSS ハンドシェイクの
 //!   Authorization ヘッダに載せる (未ペアリング時は送信しない)
 //! - 冪等: 再送は同じ seq のまま。サーバ側 UNIQUE (tenant, device, seq)
@@ -168,11 +172,13 @@ fn run(
             .unwrap_or((false, false));
 
         // --- 3. 接続管理 ---
+        // キューが空でも接続を張り、下り command (timecard / 遠隔 MEASURE) を
+        // 待ち受ける常時接続 (Refs #25。PSRAM 有効化で TLS ヒープの内蔵 SRAM
+        // 圧迫が解消したため、Wi-Fi でも常設できる)。
         // BLE 測定中は 2.4GHz を医療機器に譲る (新規接続もハンドシェイク分の
         // 電波を使うため控える)。切断は行わず既存接続は維持する。
         // 空きヒープが少ない間も延期する (TLS と BLE のヒープ食い合い対策)
         if conn.is_none()
-            && !queue.is_empty()
             && wifi_up
             && !ble_busy
             && now >= backoff_until
