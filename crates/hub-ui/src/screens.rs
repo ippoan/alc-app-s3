@@ -772,24 +772,42 @@ fn draw_bar_mem(d: &mut Cs3Display, st: &HubStatus) {
         }
         total.saturating_sub(free) * 100 / total
     }
+    /// 使用率の警告色: 80% 以上=赤 / 60% 以上=黄 / それ未満=通常
+    fn pct_color(pct: usize) -> Rgb565 {
+        if pct >= 80 {
+            Rgb565::CSS_RED
+        } else if pct >= 60 {
+            Rgb565::CSS_GOLD
+        } else {
+            C_TEXT
+        }
+    }
     if st.heap_total_int == 0 {
         return; // heap_mon の初回計測前
     }
-    let text = format!(
-        "R{}% P{}%",
-        used_pct(st.heap_free_int, st.heap_total_int),
-        used_pct(st.heap_free_psram, st.heap_total_psram),
-    );
+    let r = used_pct(st.heap_free_int, st.heap_total_int);
+    let p = used_pct(st.heap_free_psram, st.heap_total_psram);
+    let rt = format!("R{r}%");
+    let pt = format!("P{p}%");
     let (w, _) = dims(d);
-    let style = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
-        .text_color(C_TEXT)
-        .background_color(C_BAR_BG)
-        .build();
+    let style = |color: Rgb565| {
+        MonoTextStyleBuilder::new()
+            .font(&FONT_6X10)
+            .text_color(color)
+            .background_color(C_BAR_BG)
+            .build()
+    };
     // 時計 (uptime 8 桁 = 48px) の左に右詰め。桁数変化で古い描画が残らないよう
-    // 1 桁分の余白も背景色で上書きする
-    let x = w - 6 - 8 * 6 - 10 - text.len() as i32 * 6;
-    let _ = Text::new(&format!(" {text}"), Point::new(x - 6, 13), style).draw(d);
+    // 各セグメント先頭の空白 (背景色で上書き) を含めて描く
+    let total_w = (rt.len() + 1 + pt.len()) as i32 * 6;
+    let x = w - 6 - 8 * 6 - 10 - total_w;
+    let _ = Text::new(&format!(" {rt}"), Point::new(x - 6, 13), style(pct_color(r))).draw(d);
+    let _ = Text::new(
+        &format!(" {pt}"),
+        Point::new(x + rt.len() as i32 * 6, 13),
+        style(pct_color(p)),
+    )
+    .draw(d);
 }
 
 /// 全面描画 (画面遷移時のみ)
