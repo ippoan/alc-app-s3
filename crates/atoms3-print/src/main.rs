@@ -22,7 +22,7 @@ use alc_hub_common::{
     settings::Settings,
     status::{HubStatus, SharedStatus},
 };
-use alc_hub_drivers::{eth_w5500, heap, ota, ws_uplink};
+use alc_hub_drivers::{crashlog, eth_w5500, heap, ota, ws_uplink};
 use anyhow::Result;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::{
@@ -36,6 +36,10 @@ use std::sync::{mpsc, Arc, Mutex};
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    // 前回リセットの解析 + ログ捕捉 hook (CoreS3 と同じ crashlog 基盤 #43)。
+    // heap.rs の note() がリングに書くため、heap::start より前に必ず呼ぶこと
+    // (配線漏れで .noinit のゴミ帳簿に書いて boot loop になった実害 2026-07-14)
+    let crash = crashlog::init();
     log::info!(
         "alc-hub-atoms3-print v{} 起動",
         config::firmware_version_full()
@@ -60,9 +64,15 @@ fn main() -> Result<()> {
     // (drop すると ws_uplink スレッドが channel 切断で終了するため)。
     // 接続には AUTH SET 済み credential と LAN 接続が必要 (未登録の間は
     // 接続しないだけで無害)
-    let (_ws_meas_tx, ws_meas_rx) = mpsc::channel();
+    let (ws_meas_tx, ws_meas_rx) = mpsc::channel();
     let (ui_tx, _ui_rx) = mpsc::channel();
     ws_uplink::start(ws_meas_rx, ui_tx, Arc::clone(&status), settings.clone())?;
+
+    // 前回がクラッシュ由来なら panic 前ログを kind=crash_log で送信キューへ
+    // (CoreS3 と同じ。ws_meas_tx は main が保持し続けるので channel も閉じない)
+    if let Some(snap) = &crash {
+        crashlog::report(snap, &ws_meas_tx, &status);
+    }
 
     // W5500 (Atomic PoE Base): SCLK=G5 / MISO=G7 / MOSI=G8 / CS=G6。
     // DMA 必須 — 無効だと SPI 転送が 64 バイト上限になり、Ethernet フレーム
