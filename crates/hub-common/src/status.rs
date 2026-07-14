@@ -61,6 +61,17 @@ pub struct HubStatus {
     pub heap_total_int: usize,
     /// PSRAM のヒープ総量 [bytes] (未搭載/無効なら 0)
     pub heap_total_psram: usize,
+
+    /// AXP2101 を一度でも読めたか (バッテリー系表示のゲート。ui が更新、Refs #50)
+    pub power_read: bool,
+    /// バッテリー残量 [%] (AXP2101 フューエルゲージ 0xA4。255 = 未測定/電池なし)
+    pub battery_percent: u8,
+    /// バッテリー電圧 [mV] (AXP2101 ADC。0 = 未計測)
+    pub battery_mv: u16,
+    /// VBUS (外部給電) が来ているか
+    pub vbus_present: bool,
+    /// 充電状態: 0=待機/満充電 1=充電中 2=放電中 (AXP2101 0x01[6:5])
+    pub charge_state: u8,
 }
 
 impl HubStatus {

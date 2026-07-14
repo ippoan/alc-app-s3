@@ -85,6 +85,9 @@ pub(crate) enum Screen {
     Log,
 }
 
+/// バッテリー/電源状態 (AXP2101) の取得間隔。診断用なので粗くてよい (Refs #50)。
+const BATT_INTERVAL_MS: u64 = 10_000;
+
 pub fn run(
     mut display: Cs3Display,
     mut i2c: I2cDriver<'static>,
@@ -112,6 +115,7 @@ pub fn run(
     let mut dirty = true;
     let mut last_bar = 0u64;
     let mut last_spin = 0u64;
+    let mut last_batt = 0u64;
     let mut spin_phase = 0u8;
     let mut last_touch: Option<touch::TouchPoint> = None;
     // BLE で取得中の機器 (点呼画面のラベル横スピナー表示)。
@@ -125,6 +129,35 @@ pub fn run(
         // wedge して 10s feed が途切れると WDT が chip をリセットする。
         unsafe {
             sys::esp_task_wdt_reset();
+        }
+
+        // バッテリー/電源状態の定期取得 (AXP2101、~10s)。i2c はこのループが
+        // 所有しているためここで読む。EVT BATT を USB コンソールへ出し、Log
+        // 画面にも反映して「外部給電は来ているのに Core が落ちる (brownout)」
+        // 「充電できているか」を bench で確認できるようにする (Refs #50)。
+        if now.saturating_sub(last_batt) >= BATT_INTERVAL_MS {
+            match alc_hub_board::power::read_status(&mut i2c) {
+                Ok(ps) => {
+                    println!(
+                        "EVT BATT pct={} mv={} vbus={} chg={} raw={:02X},{:02X}",
+                        ps.battery_percent,
+                        ps.battery_mv,
+                        ps.vbus_present as u8,
+                        ps.charge_state,
+                        ps.status_raw.0,
+                        ps.status_raw.1,
+                    );
+                    if let Ok(mut st) = status.lock() {
+                        st.power_read = true;
+                        st.battery_percent = ps.battery_percent;
+                        st.battery_mv = ps.battery_mv;
+                        st.vbus_present = ps.vbus_present;
+                        st.charge_state = ps.charge_state;
+                    }
+                }
+                Err(e) => log::warn!("ui: バッテリー状態取得に失敗: {e:?}"),
+            }
+            last_batt = now;
         }
 
         // --- コマンド (ホスト / BLE) ---
