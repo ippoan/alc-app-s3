@@ -114,6 +114,9 @@ fn main() -> Result<()> {
         let Some(screen) = screen.as_mut() else {
             continue;
         };
+        // ペアリング有無は NVS 読み (500ms 毎で問題ない軽さ)。AUTH SET /
+        // UNPAIR がコンソールから随時来るため毎回読み直す
+        let paired = settings.device_credential().is_some();
         let view = status
             .lock()
             .map(|st| display::View {
@@ -125,6 +128,8 @@ fn main() -> Result<()> {
                 } else {
                     0
                 },
+                paired,
+                ws_up: st.ws_connected,
             })
             .unwrap_or_default();
         if let Err(e) = screen.draw(&view) {
