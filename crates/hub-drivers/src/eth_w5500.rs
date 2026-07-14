@@ -121,12 +121,14 @@ fn monitor_loop(
                 println!("EVT ETH_CONNECTED {ip}");
                 if let Ok(mut st) = status.lock() {
                     st.lan_link = true;
+                    st.lan_ip = ip.clone();
                     st.push_event(now_ms(), &format!("LAN 接続 {ip}"));
                 }
             } else {
                 println!("EVT ETH_DISCONNECTED");
                 if let Ok(mut st) = status.lock() {
                     st.lan_link = false;
+                    st.lan_ip.clear();
                     st.push_event(now_ms(), "LAN 切断");
                 }
             }

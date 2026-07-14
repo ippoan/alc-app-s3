@@ -329,5 +329,10 @@ fn handle_line(
                 s.free_int, s.min_int, s.free_psram, s.total_int, s.total_psram,
             );
         }
+        // 印刷系は AtomS3 印刷ブリッジ (atoms3-print) 専用 (#38)。CoreS3 は
+        // プリンター配線を持たないため未対応と明示する
+        HostCommand::Print { .. } | HostCommand::PrinterAddr { .. } | HostCommand::PrinterStatus => {
+            println!("ERR UNSUPPORTED (kiosk hub)");
+        }
     }
 }

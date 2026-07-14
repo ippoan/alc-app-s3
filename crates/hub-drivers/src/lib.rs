@@ -14,6 +14,7 @@ pub mod host_link;
 pub mod lan;
 pub mod ntp;
 pub mod ota;
+pub mod printer;
 pub mod recorder;
 pub mod rs232;
 pub mod ws_uplink;

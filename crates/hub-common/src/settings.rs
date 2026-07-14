@@ -32,6 +32,8 @@ const KEY_WS_QUEUE: &str = "ws_queue";
 const KEY_WS_SEQ: &str = "ws_seq";
 /// cf-alc-recorder WS URL の上書き (`WS URL` コマンド)
 const KEY_WS_URL: &str = "ws_url";
+/// プリンター宛先 host:port (印刷ブリッジ、`PRINTER ADDR` コマンド。#38)
+const KEY_PRINTER_ADDR: &str = "printer_addr";
 
 #[derive(Clone)]
 pub struct Settings {
@@ -241,6 +243,24 @@ impl Settings {
         );
         let nvs = self.nvs.lock().expect("settings nvs lock");
         nvs.set_str(KEY_WS_URL, url)?;
+        Ok(())
+    }
+
+    /// プリンター宛先 host:port (`PRINTER ADDR` で保存)。未設定は None
+    pub fn printer_addr(&self) -> Option<String> {
+        let nvs = self.nvs.lock().ok()?;
+        let mut buf = [0u8; 128];
+        let addr = nvs.get_str(KEY_PRINTER_ADDR, &mut buf).ok()??.to_string();
+        (!addr.is_empty()).then_some(addr)
+    }
+
+    pub fn set_printer_addr(&self, addr: &str) -> Result<()> {
+        anyhow::ensure!(
+            alc_hub_core::printer::valid_addr(addr) && addr.len() < 128,
+            "宛先が不正です (host:port)"
+        );
+        let nvs = self.nvs.lock().expect("settings nvs lock");
+        nvs.set_str(KEY_PRINTER_ADDR, addr)?;
         Ok(())
     }
 
