@@ -15,6 +15,10 @@ path = "crates/hub-core/src/coex.rs"
 type = "unit"
 
 [[file]]
+path = "crates/hub-core/src/crashlog.rs"
+type = "unit"
+
+[[file]]
 path = "crates/hub-core/src/device.rs"
 type = "unit"
 
