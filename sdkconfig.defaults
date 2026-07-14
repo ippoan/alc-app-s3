@@ -81,7 +81,16 @@ CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
 CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+# Task WDT: UI ループ (メインタスク) の wedge を検出して chip をリセットする
+# (hub-ui が起動時に自タスクを esp_task_wdt_add で登録し、ループ毎に feed)。
+# - PANIC=y にしないと timeout は警告のみでリセットされない (既定 n)。
+# - 既定の idle タスク監視は無効化: Wi-Fi/BLE が一時的に core を専有しても
+#   誤リセットせず、明示登録した UI タスクの wedge だけを見る。
+# リセット後は crashlog が reset_reason=task_wdt を crash_log で送信する。
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
 
 # ボンディング: 血圧計 (NBP-1BLE) は暗号化リンクを要求するため、Just Works で
 # ペアリングしボンド情報を NVS に永続化する (次回接続で再ペアリング不要)。
