@@ -8,7 +8,8 @@
     {
       "chipFamily": "ESP32-S3",
       "parts": [
-        { "path": "firmware/alc-hub-atoms3-print-merged.bin", "offset": 0 }
+        { "path": "firmware/alc-hub-atoms3-print-boot.bin", "offset": 0 },
+        { "path": "firmware/alc-hub-atoms3-print-main.bin", "offset": 65536 }
       ]
     }
   ]

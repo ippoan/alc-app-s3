@@ -8,7 +8,8 @@
     {
       "chipFamily": "ESP32-S3",
       "parts": [
-        { "path": "firmware/alc-hub-cores3-merged.bin", "offset": 0 }
+        { "path": "firmware/alc-hub-cores3-boot.bin", "offset": 0 },
+        { "path": "firmware/alc-hub-cores3-main.bin", "offset": 65536 }
       ]
     }
   ]
