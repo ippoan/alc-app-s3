@@ -1,8 +1,11 @@
 # CoreS3 (16MB flash) 用パーティションテーブル。
-# ESP-IDF 既定レイアウト互換 (nvs/phy_init のオフセット維持 = 再パーティション
-# しても Wi-Fi 設定・device credential が消えない) + OTA 2 スロット構成。
+# ESP-IDF 既定レイアウト互換 (nvs/phy_init のオフセット維持) + OTA 2 スロット構成。
 # espflash save-image --partition-table で merged イメージに焼き込まれ、
 # 実行時の ESP-IDF はフラッシュ上のこのテーブルを参照する。
+# NVS の温存について (Refs #48): Web インストーラーは merged を [0x0,0x9000) と
+# [0x10000,末尾) に分割して書くため nvs/phy_init は消えない (build.yml の Split
+# step。nvs=0x9000 / otadata=0x10000 を動かすときはそちらも要修正)。
+# merged.bin を offset 0 に一括書き込みする CLI 経路は従来どおり NVS が消える。
 # local/flash.ps1 も --partition-table でこのファイルを渡すこと (app は ota_0 =
 # 0x20000 に置かれるため、espflash 既定テーブルだとオフセットがずれる)。
 # app スロットは実測 ~1.9MB に対し各 6MB (将来の余裕 + 残り ~3.8MB は

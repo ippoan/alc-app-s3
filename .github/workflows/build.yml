@@ -338,6 +338,23 @@ jobs:
             target/xtensa-esp32s3-espidf/release/${{ matrix.bin }} \
             ${{ matrix.bin }}-merged.bin
 
+      # Web インストーラー用に merged を 2 分割し、NVS/phy_init 領域
+      # (0x9000–0xFFFF) を書き込み対象から外す (Refs #48)。merged を offset 0 に
+      # 一括書き込みすると間の 0xFF パディングが NVS を消し、再インストールの
+      # たびに device credential・プリンター宛先が飛ぶため。
+      # - boot 部 [0x0, 0x9000): bootloader + partition table (espflash が
+      #   flash-size ヘッダをパッチ済みのバイトをそのまま使う)
+      # - main 部 [0x10000, 末尾): otadata (blank 0xFF) + ota_0 app。otadata を
+      #   blank で書くことで、OTA 済み (ota_1 起動中) デバイスへの再インストール
+      #   でも必ず書き込んだ ota_0 から起動する
+      # 分割オフセットは両機種の partitions.csv で共通 (nvs=0x9000 /
+      # otadata=0x10000)。変更時はここも合わせること
+      - name: Split web-installer images (NVS 温存)
+        run: |
+          test "$(stat -c %s ${{ matrix.bin }}-merged.bin)" -gt $((0x10000))
+          head -c $((0x9000)) ${{ matrix.bin }}-merged.bin > ${{ matrix.bin }}-boot.bin
+          tail -c +$((0x10000 + 1)) ${{ matrix.bin }}-merged.bin > ${{ matrix.bin }}-main.bin
+
       # OTA (`OTA <url>` / WS 下り {"action":"ota"}) 用の app 単体イメージ。
       # merged と違い bootloader/partition table を含まない (ota.rs 参照)
       - name: Save OTA app image
@@ -371,6 +388,9 @@ jobs:
           espflash save-image --chip esp32s3 \
             target/xtensa-esp32s3-espidf/release/${{ matrix.bin }} \
             ${{ matrix.bin }}-dev-app.bin
+          # Web インストーラー用 2 分割 (通常ビルドの Split step と同じ、Refs #48)
+          head -c $((0x9000)) ${{ matrix.bin }}-dev-merged.bin > ${{ matrix.bin }}-dev-boot.bin
+          tail -c +$((0x10000 + 1)) ${{ matrix.bin }}-dev-merged.bin > ${{ matrix.bin }}-dev-main.bin
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
@@ -416,10 +436,19 @@ jobs:
           mkdir -p _site/firmware
           cp docs/index.html _site/
           cp docs/atoms3-print.html _site/
+          # boot/main = Web インストーラー用 (manifest の parts、NVS 温存 #48)。
+          # merged = espflash/esptool で offset 0 に一括書き込みする CLI 用
+          # (この経路は従来どおり NVS が消える)。app = OTA 用
+          cp alc-hub-cores3-boot.bin _site/firmware/
+          cp alc-hub-cores3-main.bin _site/firmware/
           cp alc-hub-cores3-merged.bin _site/firmware/
           cp alc-hub-cores3-app.bin _site/firmware/
+          cp alc-hub-cores3-dev-boot.bin _site/firmware/
+          cp alc-hub-cores3-dev-main.bin _site/firmware/
           cp alc-hub-cores3-dev-merged.bin _site/firmware/
           cp alc-hub-cores3-dev-app.bin _site/firmware/
+          cp alc-hub-atoms3-print-boot.bin _site/firmware/
+          cp alc-hub-atoms3-print-main.bin _site/firmware/
           cp alc-hub-atoms3-print-merged.bin _site/firmware/
           cp alc-hub-atoms3-print-app.bin _site/firmware/
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
@@ -428,7 +457,8 @@ jobs:
           # dev manifest: 同じ version で dev バイナリ (mem-hud) を指す (Refs #44)。
           # auth-worker /device/setup の最新版照会は機種単位なので version は prod と揃える
           sed -e "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.version }}+$SHORT_SHA\"/" \
-              -e "s#firmware/alc-hub-cores3-merged.bin#firmware/alc-hub-cores3-dev-merged.bin#" \
+              -e "s#firmware/alc-hub-cores3-boot.bin#firmware/alc-hub-cores3-dev-boot.bin#" \
+              -e "s#firmware/alc-hub-cores3-main.bin#firmware/alc-hub-cores3-dev-main.bin#" \
               -e "s/\"name\": \"alc-hub CoreS3\"/\"name\": \"alc-hub CoreS3 (dev mem-hud)\"/" \
             docs/manifest.json > _site/manifest-dev.json
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.atoms3_version }}+$SHORT_SHA\"/" \
