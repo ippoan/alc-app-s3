@@ -392,6 +392,26 @@ fn handle_downlink(
                     );
                     send_command_result(conn, &id, &payload);
                 }
+                // 電源/バッテリー照会: UI ループが AXP2101 から読んで HubStatus に
+                // キャッシュした値を返す (i2c は UI ループが所有するため、ここでは
+                // 共有状態を読むだけ)。/device/setup から brownout / 充電の
+                // 切り分けに使う (Refs #50, #52)
+                Some("battery") => {
+                    let payload = status
+                        .lock()
+                        .map(|st| {
+                            format!(
+                                r#"{{"read":{},"percent":{},"mv":{},"vbus":{},"charge":{}}}"#,
+                                st.power_read,
+                                st.battery_percent,
+                                st.battery_mv,
+                                st.vbus_present,
+                                st.charge_state,
+                            )
+                        })
+                        .unwrap_or_else(|_| r#"{"read":false}"#.to_string());
+                    send_command_result(conn, &id, &payload);
+                }
                 // 未知の action も従来どおり空 result で ack する
                 _ => send_command_result(conn, &id, "{}"),
             }

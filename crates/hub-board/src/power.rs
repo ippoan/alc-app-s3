@@ -31,6 +31,11 @@ pub fn init(i2c: &mut I2cDriver) -> Result<()> {
     // バックライト最大 (DLDO1 = 3.3V)。set_backlight() でも変更可
     write_reg(i2c, AXP2101_ADDR, 0x99, 28)?;
 
+    // バッテリー/電源 ADC を有効化 (0x30: bit0=Vbat, bit2=Vbus, bit3=Vsys)。
+    // 立てないと read_status() の電圧が 0 のままになる (残量% と充電/VBUS
+    // ステータスは ADC 不要)。Refs #50
+    write_reg(i2c, AXP2101_ADDR, 0x30, 0x0D)?;
+
     // --- AW9523: ポート初期値・方向 (P1_1 = LCD RST を H で解放) ---
     write_reg(i2c, AW9523_ADDR, 0x02, 0b0000_0101)?; // P0 出力値
     write_reg(i2c, AW9523_ADDR, 0x03, 0b0000_0011)?; // P1 出力値 (bit1: LCD RST = H)
@@ -55,4 +60,49 @@ pub fn set_backlight(i2c: &mut I2cDriver, percent: u8) -> Result<()> {
     // 20 (2.5V) 〜 28 (3.3V) にマップ
     let step = 20 + (percent * 8) / 100;
     write_reg(i2c, AXP2101_ADDR, 0x99, step as u8)
+}
+
+/// AXP2101 が測る電源/バッテリー状態のスナップショット。
+/// 「外部給電は来ているのに Core が起動しない (brownout)」「充電できているか」
+/// を実データで確認するための診断値 (Refs #50)。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PowerStatus {
+    /// バッテリー残量 [%] (フューエルゲージ 0xA4)。255 = 未測定/電池なし
+    pub battery_percent: u8,
+    /// バッテリー電圧 [mV] (0x34/0x35、ADC 有効時)。0 = 未計測
+    pub battery_mv: u16,
+    /// VBUS (外部給電) が有効か (0x00 bit5)
+    pub vbus_present: bool,
+    /// バッテリーが接続されているか (0x00 bit3)
+    pub battery_present: bool,
+    /// 充電状態 (0x01 bits[6:5]): 0=待機/満充電, 1=充電中, 2=放電中
+    pub charge_state: u8,
+    /// 生ステータス (0x00, 0x01) — 解釈の裏取り用
+    pub status_raw: (u8, u8),
+}
+
+fn read_reg(i2c: &mut I2cDriver, addr: u8, reg: u8) -> Result<u8> {
+    let mut buf = [0u8; 1];
+    i2c.write_read(addr, &[reg], &mut buf, BLOCK)
+        .with_context(|| format!("I2C read addr=0x{addr:02X} reg=0x{reg:02X}"))?;
+    Ok(buf[0])
+}
+
+/// AXP2101 の電源/バッテリー状態を読む。レジスタ定義は M5Unified /
+/// XPowersLib の AXP2101 に準拠 (電圧の目盛りは実機で要確認)。
+pub fn read_status(i2c: &mut I2cDriver) -> Result<PowerStatus> {
+    let s0 = read_reg(i2c, AXP2101_ADDR, 0x00)?; // PMU status1
+    let s1 = read_reg(i2c, AXP2101_ADDR, 0x01)?; // PMU status2
+    let percent = read_reg(i2c, AXP2101_ADDR, 0xA4)?; // フューエルゲージ %
+    // 電池電圧: 0x34[5:0]=上位 6bit, 0x35=下位 8bit の 14bit 値 (mV)
+    let vh = read_reg(i2c, AXP2101_ADDR, 0x34)?;
+    let vl = read_reg(i2c, AXP2101_ADDR, 0x35)?;
+    Ok(PowerStatus {
+        battery_percent: percent,
+        battery_mv: (((vh & 0x3F) as u16) << 8) | vl as u16,
+        vbus_present: (s0 & 0x20) != 0,
+        battery_present: (s0 & 0x08) != 0,
+        charge_state: (s1 >> 5) & 0x03,
+        status_raw: (s0, s1),
+    })
 }

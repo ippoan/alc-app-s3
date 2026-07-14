@@ -684,6 +684,19 @@ fn draw_log(d: &mut Cs3Display, st: &HubStatus, now: u64) {
         }
         line2.push_str(&format!("min{}K", st.heap_min_int / 1024));
     }
+    // バッテリー/電源 (AXP2101、Refs #50)。brownout/充電の切り分け用
+    if st.power_read {
+        if !line2.is_empty() {
+            line2.push_str("  ");
+        }
+        let chg = match st.charge_state {
+            1 => "充電",
+            2 => "放電",
+            _ => "待機",
+        };
+        let src = if st.vbus_present { "外部" } else { "電池" };
+        line2.push_str(&format!("bat{}% {} {}", st.battery_percent, chg, src));
+    }
     if !line2.is_empty() {
         text(d, &JP16, &line2, 6, BAR_H + 22, C_MUTED, HorizontalAlignment::Left);
     }
