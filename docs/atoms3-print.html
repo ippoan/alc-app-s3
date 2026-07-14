@@ -57,6 +57,15 @@
             <li>書き込み完了後、PoE Base に載せて LAN ケーブル (PoE) を接続</li>
             <li>画面に <code>ETH UP</code> と IP アドレスが出れば疎通完了</li>
         </ol>
+        <div class="warning">
+            <h3>書き込むと保存済み設定が消えます</h3>
+            <p>本ツールはフラッシュ全域のイメージを書き込むため、デバイス登録
+               (credential)・プリンター宛先などの NVS 設定が毎回消えます。
+               書き込み後は画面に <code>NO AUTH</code> が表示されるので、
+               <a href="https://auth.ippoan.org/device/setup" target="_blank">auth.ippoan.org/device/setup</a>
+               の「登録済みデバイス」一覧から <strong>再登録</strong> を実行し、
+               続けて <code>PRINTER ADDR</code> を再設定してください。</p>
+        </div>
     </div>
 
     <div class="requirements">

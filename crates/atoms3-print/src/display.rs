@@ -54,6 +54,10 @@ pub struct View {
     pub ip: String,
     /// 内部RAM の使用率 [%] (パーセント単位なので変化は緩やか = 再描画も稀)
     pub heap_used_pct: u8,
+    /// device credential が NVS にあるか (無ければ WS は接続を試みない)
+    pub paired: bool,
+    /// cf-alc-recorder への WS 接続中か
+    pub ws_up: bool,
 }
 
 pub struct Screen {
@@ -177,8 +181,22 @@ impl Screen {
             .draw(d)
             .map_err(|e| anyhow!("描画失敗: {e:?}"))?;
 
+        // 遠隔管理 (WS) の状態。未ペアリングはそもそも接続を試みないため
+        // WS DOWN と区別して NO AUTH を出す (再フラッシュで NVS が消えた
+        // ことに現地で気付けるように)
+        let (ws_label, ws_color) = if !view.paired {
+            ("NO AUTH", Rgb565::RED)
+        } else if view.ws_up {
+            ("WS UP", Rgb565::GREEN)
+        } else {
+            ("WS DOWN", Rgb565::YELLOW)
+        };
+        Text::new(&pad(ws_label), Point::new(4, 84), style(ws_color))
+            .draw(d)
+            .map_err(|e| anyhow!("描画失敗: {e:?}"))?;
+
         let heap = format!("MEM USED {}%", view.heap_used_pct);
-        Text::new(&pad(&heap), Point::new(4, 84), style(Rgb565::CSS_LIGHT_GRAY))
+        Text::new(&pad(&heap), Point::new(4, 104), style(Rgb565::CSS_LIGHT_GRAY))
             .draw(d)
             .map_err(|e| anyhow!("描画失敗: {e:?}"))?;
 
