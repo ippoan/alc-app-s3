@@ -50,10 +50,19 @@ pub fn ring_valid(cap: usize, pos: u32, len: u32) -> bool {
 }
 
 /// リングへ追記する。容量を超えた分は最古のバイトから上書きされる。
+///
+/// 帳簿 (pos/len) が壊れていても **panic せず** リセットして書き始める —
+/// `.noinit` は電源投入直後や init 前にゴミを含み得るため、この関数は
+/// どんな入力でも安全でなければならない (実害: atoms3-print が init 前の
+/// `note()` で index out of bounds → boot loop、2026-07-14)。
 pub fn ring_append(data: &mut [u8], pos: &mut u32, len: &mut u32, bytes: &[u8]) {
     let cap = data.len();
     if cap == 0 {
         return;
+    }
+    if !ring_valid(cap, *pos, *len) {
+        *pos = 0;
+        *len = 0;
     }
     for &b in bytes {
         data[*pos as usize] = b;
@@ -205,6 +214,16 @@ mod tests {
         // 追記を続けても常に直近 cap バイトが残る
         ring_append(&mut data, &mut pos, &mut len, b"XY");
         assert_eq!(ring_snapshot(&data, pos, len), b"6789abXY");
+    }
+
+    #[test]
+    fn ring_append_resets_corrupt_bookkeeping_instead_of_panicking() {
+        // 未初期化 .noinit のゴミ帳簿 (pos が範囲外) でも panic しない
+        let mut data = [0u8; 8];
+        let (mut pos, mut len) = (251_410_212u32, 99u32);
+        ring_append(&mut data, &mut pos, &mut len, b"ok");
+        assert_eq!((pos, len), (2, 2));
+        assert_eq!(ring_snapshot(&data, pos, len), b"ok");
     }
 
     #[test]

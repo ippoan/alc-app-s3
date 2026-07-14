@@ -85,6 +85,14 @@ fn ring_write(bytes: &[u8]) {
     let _g = RING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         let r = ring_ptr();
+        // 自己修復: init() 前 (または電源投入直後のゴミ) に呼ばれても安全に
+        // 書けるよう、magic/帳簿が不正ならここで初期化する。init() の配線漏れが
+        // boot loop に化けた実害 (atoms3-print 2026-07-14) の再発防止
+        if (*r).magic != MAGIC || !pure::ring_valid(RING_CAP, (*r).pos, (*r).len) {
+            (*r).magic = MAGIC;
+            (*r).pos = 0;
+            (*r).len = 0;
+        }
         let mut pos = (*r).pos;
         let mut len = (*r).len;
         pure::ring_append(&mut (*r).data, &mut pos, &mut len, bytes);
