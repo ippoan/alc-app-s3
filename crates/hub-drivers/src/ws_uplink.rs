@@ -28,8 +28,8 @@
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
 use alc_hub_core::uplink::{
-    command_action, command_ota_url, command_result_frame, measurement_frame, parse_downlink,
-    Downlink, UplinkQueue, PING_FRAME,
+    command_action, command_ota_url, command_print_url, command_result_frame, measurement_frame,
+    parse_downlink, Downlink, UplinkQueue, PING_FRAME,
 };
 use anyhow::Result;
 use esp_idf_svc::ws::client::{
@@ -180,20 +180,22 @@ fn run(
         }
 
         let now = now_ms();
-        let (wifi_up, ble_busy) = status
+        let (net_up, ble_busy) = status
             .lock()
-            .map(|s| (s.wifi_connected, s.ble_connected))
+            .map(|s| (s.wifi_connected || s.lan_link, s.ble_connected))
             .unwrap_or((false, false));
 
         // --- 3. 接続管理 ---
-        // キューが空でも接続を張り、下り command (timecard / 遠隔 MEASURE) を
-        // 待ち受ける常時接続 (Refs #25。PSRAM 有効化で TLS ヒープの内蔵 SRAM
-        // 圧迫が解消したため、Wi-Fi でも常設できる)。
+        // キューが空でも接続を張り、下り command (timecard / 遠隔 MEASURE /
+        // 印刷ブリッジの print・ota) を待ち受ける常時接続 (Refs #25。PSRAM
+        // 有効化で TLS ヒープの内蔵 SRAM 圧迫が解消したため、Wi-Fi でも
+        // 常設できる)。ネットワークは Wi-Fi (CoreS3) と LAN (AtomS3 印刷
+        // ブリッジ = W5500、lan_link) のどちらでもよい。
         // BLE 測定中は 2.4GHz を医療機器に譲る (新規接続もハンドシェイク分の
         // 電波を使うため控える)。切断は行わず既存接続は維持する。
         // 空きヒープが少ない間も延期する (TLS と BLE のヒープ食い合い対策)
         if conn.is_none()
-            && wifi_up
+            && net_up
             && !ble_busy
             && now >= backoff_until
             && heap_headroom_ok(now, &mut heap_log_at)
@@ -358,6 +360,26 @@ fn handle_downlink(
                             r#"{"phase":"error","message":"invalid url"}"#,
                         );
                     }
+                },
+                // 印刷指示 (印刷ブリッジ #38): PDF URL を取得しプリンターへ
+                // 9100 送信する。宛先未設定・URL 不正は command_result で返す
+                Some("print") => match command_print_url(&payload) {
+                    Some(url) => match settings.printer_addr() {
+                        Some(addr) => {
+                            crate::printer::spawn_print(url, addr, status.clone());
+                            send_command_result(conn, &id, r#"{"phase":"started"}"#);
+                        }
+                        None => send_command_result(
+                            conn,
+                            &id,
+                            r#"{"phase":"error","message":"printer addr not set"}"#,
+                        ),
+                    },
+                    None => send_command_result(
+                        conn,
+                        &id,
+                        r#"{"phase":"error","message":"invalid url"}"#,
+                    ),
                 },
                 // バージョン照会: 現在の firmware version + 実行スロットを返す
                 // (web の「更新必要か」判定用、config::firmware_version_full が

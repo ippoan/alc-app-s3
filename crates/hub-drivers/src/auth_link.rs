@@ -28,9 +28,9 @@ use alc_hub_common::status::SharedStatus;
 const MAX_BODY: usize = 8 * 1024;
 /// HTTP タイムアウト
 const HTTP_TIMEOUT_S: u64 = 15;
-/// AUTH TOKEN 自己診断で Wi-Fi 接続を待つ上限。ポート open のリセット後は
-/// Wi-Fi 再接続に ~30 秒かかるため長めに取る
-const WIFI_WAIT_MS: u64 = 45_000;
+/// AUTH TOKEN 自己診断でネットワーク接続を待つ上限。ポート open のリセット後は
+/// Wi-Fi 再接続に ~30 秒かかるため長めに取る (LAN は数秒で上がる)
+const NETWORK_WAIT_MS: u64 = 45_000;
 
 /// `AUTH TOKEN` 自己診断を一時スレッドで実行する。TLS ハンドシェイクの
 /// スタック (20KB) は診断中だけ確保し、終わったら返す (定常ヒープ節約 —
@@ -49,8 +49,8 @@ pub fn spawn_mint_test(settings: Settings, status: SharedStatus) {
                 println!("EVT AUTH_TOKEN NG 未登録 (AUTH SET で credential を注入してください)");
                 return;
             };
-            if !wait_for_wifi(&status, WIFI_WAIT_MS) {
-                println!("EVT AUTH_TOKEN NG Wi-Fi 未接続 (Improv で Wi-Fi 設定を確認してください)");
+            if !wait_for_network(&status, NETWORK_WAIT_MS) {
+                println!("EVT AUTH_TOKEN NG ネットワーク未接続 (Wi-Fi 設定または LAN ケーブルを確認してください)");
                 return;
             }
             match mint_token(&settings.auth_url(), &id, &secret) {
@@ -63,11 +63,17 @@ pub fn spawn_mint_test(settings: Settings, status: SharedStatus) {
     }
 }
 
-/// Wi-Fi が接続されるまで最大 `timeout_ms` 待つ。接続できたら true。
-fn wait_for_wifi(status: &SharedStatus, timeout_ms: u64) -> bool {
+/// ネットワーク (Wi-Fi または LAN) が接続されるまで最大 `timeout_ms` 待つ。
+/// 印刷ブリッジ (AtomS3 + PoE) は LAN 専用で wifi_connected が常に false のため
+/// lan_link も見る。接続できたら true。
+fn wait_for_network(status: &SharedStatus, timeout_ms: u64) -> bool {
     let mut waited = 0u64;
     loop {
-        if status.lock().map(|s| s.wifi_connected).unwrap_or(false) {
+        if status
+            .lock()
+            .map(|s| s.wifi_connected || s.lan_link)
+            .unwrap_or(false)
+        {
             return true;
         }
         if waited >= timeout_ms {

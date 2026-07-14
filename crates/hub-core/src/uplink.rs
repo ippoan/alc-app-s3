@@ -133,6 +133,15 @@ pub fn command_ota_url(payload: &str) -> Option<String> {
     (url.starts_with("https://") || url.starts_with("http://")).then(|| url.to_string())
 }
 
+/// 下り command payload から印刷対象 PDF の URL を取り出す
+/// (`{"action":"print","url":"https://..."}`、印刷ブリッジ #38)。
+/// http(s) 以外・欠落は None。
+pub fn command_print_url(payload: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(payload).ok()?;
+    let url = v.get("url")?.as_str()?;
+    (url.starts_with("https://") || url.starts_with("http://")).then(|| url.to_string())
+}
+
 /// 送信キューの帳簿。実際の送受信・永続化は呼び出し側が行う。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UplinkQueue {
@@ -459,6 +468,22 @@ mod tests {
         assert_eq!(command_action(r#"{"action":1}"#), None);
         assert_eq!(command_action(r#"{}"#), None);
         assert_eq!(command_action("{oops"), None);
+    }
+
+    #[test]
+    fn command_print_url_requires_http_scheme() {
+        assert_eq!(
+            command_print_url(r#"{"action":"print","url":"https://auth.ippoan.org/print/test.pdf"}"#),
+            Some("https://auth.ippoan.org/print/test.pdf".into())
+        );
+        assert_eq!(
+            command_print_url(r#"{"action":"print","url":"http://192.168.11.2:8000/t.pdf"}"#),
+            Some("http://192.168.11.2:8000/t.pdf".into())
+        );
+        assert_eq!(command_print_url(r#"{"action":"print","url":"ftp://x"}"#), None);
+        assert_eq!(command_print_url(r#"{"action":"print","url":1}"#), None);
+        assert_eq!(command_print_url(r#"{"action":"print"}"#), None);
+        assert_eq!(command_print_url("{oops"), None);
     }
 
     #[test]
