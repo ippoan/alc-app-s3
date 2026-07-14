@@ -24,7 +24,7 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::{
     delay::FreeRtos,
     peripherals::Peripherals,
-    spi::{config::DriverConfig as SpiDriverConfig, SpiDriver},
+    spi::{config::DriverConfig as SpiDriverConfig, Dma, SpiDriver},
 };
 use std::sync::{Arc, Mutex};
 
@@ -43,13 +43,15 @@ fn main() -> Result<()> {
     // ヒープ監視 (OOM 捕捉 + low-water 計測) は重いアロケーションより先に登録
     heap::start(Arc::clone(&status))?;
 
-    // W5500 (Atomic PoE Base): SCLK=G5 / MISO=G7 / MOSI=G8 / CS=G6
+    // W5500 (Atomic PoE Base): SCLK=G5 / MISO=G7 / MOSI=G8 / CS=G6。
+    // DMA 必須 — 無効だと SPI 転送が 64 バイト上限になり、Ethernet フレーム
+    // (最大 ~1.5KB) の read/write が "spi transmit failed" で全滅する (実機で確認)
     let spi = SpiDriver::new(
         p.spi2,
         p.pins.gpio5,
         p.pins.gpio8,
         Some(p.pins.gpio7),
-        &SpiDriverConfig::new(),
+        &SpiDriverConfig::new().dma(Dma::Auto(4096)),
     )?;
     eth_w5500::start(spi, p.pins.gpio6.into(), sysloop, Arc::clone(&status))?;
 
