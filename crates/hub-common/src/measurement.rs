@@ -9,7 +9,8 @@
 /// recorder スレッドがホスト向け JSON と同じ payload を積む
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UplinkRecord {
-    /// cf-alc-recorder の kind (temperature / blood_pressure / alcohol / fc1200_raw)
+    /// cf-alc-recorder の kind (temperature / blood_pressure / alcohol /
+    /// fc1200_raw / crash_log)
     pub kind: &'static str,
     /// ble-medical-gateway 互換 JSON オブジェクト文字列
     pub payload: String,

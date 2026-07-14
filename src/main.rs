@@ -24,7 +24,7 @@ use alc_hub_common::{
     settings::Settings,
     status::{HubStatus, SharedStatus},
 };
-use alc_hub_drivers::{heap, host_link, lan, ntp, recorder, rs232, ws_uplink};
+use alc_hub_drivers::{crashlog, heap, host_link, lan, ntp, recorder, rs232, ws_uplink};
 use alc_hub_ui as ui;
 use alc_hub_wifi::{improv, wifi};
 use anyhow::Result;
@@ -39,6 +39,10 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    // 前回リセットの解析 (クラッシュ由来なら panic 前ログの snapshot を得る) と
+    // ログ捕捉 hook (vprintf tee + Rust panic hook) の設置。他モジュールの
+    // 初期化より先に呼び、起動中のログ・クラッシュも捕まえる (Refs #43)
+    let crash = crashlog::init();
     log::info!("alc-hub-cores3 v{} 起動", config::FIRMWARE_VERSION);
 
     let p = Peripherals::take()?;
@@ -103,6 +107,12 @@ fn main() -> Result<()> {
     // NVS 永続キュー経由で送る (未ペアリング・圏外でも測定は失わない)
     let (ws_tx, ws_rx) = mpsc::channel();
     ws_uplink::start(ws_rx, tx.clone(), Arc::clone(&status), settings.clone())?;
+
+    // 前回がクラッシュ由来のリセットだったら、panic 前ログ + reset reason を
+    // kind="crash_log" として送信キューへ積む (NVS 永続なので圏外でも失わない)
+    if let Some(snap) = &crash {
+        crashlog::report(snap, &ws_tx, &status);
+    }
 
     // 測定値レコーダ (BLE コールバックを軽量に保つための専用スレッド):
     // JSON 出力 + NVS 記録 + 画面通知 + WS fan-out を担う

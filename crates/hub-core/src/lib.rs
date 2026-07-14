@@ -8,6 +8,7 @@
 pub mod cfg;
 pub mod clock;
 pub mod coex;
+pub mod crashlog;
 pub mod device;
 pub mod ieee11073;
 pub mod improv;

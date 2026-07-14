@@ -346,13 +346,38 @@ jobs:
             target/xtensa-esp32s3-espidf/release/${{ matrix.bin }} \
             ${{ matrix.bin }}-app.bin
 
+      # 開発機向け dev バリアント (mem-hud = ステータスバーに RAM/PSRAM 使用率)。
+      # auth-worker /device/setup の「dev ビルドを配信」選択がこの app イメージを
+      # OTA URL に使う (Refs #44)。通常ビルドの後に同じ leg で回すことで
+      # sccache/rust-cache を共有する (差分は mem-hud が伝搬する hub-ui + bin のみ)。
+      # 通常イメージの save より後に置くこと — cargo build が同じ出力パスを上書きする
+      - name: Build dev variant (mem-hud, cores3 のみ)
+        if: matrix.name == 'cores3'
+        env:
+          SCCACHE_GHA_ENABLED: 'true'
+          RUSTC_WRAPPER: sccache
+        run: |
+          cargo build --release --locked -p ${{ matrix.bin }} --features mem-hud
+          sccache --show-stats
+
+      - name: Save dev images (mem-hud, cores3 のみ)
+        if: matrix.name == 'cores3'
+        run: |
+          espflash save-image --chip esp32s3 --merge \
+            --flash-size ${{ matrix.flash_size }} \
+            --partition-table ${{ matrix.partition_table }} \
+            target/xtensa-esp32s3-espidf/release/${{ matrix.bin }} \
+            ${{ matrix.bin }}-dev-merged.bin
+          espflash save-image --chip esp32s3 \
+            target/xtensa-esp32s3-espidf/release/${{ matrix.bin }} \
+            ${{ matrix.bin }}-dev-app.bin
+
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
           name: firmware-${{ matrix.name }}
-          path: |
-            ${{ matrix.bin }}-merged.bin
-            ${{ matrix.bin }}-app.bin
+          # cores3 leg は dev バリアント (-dev-merged/-dev-app) も含む
+          path: ${{ matrix.bin }}-*.bin
           if-no-files-found: error
 
   # ------------------------------------------------------------------
@@ -393,14 +418,22 @@ jobs:
           cp docs/atoms3-print.html _site/
           cp alc-hub-cores3-merged.bin _site/firmware/
           cp alc-hub-cores3-app.bin _site/firmware/
+          cp alc-hub-cores3-dev-merged.bin _site/firmware/
+          cp alc-hub-cores3-dev-app.bin _site/firmware/
           cp alc-hub-atoms3-print-merged.bin _site/firmware/
           cp alc-hub-atoms3-print-app.bin _site/firmware/
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.version }}+$SHORT_SHA\"/" \
             docs/manifest.json > _site/manifest.json
+          # dev manifest: 同じ version で dev バイナリ (mem-hud) を指す (Refs #44)。
+          # auth-worker /device/setup の最新版照会は機種単位なので version は prod と揃える
+          sed -e "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.version }}+$SHORT_SHA\"/" \
+              -e "s#firmware/alc-hub-cores3-merged.bin#firmware/alc-hub-cores3-dev-merged.bin#" \
+              -e "s/\"name\": \"alc-hub CoreS3\"/\"name\": \"alc-hub CoreS3 (dev mem-hud)\"/" \
+            docs/manifest.json > _site/manifest-dev.json
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.atoms3_version }}+$SHORT_SHA\"/" \
             docs/manifest-atoms3-print.json > _site/manifest-atoms3-print.json
-          cat _site/manifest.json _site/manifest-atoms3-print.json
+          cat _site/manifest.json _site/manifest-dev.json _site/manifest-atoms3-print.json
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

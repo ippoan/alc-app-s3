@@ -166,11 +166,15 @@ fn monitor_loop(status: SharedStatus) -> ! {
     let mut last_min = usize::MAX;
     loop {
         let s = stats();
-        // ホスト/observability 向け (EVT プレフィックスで行解釈される)
-        println!(
+        // ホスト/observability 向け (EVT プレフィックスで行解釈される)。
+        // println! は crashlog の vprintf hook を通らないため、クラッシュ前の
+        // ヒープ推移が crash_log に残るようリングにも明示追記する
+        let line = format!(
             "EVT HEAP free_int={} min_int={} free_psram={}",
             s.free_int, s.min_int, s.free_psram
         );
+        println!("{line}");
+        crate::crashlog::note(&line);
         if let Ok(mut st) = status.lock() {
             st.heap_free_int = s.free_int;
             st.heap_min_int = s.min_int;
