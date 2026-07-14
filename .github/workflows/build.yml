@@ -357,8 +357,10 @@ jobs:
 
   # ------------------------------------------------------------------
   # assemble-pages: 各 build leg の成果物を集めて Pages サイトを組む。
-  # 現状の公開内容は CoreS3 のみ (従来と同一)。atoms3-print の
-  # インストーラーページ/manifest は後続 PR で追加する (issue #38)
+  # CoreS3 (index.html + manifest.json) と AtomS3 印刷ブリッジ
+  # (atoms3-print.html + manifest-atoms3-print.json) の 2 機種分。
+  # manifest の version は auth-worker /device/setup の「最新版」照会
+  # (機種別) が突き合わせるため、それぞれの crate version + SHA を刻む
   # ------------------------------------------------------------------
   assemble-pages:
     name: Assemble Pages site
@@ -375,27 +377,30 @@ jobs:
           pattern: firmware-*
           merge-multiple: true
 
-      - name: Extract version from Cargo.toml
+      - name: Extract versions from Cargo.toml
         id: version
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version *= *"\(.*\)"/\1/')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Version: $VERSION"
+          ATOMS3_VERSION=$(grep '^version' crates/atoms3-print/Cargo.toml | head -1 | sed 's/version *= *"\(.*\)"/\1/')
+          echo "atoms3_version=$ATOMS3_VERSION" >> "$GITHUB_OUTPUT"
+          echo "cores3: $VERSION / atoms3-print: $ATOMS3_VERSION"
 
       - name: Assemble Pages site
         run: |
           mkdir -p _site/firmware
           cp docs/index.html _site/
+          cp docs/atoms3-print.html _site/
           cp alc-hub-cores3-merged.bin _site/firmware/
           cp alc-hub-cores3-app.bin _site/firmware/
-          # atoms3-print はオンラインアップデート (OTA <url>) 用に bin だけ公開。
-          # ESP Web Tools のインストーラーページ/manifest は後続 PR (issue #38)
           cp alc-hub-atoms3-print-merged.bin _site/firmware/
           cp alc-hub-atoms3-print-app.bin _site/firmware/
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.version }}+$SHORT_SHA\"/" \
             docs/manifest.json > _site/manifest.json
-          cat _site/manifest.json
+          sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.atoms3_version }}+$SHORT_SHA\"/" \
+            docs/manifest-atoms3-print.json > _site/manifest-atoms3-print.json
+          cat _site/manifest.json _site/manifest-atoms3-print.json
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

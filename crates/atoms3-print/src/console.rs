@@ -16,6 +16,8 @@
 //! | `PRINT <url>` | PDF を取得しプリンターへ 9100 送信 (`EVT PRINT_*`) |
 //! | `PRINTER ADDR <host:port>` | プリンター宛先の保存 (NVS) |
 //! | `PRINTER STATUS` | `PRINTER <addr>` / `PRINTER UNSET` 応答 |
+//! | `AUTH SET/UNPAIR/STATUS/TOKEN/URL` | device credential 管理 (CoreS3 と同形式。/device/setup ページからの provisioning 用) |
+//! | `WS URL <url>` / `WS STATUS` | cf-alc-recorder 常時接続の URL 上書き / 状態 |
 
 use std::io::Read;
 
@@ -25,7 +27,7 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::sys;
 
 use alc_hub_common::{config, settings::Settings, status::SharedStatus};
-use alc_hub_drivers::{heap, ota, printer};
+use alc_hub_drivers::{auth_link, heap, ota, printer};
 
 /// 行としてバッファする最大長 (超えたら読み捨て — バイナリノイズ対策)
 const MAX_LINE: usize = 512;
@@ -141,6 +143,62 @@ fn handle_line(line: &str, status: &SharedStatus, settings: &Settings) {
             Some(addr) => println!("PRINTER {addr}"),
             None => println!("PRINTER UNSET"),
         },
+        // device credential 管理 (host_link.rs と同じ応答形式 —
+        // /device/setup ページの provisioning フローがそのまま使えるように)
+        HostCommand::AuthSet {
+            device_id,
+            device_secret,
+            tenant_id,
+        } => match settings.set_device_credential(&device_id, &device_secret, &tenant_id) {
+            Ok(()) => println!("OK AUTH SET"),
+            Err(e) => {
+                log::error!("console: credential 保存失敗: {e:?}");
+                println!("ERR AUTH: credential の保存に失敗しました");
+            }
+        },
+        HostCommand::AuthUnpair => match settings.clear_device_credential() {
+            Ok(()) => println!("OK AUTH UNPAIR"),
+            Err(e) => {
+                log::error!("console: credential 破棄失敗: {e:?}");
+                println!("ERR AUTH: 破棄に失敗しました");
+            }
+        },
+        HostCommand::AuthStatus => match settings.device_credential() {
+            Some((id, _)) => println!(
+                "AUTH PAIRED {} {}",
+                settings.device_tenant().unwrap_or_default(),
+                id,
+            ),
+            None => println!("AUTH UNPAIRED"),
+        },
+        HostCommand::AuthToken => {
+            auth_link::spawn_mint_test(settings.clone(), status.clone());
+            println!("OK AUTH TOKEN");
+        }
+        HostCommand::AuthUrl { url } => match settings.set_auth_url(&url) {
+            Ok(()) => println!("OK AUTH URL"),
+            Err(e) => {
+                log::error!("console: auth URL 保存失敗: {e:?}");
+                println!("ERR AUTH: URL の保存に失敗しました");
+            }
+        },
+        // cf-alc-recorder 常時接続 (ws_uplink.rs — 下り print/ota command 待受)
+        HostCommand::WsUrl { url } => match settings.set_ws_url(&url) {
+            Ok(()) => println!("OK WS URL"),
+            Err(e) => {
+                log::error!("console: WS URL 保存失敗: {e:?}");
+                println!("ERR WS: URL の保存に失敗しました");
+            }
+        },
+        HostCommand::WsStatus => {
+            let st = status.lock().map(|s| s.clone()).unwrap_or_default();
+            println!(
+                "WS CONNECTED={} QUEUE={} SEQ={}",
+                u8::from(st.ws_connected),
+                st.ws_queue_len,
+                st.ws_last_seq,
+            );
+        }
         // 本機で意味を持たないコマンド (画面遷移 / BLE / Wi-Fi / CFG 等)
         other => {
             log::debug!("console: unsupported command: {other:?}");

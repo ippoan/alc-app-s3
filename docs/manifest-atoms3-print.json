@@ -1,0 +1,15 @@
+{
+  "name": "alc-hub AtomS3 Print",
+  "version": "0.1.0",
+  "home_assistant_domain": "",
+  "funding_url": "",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "firmware/alc-hub-atoms3-print-merged.bin", "offset": 0 }
+      ]
+    }
+  ]
+}

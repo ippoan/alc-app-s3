@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>alc-hub AtomS3 Print - Firmware Writer</title>
+    <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px; margin: 0 auto; padding: 20px;
+            background: #f5f5f5; color: #333;
+        }
+        h1 { color: #1a73e8; border-bottom: 2px solid #1a73e8; padding-bottom: 10px; }
+        .card { background: white; border-radius: 12px; padding: 24px; margin: 20px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .card h2 { margin-top: 0; color: #333; }
+        .requirements { background: #e8f5e9; border-left: 4px solid #4caf50; padding: 16px; margin: 16px 0; }
+        .requirements h3 { margin-top: 0; color: #2e7d32; }
+        .warning { background: #fff3e0; border-left: 4px solid #ff9800; padding: 16px; margin: 16px 0; }
+        .warning h3 { margin-top: 0; color: #e65100; }
+        .install-section {
+            text-align: center; padding: 40px 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 12px; color: white;
+        }
+        .install-section h2 { color: white; margin-bottom: 20px; }
+        esp-web-install-button { --esp-tools-button-color: #4caf50; --esp-tools-button-text-color: white; }
+        .device-info { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-top: 16px; }
+        .device-info div { background: #f8f9fa; padding: 12px; border-radius: 8px; }
+        .device-info strong { display: block; color: #666; font-size: 12px; margin-bottom: 4px; }
+        code { background: #f0f0f0; padding: 2px 6px; border-radius: 4px; }
+        footer { text-align: center; margin-top: 40px; color: #666; font-size: 14px; }
+        footer a { color: #1a73e8; }
+    </style>
+</head>
+<body>
+    <h1>alc-hub AtomS3 Print</h1>
+    <p>AtomS3 + Atomic PoE Base 印刷ブリッジ ファームウェア書き込みツール —
+       点呼記録 PDF を営業所プリンター (9100/raw) へ自動印刷します。
+       CoreS3 統合ハブは <a href="index.html">こちら</a>。</p>
+
+    <div class="card">
+        <h2>対応機器</h2>
+        <div class="device-info">
+            <div><strong>マイコン</strong>M5Stack AtomS3 (SKU C123)</div>
+            <div><strong>ネットワーク</strong>Atomic PoE Base (SKU A091, W5500 + PoE 給電)</div>
+            <div><strong>プリンター</strong>9100/tcp (raw) 対応・PDF ダイレクトプリント対応機</div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>書き込み手順</h2>
+        <ol>
+            <li>AtomS3 を USB-C ケーブルで PC に接続 (PoE Base は外れていてもよい)</li>
+            <li>下の「Install」ボタンをクリックし、シリアルポートを選択</li>
+            <li>書き込み完了後、PoE Base に載せて LAN ケーブル (PoE) を接続</li>
+            <li>画面に <code>ETH UP</code> と IP アドレスが出れば疎通完了</li>
+        </ol>
+    </div>
+
+    <div class="requirements">
+        <h3>動作要件</h3>
+        <ul>
+            <li>Chrome / Edge / Opera (Web Serial API 対応ブラウザ)</li>
+            <li>AtomS3 は USB Serial/JTAG 内蔵のため追加ドライバ不要</li>
+            <li>認識されない場合は本体側面のリセットボタンを約 2 秒長押しして書き込みモードへ</li>
+        </ul>
+    </div>
+
+    <div class="card install-section">
+        <h2>ファームウェアをインストール</h2>
+        <esp-web-install-button manifest="manifest-atoms3-print.json">
+            <button slot="activate">Install alc-hub AtomS3 Print</button>
+            <span slot="unsupported">
+                お使いのブラウザは Web Serial API に対応していません。<br>
+                Chrome, Edge, または Opera をお使いください。
+            </span>
+            <span slot="not-allowed">シリアルポートへのアクセスが許可されていません。</span>
+        </esp-web-install-button>
+    </div>
+
+    <div class="card">
+        <h2>初期設定 (シリアル 115200bps)</h2>
+        <p>書き込み後の設定はシリアルコマンドで行います
+           (デバイス登録は <a href="https://auth.ippoan.org/device/setup" target="_blank">auth.ippoan.org/device/setup</a>、
+           印刷テストは <a href="https://auth.ippoan.org/device/print-test" target="_blank">/device/print-test</a> からも実行可)。</p>
+        <ul>
+            <li><code>PRINTER ADDR 192.168.x.x:9100</code> — プリンター宛先の保存 (NVS)</li>
+            <li><code>PRINT https://…/test.pdf</code> — 手動テスト印刷 (進捗は <code>EVT PRINT_*</code>)</li>
+            <li><code>AUTH SET &lt;id&gt; &lt;secret&gt; &lt;tenant&gt;</code> → <code>AUTH TOKEN</code> — デバイス登録と疎通確認</li>
+            <li><code>WS STATUS</code> — 遠隔管理 (下り print/ota) 接続の確認</li>
+            <li><code>OTA &lt;url&gt;</code> — 手動ファームウェア更新</li>
+        </ul>
+    </div>
+
+    <footer>
+        <p><a href="https://github.com/ippoan/alc-app-s3" target="_blank">GitHub Repository</a> ·
+           <a href="index.html">CoreS3 統合ハブ</a></p>
+    </footer>
+</body>
+</html>
