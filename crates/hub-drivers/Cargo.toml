@@ -16,3 +16,6 @@ esp-idf-svc = { version = "0.52", default-features = false, features = [
     "alloc",
     "binstart",
 ] }
+
+[build-dependencies]
+embuild = "0.33"

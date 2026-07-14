@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/atoms3-print",
     "crates/hub-ble",
     "crates/hub-board",
     "crates/hub-common",

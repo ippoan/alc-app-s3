@@ -1,0 +1,12 @@
+# AtomS3 (8MB flash) 用パーティションテーブル。
+# ルートの partitions.csv (CoreS3, 16MB) と同じレイアウト方針:
+# nvs/phy_init のオフセットは ESP-IDF 既定互換 (再フラッシュしても
+# Wi-Fi 設定・device credential が消えない) + OTA 2 スロット構成。
+# 8MB に収めるため app スロットは各 3MB (実測 ~1.9MB に対し余裕あり)。
+# espflash save-image / flash の --partition-table でこのファイルを渡すこと。
+# Name,   Type, SubType, Offset,   Size,   Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+otadata,  data, ota,     0x10000,  0x2000,
+ota_0,    app,  ota_0,   0x20000,  3M,
+ota_1,    app,  ota_1,   0x320000, 3M,
