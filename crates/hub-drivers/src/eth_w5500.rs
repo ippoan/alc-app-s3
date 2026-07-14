@@ -48,6 +48,12 @@ pub fn start(
     sysloop: EspSystemEventLoop,
     status: SharedStatus,
 ) -> Result<()> {
+    // SpiDriver は leak して 'static 参照で渡す。EthDriver に所有で渡すと
+    // esp_eth_driver_install 失敗時 (基板未接続等) の drop 連鎖で
+    // esp-idf-hal の SpiDriver::drop が ESP_ERR_INVALID_STATE を unwrap
+    // panic し再起動ループになる (実機で確認)。バスは一度きりの初期化
+    // なので leak で問題ない
+    let spi: &'static SpiDriver<'static> = Box::leak(Box::new(spi));
     std::thread::Builder::new()
         .name("eth_w5500".into())
         // TCP/IP イベント + ドライバ初期化を考慮して余裕を持たせる
@@ -61,10 +67,10 @@ pub fn start(
 }
 
 fn init(
-    spi: SpiDriver<'static>,
+    spi: &'static SpiDriver<'static>,
     cs: AnyOutputPin<'static>,
     sysloop: EspSystemEventLoop,
-) -> Result<EspEth<'static, esp_idf_svc::eth::SpiEth<SpiDriver<'static>>>> {
+) -> Result<EspEth<'static, esp_idf_svc::eth::SpiEth<&'static SpiDriver<'static>>>> {
     // W5500 は MAC 不揮発領域を持たないため efuse 由来の ETH MAC を使う
     let mut mac = [0u8; 6];
     unsafe {
@@ -99,7 +105,7 @@ fn init(
 /// リンク状態を監視し、変化時にイベント出力 + HubStatus を更新し続ける。
 /// eth ハンドルはこのループが所有し続ける (drop すると停止するため)。
 fn monitor_loop(
-    eth: EspEth<'static, esp_idf_svc::eth::SpiEth<SpiDriver<'static>>>,
+    eth: EspEth<'static, esp_idf_svc::eth::SpiEth<&'static SpiDriver<'static>>>,
     status: SharedStatus,
 ) -> ! {
     let mut was_up = false;
