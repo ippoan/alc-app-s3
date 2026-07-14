@@ -74,80 +74,82 @@ mod tests {
         assert!(!valid_addr("ho st:9100"));
     }
 
-    /// data を fail_at バイトまで返し、その後エラーする reader を作る
-    fn reader_with(data: Vec<u8>, fail_at: Option<usize>) -> impl FnMut(&mut [u8]) -> Result<usize, String> {
+    /// copy_stream をテスト条件で駆動する共通ドライバ。
+    /// クロージャの定義箇所を 1 箇所に集約する (呼ばれないケース専用の
+    /// クロージャを test 毎に作ると、その行が「未実行」としてカバレッジを
+    /// 割るため)。fail_read_at = 読み込み済みがこのバイト数に達したら read
+    /// エラー、fail_write_at = n 回目の write でエラー。
+    fn run(
+        data: Vec<u8>,
+        chunk_size: usize,
+        fail_read_at: Option<usize>,
+        fail_write_at: Option<usize>,
+    ) -> (Result<usize, String>, Vec<u8>, Vec<usize>) {
         let mut pos = 0usize;
-        move |buf: &mut [u8]| {
-            if let Some(f) = fail_at {
-                if pos >= f {
-                    return Err("timeout".into());
+        let mut out = Vec::new();
+        let mut writes = 0usize;
+        let mut progress_calls = Vec::new();
+        let mut chunk = vec![0u8; chunk_size];
+        let result = copy_stream(
+            |buf| {
+                if let Some(f) = fail_read_at {
+                    if pos >= f {
+                        return Err("timeout".into());
+                    }
                 }
-            }
-            let end = fail_at.unwrap_or(data.len()).min(data.len());
-            let n = buf.len().min(end - pos);
-            buf[..n].copy_from_slice(&data[pos..pos + n]);
-            pos += n;
-            Ok(n)
-        }
+                let end = fail_read_at.unwrap_or(data.len()).min(data.len());
+                let n = buf.len().min(end - pos);
+                buf[..n].copy_from_slice(&data[pos..pos + n]);
+                pos += n;
+                Ok(n)
+            },
+            |bytes| {
+                writes += 1;
+                if fail_write_at.is_some_and(|f| writes >= f) {
+                    return Err("reset".into());
+                }
+                out.extend_from_slice(bytes);
+                Ok(())
+            },
+            &mut chunk,
+            |t| progress_calls.push(t),
+        );
+        (result, out, progress_calls)
     }
 
     #[test]
     fn copy_stream_copies_all_bytes_with_progress() {
         let src: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
-        let mut out = Vec::new();
-        let mut calls = Vec::new();
-        let mut chunk = [0u8; 256];
-        let total = copy_stream(
-            reader_with(src.clone(), None),
-            |b| {
-                out.extend_from_slice(b);
-                Ok(())
-            },
-            &mut chunk,
-            |t| calls.push(t),
-        )
-        .unwrap();
-        assert_eq!(total, 1000);
+        let (result, out, calls) = run(src.clone(), 256, None, None);
+        assert_eq!(result.unwrap(), 1000);
         assert_eq!(out, src);
         assert_eq!(calls, vec![256, 512, 768, 1000]);
     }
 
     #[test]
     fn copy_stream_rejects_empty_source() {
-        let mut chunk = [0u8; 16];
-        let err = copy_stream(reader_with(Vec::new(), None), |_| Ok(()), &mut chunk, |_| {})
-            .unwrap_err();
+        let (result, out, calls) = run(Vec::new(), 16, None, None);
+        let err = result.unwrap_err();
         assert!(err.contains("0 バイト"), "{err}");
+        assert!(out.is_empty());
+        assert!(calls.is_empty());
     }
 
     #[test]
     fn copy_stream_reports_read_error() {
-        let mut out = Vec::new();
-        let mut chunk = [0u8; 16];
-        let err = copy_stream(
-            reader_with(vec![7u8; 64], Some(32)),
-            |b| {
-                out.extend_from_slice(b);
-                Ok(())
-            },
-            &mut chunk,
-            |_| {},
-        )
-        .unwrap_err();
+        let (result, out, _) = run(vec![7u8; 64], 16, Some(32), None);
+        let err = result.unwrap_err();
         assert!(err.contains("ダウンロード中断"), "{err}");
         assert_eq!(out.len(), 32); // 失敗前までは書けている
     }
 
     #[test]
     fn copy_stream_reports_write_error() {
-        let mut chunk = [0u8; 16];
-        let err = copy_stream(
-            reader_with(vec![1u8; 8], None),
-            |_| Err("reset".into()),
-            &mut chunk,
-            |_| {},
-        )
-        .unwrap_err();
+        // 1 回目の write は成功させ progress も 1 回動かす (2 回目で失敗)
+        let (result, out, calls) = run(vec![1u8; 8], 4, None, Some(2));
+        let err = result.unwrap_err();
         assert!(err.contains("送信失敗"), "{err}");
+        assert_eq!(out.len(), 4);
+        assert_eq!(calls, vec![4]);
     }
 }
