@@ -51,6 +51,14 @@ pub enum HostCommand {
     /// OTA 更新: firmware (app 単体イメージ) の URL からダウンロードして
     /// もう一方の OTA スロットへ書き込み、再起動する (`EVT OTA_* ...` を出力)
     Ota { url: String },
+    /// PDF を URL から取得しプリンター 9100 (raw) へストリーミング印刷
+    /// (印刷ブリッジ用。宛先は `PRINTER ADDR` で保存済みのもの。
+    /// 進捗・結果は `EVT PRINT_* ...`)
+    Print { url: String },
+    /// プリンター宛先 `host:port` の保存 (NVS)。検証は printer::valid_addr
+    PrinterAddr { addr: String },
+    /// プリンター宛先の問い合わせ (`PRINTER <addr>` / `PRINTER UNSET` を応答)
+    PrinterStatus,
 }
 
 /// 画面向きとして有効な角度か
@@ -120,6 +128,25 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                 }
             }
             _ => return Err("ERR OTA: http(s):// で始まる firmware URL が必要です".into()),
+        },
+        // 印刷 (URL は大文字小文字を保持。宛先は PRINTER ADDR で事前設定)
+        "PRINT" => match it.next() {
+            Some(url) if url.starts_with("https://") || url.starts_with("http://") => {
+                HostCommand::Print {
+                    url: url.to_string(),
+                }
+            }
+            _ => return Err("ERR PRINT: http(s):// で始まる PDF URL が必要です".into()),
+        },
+        "PRINTER" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+            Some("ADDR") => match it.next() {
+                Some(addr) if crate::printer::valid_addr(addr) => HostCommand::PrinterAddr {
+                    addr: addr.to_string(),
+                },
+                _ => return Err("ERR PRINTER: ADDR には host:port が必要です".into()),
+            },
+            Some("STATUS") => HostCommand::PrinterStatus,
+            _ => return Err("ERR PRINTER: ADDR|STATUS が必要です".into()),
         },
         "CFG" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
             Some("GET") => HostCommand::CfgGet,
@@ -326,6 +353,52 @@ mod tests {
         assert!(parse_line("OTA", T).is_err());
         assert!(parse_line("OTA ftp://x/app.bin", T).is_err());
         assert!(parse_line("OTA example.com/app.bin", T).is_err());
+    }
+
+    #[test]
+    fn print_url_preserves_case() {
+        assert_eq!(
+            parse_line("PRINT https://Example.com/Tenko.pdf", T),
+            Ok(Some(HostCommand::Print {
+                url: "https://Example.com/Tenko.pdf".into(),
+            }))
+        );
+        assert_eq!(
+            parse_line("print http://192.168.11.2:8000/t.pdf", T),
+            Ok(Some(HostCommand::Print {
+                url: "http://192.168.11.2:8000/t.pdf".into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn print_errors() {
+        assert!(parse_line("PRINT", T).is_err());
+        assert!(parse_line("PRINT ftp://x/t.pdf", T).is_err());
+        assert!(parse_line("PRINT example.com/t.pdf", T).is_err());
+    }
+
+    #[test]
+    fn printer_addr_and_status() {
+        assert_eq!(
+            parse_line("PRINTER ADDR 192.168.11.60:9100", T),
+            Ok(Some(HostCommand::PrinterAddr {
+                addr: "192.168.11.60:9100".into(),
+            }))
+        );
+        assert_eq!(
+            parse_line("printer status", T),
+            Ok(Some(HostCommand::PrinterStatus))
+        );
+    }
+
+    #[test]
+    fn printer_errors() {
+        assert!(parse_line("PRINTER", T).is_err());
+        assert!(parse_line("PRINTER ADDR", T).is_err());
+        assert!(parse_line("PRINTER ADDR hostonly", T).is_err());
+        assert!(parse_line("PRINTER ADDR host:0", T).is_err());
+        assert!(parse_line("PRINTER RESET", T).is_err());
     }
 
     #[test]

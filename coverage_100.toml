@@ -35,6 +35,10 @@ path = "crates/hub-core/src/pairing.rs"
 type = "unit"
 
 [[file]]
+path = "crates/hub-core/src/printer.rs"
+type = "unit"
+
+[[file]]
 path = "crates/hub-core/src/protocol.rs"
 type = "unit"
 

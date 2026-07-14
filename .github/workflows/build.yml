@@ -388,6 +388,10 @@ jobs:
           cp docs/index.html _site/
           cp alc-hub-cores3-merged.bin _site/firmware/
           cp alc-hub-cores3-app.bin _site/firmware/
+          # atoms3-print はオンラインアップデート (OTA <url>) 用に bin だけ公開。
+          # ESP Web Tools のインストーラーページ/manifest は後続 PR (issue #38)
+          cp alc-hub-atoms3-print-merged.bin _site/firmware/
+          cp alc-hub-atoms3-print-app.bin _site/firmware/
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.version }}+$SHORT_SHA\"/" \
             docs/manifest.json > _site/manifest.json

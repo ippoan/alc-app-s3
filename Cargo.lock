@@ -16,11 +16,14 @@ name = "alc-hub-atoms3-print"
 version = "0.1.0"
 dependencies = [
  "alc-hub-common",
+ "alc-hub-core",
  "alc-hub-drivers",
  "anyhow",
+ "embedded-graphics",
  "embuild",
  "esp-idf-svc",
  "log",
+ "mipidsi",
 ]
 
 [[package]]

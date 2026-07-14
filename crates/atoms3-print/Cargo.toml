@@ -18,6 +18,7 @@ harness = false
 
 [dependencies]
 alc-hub-common = { path = "../hub-common" }
+alc-hub-core = { path = "../hub-core" }
 alc-hub-drivers = { path = "../hub-drivers" }
 anyhow = "1"
 log = "0.4"
@@ -27,6 +28,9 @@ esp-idf-svc = { version = "0.52", default-features = false, features = [
     "alloc",
     "binstart",
 ] }
+# 内蔵 GC9107 LCD (128x128) のステータス表示
+mipidsi = "0.9"
+embedded-graphics = "0.8"
 
 [build-dependencies]
 embuild = "0.33"

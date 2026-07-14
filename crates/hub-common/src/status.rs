@@ -25,8 +25,11 @@ pub struct HubStatus {
     /// 直近イベント (新しいものが末尾)。ログ確認画面に表示する
     pub events: VecDeque<String>,
 
-    /// LAN Module 13.2 (W5500) のリンク状態 (lan.rs — 未実装のため常に false)
+    /// LAN Module 13.2 (W5500) のリンク状態 (lan.rs — 未実装のため常に false)。
+    /// AtomS3 印刷ブリッジでは eth_w5500.rs が更新する
     pub lan_link: bool,
+    /// LAN 接続時の IP アドレス (eth_w5500.rs が更新。未接続は空)
+    pub lan_ip: String,
 
     /// RS232 (FC-1200) の最終受信時刻 [ms]。None = 起動後受信なし
     pub rs232_last_rx_ms: Option<u64>,

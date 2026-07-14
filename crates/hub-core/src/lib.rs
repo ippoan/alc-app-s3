@@ -13,6 +13,7 @@ pub mod ieee11073;
 pub mod improv;
 pub mod layout;
 pub mod pairing;
+pub mod printer;
 pub mod protocol;
 pub mod uplink;
 pub mod vitals;
