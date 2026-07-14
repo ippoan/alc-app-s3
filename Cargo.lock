@@ -12,6 +12,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "alc-hub-atoms3-print"
+version = "0.1.0"
+dependencies = [
+ "alc-hub-common",
+ "alc-hub-drivers",
+ "anyhow",
+ "embuild",
+ "esp-idf-svc",
+ "log",
+]
+
+[[package]]
 name = "alc-hub-ble"
 version = "0.1.0"
 dependencies = [
@@ -73,6 +85,7 @@ dependencies = [
  "alc-hub-core",
  "alc-hub-wifi",
  "anyhow",
+ "embuild",
  "esp-idf-svc",
  "log",
 ]

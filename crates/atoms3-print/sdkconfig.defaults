@@ -1,0 +1,27 @@
+# alc-hub-atoms3-print (M5Stack AtomS3 C123 / ESP32-S3FN8 + Atomic PoE Base A091)
+#
+# CoreS3 (ルートの sdkconfig.defaults) との違い:
+# - PSRAM 無し (C123 = ESP32-S3FN8 は物理非搭載。SPIRAM 系は一切書かない)
+# - BLE 無し (印刷ブリッジは W5500 Ethernet + HTTPS/WSS のみ)
+# - W5500 SPI Ethernet を有効化 (Atomic PoE Base、INT 未配線 = polling)
+
+# ホストリンク (デバッグ/AUTH 注入) は AtomS3 ネイティブ USB-C の
+# USB Serial/JTAG コンソール経由
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
+CONFIG_FREERTOS_HZ=1000
+# HEAP DUMP (タスク別スタック余裕の列挙 = uxTaskGetSystemState) に必要
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+
+# OTA (ota.rs): 新 FW が起動完了前に死んだらブートローダが旧スロットへ戻す
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# auth-worker への HTTPS / cf-alc-recorder への WSS (公開 CA バンドル検証)
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+
+# W5500 (Atomic PoE Base) — SPI Ethernet。INT ピンは基板上未配線のため
+# esp-idf-svc 側は SpiEventSource::polling を使う (eth_w5500.rs)
+CONFIG_ETH_USE_SPI_ETHERNET=y
+CONFIG_ETH_SPI_ETHERNET_W5500=y

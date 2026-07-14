@@ -103,6 +103,12 @@ jobs:
           - { name: drivers, cmd: "cargo build --release --locked -p alc-hub-drivers" }
           - { name: ui,      cmd: "cargo build --release --locked -p alc-hub-ui" }
           - { name: bin,     cmd: "cargo check --release --locked -p alc-hub-cores3" }
+          # atoms3-print は sdkconfig が別 (W5500 有効/PSRAM・BLE 無し) のため
+          # esp-idf-sys の設定元を ESP_IDF_SYS_ROOT_CRATE で本 crate に向ける。
+          # sccache/rust-cache は cores3 系と esp-idf-sys ビルドを共有できない
+          # (sdkconfig が違う) が、leg が独立 job なので互いを汚さない
+          - { name: atoms3-print,
+              cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-print cargo check --release --locked -p alc-hub-atoms3-print" }
 
     steps:
       - name: Checkout
@@ -189,12 +195,33 @@ jobs:
           sccache --show-stats
 
   # ------------------------------------------------------------------
-  # build: フルビルド + 書き込みイメージ + Pages サイト組み立て (main のみ)
+  # build: フルビルド + 書き込みイメージ (main のみ)。
+  # cores3 (CoreS3 統合ハブ) と atoms3-print (AtomS3 印刷ブリッジ) の
+  # 2 バイナリを並行ビルドする。sdkconfig が異なるため esp-idf-sys の
+  # ビルドは共有できず、rust-cache は leg ごとに分離する (cache_key)。
+  # Pages サイト組み立ては assemble-pages job (後述) に分離
   # ------------------------------------------------------------------
   build:
-    name: Build firmware & assemble Pages site
+    name: "Build firmware (${{ matrix.name }})"
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # cores3 は従来と同じ cache_key (build) で warm 済みキャッシュを継続利用
+          - name: cores3
+            bin: alc-hub-cores3
+            build_env: ''
+            flash_size: 16mb
+            partition_table: partitions.csv
+            cache_key: build
+          - name: atoms3-print
+            bin: alc-hub-atoms3-print
+            build_env: 'ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-print'
+            flash_size: 8mb
+            partition_table: crates/atoms3-print/partitions.csv
+            cache_key: build-atoms3
 
     steps:
       - name: Checkout
@@ -265,7 +292,7 @@ jobs:
       - name: Cache cargo registry/target
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: build
+          shared-key: ${{ matrix.cache_key }}
           key: ${{ hashFiles('.cargo/config.toml') }}
           cache-on-failure: true
           # 自作クレートの成果物も保存する (restore-mtime とセットで
@@ -289,38 +316,71 @@ jobs:
       - name: Clear stale esp-idf-sys CMake build dir
         run: rm -rf target/xtensa-esp32s3-espidf/*/build/esp-idf-sys-*/out/build
 
-      - name: Extract version from Cargo.toml
-        id: version
-        run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version *= *"\(.*\)"/\1/')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Version: $VERSION"
-
       # ワークスペース内クレートの mtime 起因の再コンパイルを内容ベースの
       # rustc キャッシュでヒットに変える (check job のコメント参照)
       - uses: mozilla-actions/sccache-action@v0.0.9
 
+      # build_env (atoms3-print の ESP_IDF_SYS_ROOT_CRATE) は run の env に
+      # 直接書けない (空文字 leg があるため) ので、コマンド行頭に前置する
       - name: Build
         env:
           SCCACHE_GHA_ENABLED: 'true'
           RUSTC_WRAPPER: sccache
-        run: cargo build --release --locked
+        run: |
+          env ${{ matrix.build_env }} cargo build --release --locked -p ${{ matrix.bin }}
+          sccache --show-stats
 
       - name: Save merged flashable image
         run: |
           espflash save-image --chip esp32s3 --merge \
-            --flash-size 16mb \
-            --partition-table partitions.csv \
-            target/xtensa-esp32s3-espidf/release/alc-hub-cores3 \
-            alc-hub-cores3-merged.bin
+            --flash-size ${{ matrix.flash_size }} \
+            --partition-table ${{ matrix.partition_table }} \
+            target/xtensa-esp32s3-espidf/release/${{ matrix.bin }} \
+            ${{ matrix.bin }}-merged.bin
 
       # OTA (`OTA <url>` / WS 下り {"action":"ota"}) 用の app 単体イメージ。
       # merged と違い bootloader/partition table を含まない (ota.rs 参照)
       - name: Save OTA app image
         run: |
           espflash save-image --chip esp32s3 \
-            target/xtensa-esp32s3-espidf/release/alc-hub-cores3 \
-            alc-hub-cores3-app.bin
+            target/xtensa-esp32s3-espidf/release/${{ matrix.bin }} \
+            ${{ matrix.bin }}-app.bin
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.name }}
+          path: |
+            ${{ matrix.bin }}-merged.bin
+            ${{ matrix.bin }}-app.bin
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # assemble-pages: 各 build leg の成果物を集めて Pages サイトを組む。
+  # 現状の公開内容は CoreS3 のみ (従来と同一)。atoms3-print の
+  # インストーラーページ/manifest は後続 PR で追加する (issue #38)
+  # ------------------------------------------------------------------
+  assemble-pages:
+    name: Assemble Pages site
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: firmware-*
+          merge-multiple: true
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version *= *"\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
 
       - name: Assemble Pages site
         run: |
@@ -333,13 +393,6 @@ jobs:
             docs/manifest.json > _site/manifest.json
           cat _site/manifest.json
 
-      - name: Upload firmware artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: firmware
-          path: alc-hub-cores3-merged.bin
-          if-no-files-found: error
-
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
@@ -347,7 +400,7 @@ jobs:
 
   deploy:
     name: Deploy to GitHub Pages
-    needs: build
+    needs: assemble-pages
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment:

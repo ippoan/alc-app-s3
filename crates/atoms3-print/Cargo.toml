@@ -1,0 +1,41 @@
+# AtomS3 (C123) + Atomic PoE Base (A091, W5500) 印刷ブリッジ (issue #38 / #37)。
+#
+# ルートの alc-hub-cores3 と同一ワークスペースの別バイナリ。esp-idf-sys は
+# 既定で「ワークスペースの root package (= ルートの alc-hub-cores3)」の
+# metadata から sdkconfig 等を読むため、本 crate をビルドするときは
+# `ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-print` を指定して本 crate の
+# metadata (下記) を使わせること (CI / local/flash-atoms3.ps1 が設定する)。
+[package]
+name = "alc-hub-atoms3-print"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "AtomS3 + Atomic PoE Base 印刷ブリッジ — PDF を HTTP GET しプリンター 9100 へストリーミング"
+
+[[bin]]
+name = "alc-hub-atoms3-print"
+harness = false
+
+[dependencies]
+alc-hub-common = { path = "../hub-common" }
+alc-hub-drivers = { path = "../hub-drivers" }
+anyhow = "1"
+log = "0.4"
+esp-idf-svc = { version = "0.52", default-features = false, features = [
+    "native",
+    "std",
+    "alloc",
+    "binstart",
+] }
+
+[build-dependencies]
+embuild = "0.33"
+
+[package.metadata.esp-idf-sys]
+# 相対パスはワークスペースルート基準で解決される (esp-idf-sys の仕様)
+esp_idf_sdkconfig_defaults = "crates/atoms3-print/sdkconfig.defaults"
+
+# hub-drivers の ws_uplink (esp-idf-svc ws::client) に必要な managed component。
+# ルート (cores3) の宣言と同一バージョンに揃えること (components_esp32s3.lock 共有)
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp_websocket_client", version = "^1.5" }
