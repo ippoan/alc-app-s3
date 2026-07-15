@@ -1,8 +1,9 @@
-//! PDF のプリンター 9100 (raw) 印刷 (ippoan/alc-app-s3#38)。
+//! PDF のプリンター 9100 (raw) / 631 (IPP Print-Job) 印刷 (ippoan/alc-app-s3#38, #68)。
 //!
 //! `PRINT <url>` コマンド / WS 下り `{"action":"print","url":"..."}` から
-//! 呼ばれ、PDF を HTTP GET しながらプリンターの 9100/tcp へチャンク単位で
-//! ストリーミング書き込みする。全体を貯めないためメモリはチャンク分 (8KB)
+//! 呼ばれ、PDF を HTTP GET しながらプリンターへチャンク単位でストリーミング
+//! 書き込みする。宛先ポートが 631 なら IPP Print-Job (HTTP POST) で包む
+//! (Canon LBP241 の RAW 9100 が本機からの接続だけ受信しない問題の回避 #68)。全体を貯めないためメモリはチャンク分 (8KB)
 //! しか使わない。チャンクコピーの核は alc_hub_core::printer::copy_stream
 //! (純粋・テスト済み)。ota.rs の download_and_write と同じ構造。
 //!
@@ -15,7 +16,7 @@
 //! | `EVT PRINT OK <bytes>` | 全バイト送信完了 |
 //! | `EVT PRINT NG <理由>` | 失敗 |
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -118,12 +119,57 @@ fn fetch_and_send(url: &str, printer_addr: &str) -> Result<usize> {
     printer
         .set_write_timeout(Some(Duration::from_secs(IO_TIMEOUT_S)))
         .context("送信タイムアウト設定失敗")?;
+    // チャンク毎に即送出する (Nagle でジョブ先頭が遅延しないように)
+    let _ = printer.set_nodelay(true);
+
+    // 宛先ポート 631 なら IPP Print-Job (HTTP POST + IPP header + 本体) で送る。
+    // Canon LBP241 は RAW 9100 が本機からの接続だけデータを読まず write が
+    // EAGAIN するが、HTTP 系ポート (80/631) は正常に通る (#68 実機切り分け)。
+    // document-format は octet-stream でプリンターの PDL 自動判別に任せる。
+    let ipp = alc_hub_core::printer::is_ipp_addr(printer_addr);
+    // 取得側の Content-Length が不明なときだけ chunked (IPP のみ)
+    let chunked = ipp && total == 0;
+    if ipp {
+        let host = printer_addr
+            .rsplit_once(':')
+            .map_or(printer_addr, |(h, _)| h);
+        let ipp_header = alc_hub_core::printer::ipp_print_job_header(host, "alc-hub");
+        let head = alc_hub_core::printer::http_post_head(
+            printer_addr,
+            (!chunked).then(|| ipp_header.len() + total),
+        );
+        let send_head = printer
+            .write_all(head.as_bytes())
+            .and_then(|()| {
+                if chunked {
+                    printer
+                        .write_all(
+                            alc_hub_core::printer::chunk_head(ipp_header.len()).as_bytes(),
+                        )
+                        .and_then(|()| printer.write_all(&ipp_header))
+                        .and_then(|()| printer.write_all(b"\r\n"))
+                } else {
+                    printer.write_all(&ipp_header)
+                }
+            });
+        send_head.context("プリンターへの送信失敗 (IPP ヘッダ)")?;
+    }
 
     let mut chunk = vec![0u8; CHUNK];
     let mut next_progress = PROGRESS_STEP;
     let sent = alc_hub_core::printer::copy_stream(
         |buf| conn.read(buf).map_err(|e| e.to_string()),
-        |bytes| printer.write_all(bytes).map_err(|e| e.to_string()),
+        |bytes| {
+            let result = if chunked {
+                printer
+                    .write_all(alc_hub_core::printer::chunk_head(bytes.len()).as_bytes())
+                    .and_then(|()| printer.write_all(bytes))
+                    .and_then(|()| printer.write_all(b"\r\n"))
+            } else {
+                printer.write_all(bytes)
+            };
+            result.map_err(|e| e.to_string())
+        },
         &mut chunk,
         |t| {
             if t >= next_progress {
@@ -134,7 +180,44 @@ fn fetch_and_send(url: &str, printer_addr: &str) -> Result<usize> {
     )
     .map_err(|e| anyhow::anyhow!(e))?;
 
+    if chunked {
+        printer
+            .write_all(alc_hub_core::printer::CHUNK_END.as_bytes())
+            .context("プリンターへの送信失敗 (IPP 終端)")?;
+    }
     printer.flush().context("プリンターへの送信失敗 (flush)")?;
+
+    if ipp {
+        // IPP は HTTP 応答 + IPP status-code でジョブ受理を確認できる
+        printer
+            .set_read_timeout(Some(Duration::from_secs(IO_TIMEOUT_S)))
+            .context("受信タイムアウト設定失敗")?;
+        let mut resp = Vec::new();
+        let mut rbuf = [0u8; 512];
+        loop {
+            match printer.read(&mut rbuf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    resp.extend_from_slice(&rbuf[..n]);
+                    if resp.len() >= 4096 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if resp.is_empty() {
+                        return Err(e).context("IPP 応答の受信失敗");
+                    }
+                    break;
+                }
+            }
+        }
+        let status = alc_hub_core::printer::ipp_response_status(&resp)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        // 0x0000〜0x0002 = successful-ok 系
+        if status > 2 {
+            bail!("IPP エラー status=0x{status:04x}");
+        }
+    }
     // 9100 raw はレスポンスを返さない。close (drop) で送信完了
     Ok(sent)
 }
