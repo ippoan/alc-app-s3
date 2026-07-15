@@ -22,8 +22,8 @@ pub fn firmware_version_full() -> String {
     format!("{FIRMWARE_VERSION}+{FIRMWARE_SHA}")
 }
 
-/// FC-1200 側 RS232 ボーレート (M5Stack 公式 RS232.ino サンプル準拠, 8N1)
-pub const RS232_BAUD: u32 = 115_200;
+/// FC-1200 側 RS232 ボーレート (タニタ FC-1200/ALBLO 仕様: 9600bps 8N1、fc1200-wasm README 準拠)
+pub const RS232_BAUD: u32 = 9_600;
 
 /// QR 画面の既定有効期限
 pub const QR_DEFAULT_TIMEOUT_MS: u64 = 60_000;
