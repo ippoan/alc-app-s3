@@ -17,7 +17,7 @@
 
 use std::io::Write;
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
@@ -113,17 +113,44 @@ fn fetch_and_send(url: &str, printer_addr: &str) -> Result<usize> {
         .unwrap_or(0);
 
     // レスポンスが取得できてから接続する (接続直後にすぐ書き込める状態にする)
+    // #68 診断: connect 所要時間 / connect→初回 write の遅延 / write 毎の所要時間を
+    // EVT PRINT_DIAG で出す。原因確定後に撤去する
+    let t_connect = Instant::now();
     let mut printer = TcpStream::connect(printer_addr)
         .with_context(|| format!("プリンター {printer_addr} に接続できません"))?;
+    let connect_ms = t_connect.elapsed().as_millis();
     printer
         .set_write_timeout(Some(Duration::from_secs(IO_TIMEOUT_S)))
         .context("送信タイムアウト設定失敗")?;
+    // #68 診断: Nagle 無効化の効果検証 (未着手項目)
+    let nodelay_ok = printer.set_nodelay(true).is_ok();
+    println!(
+        "EVT PRINT_DIAG connect_ms={connect_ms} nodelay={} local={}",
+        u8::from(nodelay_ok),
+        printer
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "?".into()),
+    );
 
     let mut chunk = vec![0u8; CHUNK];
     let mut next_progress = PROGRESS_STEP;
+    let mut last_io = Instant::now();
     let sent = alc_hub_core::printer::copy_stream(
         |buf| conn.read(buf).map_err(|e| e.to_string()),
-        |bytes| printer.write_all(bytes).map_err(|e| e.to_string()),
+        |bytes| {
+            let wait_ms = last_io.elapsed().as_millis();
+            let t_write = Instant::now();
+            let result = printer.write_all(bytes);
+            println!(
+                "EVT PRINT_DIAG write bytes={} wait_ms={wait_ms} write_ms={} ok={}",
+                bytes.len(),
+                t_write.elapsed().as_millis(),
+                u8::from(result.is_ok()),
+            );
+            last_io = Instant::now();
+            result.map_err(|e| e.to_string())
+        },
         &mut chunk,
         |t| {
             if t >= next_progress {
