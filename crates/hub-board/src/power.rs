@@ -32,9 +32,9 @@ pub fn init(i2c: &mut I2cDriver) -> Result<()> {
     write_reg(i2c, AXP2101_ADDR, 0x99, 28)?;
 
     // バッテリー/電源 ADC を有効化 (0x30: bit0=Vbat, bit2=Vbus, bit3=Vsys)。
-    // 立てないと read_status() の電圧が 0 のままになる (残量% と充電/VBUS
-    // ステータスは ADC 不要)。Refs #50
-    write_reg(i2c, AXP2101_ADDR, 0x30, 0x0D)?;
+    // bit0=VBAT / bit1=TS / bit2=VBUS / bit3=VSYS。M5Unified CoreS3 と同値 0x0F
+    // で全チャネル有効化する (立てないと read_status() の電圧が読めない)。Refs #50
+    write_reg(i2c, AXP2101_ADDR, 0x30, 0x0F)?;
 
     // --- AW9523: ポート初期値・方向 (P1_1 = LCD RST を H で解放) ---
     write_reg(i2c, AW9523_ADDR, 0x02, 0b0000_0101)?; // P0 出力値
@@ -67,9 +67,9 @@ pub fn set_backlight(i2c: &mut I2cDriver, percent: u8) -> Result<()> {
 /// を実データで確認するための診断値 (Refs #50)。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PowerStatus {
-    /// バッテリー残量 [%] (フューエルゲージ 0xA4)。255 = 未測定/電池なし
+    /// バッテリー残量 [%] (電圧から推定。M5Unified 準拠 — 0xA4 ゲージは CoreS3 で不定)
     pub battery_percent: u8,
-    /// バッテリー電圧 [mV] (0x34/0x35、ADC 有効時)。0 = 未計測
+    /// バッテリー電圧 [mV] (0x34/0x35、1mV/LSB)。0 = 未計測
     pub battery_mv: u16,
     /// VBUS (外部給電) が有効か (0x00 bit5)
     pub vbus_present: bool,
@@ -77,6 +77,12 @@ pub struct PowerStatus {
     pub battery_present: bool,
     /// 充電状態 (0x01 bits[6:5]): 0=待機/満充電, 1=充電中, 2=放電中
     pub charge_state: u8,
+    /// ADC channel enable (0x30) の readback — VBAT(bit0) が立っているかの診断用
+    pub adc_cfg: u8,
+    /// フューエルゲージ 0xA4 の生値 (CoreS3 では不定。診断用に残す)
+    pub gauge_raw: u8,
+    /// 電圧レジスタ生値 (0x34, 0x35) — 実機での電圧デコード確認用
+    pub volt_raw: (u8, u8),
     /// 生ステータス (0x00, 0x01) — 解釈の裏取り用
     pub status_raw: (u8, u8),
 }
@@ -93,16 +99,30 @@ fn read_reg(i2c: &mut I2cDriver, addr: u8, reg: u8) -> Result<u8> {
 pub fn read_status(i2c: &mut I2cDriver) -> Result<PowerStatus> {
     let s0 = read_reg(i2c, AXP2101_ADDR, 0x00)?; // PMU status1
     let s1 = read_reg(i2c, AXP2101_ADDR, 0x01)?; // PMU status2
-    let percent = read_reg(i2c, AXP2101_ADDR, 0xA4)?; // フューエルゲージ %
-    // 電池電圧: 0x34[5:0]=上位 6bit, 0x35=下位 8bit の 14bit 値 (mV)
+    let adc_cfg = read_reg(i2c, AXP2101_ADDR, 0x30)?; // ADC enable readback
+    let gauge_raw = read_reg(i2c, AXP2101_ADDR, 0xA4)?; // E-gauge % (CoreS3 で不定)
+    // 電池電圧: 0x34[5:0]=上位 6bit, 0x35=下位 8bit の 14bit 値 (1mV/LSB)
     let vh = read_reg(i2c, AXP2101_ADDR, 0x34)?;
     let vl = read_reg(i2c, AXP2101_ADDR, 0x35)?;
+    let mv = (((vh & 0x3F) as u16) << 8) | vl as u16;
+    // 残量は電圧から推定する (M5Unified 準拠: 3.3V=0% 〜 4.1V=100% 線形 clamp)。
+    // AXP2101 の E-gauge (0xA4) は CoreS3 で不定のため使わない。
+    let percent = if mv <= 3300 {
+        0
+    } else if mv >= 4100 {
+        100
+    } else {
+        (((mv - 3300) as u32 * 100) / 800) as u8
+    };
     Ok(PowerStatus {
         battery_percent: percent,
-        battery_mv: (((vh & 0x3F) as u16) << 8) | vl as u16,
+        battery_mv: mv,
         vbus_present: (s0 & 0x20) != 0,
         battery_present: (s0 & 0x08) != 0,
         charge_state: (s1 >> 5) & 0x03,
+        adc_cfg,
+        gauge_raw,
+        volt_raw: (vh, vl),
         status_raw: (s0, s1),
     })
 }

@@ -139,11 +139,15 @@ pub fn run(
             match alc_hub_board::power::read_status(&mut i2c) {
                 Ok(ps) => {
                     println!(
-                        "EVT BATT pct={} mv={} vbus={} chg={} raw={:02X},{:02X}",
+                        "EVT BATT pct={} mv={} vbus={} chg={} adc={:02X} gauge={} vraw={:02X},{:02X} raw={:02X},{:02X}",
                         ps.battery_percent,
                         ps.battery_mv,
                         ps.vbus_present as u8,
                         ps.charge_state,
+                        ps.adc_cfg,
+                        ps.gauge_raw,
+                        ps.volt_raw.0,
+                        ps.volt_raw.1,
                         ps.status_raw.0,
                         ps.status_raw.1,
                     );
