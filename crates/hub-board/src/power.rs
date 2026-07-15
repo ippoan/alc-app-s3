@@ -19,7 +19,7 @@ fn write_reg(i2c: &mut I2cDriver, addr: u8, reg: u8, value: u8) -> Result<()> {
 /// 電源系の初期化。LCD を含む周辺電源を有効化し、LCD リセットを解放する。
 pub fn init(i2c: &mut I2cDriver) -> Result<()> {
     // --- AXP2101: LDO 有効化と電圧設定 (M5Unified CoreS3 シーケンス準拠) ---
-    write_reg(i2c, AXP2101_ADDR, 0x90, 0xBF)?; // LDO 有効化 (bit7 = DLDO1: LCD バックライト)
+    write_reg(i2c, AXP2101_ADDR, 0x90, LDO_ENABLE_ALL)?; // LDO 有効化 (bit7 = DLDO1: LCD バックライト)
     write_reg(i2c, AXP2101_ADDR, 0x92, 13)?; // ALDO1 1.8V (AW88298 スピーカー AMP)
     write_reg(i2c, AXP2101_ADDR, 0x93, 28)?; // ALDO2 3.3V (ES7210 マイク ADC)
     write_reg(i2c, AXP2101_ADDR, 0x94, 28)?; // ALDO3 3.3V (カメラ)
@@ -50,16 +50,31 @@ pub fn init(i2c: &mut I2cDriver) -> Result<()> {
     Ok(())
 }
 
-/// バックライト輝度 (0-100%)。AXP2101 DLDO1 の電圧 (2.5V-3.3V) で制御する。
+/// init() が 0x90 (LDO 有効化レジスタ) に書く値。bit7=DLDO1 (LCD バックライト)、
+/// 他 bit は ALDO1-4 (スピーカー/マイク/カメラ/TF カード)
+const LDO_ENABLE_ALL: u8 = 0xBF;
+
+/// LCD バックライト (DLDO1) の有効/無効を切り替える。他 LDO (マイク/カメラ/
+/// TF カード等) の電源はそのまま保持する — 影響するのは 0x90 の bit7 のみ。
+/// 無効時も輝度レジスタ (0x99) は触らないため、再度有効化すると前回の
+/// 輝度に戻る
 #[allow(dead_code)]
+pub fn set_backlight_enabled(i2c: &mut I2cDriver, enabled: bool) -> Result<()> {
+    let reg = if enabled {
+        LDO_ENABLE_ALL
+    } else {
+        LDO_ENABLE_ALL & !0x80
+    };
+    write_reg(i2c, AXP2101_ADDR, 0x90, reg)
+}
+
+/// バックライト輝度 (0-100%)。AXP2101 DLDO1 の電圧 (2.5V-3.3V) で制御する。
+/// 完全消灯 (set_backlight_enabled(false)) だと本体が動作中か判別できる
+/// 光が無くなるため、無操作時は最低輝度 (0%=2.5V) までに留める運用にしている
+/// (画面焼け対策、ui/lib.rs 参照)
 pub fn set_backlight(i2c: &mut I2cDriver, percent: u8) -> Result<()> {
     let percent = percent.min(100) as u32;
-    if percent == 0 {
-        // DLDO1 を最低電圧に (完全消灯は 0x90 bit7 クリアだが他 LDO 設定を保持
-        // したまま最低輝度に落とす方が安全)
-        return write_reg(i2c, AXP2101_ADDR, 0x99, 20);
-    }
-    // 20 (2.5V) 〜 28 (3.3V) にマップ
+    // 20 (2.5V, 最低輝度) 〜 28 (3.3V, 最大輝度) にマップ
     let step = 20 + (percent * 8) / 100;
     write_reg(i2c, AXP2101_ADDR, 0x99, step as u8)
 }

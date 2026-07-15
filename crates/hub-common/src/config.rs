@@ -44,6 +44,12 @@ pub const TENKO_TIMEOUT_MS: u64 = 180_000;
 /// 点呼画面で体温・血圧の両方が揃ってから待機画面へ戻るまでの時間
 pub const TENKO_DONE_CLOSE_MS: u64 = 5_000;
 
+/// 無操作 (タッチ・ホスト/BLE コマンドなし) が続いた時にバックライトを
+/// 最低輝度まで落とすまでの時間。常時表示の画面焼け対策の一環
+/// (Refs C_TEXT 減光)。完全消灯にしないのは、本体が動作中か外から
+/// 見分けが付かなくなるため
+pub const BACKLIGHT_IDLE_DIM_MS: u64 = 60_000;
+
 /// auth-worker の既定ベース URL (`AUTH URL` コマンドで NVS 上書き可)。
 /// provisioning は USB 前提: credential はホストが `/device/pair` 系で取得し
 /// `AUTH SET` で注入する (role は host 側で `device-hub` を指定)
