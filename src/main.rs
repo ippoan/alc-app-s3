@@ -148,6 +148,7 @@ fn main() -> Result<()> {
         p.pins.gpio18,
         Arc::clone(&status),
         meas_tx.clone(),
+        tx.clone(),
     )?;
     // LAN Module 13.2 (W5500): CS=G13 (RS232M 併用ジャンパ) / RST=G0 / INT=G10 未使用
     lan::start(
