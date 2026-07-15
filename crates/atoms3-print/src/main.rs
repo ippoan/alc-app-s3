@@ -84,7 +84,9 @@ fn main() -> Result<()> {
         Some(p.pins.gpio7),
         &SpiDriverConfig::new().dma(Dma::Auto(4096)),
     )?;
-    eth_w5500::start(spi, p.pins.gpio6.into(), sysloop, Arc::clone(&status))?;
+    // leak して 'static 参照で渡す (eth_w5500::start の doc コメント参照)
+    let spi: &'static SpiDriver<'static> = Box::leak(Box::new(spi));
+    eth_w5500::start(spi, p.pins.gpio6.into(), None, sysloop, Arc::clone(&status))?;
 
     // 内蔵 LCD (SPI3): 現地で状態を体感できるステータス画面。
     // 初期化失敗しても本体機能 (印刷ブリッジ) は継続する
