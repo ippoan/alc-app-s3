@@ -113,12 +113,18 @@ fn monitor_loop(
         let up = eth.is_up().unwrap_or(false);
         if up != was_up {
             if up {
-                let ip = eth
-                    .netif()
-                    .get_ip_info()
+                // 診断: ip だけでなく subnet (netmask + gateway) も出す。
+                // デバイスとプリンターが同一サブネットか (例 .18.x と .21.x が
+                // /24 なら別サブネットで直接到達不可) の切り分けに使う。
+                let info = eth.netif().get_ip_info();
+                let ip = info
+                    .as_ref()
                     .map(|i| i.ip.to_string())
                     .unwrap_or_default();
-                println!("EVT ETH_CONNECTED {ip}");
+                match &info {
+                    Ok(i) => println!("EVT ETH_CONNECTED {ip} subnet={:?}", i.subnet),
+                    Err(e) => println!("EVT ETH_CONNECTED {ip} (ip_info 取得失敗: {e})"),
+                }
                 if let Ok(mut st) = status.lock() {
                     st.lan_link = true;
                     st.lan_ip = ip.clone();
