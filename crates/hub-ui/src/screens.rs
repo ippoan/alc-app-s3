@@ -33,7 +33,8 @@ const BAR_H: i32 = 18;
 
 const C_BG: Rgb565 = Rgb565::BLACK;
 const C_BAR_BG: Rgb565 = Rgb565::CSS_DARK_SLATE_GRAY;
-const C_TEXT: Rgb565 = Rgb565::WHITE;
+// 純白は常時表示で画面焼け (残像) を起こすため 75% 輝度に抑える
+const C_TEXT: Rgb565 = Rgb565::CSS_SILVER;
 const C_MUTED: Rgb565 = Rgb565::CSS_GRAY;
 const C_ACCENT: Rgb565 = Rgb565::CSS_DEEP_SKY_BLUE;
 const C_OK: Rgb565 = Rgb565::CSS_LIME_GREEN;
