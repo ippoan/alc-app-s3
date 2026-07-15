@@ -102,10 +102,9 @@ jobs:
           - { name: core,    cmd: "cargo build --release --locked -p alc-hub-core",    cache_key: build }
           - { name: common,  cmd: "cargo build --release --locked -p alc-hub-common",  cache_key: build }
           - { name: board,   cmd: "cargo build --release --locked -p alc-hub-board",   cache_key: build }
-          # ble leg は #63 診断対象: esp-idf-sys が Fresh にならない (build script が
-          # 毎回再走する) 理由を fingerprint ログ + --timings で確定する。原因確定後に
-          # diag / --timings / CARGO_LOG は別 PR で撤去する (恒久化しない)
-          - { name: ble,     cmd: "cargo build --release --locked -p alc-hub-ble --timings", cache_key: build, diag: true }
+          # 注意: 診断等で leg に CARGO_* env を足すと sccache が 0% hit になる
+          # (sccache は CARGO_* env を hash に含める)。#63 の診断で実測済み
+          - { name: ble,     cmd: "cargo build --release --locked -p alc-hub-ble",     cache_key: build }
           - { name: wifi,    cmd: "cargo build --release --locked -p alc-hub-wifi",    cache_key: build }
           - { name: drivers, cmd: "cargo build --release --locked -p alc-hub-drivers", cache_key: build }
           - { name: ui,      cmd: "cargo build --release --locked -p alc-hub-ui",      cache_key: build }
@@ -200,23 +199,9 @@ jobs:
         env:
           SCCACHE_GHA_ENABLED: 'true'
           RUSTC_WRAPPER: sccache
-          # #63 診断: diag leg (ble) のみ cargo の fingerprint 判定ログを出す。
-          # esp-idf-sys が Fresh にならず build script が再走する理由 (env changed /
-          # fingerprint missing) を確定するため。他 leg では空文字 = 無効
-          CARGO_LOG: ${{ matrix.diag && 'cargo::core::compiler::fingerprint=info' || '' }}
         run: |
           ${{ matrix.cmd }}
           sccache --show-stats
-
-      # #63 診断: --timings の HTML を回収し、88s 無音区間の内訳 (custom-build 実行
-      # 時間 vs rustc 時間) を unit 別に確認する。原因確定後に別 PR で撤去する
-      - name: Upload cargo --timings (diag leg)
-        if: ${{ matrix.diag && always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-timings-${{ matrix.name }}
-          path: target/cargo-timings/*.html
-          if-no-files-found: warn
 
   # ------------------------------------------------------------------
   # build: フルビルド + 書き込みイメージ (main のみ)。
