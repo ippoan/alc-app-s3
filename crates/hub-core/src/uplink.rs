@@ -142,6 +142,74 @@ pub fn command_print_url(payload: &str) -> Option<String> {
     (url.starts_with("https://") || url.starts_with("http://")).then(|| url.to_string())
 }
 
+/// WS push 印刷 (#38) の 1 チャンク。`print_data` command payload
+/// (`{"action":"print_data","seq":N,"chunk":"<base64>","last":bool}`) を
+/// デコードした結果。`data` は base64 デコード済みの生バイト列。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrintChunk {
+    /// 送信側 (DO) が採番する連番。欠落検出・進捗用
+    pub seq: u64,
+    /// base64 デコード済みの PDF バイト列 (そのまま 9100 へ流す)
+    pub data: Vec<u8>,
+    /// 最終チャンクなら true (受信側は flush してセッションを閉じる)
+    pub last: bool,
+}
+
+/// 下り `print_data` command payload をデコードする (#38、WS push 印刷)。
+/// `seq` (数値必須) / `chunk` (base64 文字列必須) / `last` (bool、既定 false) を
+/// 取り出し、`chunk` を base64 デコードする。いずれか欠落・型不一致・base64
+/// 不正は None。副作用は無い (9100 送信は firmware 側)。
+pub fn command_print_chunk(payload: &str) -> Option<PrintChunk> {
+    let v: Value = serde_json::from_str(payload).ok()?;
+    let seq = v.get("seq")?.as_u64()?;
+    let chunk = v.get("chunk")?.as_str()?;
+    let last = v.get("last").and_then(|b| b.as_bool()).unwrap_or(false);
+    let data = base64_decode(chunk)?;
+    Some(PrintChunk { seq, data, last })
+}
+
+/// 標準 base64 (RFC4648、`+` `/`、末尾 `=` パディング) をデコードする純粋関数。
+/// 印刷チャンク (#38) 用。lib を足さず手書きにしている理由は、CCoW では
+/// `Cargo.lock` を再生成できず新規依存追加が `--locked` CI を壊すため
+/// (本関数は coverage 100% 対象なので小さく testable に保つ)。
+/// alphabet 外・長さが 4 の倍数でない・パディング位置不正は None。
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for quad in bytes.chunks(4) {
+        let c0 = val(quad[0])?;
+        let c1 = val(quad[1])?;
+        out.push((c0 << 2) | (c1 >> 4));
+        if quad[2] == b'=' {
+            // 1 バイト出力。4 文字目も `=` でなければ不正パディング
+            if quad[3] != b'=' {
+                return None;
+            }
+        } else {
+            let c2 = val(quad[2])?;
+            out.push((c1 << 4) | (c2 >> 2));
+            if quad[3] != b'=' {
+                let c3 = val(quad[3])?;
+                out.push((c2 << 6) | c3);
+            }
+        }
+    }
+    Some(out)
+}
+
 /// 送信キューの帳簿。実際の送受信・永続化は呼び出し側が行う。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UplinkQueue {
@@ -500,6 +568,59 @@ mod tests {
         assert_eq!(command_ota_url(r#"{"action":"ota","url":1}"#), None);
         assert_eq!(command_ota_url(r#"{"action":"ota"}"#), None);
         assert_eq!(command_ota_url("{oops"), None);
+    }
+
+    #[test]
+    fn command_print_chunk_decodes_base64_payload() {
+        // "SGVsbG8=" は base64("Hello")。last 明示 true。
+        let c = command_print_chunk(
+            r#"{"action":"print_data","seq":7,"chunk":"SGVsbG8=","last":true}"#,
+        )
+        .unwrap();
+        assert_eq!(c.seq, 7);
+        assert_eq!(c.data, b"Hello");
+        assert!(c.last);
+    }
+
+    #[test]
+    fn command_print_chunk_last_defaults_false() {
+        // last 省略時は false。空 chunk ("" は valid base64) は空バイト列。
+        let c = command_print_chunk(r#"{"seq":0,"chunk":""}"#).unwrap();
+        assert_eq!(c.seq, 0);
+        assert!(c.data.is_empty());
+        assert!(!c.last);
+    }
+
+    #[test]
+    fn command_print_chunk_rejects_malformed() {
+        assert!(command_print_chunk("{oops").is_none()); // JSON 不正
+        assert!(command_print_chunk(r#"{"chunk":"SGk="}"#).is_none()); // seq 欠落
+        assert!(command_print_chunk(r#"{"seq":"1","chunk":"SGk="}"#).is_none()); // seq 非数値
+        assert!(command_print_chunk(r#"{"seq":1}"#).is_none()); // chunk 欠落
+        assert!(command_print_chunk(r#"{"seq":1,"chunk":9}"#).is_none()); // chunk 非文字列
+        assert!(command_print_chunk(r#"{"seq":1,"chunk":"!!!!"}"#).is_none()); // base64 不正
+    }
+
+    #[test]
+    fn base64_decode_valid() {
+        assert_eq!(base64_decode("").unwrap(), b""); // 空
+        assert_eq!(base64_decode("SGk=").unwrap(), b"Hi"); // 2 バイト (末尾 1 パディング)
+        assert_eq!(base64_decode("SG==").unwrap(), b"H"); // 1 バイト (末尾 2 パディング)
+        assert_eq!(base64_decode("SGVsbG8=").unwrap(), b"Hello"); // 5 バイト
+        // '+' '/' と 0-9・大小英字を含む全 alphabet 経路を通す。
+        // base64("\xfb\xff\xbf") = "+/+/"
+        assert_eq!(base64_decode("+/+/").unwrap(), vec![0xfb, 0xff, 0xbf]);
+        assert_eq!(base64_decode("0189").unwrap().len(), 3); // 数字経路
+    }
+
+    #[test]
+    fn base64_decode_rejects_bad_input() {
+        assert!(base64_decode("SGk").is_none()); // 長さが 4 の倍数でない
+        assert!(base64_decode("SG=x").is_none()); // 不正パディング (3 文字目 = だが 4 文字目 ≠ =)
+        assert!(base64_decode("!AAA").is_none()); // 1 文字目 alphabet 外
+        assert!(base64_decode("A!AA").is_none()); // 2 文字目 alphabet 外
+        assert!(base64_decode("AA!A").is_none()); // 3 文字目 alphabet 外 (非パディング)
+        assert!(base64_decode("AAA!").is_none()); // 4 文字目 alphabet 外 (非パディング)
     }
 
     #[test]

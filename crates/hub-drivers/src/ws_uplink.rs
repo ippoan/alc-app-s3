@@ -25,11 +25,13 @@
 //! | `EVT WS_COMMAND <id> <payload>` | 下り command を受信 |
 //! | `EVT WS_DROPPED <seq>` | キュー上限で最古の未送信測定を破棄 |
 
+use std::io::Write;
+use std::net::TcpStream;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
 use alc_hub_core::uplink::{
-    command_action, command_ota_url, command_print_url, command_result_frame, measurement_frame,
-    parse_downlink, Downlink, UplinkQueue, PING_FRAME,
+    command_action, command_ota_url, command_print_chunk, command_print_url, command_result_frame,
+    measurement_frame, parse_downlink, Downlink, UplinkQueue, PING_FRAME,
 };
 use anyhow::Result;
 use esp_idf_svc::ws::client::{
@@ -94,6 +96,40 @@ struct Conn {
     connected: bool,
 }
 
+/// WS push 印刷 (#38) の TcpStream 書き込みタイムアウト。fetch_and_send と同値
+const PRINT_IO_TIMEOUT_S: u64 = 30;
+
+/// WS push 印刷 (#38) の進行中セッション。`print_begin` で NVS の printer_addr
+/// (9100) へ接続し、`print_data` チャンクを書き足し、`print_end` で flush して
+/// 閉じる。複数の下りフレームに跨って TcpStream を保持するため、run ループが
+/// `Option<PrintSession>` として所有する (Conn と同じ持ち方)。WS 切断時は破棄。
+struct PrintSession {
+    printer: TcpStream,
+    bytes: usize,
+}
+
+impl PrintSession {
+    /// printer_addr (9100) へ接続してセッションを開く
+    fn open(addr: &str) -> std::io::Result<Self> {
+        let printer = TcpStream::connect(addr)?;
+        printer.set_write_timeout(Some(core::time::Duration::from_secs(PRINT_IO_TIMEOUT_S)))?;
+        Ok(Self { printer, bytes: 0 })
+    }
+
+    /// デコード済みチャンクを 9100 へ書き足す
+    fn write_chunk(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.printer.write_all(data)?;
+        self.bytes += data.len();
+        Ok(())
+    }
+
+    /// flush してセッションを閉じる (drop で TcpStream が close され 9100 raw は
+    /// それを送信完了として扱う)
+    fn finish(mut self) -> std::io::Result<()> {
+        self.printer.flush()
+    }
+}
+
 fn run(
     rx: Receiver<UplinkRecord>,
     ui_tx: Sender<UiCommand>,
@@ -110,6 +146,9 @@ fn run(
 
     let (ev_tx, ev_rx) = mpsc::channel::<WsEvent>();
     let mut conn: Option<Conn> = None;
+    // WS push 印刷 (#38) の進行中セッション (print_begin〜print_end)。フレーム
+    // 跨ぎで 9100 の TcpStream を保持する。WS 切断で破棄する (未完印刷は中断)
+    let mut print_session: Option<PrintSession> = None;
     // device JWT と失効時刻 (稼働 ms)
     let mut token: Option<(String, u64)> = None;
     let mut backoff_until: u64 = 0;
@@ -155,12 +194,21 @@ fn run(
                     if conn.take().is_some() {
                         println!("EVT WS_DISCONNECTED");
                     }
+                    // 印刷中の切断は未完なので破棄 (drop で 9100 を閉じる)
+                    print_session = None;
                     backoff_until = now_ms() + RECONNECT_BACKOFF_MS;
                     dirty = true;
                 }
                 WsEvent::Text(text) => {
                     handle_downlink(
-                        &text, &mut queue, &settings, &mut conn, &ui_tx, &status, &ev_tx,
+                        &text,
+                        &mut queue,
+                        &settings,
+                        &mut conn,
+                        &mut print_session,
+                        &ui_tx,
+                        &status,
+                        &ev_tx,
                     );
                     dirty = true;
                 }
@@ -308,11 +356,13 @@ fn publish_status(status: &SharedStatus, queue: &UplinkQueue, connected: bool) {
 }
 
 /// 下りフレームの処理 (ack 消し込み / command 中継)
+#[allow(clippy::too_many_arguments)]
 fn handle_downlink(
     text: &str,
     queue: &mut UplinkQueue,
     settings: &Settings,
     conn: &mut Option<Conn>,
+    print: &mut Option<PrintSession>,
     ui_tx: &Sender<UiCommand>,
     status: &SharedStatus,
     ev_tx: &mpsc::Sender<WsEvent>,
@@ -379,6 +429,85 @@ fn handle_downlink(
                         conn,
                         &id,
                         r#"{"phase":"error","message":"invalid url"}"#,
+                    ),
+                },
+                // WS push 印刷 (#38): PDF 本体を下り WS で受けて 9100 へ流す。
+                // recorder / public URL / R2 不要。print_begin で printer へ接続、
+                // print_data チャンクを書き足し、print_end で flush して閉じる。
+                Some("print_begin") => match settings.printer_addr() {
+                    Some(addr) => match PrintSession::open(&addr) {
+                        Ok(sess) => {
+                            *print = Some(sess);
+                            send_command_result(conn, &id, r#"{"phase":"started"}"#);
+                        }
+                        Err(e) => {
+                            log::warn!("ws_uplink: 印刷 9100 接続失敗: {e}");
+                            *print = None;
+                            send_command_result(
+                                conn,
+                                &id,
+                                r#"{"phase":"error","message":"printer connect failed"}"#,
+                            );
+                        }
+                    },
+                    None => send_command_result(
+                        conn,
+                        &id,
+                        r#"{"phase":"error","message":"printer addr not set"}"#,
+                    ),
+                },
+                Some("print_data") => match (print.as_mut(), command_print_chunk(&payload)) {
+                    (Some(sess), Some(chunk)) => match sess.write_chunk(&chunk.data) {
+                        Ok(()) => {
+                            let payload = format!(
+                                r#"{{"phase":"progress","seq":{},"bytes":{}}}"#,
+                                chunk.seq, sess.bytes,
+                            );
+                            send_command_result(conn, &id, &payload);
+                        }
+                        Err(e) => {
+                            log::warn!("ws_uplink: 印刷 9100 書き込み失敗: {e}");
+                            *print = None; // セッション破棄
+                            send_command_result(
+                                conn,
+                                &id,
+                                r#"{"phase":"error","message":"printer write failed"}"#,
+                            );
+                        }
+                    },
+                    (None, _) => send_command_result(
+                        conn,
+                        &id,
+                        r#"{"phase":"error","message":"no active print session"}"#,
+                    ),
+                    (Some(_), None) => send_command_result(
+                        conn,
+                        &id,
+                        r#"{"phase":"error","message":"invalid print_data"}"#,
+                    ),
+                },
+                Some("print_end") => match print.take() {
+                    Some(sess) => {
+                        let bytes = sess.bytes;
+                        match sess.finish() {
+                            Ok(()) => {
+                                let payload = format!(r#"{{"phase":"done","bytes":{bytes}}}"#);
+                                send_command_result(conn, &id, &payload);
+                            }
+                            Err(e) => {
+                                log::warn!("ws_uplink: 印刷 flush 失敗: {e}");
+                                send_command_result(
+                                    conn,
+                                    &id,
+                                    r#"{"phase":"error","message":"printer flush failed"}"#,
+                                );
+                            }
+                        }
+                    }
+                    None => send_command_result(
+                        conn,
+                        &id,
+                        r#"{"phase":"error","message":"no active print session"}"#,
                     ),
                 },
                 // バージョン照会: 現在の firmware version + 実行スロットを返す
