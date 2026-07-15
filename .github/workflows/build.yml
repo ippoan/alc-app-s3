@@ -94,21 +94,29 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # cache_key: restore 元の rust-cache shared-key。cores3 系は main の build
+        # job が warm する `build`、atoms3-print は sdkconfig が別なので同 build job
+        # が別途 warm する `build-atoms3` を restore する。全 leg 一律 `build` だと
+        # atoms3 フレーバーの esp-idf-sys 成果物が永遠に cold だった (Refs #63)
         include:
-          - { name: core,    cmd: "cargo build --release --locked -p alc-hub-core" }
-          - { name: common,  cmd: "cargo build --release --locked -p alc-hub-common" }
-          - { name: board,   cmd: "cargo build --release --locked -p alc-hub-board" }
-          - { name: ble,     cmd: "cargo build --release --locked -p alc-hub-ble" }
-          - { name: wifi,    cmd: "cargo build --release --locked -p alc-hub-wifi" }
-          - { name: drivers, cmd: "cargo build --release --locked -p alc-hub-drivers" }
-          - { name: ui,      cmd: "cargo build --release --locked -p alc-hub-ui" }
-          - { name: bin,     cmd: "cargo check --release --locked -p alc-hub-cores3" }
+          - { name: core,    cmd: "cargo build --release --locked -p alc-hub-core",    cache_key: build }
+          - { name: common,  cmd: "cargo build --release --locked -p alc-hub-common",  cache_key: build }
+          - { name: board,   cmd: "cargo build --release --locked -p alc-hub-board",   cache_key: build }
+          # ble leg は #63 診断対象: esp-idf-sys が Fresh にならない (build script が
+          # 毎回再走する) 理由を fingerprint ログ + --timings で確定する。原因確定後に
+          # diag / --timings / CARGO_LOG は別 PR で撤去する (恒久化しない)
+          - { name: ble,     cmd: "cargo build --release --locked -p alc-hub-ble --timings", cache_key: build, diag: true }
+          - { name: wifi,    cmd: "cargo build --release --locked -p alc-hub-wifi",    cache_key: build }
+          - { name: drivers, cmd: "cargo build --release --locked -p alc-hub-drivers", cache_key: build }
+          - { name: ui,      cmd: "cargo build --release --locked -p alc-hub-ui",      cache_key: build }
+          - { name: bin,     cmd: "cargo check --release --locked -p alc-hub-cores3",  cache_key: build }
           # atoms3-print は sdkconfig が別 (W5500 有効/PSRAM・BLE 無し) のため
           # esp-idf-sys の設定元を ESP_IDF_SYS_ROOT_CRATE で本 crate に向ける。
-          # sccache/rust-cache は cores3 系と esp-idf-sys ビルドを共有できない
-          # (sdkconfig が違う) が、leg が独立 job なので互いを汚さない
+          # cores3 系と esp-idf-sys ビルドを共有できない (sdkconfig が違う) ので
+          # build-atoms3 キャッシュを restore する
           - { name: atoms3-print,
-              cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-print cargo check --release --locked -p alc-hub-atoms3-print" }
+              cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-print cargo check --release --locked -p alc-hub-atoms3-print",
+              cache_key: build-atoms3 }
 
     steps:
       - name: Checkout
@@ -173,7 +181,9 @@ jobs:
       - name: Cache cargo registry/target (restore only)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: build
+          # leg のフレーバーに対応する main warm キャッシュを restore する
+          # (cores3 系 = build / atoms3-print = build-atoms3、Refs #63)
+          shared-key: ${{ matrix.cache_key }}
           key: ${{ hashFiles('.cargo/config.toml') }}
           save-if: 'false'
           # 自作クレートの成果物も復元する (restore-mtime とセットで
@@ -190,9 +200,23 @@ jobs:
         env:
           SCCACHE_GHA_ENABLED: 'true'
           RUSTC_WRAPPER: sccache
+          # #63 診断: diag leg (ble) のみ cargo の fingerprint 判定ログを出す。
+          # esp-idf-sys が Fresh にならず build script が再走する理由 (env changed /
+          # fingerprint missing) を確定するため。他 leg では空文字 = 無効
+          CARGO_LOG: ${{ matrix.diag && 'cargo::core::compiler::fingerprint=info' || '' }}
         run: |
           ${{ matrix.cmd }}
           sccache --show-stats
+
+      # #63 診断: --timings の HTML を回収し、88s 無音区間の内訳 (custom-build 実行
+      # 時間 vs rustc 時間) を unit 別に確認する。原因確定後に別 PR で撤去する
+      - name: Upload cargo --timings (diag leg)
+        if: ${{ matrix.diag && always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-${{ matrix.name }}
+          path: target/cargo-timings/*.html
+          if-no-files-found: warn
 
   # ------------------------------------------------------------------
   # build: フルビルド + 書き込みイメージ (main のみ)。
