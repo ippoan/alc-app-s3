@@ -5,6 +5,18 @@
 
 use alc_hub_core::device::DeviceKind;
 
+/// FC-1200 (RS232) の測定進行状態。点呼画面のアルコール欄に
+/// 「計測待ち」の代わりのライブ表示を出すために rs232.rs が送る
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlcoholStage {
+    /// ウォームアップ中 (UT 受信〜MSWM 待ち) → 「準備中」
+    Warming,
+    /// 吹込待ち (MSWM 受信後) → 「吹込待ち」
+    BlowWaiting,
+    /// 吹込完了・判定中 (MSEN 受信後) → 「判定中」
+    Measuring,
+}
+
 /// ホスト / BLE からの画面操作コマンド
 pub enum UiCommand {
     ShowQr {
@@ -36,4 +48,7 @@ pub enum UiCommand {
     BleAcquiring { device: DeviceKind },
     /// BLE 接続の終了 — 切断/再スキャン (スピナー消去)
     BleIdle,
+    /// FC-1200 の測定進行状態 (None = 待機へ戻った: タイムアウト等)。
+    /// 点呼画面表示中のみアルコール欄に反映される
+    AlcoholStage(Option<AlcoholStage>),
 }

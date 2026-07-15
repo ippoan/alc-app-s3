@@ -56,10 +56,13 @@ pub(crate) enum Screen {
         temp: Option<f32>,
         /// 血圧 (収縮期, 拡張期, 脈拍)。None = 未計測
         bp: Option<(f32, f32, Option<f32>)>,
-        /// アルコール測定結果 (ok, 表示値)。ホストの RESULT で更新。
-        /// 表示のみで点呼完了条件には含めない (対面点呼など運用により
-        /// アルコールチェッカーの扱いが異なるため — 今後実装)
+        /// アルコール測定結果 (ok, 表示値)。ホストの RESULT または
+        /// FC-1200 (recorder 経由) で更新。表示のみで点呼完了条件には
+        /// 含めない (対面点呼など運用によりアルコールチェッカーの扱いが
+        /// 異なるため — 今後実装)
         alcohol: Option<(bool, String)>,
+        /// FC-1200 の測定進行状態 (結果が無い間の「準備中/吹込待ち/判定中」表示)
+        alc_stage: Option<alc_hub_common::ui_api::AlcoholStage>,
         /// 体温+血圧が揃った時刻 [ms]。TENKO_DONE_CLOSE_MS 経過で待機画面へ
         done_at: Option<u64>,
     },
@@ -242,13 +245,27 @@ pub fn run(
                 // 点呼中の RESULT はアルコール欄の更新のみ (画面遷移しない)。
                 // それ以外は従来どおり結果画面へ
                 UiCommand::Result { ok, value } => {
-                    if let Screen::Measuring { alcohol, .. } = &mut screen {
+                    if let Screen::Measuring {
+                        alcohol, alc_stage, ..
+                    } = &mut screen
+                    {
                         *alcohol = Some((ok, value));
+                        *alc_stage = None;
                         dirty = true;
                     } else {
                         screen = Screen::Result { ok, value };
                         entered = now;
                         dirty = true;
+                    }
+                }
+                // FC-1200 の進行状態: 点呼画面のアルコール欄のみ更新。
+                // 他画面では無視 (測定フローは FC-1200 側が勝手に進むため)
+                UiCommand::AlcoholStage(stage) => {
+                    if let Screen::Measuring { alc_stage, .. } = &mut screen {
+                        if *alc_stage != stage {
+                            *alc_stage = stage;
+                            dirty = true;
+                        }
                     }
                 }
                 cmd => {
@@ -264,6 +281,7 @@ pub fn run(
                             temp: None,
                             bp: None,
                             alcohol: None,
+                            alc_stage: None,
                             done_at: None,
                         },
                         UiCommand::Error { message } => Screen::Error { message },
@@ -273,6 +291,7 @@ pub fn run(
                         | UiCommand::BloodPressure { .. }
                         | UiCommand::BleAcquiring { .. }
                         | UiCommand::BleIdle
+                        | UiCommand::AlcoholStage(_)
                         | UiCommand::Result { .. } => unreachable!(),
                     };
                     entered = now;
@@ -409,6 +428,7 @@ fn on_click(screen: &Screen, y: i32, logical_h: i32) -> Option<Screen> {
                     temp: None,
                     bp: None,
                     alcohol: None,
+                    alc_stage: None,
                     done_at: None,
                 })
             } else {

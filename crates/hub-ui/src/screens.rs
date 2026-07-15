@@ -27,7 +27,7 @@ use u8g2_fonts::{
 
 use super::Screen;
 use alc_hub_board::display::Cs3Display;
-use alc_hub_common::{config, status::HubStatus};
+use alc_hub_common::{config, status::HubStatus, ui_api::AlcoholStage};
 
 const BAR_H: i32 = 18;
 
@@ -252,8 +252,12 @@ pub fn draw_full(d: &mut Cs3Display, screen: &Screen, st: &HubStatus, now: u64, 
             draw_qr(d, payload, remain_s);
         }
         Screen::Measuring {
-            temp, bp, alcohol, ..
-        } => draw_tenko(d, *temp, *bp, alcohol),
+            temp,
+            bp,
+            alcohol,
+            alc_stage,
+            ..
+        } => draw_tenko(d, *temp, *bp, alcohol, *alc_stage),
         Screen::Result { ok, value } => draw_result(d, *ok, value),
         Screen::Error { message } => draw_error(d, message),
         Screen::Temperature { celsius } => draw_temperature(d, *celsius),
@@ -400,12 +404,14 @@ fn tenko_waiting(d: &mut Cs3Display, row_y: i32) {
 }
 
 /// 点呼画面: 体温 / 血圧 / アルコールを同一画面で計測・確認する (3 段)。
-/// 未計測の欄は「計測待ち」。取得中スピナーは draw_tenko_spinner (部分更新)
+/// 未計測の欄は「計測待ち」。取得中スピナーは draw_tenko_spinner (部分更新)。
+/// アルコール欄は FC-1200 の進行状態 (準備中/吹込待ち/判定中) をライブ表示する
 fn draw_tenko(
     d: &mut Cs3Display,
     temp: Option<f32>,
     bp: Option<(f32, f32, Option<f32>)>,
     alcohol: &Option<(bool, String)>,
+    alc_stage: Option<AlcoholStage>,
 ) {
     let (w, _) = dims(d);
     clear(d);
@@ -519,7 +525,20 @@ fn draw_tenko(
                 );
             }
         }
-        None => tenko_waiting(d, TENKO_ALC_Y),
+        // 結果が無い間は FC-1200 の進行状態をライブ表示 (無ければ計測待ち)。
+        // 吹込待ちはユーザー操作を促す段階なので強調色にする
+        None => match alc_stage {
+            Some(AlcoholStage::Warming) => {
+                jp2x_left(d, "準備中", w - 104, TENKO_ALC_Y + 20, C_MUTED, C_BG);
+            }
+            Some(AlcoholStage::BlowWaiting) => {
+                jp2x_left(d, "吹込待ち", w - 136, TENKO_ALC_Y + 20, C_ACCENT, C_BG);
+            }
+            Some(AlcoholStage::Measuring) => {
+                jp2x_left(d, "判定中", w - 104, TENKO_ALC_Y + 20, C_ACCENT, C_BG);
+            }
+            None => tenko_waiting(d, TENKO_ALC_Y),
+        },
     }
 }
 
