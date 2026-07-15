@@ -37,35 +37,31 @@ const PROGRESS_STEP: usize = 64 * 1024;
 /// 結果はイベント出力のみ。同時印刷の直列化は呼び出し側の責務 (現状は
 /// コンソール/WS からの手動トリガーのみなので未対策)。
 pub fn spawn_print(url: String, printer_addr: String, status: SharedStatus) {
-    // ネットワーク (LAN) が上がる前に lwip の socket API を叩くと
-    // `tcpip_send_msg_wait_sem (Invalid mbox)` の assert でリブートする
-    // (実機で確認 — シリアルポート open のリセット直後に PRINT が届いた場合)。
-    // 接続確立前は開始せずエラー応答で止める。
-    //
-    // 診断ログ (EVT PRINT_DIAG): lan_link が false と読める原因の切り分け用。
-    // WS が繋がっているのに lan_link=false なら status/lock の不整合、
-    // lock=poisoned なら他スレッド panic の巻き添えを疑う (実機ログで判定)。
-    let lan_up = match status.lock() {
-        Ok(s) => {
-            println!(
-                "EVT PRINT_DIAG lan_link={} wifi={} ws={} ip={}",
-                s.lan_link, s.wifi_connected, s.ws_connected, s.lan_ip,
-            );
-            s.lan_link
-        }
-        Err(_) => {
-            println!("EVT PRINT_DIAG lock=poisoned");
-            false
-        }
-    };
-    if !lan_up {
-        println!("EVT PRINT NG LAN 未接続 (ETH_CONNECTED を待ってください)");
-        return;
-    }
+    // LAN 待ちは印刷スレッド内で行う (console スレッドを最大 20 秒ブロックしない)。
     let spawned = std::thread::Builder::new()
         .name("print".into())
         .stack_size(20 * 1024)
         .spawn(move || {
+            // ネットワーク (LAN) が上がる前に lwip の socket API を叩くと
+            // `tcpip_send_msg_wait_sem (Invalid mbox)` の assert でリブートする。
+            // 以前は即 NG で弾いていたが、ポート open のリセット直後や W5500 の
+            // リンク negotiation 過渡期に PRINT が届くと lan_link=false で誤って
+            // 失敗した (実機: 静かな再起動を挟むと boot 直後に PRINT が来る #59)。
+            // lan_link が立つまで最大 20 秒待つ (auth_link と同じ待機を流用)。
+            println!("EVT PRINT_WAIT_LAN");
+            if !crate::auth_link::wait_for_network(&status, 20_000) {
+                let diag = status
+                    .lock()
+                    .map(|s| {
+                        format!(
+                            "lan_link={} wifi={} ws={} ip={}",
+                            s.lan_link, s.wifi_connected, s.ws_connected, s.lan_ip
+                        )
+                    })
+                    .unwrap_or_else(|_| "lock=poisoned".into());
+                println!("EVT PRINT NG LAN 未接続 (20秒待機後も未確立: {diag})");
+                return;
+            }
             println!("EVT PRINT_START url={url} printer={printer_addr}");
             if let Ok(mut st) = status.lock() {
                 st.push_event(now_ms(), "印刷開始");

@@ -66,7 +66,8 @@ pub fn spawn_mint_test(settings: Settings, status: SharedStatus) {
 /// ネットワーク (Wi-Fi または LAN) が接続されるまで最大 `timeout_ms` 待つ。
 /// 印刷ブリッジ (AtomS3 + PoE) は LAN 専用で wifi_connected が常に false のため
 /// lan_link も見る。接続できたら true。
-fn wait_for_network(status: &SharedStatus, timeout_ms: u64) -> bool {
+/// printer.rs (印刷開始前の LAN 待ち) でも流用する (pub(crate))。
+pub(crate) fn wait_for_network(status: &SharedStatus, timeout_ms: u64) -> bool {
     let mut waited = 0u64;
     loop {
         if status
