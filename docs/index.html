@@ -433,21 +433,33 @@
         // ------------------------------------------------------------------
         // 1 行コマンドを送り、prefixes のいずれかで始まる応答行を返す (最大 timeoutMs)。
         // ESP-IDF ログが混在するため既知プレフィックスだけを拾う。
+        //
+        // ★CoreS3 は USB Serial/JTAG 直結のため、Web Serial の open (DTR 操作) で
+        // チップが**リセット**され、起動完了まで 5〜7 秒コマンドに応答できない。
+        // そのため 1 回送って待つのではなく、応答があるまで約 2 秒間隔で
+        // コマンドを再送しながら全体で timeoutMs (呼び出し側は 15 秒以上推奨) 待つ。
         async function serialCommand(line, prefixes, timeoutMs) {
             if (!('serial' in navigator)) throw new Error('このブラウザは Web Serial API 非対応 (Chrome/Edge/Opera)');
             const port = await navigator.serial.requestPort();
             await port.open({ baudRate: 115200 });
             try {
                 const writer = port.writable.getWriter();
-                await writer.write(new TextEncoder().encode(line + '\n'));
-                writer.releaseLock();
-
                 const reader = port.readable.getReader();
-                const deadline = Date.now() + timeoutMs;
+                const deadline = Date.now() + Math.max(timeoutMs, 15000);
                 const timer = setInterval(() => { if (Date.now() >= deadline) reader.cancel().catch(() => {}); }, 200);
+                const send = () => writer.write(new TextEncoder().encode(line + '\n')).catch(() => {});
+                const opened = Date.now();
+                await send();
+                let lastSend = Date.now();
                 let buf = '';
                 try {
                     while (Date.now() < deadline) {
+                        // リセット起動中の取りこぼしに備え、開いてから 10 秒間だけ
+                        // 2 秒間隔で再送する (WIFI TEST 等を試験中に連発しないため)
+                        if (Date.now() - opened < 10000 && Date.now() - lastSend >= 2000) {
+                            await send();
+                            lastSend = Date.now();
+                        }
                         const { value, done } = await reader.read();
                         if (done) break;
                         buf += new TextDecoder().decode(value);
@@ -459,7 +471,7 @@
                         }
                     }
                 } catch (e) { /* timeout cancel */ }
-                finally { clearInterval(timer); reader.releaseLock(); }
+                finally { clearInterval(timer); writer.releaseLock(); reader.releaseLock(); }
                 return null;
             } finally {
                 try { await port.close(); } catch (e) { /* noop */ }
