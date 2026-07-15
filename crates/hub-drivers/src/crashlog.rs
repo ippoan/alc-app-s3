@@ -139,6 +139,15 @@ extern "C" {
 /// 渡すこと。
 pub fn init() -> Option<CrashSnapshot> {
     let reset_code = unsafe { sys::esp_reset_reason() } as i32;
+    // 起動時の reset 理由を EVT で出す (setup ページの KNOWN フィルタに乗せる #59)。
+    // usb/jtag/sw = シリアルポート open 等の無害なリセット (メール通知なし)、
+    // panic/int_wdt/task_wdt/wdt/brownout/pwr_glitch/cpu_lockup = 異常
+    // (is_crash_reset → crash_log 送信 + メール)。log::info! は "I (..)" 始まりで
+    // setup ページに出ないため println! で別途出す。
+    println!(
+        "EVT BOOT reset={} ({reset_code})",
+        pure::reset_reason_name(reset_code)
+    );
     let mut snapshot = None;
     unsafe {
         let r = ring_ptr();
