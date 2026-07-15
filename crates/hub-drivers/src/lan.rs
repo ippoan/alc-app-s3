@@ -1,19 +1,22 @@
 //! LAN Module 13.2 (W5500, Ethernet + PoE) — 未実装スタブ。
 //!
 //! plan/cores3-hub-consolidation.md (issue #102 参照):
-//! - CoreS3 ピン: CS=G1 / RST=G0 / INT=G10。公式 M5Module-LAN-13.2 の
+//! - CoreS3 単体デフォルトピン: CS=G1 / RST=G0 / INT=G10。公式 M5Module-LAN-13.2 の
 //!   examples/LinkStatus/LinkStatus.ino の board_M5StackCoreS3 分岐で確認済み。
-//! - 割当変更は M5-Bus 側の JC ジャンパ (CSN/RSTN/INTN の 3 組、差し替え式)。
-//!   公式 doc の切替値は無印 Core 基準で、CoreS3 の変更後 GPIO は公式サンプルに
-//!   定義が無い (回路図/実機で要確認)。
-//! - RS232M Module と G10 (INT) が競合し得るため、両モジュールスタック時は
-//!   RS232M の DIP を G10 に振らない/LAN の INTN ジャンパで逃がす等の調整が必要
-//!   (実機で要確認)。
+//! - 割当変更は M5-Bus 側の JC ジャンパ 3 組 (INT / RST / CS、差し替え式)。
+//!   シルク番号はバスピン (無印 Core 基準) で、CoreS3 実 GPIO への翻訳は下記
+//!   (スタック互換ツール K128+M131+M136 で確定):
+//!     INT: G35→G10 (default) / G34→G14
+//!     RST: G0 →G0  (default) / G13→G7
+//!     CS : G5 →G1  (default) / G15→G13
+//! - ★RS232M と同時スタック時: LAN の CS (default G5=CoreS3 G1) が RS232M の CS
+//!   (CoreS3 G1) と衝突する。CS ジャンパを G15 (=CoreS3 G13) へ動かし、本ドライバ
+//!   実装時は CS=13 を使う。INT=10 / RST=0 はデフォルトのまま変更不要。
 //! - 給電は本モジュールの PoE (IEEE802.3at) から行う設計。
 //!
 //! TODO: W5500 ドライバ (esp-idf の eth ドライバ or `w5500` crate) で
 //! リンク監視とクラウド (alc-app backend) 接続を実装し、
-//! `HubStatus::lan_link` を更新する。
+//! `HubStatus::lan_link` を更新する。RS232M と同時スタックなら CS=13 で初期化する。
 
 use alc_hub_common::status::SharedStatus;
 
