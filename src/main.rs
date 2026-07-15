@@ -135,7 +135,13 @@ fn main() -> Result<()> {
         pair_flag.clone(),
         improv,
     )?;
-    rs232::start(p.uart1, p.pins.gpio17, p.pins.gpio18, Arc::clone(&status))?;
+    rs232::start(
+        p.uart1,
+        p.pins.gpio17,
+        p.pins.gpio18,
+        Arc::clone(&status),
+        meas_tx.clone(),
+    )?;
     lan::start(Arc::clone(&status)); // TODO: W5500 実装 (lan.rs 参照)
     // NTP: ネットワーク接続後に時刻同期し、測定ログを日本時間で記録する。
     // EspSntp は drop すると同期が止まるため、UI ループ (戻らない) の間

@@ -17,7 +17,7 @@ use alc_hub_common::{
     status::{event_timestamp, SharedStatus},
     ui_api::UiCommand,
 };
-use alc_hub_core::vitals;
+use alc_hub_core::{fc1200, vitals};
 use anyhow::Result;
 
 /// 現在の epoch ms (NTP 未同期時は 1970 起点の稼働時間になる — サーバ側は
@@ -47,6 +47,9 @@ pub fn start(
             // 値も含めて完全一致した場合のみ再送とみなす
             let mut last_temp: Option<(u64, f32)> = None;
             let mut last_bp: Option<(u64, f32, f32, Option<f32>)> = None;
+            // FC-1200 は累計使用回数 (use_count) が測定ごとに増えるため、
+            // RSOK 取りこぼしによる再送は use_count 一致で見分ける
+            let mut last_alc: Option<u32> = None;
             for m in meas_rx {
                 match m {
                     Measurement::Temperature {
@@ -117,6 +120,35 @@ pub fn start(
                             systolic,
                             diastolic,
                             pulse,
+                        });
+                    }
+                    Measurement::Alcohol {
+                        result,
+                        centi_mg_per_l,
+                        use_count,
+                        at_ms,
+                    } => {
+                        if last_alc == Some(use_count) {
+                            log::info!("recorder: アルコールの再送を無視 (use_count={use_count})");
+                            continue;
+                        }
+                        last_alc = Some(use_count);
+                        let json = fc1200::payload_json(result, centi_mg_per_l, use_count);
+                        println!("{json}");
+                        let _ = ws_tx.send(UplinkRecord {
+                            kind: "alcohol",
+                            payload: json,
+                            recorded_at_ms: epoch_ms(),
+                        });
+                        record(
+                            &status,
+                            &settings,
+                            at_ms,
+                            &fc1200::event_line(result, centi_mg_per_l),
+                        );
+                        let _ = ui_tx.send(UiCommand::Result {
+                            ok: fc1200::is_pass(result, centi_mg_per_l),
+                            value: fc1200::value_str(centi_mg_per_l),
                         });
                     }
                 }
