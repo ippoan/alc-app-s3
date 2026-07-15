@@ -75,11 +75,12 @@ pub fn spawn_update(url: String, status: SharedStatus, progress: Option<Progress
                 st.push_event(now_ms(), "OTA 更新開始");
             }
             // OTA 中は UI ループが 10s 以上 feed できず task_wdt が誤リセットする
-            // (更新が毎回中断する実害、Refs #55)。UI タスクの WDT 監視を一時停止し、
-            // 完了/失敗のどちらでも必ず戻す。
-            alc_hub_common::wdt::pause_ui();
-            let result = download_and_write(&url, progress.as_ref());
-            alc_hub_common::wdt::resume_ui();
+            // (更新が毎回中断する実害、Refs #55)。UI タスクの WDT 監視を download の
+            // 間だけ止める。RAII ガードなので panic / 早期 return でも必ず戻る。
+            let result = {
+                let _wdt_pause = alc_hub_common::wdt::OtaWdtPause::new();
+                download_and_write(&url, progress.as_ref())
+            };
             match result {
                 Ok(bytes) => {
                     println!("EVT OTA OK {bytes}");

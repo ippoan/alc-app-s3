@@ -18,3 +18,4 @@ pub mod printer;
 pub mod protocol;
 pub mod uplink;
 pub mod vitals;
+pub mod wdt_gate;
