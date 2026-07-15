@@ -37,4 +37,12 @@ pub enum Measurement {
         timestamp: Option<u64>,
         at_ms: u64,
     },
+    /// FC-1200 (RS232) のアルコール測定。値は 0.01mg/L 単位の整数
+    Alcohol {
+        result: alc_hub_core::fc1200::AlcoholResult,
+        centi_mg_per_l: u16,
+        /// 機器の累計使用回数。同一測定の再送 (RSOK 取りこぼし時) の重複排除に使う
+        use_count: u32,
+        at_ms: u64,
+    },
 }

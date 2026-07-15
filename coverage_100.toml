@@ -23,6 +23,10 @@ path = "crates/hub-core/src/device.rs"
 type = "unit"
 
 [[file]]
+path = "crates/hub-core/src/fc1200.rs"
+type = "unit"
+
+[[file]]
 path = "crates/hub-core/src/ieee11073.rs"
 type = "unit"
 

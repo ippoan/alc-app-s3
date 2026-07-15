@@ -107,5 +107,7 @@ CoreS3 実 GPIO はスタック互換ツールで確定:
 
 - [x] RS232M Module の DIP 実配置確認 (RXD-2=G17 / TXD-3=G18)
 - [x] LAN Module JC ジャンパ ↔ CoreS3 GPIO 対応を確定 (INT G35=G10 / RST G0=G0 / CS G5=G1・G15=G13)
-- [ ] LAN Module 13.2 (W5500) リンク監視・クラウド接続実装 (`lan.rs`、CS=13 で実装)
-- [ ] 実機で RS232 受信 (`FC1200 <hex>`) と (LAN 実装後) リンクアップの同時動作を確認
+- [x] LAN Module 13.2 (W5500) リンク監視実装 (`lan.rs` → `eth_w5500.rs`、CS=13。
+      LCD との SPI バス共有 + G35 二役対応は `hub-board/src/display.rs` 参照)
+- [x] 実機で RS232 受信を確認 (FC-1200B の `RQCNFC-1200B` 受信、2026-07-15)
+- [ ] 実機で LAN リンクアップと RS232 受信の同時動作を確認

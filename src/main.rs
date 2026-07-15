@@ -32,6 +32,7 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::{
     i2c::{config::Config as I2cConfig, I2cDriver},
     peripherals::Peripherals,
+    spi::{config::DriverConfig as SpiDriverConfig, Dma, SpiDriver},
     units::Hertz,
 };
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
@@ -56,17 +57,23 @@ fn main() -> Result<()> {
     let i2c_cfg = I2cConfig::new().baudrate(Hertz(400_000));
     let mut i2c = I2cDriver::new(p.i2c0, p.pins.gpio12, p.pins.gpio11, &i2c_cfg)?;
 
-    // 電源 (LCD バックライト・リセット含む) → LCD の順で初期化
+    // 電源 (LCD バックライト・リセット含む) → LCD の順で初期化。
+    // M-Bus/SPI2 バス (SCK=G36 / MISO=G35 / MOSI=G37) は LCD (CS=G3) と
+    // LAN Module 13.2 の W5500 (CS=G13、lan.rs) が共有する。G35 は LCD の
+    // DC と二役 (display.rs SharedDcInterface 参照)。DMA 必須 — 無効だと
+    // Ethernet フレーム転送が 64 バイト上限で全滅する (atoms3-print の実機知見)
     board::power::init(&mut i2c)?;
     let rotation = settings.rotation();
-    let display = board::display::init(
+    let spi = SpiDriver::new(
         p.spi2,
         p.pins.gpio36,
         p.pins.gpio37,
-        p.pins.gpio3,
-        p.pins.gpio35,
-        rotation,
+        Some(p.pins.gpio35),
+        &SpiDriverConfig::new().dma(Dma::Auto(4096)),
     )?;
+    // LCD と W5500 で共有するため leak して 'static 参照で配る
+    let spi: &'static SpiDriver<'static> = Box::leak(Box::new(spi));
+    let display = board::display::init(spi, p.pins.gpio3, rotation)?;
 
     let status: SharedStatus = Arc::new(Mutex::new(HubStatus::default()));
     // ヒープ監視 (OOM 捕捉 + low-water 継続計測、Refs #27)。Wi-Fi/BLE/TLS の
@@ -84,7 +91,7 @@ fn main() -> Result<()> {
     let (meas_tx, meas_rx) = mpsc::channel(); // Measurement: BLE → recorder
 
     // Wi-Fi (Improv Wi-Fi Serial で設定。保存済みなら起動時に自動接続)
-    let wifi = wifi::Wifi::new(p.modem, sysloop, nvs_partition, Arc::clone(&status))?;
+    let wifi = wifi::Wifi::new(p.modem, sysloop.clone(), nvs_partition, Arc::clone(&status))?;
     let coex = wifi.coex_handle();
     let saved_credentials = settings.wifi_credentials();
     let provisioned = saved_credentials.is_some();
@@ -135,8 +142,21 @@ fn main() -> Result<()> {
         pair_flag.clone(),
         improv,
     )?;
-    rs232::start(p.uart1, p.pins.gpio17, p.pins.gpio18, Arc::clone(&status))?;
-    lan::start(Arc::clone(&status)); // TODO: W5500 実装 (lan.rs 参照)
+    rs232::start(
+        p.uart1,
+        p.pins.gpio17,
+        p.pins.gpio18,
+        Arc::clone(&status),
+        meas_tx.clone(),
+    )?;
+    // LAN Module 13.2 (W5500): CS=G13 (RS232M 併用ジャンパ) / RST=G0 / INT=G10 未使用
+    lan::start(
+        spi,
+        p.pins.gpio13.into(),
+        p.pins.gpio0.into(),
+        sysloop,
+        Arc::clone(&status),
+    )?;
     // NTP: ネットワーク接続後に時刻同期し、測定ログを日本時間で記録する。
     // EspSntp は drop すると同期が止まるため、UI ループ (戻らない) の間
     // 生かし続ける。

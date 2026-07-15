@@ -42,23 +42,25 @@ const LINK_CHECK_INTERVAL_MS: u32 = 500;
 /// W5500 を初期化しリンク監視スレッドを起動する。
 /// 初期化失敗はイベント出力のみで呼び出し元へはエラーを返さない
 /// (LAN 無しでも USB 経由の診断は生かす — lan.rs スタブと同方針)。
+///
+/// `spi` は leak 済みの 'static 参照で受け取る。EthDriver に所有で渡すと
+/// esp_eth_driver_install 失敗時 (基板未接続等) の drop 連鎖で
+/// esp-idf-hal の SpiDriver::drop が ESP_ERR_INVALID_STATE を unwrap
+/// panic し再起動ループになる (実機で確認)。また CoreS3 では LCD と
+/// バスを共有するため、そもそも所有で渡せない。
+/// `rst` は W5500 のハードリセット線 (未配線基板は None → ソフトリセットのみ)
 pub fn start(
-    spi: SpiDriver<'static>,
+    spi: &'static SpiDriver<'static>,
     cs: AnyOutputPin<'static>,
+    rst: Option<AnyOutputPin<'static>>,
     sysloop: EspSystemEventLoop,
     status: SharedStatus,
 ) -> Result<()> {
-    // SpiDriver は leak して 'static 参照で渡す。EthDriver に所有で渡すと
-    // esp_eth_driver_install 失敗時 (基板未接続等) の drop 連鎖で
-    // esp-idf-hal の SpiDriver::drop が ESP_ERR_INVALID_STATE を unwrap
-    // panic し再起動ループになる (実機で確認)。バスは一度きりの初期化
-    // なので leak で問題ない
-    let spi: &'static SpiDriver<'static> = Box::leak(Box::new(spi));
     std::thread::Builder::new()
         .name("eth_w5500".into())
         // TCP/IP イベント + ドライバ初期化を考慮して余裕を持たせる
         .stack_size(8 * 1024)
-        .spawn(move || match init(spi, cs, sysloop) {
+        .spawn(move || match init(spi, cs, rst, sysloop) {
             Ok(eth) => monitor_loop(eth, status),
             Err(e) => println!("EVT ETH NG {e:#}"),
         })
@@ -69,6 +71,7 @@ pub fn start(
 fn init(
     spi: &'static SpiDriver<'static>,
     cs: AnyOutputPin<'static>,
+    rst: Option<AnyOutputPin<'static>>,
     sysloop: EspSystemEventLoop,
 ) -> Result<EspEth<'static, esp_idf_svc::eth::SpiEth<&'static SpiDriver<'static>>>> {
     // W5500 は MAC 不揮発領域を持たないため efuse 由来の ETH MAC を使う
@@ -88,14 +91,14 @@ fn init(
         spi,
         event_source,
         Some(cs),
-        Option::<AnyOutputPin>::None, // RST 未配線
+        rst,
         SpiEthChipset::W5500,
         Hertz(SPI_BAUDRATE_HZ),
         Some(&mac),
         None,
         sysloop,
     )
-    .context("W5500 ドライバ初期化失敗 (PoE Base の接続を確認してください)")?;
+    .context("W5500 ドライバ初期化失敗 (基板/モジュールの接続を確認してください)")?;
 
     let mut eth = EspEth::wrap(driver).context("Ethernet netif 初期化失敗")?;
     eth.start().context("Ethernet 開始失敗")?;
