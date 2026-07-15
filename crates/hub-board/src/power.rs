@@ -37,8 +37,10 @@ pub fn init(i2c: &mut I2cDriver) -> Result<()> {
     write_reg(i2c, AXP2101_ADDR, 0x30, 0x0F)?;
 
     // --- AW9523: ポート初期値・方向 (P1_1 = LCD RST を H で解放) ---
-    write_reg(i2c, AW9523_ADDR, 0x02, 0b0000_0101)?; // P0 出力値
-    write_reg(i2c, AW9523_ADDR, 0x03, 0b0000_0011)?; // P1 出力値 (bit1: LCD RST = H)
+    // bit1 (BUS_EN) を立てて M-Bus へ 5V を出す (M5Unified setExtOutput(true) 相当)。
+    // 立てないとスタックモジュール (RS232M/LAN 13.2) が無電源になる
+    write_reg(i2c, AW9523_ADDR, 0x02, 0b0000_0111)?; // P0 出力値 (bit1: BUS_EN = H)
+    write_reg(i2c, AW9523_ADDR, 0x03, 0b1000_0011)?; // P1 出力値 (bit1: LCD RST = H, bit7: BOOST_EN = H)
     write_reg(i2c, AW9523_ADDR, 0x04, 0b0001_1000)?; // P0 方向 (0 = 出力)
     write_reg(i2c, AW9523_ADDR, 0x05, 0b0000_1100)?; // P1 方向
     write_reg(i2c, AW9523_ADDR, 0x11, 0b0001_0000)?; // GCR: P0 push-pull
