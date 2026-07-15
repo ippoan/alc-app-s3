@@ -10,3 +10,4 @@ pub mod measurement;
 pub mod settings;
 pub mod status;
 pub mod ui_api;
+pub mod wdt;

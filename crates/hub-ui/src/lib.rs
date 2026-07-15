@@ -37,7 +37,6 @@ use alc_hub_common::{
     status::{now_ms, SharedStatus},
 };
 use esp_idf_svc::hal::{delay::FreeRtos, i2c::I2cDriver};
-use esp_idf_svc::sys;
 
 // コマンド定義は I/O 層 (host_link / ble が送信側) と共有
 pub use alc_hub_common::ui_api::UiCommand;
@@ -102,12 +101,7 @@ pub fn run(
     // esp_task_wdt が chip をリセットする (crashlog が reset_reason=task_wdt で
     // 記録・送信する)。TWDT は sdkconfig で init 済み・idle 監視は無効。
     // 未 init 等で失敗しても UI は続行する (fail-open)。
-    unsafe {
-        let err = sys::esp_task_wdt_add(core::ptr::null_mut());
-        if err != sys::ESP_OK {
-            log::warn!("ui: Task WDT 登録に失敗 (err={err}) — WDT 無効で続行");
-        }
-    }
+    alc_hub_common::wdt::subscribe_current_as_ui();
 
     let mut rotation = initial_rotation;
     let mut screen = Screen::Idle;
@@ -127,9 +121,8 @@ pub fn run(
 
         // Task WDT feed: このループが回っている = 画面が生きている証跡。
         // wedge して 10s feed が途切れると WDT が chip をリセットする。
-        unsafe {
-            sys::esp_task_wdt_reset();
-        }
+        // (OTA 中は ota.rs が pause_ui() で一時停止する、Refs #55)
+        alc_hub_common::wdt::feed();
 
         // バッテリー/電源状態の定期取得 (AXP2101、~10s)。i2c はこのループが
         // 所有しているためここで読む。EVT BATT を USB コンソールへ出し、Log
