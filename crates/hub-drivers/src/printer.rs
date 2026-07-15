@@ -88,13 +88,12 @@ pub fn spawn_print(url: String, printer_addr: String, status: SharedStatus) {
 
 /// PDF を GET しながらプリンターへストリーミング送信し、送信バイト数を返す
 fn fetch_and_send(url: &str, printer_addr: &str) -> Result<usize> {
-    // 先にプリンターへ接続する (不通なら PDF を引く前に失敗させる)
-    let mut printer = TcpStream::connect(printer_addr)
-        .with_context(|| format!("プリンター {printer_addr} に接続できません"))?;
-    printer
-        .set_write_timeout(Some(Duration::from_secs(IO_TIMEOUT_S)))
-        .context("送信タイムアウト設定失敗")?;
-
+    // 先に HTTP GET を完了させ、書き込める状態にしてからプリンターへ接続する。
+    // 逆順 (プリンター接続 → HTTP GET → 書き込み) だと、TLS handshake 分
+    // (数秒〜十数秒) プリンターとの TCP 接続がデータ無しで放置され、RAW/
+    // JetDirect ポート側が job-start を待たずに詰まる (実機で write_all が
+    // EAGAIN タイムアウト。PC から接続直後に即書き込むテストでは同じ
+    // プリンターに正常印字できた = 空白時間が原因と特定 #65)。
     let mut conn = EspHttpConnection::new(&HttpConfiguration {
         crt_bundle_attach: Some(sys::esp_crt_bundle_attach),
         timeout: Some(Duration::from_secs(IO_TIMEOUT_S)),
@@ -112,6 +111,13 @@ fn fetch_and_send(url: &str, printer_addr: &str) -> Result<usize> {
         .header("Content-Length")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+
+    // レスポンスが取得できてから接続する (接続直後にすぐ書き込める状態にする)
+    let mut printer = TcpStream::connect(printer_addr)
+        .with_context(|| format!("プリンター {printer_addr} に接続できません"))?;
+    printer
+        .set_write_timeout(Some(Duration::from_secs(IO_TIMEOUT_S)))
+        .context("送信タイムアウト設定失敗")?;
 
     let mut chunk = vec![0u8; CHUNK];
     let mut next_progress = PROGRESS_STEP;
