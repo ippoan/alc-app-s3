@@ -177,7 +177,13 @@ jobs:
           fi
           echo "LIBCLANG_PATH=$(dirname "$LIBCLANG_FILE")" >> "$GITHUB_ENV"
 
-      - name: Cache cargo registry/target (restore only)
+      # rust-cache は ~/.cargo (registry) 専用に縮退 (cache-targets: false)。
+      # target/ を rust-cache に持たせると save 時 cleanup が「workspace の
+      # Cargo.lock に無い package」を purge し、esp toolchain の build-std
+      # sysroot crates (core/std/alloc/compiler_builtins + std 依存の gimli 等)
+      # の fingerprint が毎回消える → 全 unit に dirty が伝播して esp-idf-sys
+      # build script が毎回再走していた (~88s、Refs #69。診断は #63)
+      - name: Cache cargo registry (restore only)
         uses: Swatinem/rust-cache@v2
         with:
           # leg のフレーバーに対応する main warm キャッシュを restore する
@@ -185,14 +191,24 @@ jobs:
           shared-key: ${{ matrix.cache_key }}
           key: ${{ hashFiles('.cargo/config.toml') }}
           save-if: 'false'
-          # 自作クレートの成果物も復元する (restore-mtime とセットで
-          # 「未変更クレートはコンパイル自体をスキップ」を成立させる)
-          cache-workspace-crates: 'true'
+          cache-targets: 'false'
 
-      # ワークスペース内クレートは checkout で mtime が変わるため、変更が
-      # 無くても毎回再コンパイルされる (docs のみのマージでも Build 142s を
-      # 実測。rust-cache も自作クレートの成果物は保存しない)。sccache は
-      # 内容ベースの rustc キャッシュなので、この再コンパイルをヒットに変える
+      # main の build job が warm した target/ (build-std fingerprint 込み) を
+      # read-only restore する。restore-keys の fallback は .cargo/config.toml +
+      # rust-toolchain.toml の hash 内に閉じる: ESP_IDF_VERSION / toolchain 変更を
+      # 跨いで古い esp-idf-sys CMake build dir (絶対パスを記憶する) が刺さる事故を
+      # 防ぐ (ble-medical-gateway で実測)
+      - name: Restore target dir (restore only)
+        uses: actions/cache/restore@v4
+        with:
+          path: target
+          key: target-${{ matrix.cache_key }}-${{ hashFiles('.cargo/config.toml', 'rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            target-${{ matrix.cache_key }}-${{ hashFiles('.cargo/config.toml', 'rust-toolchain.toml') }}-
+
+      # 変更があったクレートの再コンパイルを内容ベースの rustc キャッシュで
+      # ヒットに変える (未変更クレートは restore-mtime + target restore で
+      # コンパイル自体がスキップされる)
       - uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Check (${{ matrix.name }})
@@ -294,19 +310,31 @@ jobs:
           fi
           echo "LIBCLANG_PATH=$(dirname "$LIBCLANG_FILE")" >> "$GITHUB_ENV"
 
-      # key に ESP_IDF_VERSION (.cargo/config.toml) のハッシュを明示的に足す:
-      # esp-idf-sys の CMake ビルドディレクトリは ninja 等の絶対パスを記憶するため、
-      # ESP_IDF_VERSION 変更時に古いキャッシュを prefix fallback で復元すると
-      # CMake configure が壊れる (ble-medical-gateway で実測)
-      - name: Cache cargo registry/target
+      # rust-cache は ~/.cargo (registry) 専用に縮退 (cache-targets: false)。
+      # 理由は check job の同名コメント参照 (build-std fingerprint の purge、Refs #69)
+      - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: ${{ matrix.cache_key }}
           key: ${{ hashFiles('.cargo/config.toml') }}
           cache-on-failure: true
-          # 自作クレートの成果物も保存する (restore-mtime とセットで
-          # 「未変更クレートはコンパイル自体をスキップ」を成立させる)
-          cache-workspace-crates: 'true'
+          cache-targets: 'false'
+
+      # target/ は素の actions/cache で cleanup 無しに保存する (build-std
+      # fingerprint 込み)。main で warm し PR check leg が restore する。
+      # key に .cargo/config.toml (ESP_IDF_VERSION) + rust-toolchain.toml の
+      # ハッシュを入れ、restore-keys の fallback をその hash 内に閉じる:
+      # esp-idf-sys の CMake ビルドディレクトリは ninja 等の絶対パスを記憶する
+      # ため、ESP_IDF_VERSION 変更を跨いで古いキャッシュを復元すると CMake
+      # configure が壊れる (ble-medical-gateway で実測)。バージョン変更時は
+      # fallback 無しの cold start になり、素の状態から作り直す
+      - name: Cache target dir
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: target-${{ matrix.cache_key }}-${{ hashFiles('.cargo/config.toml', 'rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            target-${{ matrix.cache_key }}-${{ hashFiles('.cargo/config.toml', 'rust-toolchain.toml') }}-
 
       - name: Cache espflash binary
         id: cache-espflash
@@ -318,12 +346,6 @@ jobs:
       - name: Install espflash
         if: steps.cache-espflash.outputs.cache-hit != 'true'
         run: cargo install espflash --version "$ESPFLASH_VERSION" --locked
-
-      # バージョン切替初回に古い restore-key が刺さる問題の根本対策:
-      # 絶対パスを記憶する esp-idf-sys の CMake 中間生成物だけを毎回消し、
-      # CMake configure を素の状態からやり直させる
-      - name: Clear stale esp-idf-sys CMake build dir
-        run: rm -rf target/xtensa-esp32s3-espidf/*/build/esp-idf-sys-*/out/build
 
       # ワークスペース内クレートの mtime 起因の再コンパイルを内容ベースの
       # rustc キャッシュでヒットに変える (check job のコメント参照)
