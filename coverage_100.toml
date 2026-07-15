@@ -53,3 +53,7 @@ type = "unit"
 [[file]]
 path = "crates/hub-core/src/vitals.rs"
 type = "unit"
+
+[[file]]
+path = "crates/hub-core/src/wdt_gate.rs"
+type = "unit"
