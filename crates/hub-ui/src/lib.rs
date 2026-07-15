@@ -118,6 +118,11 @@ pub fn run(
     // BLE で取得中の機器 (点呼画面のラベル横スピナー表示)。
     // 接続開始 (BleAcquiring) で設定し、切断/再スキャン (BleIdle) で解除
     let mut acquiring: Option<DeviceKind> = None;
+    // バックライト減光: 直近の操作 (タッチ・ホスト/BLE コマンド) 時刻。
+    // BACKLIGHT_IDLE_DIM_MS 無操作が続くと最低輝度に落とし、操作があれば
+    // 即座に復帰する (画面焼け対策の一環)
+    let mut last_activity = now_ms();
+    let mut backlight_dimmed = false;
 
     loop {
         let now = now_ms();
@@ -162,6 +167,7 @@ pub fn run(
 
         // --- コマンド (ホスト / BLE) ---
         while let Ok(cmd) = rx.try_recv() {
+            last_activity = now;
             match cmd {
                 // 画面向き変更は現在の画面を維持したまま再描画のみ
                 UiCommand::Rotate(deg) => {
@@ -341,6 +347,7 @@ pub fn run(
         let t = touch::read(&mut i2c);
         if let Some(p) = &t {
             last_touch = Some(*p);
+            last_activity = now;
         } else if let Some(p) = last_touch.take() {
             let (_, y) = map_touch(i32::from(p.x), i32::from(p.y), rotation, LCD_W, LCD_H);
             let logical_h = if rotation == 90 || rotation == 270 {
@@ -352,6 +359,28 @@ pub fn run(
                 screen = next;
                 entered = now;
                 dirty = true;
+            }
+        }
+
+        // --- バックライト減光 (画面焼け対策): 無操作が続いたら最低輝度、
+        // 操作があれば即復帰。set_backlight の呼び出しは減光/復帰の
+        // 境界を跨いだ瞬間だけ (I2C を毎ループ叩かない)
+        let idle_ms = now.saturating_sub(last_activity);
+        if !backlight_dimmed && idle_ms >= config::BACKLIGHT_IDLE_DIM_MS {
+            match alc_hub_board::power::set_backlight(&mut i2c, 0) {
+                Ok(()) => {
+                    backlight_dimmed = true;
+                    println!("EVT BACKLIGHT_DIM");
+                }
+                Err(e) => log::warn!("ui: バックライト減光失敗: {e:?}"),
+            }
+        } else if backlight_dimmed && idle_ms < config::BACKLIGHT_IDLE_DIM_MS {
+            match alc_hub_board::power::set_backlight(&mut i2c, 100) {
+                Ok(()) => {
+                    backlight_dimmed = false;
+                    println!("EVT BACKLIGHT_ON");
+                }
+                Err(e) => log::warn!("ui: バックライト復帰失敗: {e:?}"),
             }
         }
 
