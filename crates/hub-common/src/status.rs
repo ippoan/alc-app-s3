@@ -53,6 +53,9 @@ pub struct HubStatus {
 
     /// Windows GW (alc-gw) ハブへの WS 接続状態 (gw_link.rs が更新)
     pub gw_connected: bool,
+    /// beacon (UDP 9001) 自動発見で見つけた GW の WS URL (未発見は空。
+    /// gw_link.rs が更新。`GW STATUS` / 遠隔 gw_status の表示用)
+    pub gw_discovered_url: String,
 
     /// 内部RAM の現在空き [bytes] (heap.rs が定期更新。0 = 未計測)
     pub heap_free_int: usize,

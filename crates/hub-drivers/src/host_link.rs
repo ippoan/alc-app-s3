@@ -322,11 +322,15 @@ fn handle_line(
             }
         },
         HostCommand::GwStatus => {
-            let connected = status.lock().map(|s| s.gw_connected).unwrap_or(false);
+            let (connected, discovered) = status
+                .lock()
+                .map(|s| (s.gw_connected, s.gw_discovered_url.clone()))
+                .unwrap_or((false, String::new()));
             println!(
-                "GW CONNECTED={} URL={}",
+                "GW CONNECTED={} URL={} DISCOVERED={}",
                 u8::from(connected),
                 settings.gw_url().unwrap_or_else(|| "UNSET".into()),
+                if discovered.is_empty() { "NONE".into() } else { discovered },
             );
         }
         // ヒープ詳細: ブロック概況 + タスク別スタック余裕 (heap.rs 参照)
