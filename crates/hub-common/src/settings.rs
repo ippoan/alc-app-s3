@@ -34,6 +34,8 @@ const KEY_WS_SEQ: &str = "ws_seq";
 const KEY_WS_URL: &str = "ws_url";
 /// プリンター宛先 host:port (印刷ブリッジ、`PRINTER ADDR` コマンド。#38)
 const KEY_PRINTER_ADDR: &str = "printer_addr";
+/// Windows GW (alc-gw) ハブの WS URL (`GW URL` コマンド。alc-app#120)
+const KEY_GW_URL: &str = "gw_url";
 
 #[derive(Clone)]
 pub struct Settings {
@@ -261,6 +263,25 @@ impl Settings {
         );
         let nvs = self.nvs.lock().expect("settings nvs lock");
         nvs.set_str(KEY_PRINTER_ADDR, addr)?;
+        Ok(())
+    }
+
+    /// Windows GW (alc-gw) ハブの WS URL (`GW URL` で保存)。未設定は None =
+    /// GW 連携無効
+    pub fn gw_url(&self) -> Option<String> {
+        let nvs = self.nvs.lock().ok()?;
+        let mut buf = [0u8; 160];
+        let url = nvs.get_str(KEY_GW_URL, &mut buf).ok()??.to_string();
+        (!url.is_empty()).then_some(url)
+    }
+
+    pub fn set_gw_url(&self, url: &str) -> Result<()> {
+        anyhow::ensure!(
+            (url.starts_with("ws://") || url.starts_with("wss://")) && url.len() < 160,
+            "URL が不正です"
+        );
+        let nvs = self.nvs.lock().expect("settings nvs lock");
+        nvs.set_str(KEY_GW_URL, url)?;
         Ok(())
     }
 

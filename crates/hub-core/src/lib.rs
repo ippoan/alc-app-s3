@@ -11,6 +11,7 @@ pub mod coex;
 pub mod crashlog;
 pub mod device;
 pub mod fc1200;
+pub mod gw;
 pub mod ieee11073;
 pub mod improv;
 pub mod layout;

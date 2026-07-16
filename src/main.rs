@@ -24,7 +24,7 @@ use alc_hub_common::{
     settings::Settings,
     status::{HubStatus, SharedStatus},
 };
-use alc_hub_drivers::{crashlog, heap, host_link, lan, ntp, recorder, rs232, ws_uplink};
+use alc_hub_drivers::{crashlog, gw_link, heap, host_link, lan, ntp, recorder, rs232, ws_uplink};
 use alc_hub_ui as ui;
 use alc_hub_wifi::{improv, wifi};
 use anyhow::Result;
@@ -121,14 +121,21 @@ fn main() -> Result<()> {
         crashlog::report(snap, &ws_tx, &status);
     }
 
+    // Windows GW (alc-gw) への LAN 内 WS 接続 (alc-app#120)。recorder が
+    // fan-out した測定を生中継し、下り (点呼UI の測定開始) を受ける。
+    // 接続先は `GW URL` コマンドで NVS 保存 (未設定なら何もしない)
+    let (gw_tx, gw_rx) = mpsc::channel();
+    gw_link::start(gw_rx, tx.clone(), Arc::clone(&status), settings.clone())?;
+
     // 測定値レコーダ (BLE コールバックを軽量に保つための専用スレッド):
-    // JSON 出力 + NVS 記録 + 画面通知 + WS fan-out を担う
+    // JSON 出力 + NVS 記録 + 画面通知 + WS/GW fan-out を担う
     recorder::start(
         meas_rx,
         tx.clone(),
         Arc::clone(&status),
         settings.clone(),
         ws_tx,
+        gw_tx,
     )?;
 
     // auth-worker device JWT 交換 (AUTH TOKEN 自己診断) は host_link が
