@@ -530,10 +530,17 @@ fn handle_downlink(
                         r#"{"ok":false,"message":"invalid url"}"#,
                     ),
                 },
-                // GW 接続状態の照会 (gw_link.rs が HubStatus に反映した値)
+                // GW 接続状態の照会 (gw_link.rs が HubStatus に反映した値)。
+                // url は実際の接続先候補 = NVS 設定 > beacon 自動発見 の順
                 Some("gw_status") => {
-                    let connected = status.lock().map(|st| st.gw_connected).unwrap_or(false);
-                    let payload = match settings.gw_url() {
+                    let (connected, discovered) = status
+                        .lock()
+                        .map(|st| (st.gw_connected, st.gw_discovered_url.clone()))
+                        .unwrap_or((false, String::new()));
+                    let url = settings
+                        .gw_url()
+                        .or_else(|| (!discovered.is_empty()).then_some(discovered));
+                    let payload = match url {
                         Some(url) => format!(r#"{{"connected":{connected},"url":"{url}"}}"#),
                         None => format!(r#"{{"connected":{connected},"url":null}}"#),
                     };

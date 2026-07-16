@@ -9,7 +9,10 @@
 //! - LAN 内 ws:// のみ想定 = TLS も device JWT も不要 (heap 圧迫が小さい)
 //! - 送信キューを持たない生中継 — GW が落ちている間の測定は捨てる
 //!   (記録の永続化は ws_uplink → cf-alc-recorder が担う。GW は表示用)
-//! - URL は NVS の `GW URL` 設定 (未設定なら本リンクは何もしない)
+//! - 接続先は **自動発見**: GW が UDP 9001 へブロードキャストする beacon
+//!   (`{"src":"alc-gw","type":"beacon","ws":"ws://<GW>:9000"}`、alc-gw
+//!   internal/discovery) から URL を得る。NVS の `GW URL` 設定があれば
+//!   そちらを優先 (セグメント跨ぎ等の手動オーバーライド)
 //!
 //! # 下りコマンド (GW → CoreS3)
 //!
@@ -24,6 +27,7 @@
 //! |---|---|
 //! | `EVT GW_CONNECTED` / `EVT GW_DISCONNECTED` | GW 接続状態の変化 |
 
+use std::net::UdpSocket;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
 use alc_hub_core::gw::{self, GwDownlink};
@@ -44,6 +48,8 @@ use alc_hub_common::{
 const CONNECT_TIMEOUT_S: u64 = 10;
 /// 接続失敗・切断時の再接続バックオフ
 const RECONNECT_BACKOFF_MS: u64 = 10_000;
+/// GW 自動発見 beacon の受信ポート (alc-gw internal/discovery と対)
+const BEACON_PORT: u16 = 9001;
 
 /// WS イベントコールバック → 本スレッドへの通知
 enum WsEvent {
@@ -80,6 +86,15 @@ fn run(
     // 接続不能の連続ログを抑制する (1 回目だけ warn)
     let mut connect_warned = false;
 
+    // GW 自動発見: beacon (UDP 9001) の受信ソケット。bind 失敗しても
+    // NVS の GW URL 経路は生きるので続行する
+    let beacon_sock = UdpSocket::bind(("0.0.0.0", BEACON_PORT))
+        .and_then(|s| s.set_nonblocking(true).map(|()| s))
+        .map_err(|e| log::warn!("gw_link: beacon 受信ソケット確保失敗 (自動発見無効): {e}"))
+        .ok();
+    // beacon で見つけた GW の WS URL (最新のものだけ保持)
+    let mut discovered: Option<String> = None;
+
     loop {
         // --- 1. 測定の受け取り (500ms でタイムアウトしループを回す) ---
         match rx.recv_timeout(core::time::Duration::from_millis(500)) {
@@ -93,6 +108,33 @@ fn run(
             Err(RecvTimeoutError::Disconnected) => {
                 log::warn!("gw_link: 送信元 channel が閉じたため終了");
                 return;
+            }
+        }
+
+        // --- 1.5 GW beacon の受信 (自動発見) ---
+        if let Some(sock) = &beacon_sock {
+            let mut buf = [0u8; 256];
+            // 溜まっている beacon を全部読む (最新の URL だけ残す)
+            while let Ok((n, _from)) = sock.recv_from(&mut buf) {
+                let Ok(text) = core::str::from_utf8(&buf[..n]) else {
+                    continue;
+                };
+                match gw::parse_beacon(text) {
+                    Ok(url) => {
+                        if discovered.as_deref() != Some(url.as_str()) {
+                            log::info!("gw_link: beacon で GW を発見: {url}");
+                            if let Ok(mut st) = status.lock() {
+                                st.gw_discovered_url = url.clone();
+                            }
+                            discovered = Some(url);
+                            // 新しい GW を見つけたら未接続時のバックオフを解除
+                            if conn.is_none() {
+                                backoff_until = 0;
+                            }
+                        }
+                    }
+                    Err(_) => {} // 他プロトコルのブロードキャストは黙って無視
+                }
             }
         }
 
@@ -138,11 +180,12 @@ fn run(
             })
             .unwrap_or((false, false, String::new()));
 
-        // --- 3. 接続管理 (URL 未設定なら何もしない) ---
+        // --- 3. 接続管理 ---
+        // 接続先は NVS の `GW URL` (手動オーバーライド) > beacon 自動発見の順。
         // BLE 測定中は 2.4GHz を医療機器に譲る (ws_uplink と同じ判断)。
         // 切断は行わず既存接続は維持する
         if conn.is_none() && net_up && !ble_busy && now >= backoff_until {
-            if let Some(url) = settings.gw_url() {
+            if let Some(url) = settings.gw_url().or_else(|| discovered.clone()) {
                 match connect(&url, ev_tx.clone()) {
                     Ok(c) => conn = Some(c),
                     Err(e) => {
@@ -154,7 +197,7 @@ fn run(
                     }
                 }
             } else {
-                // 未設定の間は設定を 5 秒おきに見るだけ
+                // URL 未確定 (設定なし・beacon 未受信) の間は 5 秒おきに見る
                 backoff_until = now + 5_000;
             }
         }
