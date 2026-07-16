@@ -35,6 +35,7 @@ pub fn start(
     status: SharedStatus,
     settings: Settings,
     ws_tx: Sender<UplinkRecord>,
+    gw_tx: Sender<UplinkRecord>,
 ) -> Result<()> {
     std::thread::Builder::new()
         .name("recorder".into())
@@ -73,12 +74,14 @@ pub fn start(
                             ),
                         };
                         println!("{json}");
-                        // WS 送信 (cf-alc-recorder) へも同じ payload を fan-out
-                        let _ = ws_tx.send(UplinkRecord {
+                        // WS 送信 (cf-alc-recorder) と GW (alc-gw) へ同じ payload を fan-out
+                        let rec = UplinkRecord {
                             kind: "temperature",
                             payload: json,
                             recorded_at_ms: epoch_ms(),
-                        });
+                        };
+                        let _ = gw_tx.send(rec.clone());
+                        let _ = ws_tx.send(rec);
                         record(&status, &settings, at_ms, &vitals::temp_event(celsius));
                         let _ = ui_tx.send(UiCommand::Temperature { celsius });
                     }
@@ -110,11 +113,13 @@ pub fn start(
                             "{{\"type\":\"blood_pressure\",\"systolic\":{systolic:.0},\"diastolic\":{diastolic:.0}{pulse_part},\"unit\":\"mmHg\"{ts_part}}}"
                         );
                         println!("{json}");
-                        let _ = ws_tx.send(UplinkRecord {
+                        let rec = UplinkRecord {
                             kind: "blood_pressure",
                             payload: json,
                             recorded_at_ms: epoch_ms(),
-                        });
+                        };
+                        let _ = gw_tx.send(rec.clone());
+                        let _ = ws_tx.send(rec);
                         record(&status, &settings, at_ms, &vitals::bp_event(systolic, diastolic, pulse));
                         let _ = ui_tx.send(UiCommand::BloodPressure {
                             systolic,
@@ -135,11 +140,13 @@ pub fn start(
                         last_alc = Some(use_count);
                         let json = fc1200::payload_json(result, centi_mg_per_l, use_count);
                         println!("{json}");
-                        let _ = ws_tx.send(UplinkRecord {
+                        let rec = UplinkRecord {
                             kind: "alcohol",
                             payload: json,
                             recorded_at_ms: epoch_ms(),
-                        });
+                        };
+                        let _ = gw_tx.send(rec.clone());
+                        let _ = ws_tx.send(rec);
                         record(
                             &status,
                             &settings,

@@ -10,6 +10,7 @@ pub mod crashlog;
 // CONFIG_ETH_SPI_ETHERNET_W5500 を有効にしていないためコンパイルされない
 #[cfg(esp_idf_eth_spi_ethernet_w5500)]
 pub mod eth_w5500;
+pub mod gw_link;
 pub mod heap;
 pub mod host_link;
 pub mod lan;

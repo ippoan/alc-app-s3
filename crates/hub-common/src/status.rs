@@ -51,6 +51,9 @@ pub struct HubStatus {
     /// WS 送信の最終採番 seq
     pub ws_last_seq: u64,
 
+    /// Windows GW (alc-gw) ハブへの WS 接続状態 (gw_link.rs が更新)
+    pub gw_connected: bool,
+
     /// 内部RAM の現在空き [bytes] (heap.rs が定期更新。0 = 未計測)
     pub heap_free_int: usize,
     /// 内部RAM の起動以来の最低空き (low-water mark) [bytes] (Refs #27)

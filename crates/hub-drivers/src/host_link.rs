@@ -313,6 +313,22 @@ fn handle_line(
                 st.ws_last_seq,
             );
         }
+        // Windows GW (alc-gw) 連携 (gw_link.rs)
+        HostCommand::GwUrl { url } => match settings.set_gw_url(&url) {
+            Ok(()) => println!("OK GW URL"),
+            Err(e) => {
+                log::error!("host_link: GW URL 保存失敗: {e:?}");
+                println!("ERR GW: URL の保存に失敗しました");
+            }
+        },
+        HostCommand::GwStatus => {
+            let connected = status.lock().map(|s| s.gw_connected).unwrap_or(false);
+            println!(
+                "GW CONNECTED={} URL={}",
+                u8::from(connected),
+                settings.gw_url().unwrap_or_else(|| "UNSET".into()),
+            );
+        }
         // ヒープ詳細: ブロック概況 + タスク別スタック余裕 (heap.rs 参照)
         HostCommand::HeapDump => crate::heap::dump(),
         // OTA 更新 (進捗・結果は EVT OTA_* で届く。シリアル経路は WS 進捗 sink

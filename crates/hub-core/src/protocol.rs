@@ -42,6 +42,10 @@ pub enum HostCommand {
     WsUrl { url: String },
     /// WS 送信の状態問い合わせ (`WS CONNECTED=1 QUEUE=3 SEQ=42` を応答)
     WsStatus,
+    /// Windows GW (alc-gw) ハブ URL の保存 (`GW URL ws://<GW-IP>:9000`。NVS)
+    GwUrl { url: String },
+    /// GW 接続の状態問い合わせ (`GW CONNECTED=1 URL=...` を応答)
+    GwStatus,
     /// ヒープ状態の問い合わせ
     /// (`HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> ...` を応答、Refs #27)
     Heap,
@@ -181,6 +185,19 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                 _ => return Err("ERR WS: URL には ws(s):// で始まる URL が必要です".into()),
             },
             _ => return Err("ERR WS: URL|STATUS が必要です".into()),
+        },
+        // Windows GW (alc-gw) 連携 (gw_link.rs)
+        "GW" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+            Some("STATUS") => HostCommand::GwStatus,
+            Some("URL") => match it.next() {
+                Some(url) if url.starts_with("ws://") || url.starts_with("wss://") => {
+                    HostCommand::GwUrl {
+                        url: url.to_string(),
+                    }
+                }
+                _ => return Err("ERR GW: URL には ws(s):// で始まる URL が必要です".into()),
+            },
+            _ => return Err("ERR GW: URL|STATUS が必要です".into()),
         },
         // `PAIR` または `BLE PAIR`
         "PAIR" => HostCommand::BlePair,
@@ -547,5 +564,30 @@ mod tests {
         assert!(parse_line("WS SEND", T).is_err());
         assert!(parse_line("WS URL", T).is_err());
         assert!(parse_line("WS URL https://x/ws", T).is_err());
+    }
+
+    #[test]
+    fn gw_subcommands() {
+        assert_eq!(parse_line("GW STATUS", T), Ok(Some(HostCommand::GwStatus)));
+        assert_eq!(
+            parse_line("gw url ws://192.168.11.5:9000", T),
+            Ok(Some(HostCommand::GwUrl {
+                url: "ws://192.168.11.5:9000".into(),
+            }))
+        );
+        assert_eq!(
+            parse_line("GW URL wss://gw.example:9000", T),
+            Ok(Some(HostCommand::GwUrl {
+                url: "wss://gw.example:9000".into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn gw_errors() {
+        assert!(parse_line("GW", T).is_err());
+        assert!(parse_line("GW CONNECT", T).is_err());
+        assert!(parse_line("GW URL", T).is_err());
+        assert!(parse_line("GW URL http://x:9000", T).is_err());
     }
 }
