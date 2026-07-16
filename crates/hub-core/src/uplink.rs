@@ -133,6 +133,15 @@ pub fn command_ota_url(payload: &str) -> Option<String> {
     (url.starts_with("https://") || url.starts_with("http://")).then(|| url.to_string())
 }
 
+/// 下り command payload から Windows GW (alc-gw) ハブの WS URL を取り出す
+/// (`{"action":"gw_url","url":"ws://<GW-IP>:9000"}`)。ws(s) 以外・欠落は None。
+/// auth-worker /device/setup からの遠隔設定用 (シリアルの `GW URL` と同じ保存先)
+pub fn command_gw_url(payload: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(payload).ok()?;
+    let url = v.get("url")?.as_str()?;
+    (url.starts_with("ws://") || url.starts_with("wss://")).then(|| url.to_string())
+}
+
 /// 下り command payload から印刷対象 PDF の URL を取り出す
 /// (`{"action":"print","url":"https://..."}`、印刷ブリッジ #38)。
 /// http(s) 以外・欠落は None。
@@ -568,6 +577,25 @@ mod tests {
         assert_eq!(command_ota_url(r#"{"action":"ota","url":1}"#), None);
         assert_eq!(command_ota_url(r#"{"action":"ota"}"#), None);
         assert_eq!(command_ota_url("{oops"), None);
+    }
+
+    #[test]
+    fn command_gw_url_requires_ws_scheme() {
+        assert_eq!(
+            command_gw_url(r#"{"action":"gw_url","url":"ws://192.168.11.5:9000"}"#),
+            Some("ws://192.168.11.5:9000".into())
+        );
+        assert_eq!(
+            command_gw_url(r#"{"action":"gw_url","url":"wss://gw.example:9000"}"#),
+            Some("wss://gw.example:9000".into())
+        );
+        assert_eq!(
+            command_gw_url(r#"{"action":"gw_url","url":"http://x:9000"}"#),
+            None
+        );
+        assert_eq!(command_gw_url(r#"{"action":"gw_url","url":1}"#), None);
+        assert_eq!(command_gw_url(r#"{"action":"gw_url"}"#), None);
+        assert_eq!(command_gw_url("{oops"), None);
     }
 
     #[test]

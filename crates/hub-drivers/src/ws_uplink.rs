@@ -30,8 +30,8 @@ use std::net::TcpStream;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
 use alc_hub_core::uplink::{
-    command_action, command_ota_url, command_print_chunk, command_print_url, command_result_frame,
-    measurement_frame, parse_downlink, Downlink, UplinkQueue, PING_FRAME,
+    command_action, command_gw_url, command_ota_url, command_print_chunk, command_print_url,
+    command_result_frame, measurement_frame, parse_downlink, Downlink, UplinkQueue, PING_FRAME,
 };
 use anyhow::Result;
 use esp_idf_svc::ws::client::{
@@ -510,6 +510,35 @@ fn handle_downlink(
                         r#"{"phase":"error","message":"no active print session"}"#,
                     ),
                 },
+                // Windows GW (alc-gw) ハブ URL の遠隔設定 (auth-worker
+                // /device/setup から。シリアルの `GW URL` と同じ NVS 保存先)
+                Some("gw_url") => match command_gw_url(&payload) {
+                    Some(url) => match settings.set_gw_url(&url) {
+                        Ok(()) => send_command_result(conn, &id, r#"{"ok":true}"#),
+                        Err(e) => {
+                            log::error!("ws_uplink: GW URL 保存失敗: {e:?}");
+                            send_command_result(
+                                conn,
+                                &id,
+                                r#"{"ok":false,"message":"save failed"}"#,
+                            );
+                        }
+                    },
+                    None => send_command_result(
+                        conn,
+                        &id,
+                        r#"{"ok":false,"message":"invalid url"}"#,
+                    ),
+                },
+                // GW 接続状態の照会 (gw_link.rs が HubStatus に反映した値)
+                Some("gw_status") => {
+                    let connected = status.lock().map(|st| st.gw_connected).unwrap_or(false);
+                    let payload = match settings.gw_url() {
+                        Some(url) => format!(r#"{{"connected":{connected},"url":"{url}"}}"#),
+                        None => format!(r#"{{"connected":{connected},"url":null}}"#),
+                    };
+                    send_command_result(conn, &id, &payload);
+                }
                 // バージョン照会: 現在の firmware version + 実行スロットを返す
                 // (web の「更新必要か」判定用、config::firmware_version_full が
                 // manifest.json の version と同形)
