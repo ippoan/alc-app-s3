@@ -1,0 +1,107 @@
+# NFC カードによる本人識別 — 方式調査 (Unit NFC / ST25R3916)
+
+点呼のドライバー本人確認に NFC カードを使う場合の方式整理。
+実装 issue: [#84](https://github.com/ippoan/alc-app-s3/issues/84) (交通系 IDm 読み取りドライバ)。
+
+ハードは全方式共通で **M5 Unit NFC (U216, ST25R3916, I2C/Port A)** 1台で足りる
+(NFC-A/B/F/V 対応)。⚠️ Unit RFID (MFRC522) / RFID2 (WS1850S) は FeliCa 非対応。
+
+## 結論サマリ
+
+| カード | 方式 | かざすだけ | 日常の点呼タップ | 登録時の本人確認 (eKYC) |
+|---|---|---|---|---|
+| 交通系 IC / モバイル Suica | NFC-F, IDm | ○ | **◎ 採用** | ✗ (IDm は人を証明しない) |
+| マイナンバーカード | NFC-B, APDU+PIN | ✗ | ✗ 使えない | ○ 候補 |
+| 運転免許証 (IC) | NFC-B, APDU+PIN | ✗ | ✗ 使えない | **◎ 本命候補** (点呼は免許確認が業務要件) |
+
+- **日常運用 = 交通系 IDm タップ** (#84)。
+- **PIN 方式 (マイナンバー / 免許証) は日常タップには使えない**。毎回 4 桁 PIN 入力が必須で、
+  入力ミス累積で**カードがロック**する。かざすだけ運用は原理的に不可能。
+- ただし**初回登録時に 1 回だけ** PIN 方式で実在確認し、「この IDm はこの人」の紐付けを
+  検証済みにする **二段構え**は将来資産として有力。
+
+## 1. 交通系 IC / モバイル Suica (NFC-F, IDm) — 日常運用
+
+詳細は #84。要点のみ:
+
+- FeliCa Polling (システムコード `0x0003` = Suica/PASMO/ICOCA/PiTaPa/TOICA 共通) →
+  応答先頭 8byte = **IDm**。認証・暗号不要領域なのでかざすだけで取れる。
+- モバイル Suica (おサイフケータイ / Apple Pay) も Secure Element 上の本物の FeliCa で
+  **IDm は端末ごとに固定**。IDm ランダム化は HCE-F 自作カードの話で Suica は該当しない。
+- SESAME Touch の card 認証と同一方式 (sesame リポ `FINDINGS.md` 参照。
+  BLE プロトコル上 `card_id`=IDm, `CARD_TYPE_SUICA=0x01` は表示用)。
+- 参照実装: [M5Unit-NFC `NFCF/JapanTransportationICCard`](https://github.com/m5stack/M5Unit-NFC/tree/main/examples/UnitUnified/NFCF/JapanTransportationICCard)
+  — `NFCLayerF::detect()` + `PICC::idmAsString()` のみで識別完了。ESP-IDF native 対応。
+- 弱点: IDm は平文・リプレイ可 → 単独の本人確認にしない (顔認証と併用)。
+  IDm→人の紐付けの信頼性は自己申告 → これを埋めるのが下記 PIN 方式の登録時利用。
+
+## 2. マイナンバーカード (NFC-B, 券面事項入力補助AP) — 登録時候補
+
+参照実装: [M5Unit-NFC `NFCB/JapanIDCard`](https://github.com/m5stack/M5Unit-NFC/tree/main/examples/UnitUnified/NFCB/JapanIDCard)
+(ESP-IDF native 対応。`NFCLayerB` + `NFCBFileSystem`)。
+
+読み取りシーケンス (例の実装):
+
+1. NFC-B 活性化 (`cfg.mode = NFC::B`)
+2. `selectByDfName(D3 92 10 00 31 00 01 01 04 08)` — 券面事項入力補助AP を選択
+3. `verifyGlobal(暗証番号4桁)` — **券面事項入力補助用暗証番号**の照合
+4. EF `0x0002` を `readBinary()` → 氏名等の券面情報
+
+### 日常タップに使えない理由
+
+- **毎回 PIN 入力が必須**。Type-B のカード識別子 (PUPI) はセッション毎にランダムで、
+  Suica の IDm のような「かざすだけの固定 ID」が原理的に取れない。
+- **PIN 連続ミスでカードロック** (例のソースにも警告あり)。点呼のたびに全ドライバーが
+  PIN 入力する運用は事故率的に成立しない。
+- 氏名・住所という実個人情報を端末で扱うことになり、取り扱い責務が重い
+  (IDm は無意味な 8byte なので漏洩時の被害が限定的なのと対照的)。
+
+### 登録時 eKYC としての位置づけ
+
+初回登録時のみ: マイナンバーカード + PIN で氏名を読み、IDm 紐付けを検証済みにする。
+CoreS3 側に PIN 入力 UI (タッチテンキー) が必要。
+
+## 3. 運転免許証 IC (NFC-B) — 登録時の本命候補
+
+M5Unit-NFC に**専用例はない** (NFCB は Detect / JapanIDCard のみ) が、
+マイナンバーと同じ NFC-B + APDU (`NFCLayerB` / `NFCBFileSystem`) の枠で読める。
+DF/EF 構成と APDU は警察庁「運転免許証及び運転免許証作成システム等仕様書」に準拠。
+
+### IC チップの構造 (公的一次情報で確認済み)
+
+- 暗証番号は **4 桁 × 2 組**:
+  - **暗証番号1**: 券面記載情報 (氏名・免許証番号・有効期限等) の読み出し
+  - **暗証番号2**: 顔写真・本籍の読み出し (1+2 両方の照合が必要)
+- **3 回連続ミスで IC がロック**し、以後読み取り不可 (解除は警察窓口)。
+- → マイナンバーと同じ「日常タップ不可・登録時のみ」判定。
+
+### それでも本命である理由
+
+- **点呼はもともと免許証確認が業務要件**。ドライバーが確実に携行している。
+- 暗証番号1 だけで氏名+免許証番号が取れれば、`IDm → 免許証番号 → driver` の
+  検証済み紐付けが作れる。免許証番号は既存の運行管理データと直結する。
+- 弱点: 免許証の暗証番号は交付時設定のまま忘れられていることが多い
+  (ロック 3 回制限と相まって運用リスク)。
+  → 登録フローでは「読めなければ目視確認にフォールバック」を必須とする。
+
+### マイナ免許証への収斂 (2025年3月〜)
+
+運転免許証のマイナンバーカードへの一体化 (マイナ免許証) が始まっており、
+将来的には **2 と 3 は同じ物理カード**になっていく。登録時 eKYC を実装するなら
+NFC-B + APDU の共通基盤 (`NFCLayerB`/`NFCBFileSystem`) に乗せておけば両対応できる。
+
+## 実装への含意
+
+1. まず #84 (交通系 IDm) を実装。スパイク① (M5UnitUnified NFC コアのヘッドレス切り出し)
+   が通れば、**NFC-B 系も同じ切り出しで動く** (NFCLayerB は同一ライブラリ)。
+2. 登録時 eKYC (免許証/マイナンバー + PIN テンキー UI) は別 issue として将来起票。
+   rust-alc-api 側の driver 紐付け設計と同時に決める。
+3. PIN 方式を実装する場合はロック対策 (残り試行回数の警告表示、目視フォールバック) を必須要件にする。
+
+## 参考リンク
+
+- [M5Unit-NFC (GitHub)](https://github.com/m5stack/M5Unit-NFC) / [Unit NFC 製品ページ](https://docs.m5stack.com/en/unit/Unit_NFC)
+- 免許証暗証番号の公的説明: [警視庁](https://www.keishicho.metro.tokyo.lg.jp/menkyo/menkyo/menkyo_annai/ic.html) /
+  [三重県警 (暗証番号1は券面情報のみ)](https://www.police.pref.mie.jp/licence/ic/ic_tirasi.pdf) /
+  [兵庫県警 (3回ロック)](https://www.police.pref.hyogo.lg.jp/traffic/license/ic/index.htm)
+- sesame リポ `FINDINGS.md` — SESAME Touch の card/IDm プロトコル定義
