@@ -25,7 +25,9 @@
 //! | `EVT OTA NG <理由>` | 失敗 (現行 FW のまま続行) |
 
 use anyhow::{bail, Context, Result};
+use enumset::EnumSet;
 use esp_idf_svc::hal::delay::FreeRtos;
+use esp_idf_svc::hal::task::thread::{MallocCap, ThreadSpawnConfiguration};
 use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
 use esp_idf_svc::http::Method;
 use esp_idf_svc::io::Write;
@@ -76,6 +78,25 @@ pub fn spawn_update(url: String, status: SharedStatus, progress: Option<Progress
     // のままタイムアウトする抜け穴があった)
     let progress_for_thread = progress.clone();
     let status_for_thread = status.clone();
+
+    // OTA スレッドの 20KB スタックを内蔵SRAMではなくPSRAMから確保する。
+    // 実機でRAM使用率89%の状態でこのスレッド自体の起動が失敗する障害を確認した
+    // (Refs #91) — CoreS3のPSRAM(8MB)はほぼ未使用で余裕があるため、ここを
+    // 逃がすだけでOTA起動の成功率が上がる。stack_alloc_caps は「この設定を
+    // 呼んだスレッドが次に spawn するスレッド」に適用される thread-local な
+    // 予約 (esp_pthread_set_cfg) なので、spawn 直後に必ず既定へ戻す
+    // (戻し忘れると呼び出し元スレッド — ws_uplink の run() ループ等 — が
+    // その後 spawn する別処理 — printer.rs の spawn_print 等 — も
+    // 意図せず PSRAM スタックになってしまう)
+    if let Err(e) = (ThreadSpawnConfiguration {
+        stack_size: 20 * 1024,
+        stack_alloc_caps: EnumSet::only(MallocCap::Spiram),
+        ..Default::default()
+    }
+    .set())
+    {
+        log::warn!("ota: PSRAM スタック設定に失敗 ({e:?})。内蔵SRAMのまま起動を試みる");
+    }
     let spawned = std::thread::Builder::new()
         .name("ota".into())
         .stack_size(20 * 1024)
@@ -120,6 +141,11 @@ pub fn spawn_update(url: String, status: SharedStatus, progress: Option<Progress
                 }
             }
         });
+    // 呼び出し元スレッドの以降の spawn (printer.rs の spawn_print 等) に
+    // PSRAM スタック設定が漏れないよう、成否に関わらず既定へ戻す
+    if let Err(e) = ThreadSpawnConfiguration::default().set() {
+        log::warn!("ota: スレッド設定を既定へ戻せませんでした: {e:?}");
+    }
     if spawned.is_err() {
         println!("EVT OTA NG スレッド起動失敗 (メモリ不足)");
         if let Ok(mut st) = status.lock() {

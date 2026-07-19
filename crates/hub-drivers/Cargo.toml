@@ -14,6 +14,9 @@ alc-hub-common = { path = "../hub-common" }
 alc-hub-wifi = { path = "../hub-wifi" }
 anyhow = "1"
 log = "0.4"
+# ota.rs: OTA スレッドの stack_alloc_caps (PSRAM 指定) 用。esp-idf-hal 経由の
+# 既存の間接依存と同じバージョン系列 (Cargo.lock 参照)
+enumset = "1"
 esp-idf-svc = { version = "0.52", default-features = false, features = [
     "native",
     "std",
