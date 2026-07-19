@@ -89,6 +89,7 @@ dependencies = [
  "alc-hub-wifi",
  "anyhow",
  "embuild",
+ "enumset",
  "esp-idf-svc",
  "log",
 ]
