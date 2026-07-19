@@ -107,6 +107,14 @@ pub fn spawn_update(url: String, status: SharedStatus, progress: Option<Progress
             if let Ok(mut st) = status.lock() {
                 st.push_event(now_ms(), "OTA 更新開始");
             }
+            // web 側は「更新を開始しました...」から次の command_result まで
+            // 何の手がかりも無かった (デバイスが本当にコマンドを受け取り処理を
+            // 始めたのか、単にネットワーク上で消えたのかが区別できない)。
+            // download 開始前にここで一度 "started" を送り、以後は download の
+            // 進捗 (64KB毎) が続く前提を web 側が示せるようにする
+            if let Some(s) = progress.as_ref() {
+                s(r#"{"phase":"started"}"#.to_string());
+            }
             // OTA 中は UI ループが 10s 以上 feed できず task_wdt が誤リセットする
             // (更新が毎回中断する実害、Refs #55)。UI タスクの WDT 監視を download の
             // 間だけ止める。RAII ガードなので panic / 早期 return でも必ず戻る。
