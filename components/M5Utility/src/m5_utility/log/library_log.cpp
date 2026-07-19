@@ -1,0 +1,136 @@
+/*
+ * SPDX-FileCopyrightText: 2024 M5Stack Technology CO LTD
+ *
+ * SPDX-License-Identifier: MIT
+ */
+/*!
+  @file library_log.cpp
+  @brief Logging for libraries
+*/
+#include "library_log.hpp"
+#if !M5UTILITY_HAS_USABLE_CHRONO
+#include "../compatibility_feature.hpp"
+#endif
+#include <cstdio>
+#include <cstdarg>
+#include <inttypes.h>
+#include <algorithm>
+#include <cctype>
+
+// Emit the selected timestamp representation once from this translation unit.
+#if defined(CONFIG_NEWLIB_NANO_FORMAT)
+#pragma message("M5Utility log: 32-bit timestamp (newlib-nano printf, ~49.7d wrap)")
+#elif !M5UTILITY_HAS_USABLE_CHRONO
+#pragma message("M5Utility log: 32-bit timestamp (Arduino fallback, ~49.7d wrap)")
+#else
+#pragma message("M5Utility log: 64-bit timestamp (full printf)")
+#endif
+
+#if M5UTILITY_HAS_USABLE_CHRONO
+namespace {
+using clock = std::chrono::steady_clock;
+// using clock                      = std::chrono::high_resolution_clock;
+const clock::time_point start_at = clock::now();
+}  // namespace
+#endif
+
+namespace m5 {
+namespace utility {
+namespace log {
+
+void logPrintf(const char* format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    vprintf(format, ap);
+    va_end(ap);
+#if !defined(ARDUINO)
+    fflush(stdout);
+#endif
+}
+
+void dump(const void* iaddr, const size_t len, const bool align)
+{
+    constexpr static char hc[] = "0123456789ABCDEF";
+    const uint8_t* addr        = static_cast<const uint8_t*>(iaddr);
+    uintptr_t abyte            = align ? 0x0F : 0x00;
+
+    uint_fast8_t skip_left{static_cast<uint_fast8_t>(reinterpret_cast<uintptr_t>(addr) & abyte)};
+
+    char hex[128]{};
+
+    printf("DUMP:0x%08" PRIxPTR " %zu bytes\n", reinterpret_cast<uintptr_t>(addr), len);
+
+    // First line
+    size_t i{}, ia{};
+    uint_fast8_t cols = static_cast<uint_fast8_t>(std::min(len - i, static_cast<size_t>(16) - skip_left));
+    uint_fast8_t left = static_cast<uint_fast8_t>(
+        snprintf(hex, sizeof(hex), "0x%08" PRIxPTR "| ", reinterpret_cast<uintptr_t>(addr) & ~abyte));
+
+    for (uint_fast8_t s = 0; s < skip_left; ++s) {
+        hex[left++] = ' ';
+        hex[left++] = ' ';
+        hex[left++] = ' ';
+    }
+    for (uint_fast8_t c = 0; c < cols; ++c) {
+        left +=
+            static_cast<uint_fast8_t>(snprintf(hex + left, 4, "%c%c ", hc[(addr[i] >> 4) & 0x0F], hc[addr[i] & 0x0F]));
+        ++i;
+    }
+    for (uint_fast8_t s = skip_left; s < 16U - cols; ++s) {
+        hex[left++] = ' ';
+        hex[left++] = ' ';
+        hex[left++] = ' ';
+    }
+
+    hex[left++] = '|';
+    for (uint_fast8_t s = 0; s < skip_left; ++s) {
+        hex[left++] = ' ';
+    }
+    for (uint_fast8_t c = 0; c < cols; ++c) {
+        left += static_cast<uint_fast8_t>(
+            snprintf(hex + left, 2, "%c", std::isprint(addr[ia]) ? static_cast<char>(addr[ia]) : '.'));
+        ++ia;
+    }
+    puts(hex);
+
+    // Second line~
+    while (i < len) {
+        cols = static_cast<uint_fast8_t>(std::min(len - i, static_cast<size_t>(16U)));
+        left = static_cast<uint_fast8_t>(
+            snprintf(hex, sizeof(hex), "0x%08" PRIxPTR "| ", reinterpret_cast<uintptr_t>(addr + i) & ~abyte));
+        for (uint_fast8_t c = 0; c < cols; ++c) {
+            left += static_cast<uint_fast8_t>(
+                snprintf(hex + left, 4, "%c%c ", hc[(addr[i] >> 4) & 0x0F], hc[addr[i] & 0x0F]));
+            ++i;
+        }
+        for (uint_fast8_t s = 0; s < 16U - cols; ++s) {
+            hex[left++] = ' ';
+            hex[left++] = ' ';
+            hex[left++] = ' ';
+        }
+
+        hex[left++] = '|';
+        for (uint_fast8_t c = 0; c < cols; ++c) {
+            left += static_cast<uint_fast8_t>(
+                snprintf(hex + left, 2, "%c", std::isprint(addr[ia]) ? static_cast<char>(addr[ia]) : '.'));
+            ++ia;
+        }
+        puts(hex);
+    }
+}
+
+elapsed_time_t elapsedTime()
+{
+#if M5UTILITY_HAS_USABLE_CHRONO
+    return std::chrono::duration_cast<elapsed_time_t>(clock::now() - start_at);
+#else
+    // Route through m5::utility::millis() so the clock follows
+    // M5UTILITY_TIME_SOURCE instead of assuming an Arduino environment.
+    return elapsed_time_t{static_cast<uint32_t>(m5::utility::millis())};
+#endif
+}
+
+}  // namespace log
+}  // namespace utility
+}  // namespace m5

@@ -1,0 +1,265 @@
+/*
+ * SPDX-FileCopyrightText: 2024 M5Stack Technology CO LTD
+ *
+ * SPDX-License-Identifier: MIT
+ */
+/*!
+  @file library_log.hpp
+  @brief Logging for libraries
+*/
+#ifndef M5_UTILITY_LOG_LIBRARY_LOG_HPP
+#define M5_UTILITY_LOG_LIBRARY_LOG_HPP
+
+#include <cstdint>
+#include <cinttypes>
+#include <cstddef>
+#include "../platform_detect.hpp"
+
+// Some environments ship a <chrono> that does not compile (see
+// M5UTILITY_HAS_USABLE_CHRONO in platform_detect.hpp); fall back to a 32-bit
+// millisecond timestamp backed by m5::utility::millis() there.
+#if M5UTILITY_HAS_USABLE_CHRONO
+#include <chrono>
+#endif
+// ESP-IDF / Arduino-ESP32 (any platform shipping sdkconfig.h) provides
+// CONFIG_NEWLIB_NANO_FORMAT that flags whether the linked printf supports
+// %lld. __has_include keeps this header usable on platforms without it.
+#if defined(__has_include)
+#if __has_include(<sdkconfig.h>)
+#include <sdkconfig.h>
+#endif
+#endif
+
+namespace m5 {
+namespace utility {
+namespace log {
+
+/*!
+  @enum LogLevel
+  @brief Log output control level
+*/
+enum class LogLevel : uint8_t {
+    None,     //!< No output
+    Error,    //!< Error
+    Warn,     //!< Warning
+    Info,     //!< Information
+    Debug,    //!< Debug
+    Verbose,  //!< Verbose
+};
+using log_level_t = LogLevel;
+
+#if defined(NDEBUG)
+constexpr log_level_t logOutputLevel = log_level_t::None;
+#elif defined(M5_LOG_LEVEL)
+constexpr log_level_t logOutputLevel = static_cast<log_level_t>(M5_LOG_LEVEL);
+#elif defined(CORE_DEBUG_LEVEL)
+constexpr log_level_t logOutputLevel = static_cast<log_level_t>(CORE_DEBUG_LEVEL);
+#else
+/*!
+  @var logOutputLevel
+  @brief Base value of log level to be output
+  @details The value can be specified in the compile options.
+  -DM5_LOG_LEVEL=[0..5] or -DCORE_DEBUG_LEVEL=[0..5]
+  default as NONE
+  @warning No output if NDEBUG defined
+ */
+constexpr log_level_t logOutputLevel = log_level_t::None;
+#endif
+
+/// @cond
+// Does the string contain slash?
+constexpr bool contains_slash(const char* s)
+{
+    return *s ? (*s == '/' ? true : contains_slash(s + 1)) : false;
+}
+// Returns the next position after the right-most slash
+constexpr const char* after_right_slash(const char* s)
+{
+    return (*s == '/') ? (s + 1) : after_right_slash(s - 1);
+}
+// Gets the tail of string
+constexpr const char* tail(const char* s)
+{
+    return *s ? tail(s + 1) : s;
+}
+/// @endcond
+
+/*!
+  @brief Gets the filename from full pathname
+  @warning If the string is too long, the recursion depth may be too deep to
+  fail. (If compile time calculation)
+ */
+constexpr const char* pathToFilename(const char* path)
+{
+    return (path && path[0]) ? (contains_slash(path) ? after_right_slash(tail(path)) : path) : "";
+}
+
+//! @brief Output formatted strings
+void logPrintf(const char* format, ...);
+//! @brief Output dump
+void dump(const void* addr, const size_t len, const bool align = true);
+
+#if !M5UTILITY_HAS_USABLE_CHRONO
+/*!
+  @brief Millisecond duration count; only `.count()` is provided, unlike the
+         `std::chrono::milliseconds` used everywhere else (below).
+
+  Deliberate, narrowly-scoped API difference: in this environment <chrono>
+  does not compile at all (see M5UTILITY_HAS_USABLE_CHRONO in
+  platform_detect.hpp), so there is no working `std::chrono::milliseconds`
+  to preserve here. Code that needs duration arithmetic/comparison/`rep`/
+  `period` on `elapsedTime()`'s return value will need to adapt when
+  building for this environment.
+ */
+struct elapsed_time_t {
+    constexpr elapsed_time_t() : ms(0)
+    {
+    }
+    constexpr explicit elapsed_time_t(uint32_t value) : ms(value)
+    {
+    }
+
+    uint32_t ms;
+    constexpr uint32_t count() const
+    {
+        return ms;
+    }
+};
+#else
+using elapsed_time_t                 = std::chrono::milliseconds;
+// using elapsed_time_t = std::chrono::microseconds;
+#endif
+
+//! @brief Gets the elapsed time for log
+elapsed_time_t elapsedTime();
+
+///@cond
+// ESP-IDF newlib-nano printf does not support %lld; misaligned varargs cause a
+// LoadProhibited crash on the next %s. Detect via CONFIG_NEWLIB_NANO_FORMAT and
+// fall back to a 32-bit timestamp (~49.7 day wrap, acceptable for log use).
+// The no-<chrono> fallback takes the same 32-bit branch: those bare-metal
+// cores commonly link newlib-nano too (e.g. the Arduino/Adafruit SAMD core
+// passes --specs=nano.specs) without defining CONFIG_NEWLIB_NANO_FORMAT, and
+// its elapsed_time_t::count() is 32-bit to begin with.
+#if defined(CONFIG_NEWLIB_NANO_FORMAT) || !M5UTILITY_HAS_USABLE_CHRONO
+#define M5_UTILITY_LOG_TS_FMT "%6" PRIu32
+#define M5_UTILITY_LOG_TS_VAL (uint32_t) m5::utility::log::elapsedTime().count()
+#else
+#define M5_UTILITY_LOG_TS_FMT "%6" PRId64
+#define M5_UTILITY_LOG_TS_VAL (int64_t) m5::utility::log::elapsedTime().count()
+#endif
+
+#ifndef M5_UTILITY_LOG_FORMAT
+#define M5_UTILITY_LOG_FORMAT(letter, format)                                                    \
+    "[" M5_UTILITY_LOG_TS_FMT "][" #letter "][%s:%u] %s(): " format "\n", M5_UTILITY_LOG_TS_VAL, \
+        m5::utility::log::pathToFilename(__FILE__), __LINE__, __func__
+#endif
+///@endcond
+
+/*!
+  @def M5_LIB_LOGE
+  @brief Output log (level ERROR)
+ */
+#define M5_LIB_LOGE(format, ...)                                                          \
+    do {                                                                                  \
+        if (m5::utility::log::logOutputLevel >= m5::utility::log::log_level_t::Error) {   \
+            m5::utility::log::logPrintf(M5_UTILITY_LOG_FORMAT(E, format), ##__VA_ARGS__); \
+        }                                                                                 \
+    } while (0)
+/*!
+  @def M5_LIB_LOGW
+  @brief Output log (level WARN)
+ */
+#define M5_LIB_LOGW(format, ...)                                                          \
+    do {                                                                                  \
+        if (m5::utility::log::logOutputLevel >= m5::utility::log::log_level_t::Warn) {    \
+            m5::utility::log::logPrintf(M5_UTILITY_LOG_FORMAT(W, format), ##__VA_ARGS__); \
+        }                                                                                 \
+    } while (0)
+/*!
+  @def M5_LIB_LOGI
+  @brief Output log (level INFO)
+ */
+#define M5_LIB_LOGI(format, ...)                                                          \
+    do {                                                                                  \
+        if (m5::utility::log::logOutputLevel >= m5::utility::log::log_level_t::Info) {    \
+            m5::utility::log::logPrintf(M5_UTILITY_LOG_FORMAT(I, format), ##__VA_ARGS__); \
+        }                                                                                 \
+    } while (0)
+/*!
+  @def M5_LIB_LOGD
+  @brief Output log (level DEBUG)
+ */
+#define M5_LIB_LOGD(format, ...)                                                          \
+    do {                                                                                  \
+        if (m5::utility::log::logOutputLevel >= m5::utility::log::log_level_t::Debug) {   \
+            m5::utility::log::logPrintf(M5_UTILITY_LOG_FORMAT(D, format), ##__VA_ARGS__); \
+        }                                                                                 \
+    } while (0)
+/*!
+  @def M5_LIB_LOGV
+  @brief Output log (level VERBOSE)
+ */
+#define M5_LIB_LOGV(format, ...)                                                          \
+    do {                                                                                  \
+        if (m5::utility::log::logOutputLevel >= m5::utility::log::log_level_t::Verbose) { \
+            m5::utility::log::logPrintf(M5_UTILITY_LOG_FORMAT(V, format), ##__VA_ARGS__); \
+        }                                                                                 \
+    } while (0)
+
+/*!
+  @def M5_DUMPE
+  @brief Output log (level ERROR)
+ */
+#define M5_DUMPE(addr, len)                                                             \
+    do {                                                                                \
+        if (m5::utility::log::logOutputLevel >= m5::utility::log::log_level_t::Error) { \
+            m5::utility::log::dump((addr), (len));                                      \
+        }                                                                               \
+    } while (0)
+/*!
+  @def M5_DUMPW
+  @brief Output log (level WARN)
+ */
+#define M5_DUMPW(addr, len)                                                            \
+    do {                                                                               \
+        if (m5::utility::log::logOutputLevel >= m5::utility::log::log_level_t::Warn) { \
+            m5::utility::log::dump((addr), (len));                                     \
+        }                                                                              \
+    } while (0)
+/*!
+  @def M5_DUMPI
+  @brief Output log (level INFO)
+ */
+#define M5_DUMPI(addr, len)                                                            \
+    do {                                                                               \
+        if (m5::utility::log::logOutputLevel >= m5::utility::log::log_level_t::Info) { \
+            m5::utility::log::dump((addr), (len));                                     \
+        }                                                                              \
+    } while (0)
+/*!
+  @def M5_DUMPD
+  @brief Output log (level DEBUG)
+ */
+#define M5_DUMPD(addr, len)                                                             \
+    do {                                                                                \
+        if (m5::utility::log::logOutputLevel >= m5::utility::log::log_level_t::Debug) { \
+            m5::utility::log::dump((addr), (len));                                      \
+        }                                                                               \
+    } while (0)
+/*!
+  @def M5_DUMPV
+  @brief Output log (level VERBOSE)
+ */
+#define M5_DUMPV(addr, len)                                                               \
+    do {                                                                                  \
+        if (m5::utility::log::logOutputLevel >= m5::utility::log::log_level_t::Verbose) { \
+            m5::utility::log::dump((addr), (len));                                        \
+        }                                                                                 \
+    } while (0)
+
+}  // namespace log
+}  // namespace utility
+}  // namespace m5
+
+#endif

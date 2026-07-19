@@ -14,6 +14,8 @@ pub mod gw_link;
 pub mod heap;
 pub mod host_link;
 pub mod lan;
+#[cfg(feature = "nfc-verify")]
+pub mod nfc;
 pub mod ntp;
 pub mod ota;
 pub mod printer;

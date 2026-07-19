@@ -21,6 +21,13 @@ CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 # ブートローダが旧スロットへ自動で戻す
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
+# C++ 例外 (nfc-verify feature, components/nfc_shim 経由の M5UnitUnified 統合、issue #84):
+# M5Utility.hpp が引き込む m5_utility/stl/expected.hpp が try/throw/catch を使うため、
+# ESP-IDF 既定の -fno-exceptions では expected.hpp を含むだけでコンパイルエラーになる
+# (実際に投げる経路を呼ばなくても構文自体がエラー)。RTTI (dynamic_cast/typeid) は
+# vendor コード内で不使用のため無効のまま。バイナリ増分・ヒープ影響は mem-hud で要実測
+CONFIG_COMPILER_CXX_EXCEPTIONS=y
+
 # Wi-Fi (Improv で設定) と BLE の同時使用のため SW コエグジストを明示的に有効化
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 

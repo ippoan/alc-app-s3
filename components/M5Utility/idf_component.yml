@@ -1,0 +1,25 @@
+description: Pure C++ utilities and STL helpers shared by M5Stack libraries.
+url: https://github.com/m5stack/M5Utility
+issues: https://github.com/m5stack/M5Utility/issues
+license: MIT
+version: "0.2.0"
+
+dependencies:
+  idf: ">=5.0"
+
+# No `targets:` restriction: M5Utility is pure C++ utility code with no
+# chip-specific paths (the only platform gate is ESP_PLATFORM vs host), so it
+# builds on every ESP32-family target. Restricting the list here breaks
+# dependency resolution for any downstream component (e.g. M5HAL) that
+# declares a chip absent from it.
+
+files:
+  exclude:
+    - "docs/**"
+    - "examples/**"
+    - "test/**"
+    - ".github/**"
+    - "boards/**"
+    - "platformio.ini"
+    - "library.json"
+    - "library.properties"
