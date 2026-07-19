@@ -1,4 +1,22 @@
 dependencies:
+  M5HAL:
+    dependencies: []
+    source:
+      path: C:\Users\mtama\claude\alc-app-s3\components\M5HAL
+      type: local
+    version: 0.1.2
+  M5UnitUnified:
+    dependencies: []
+    source:
+      path: C:\Users\mtama\claude\alc-app-s3\components\M5UnitUnified
+      type: local
+    version: 0.5.5
+  M5Utility:
+    dependencies: []
+    source:
+      path: C:\Users\mtama\claude\alc-app-s3\components\M5Utility
+      type: local
+    version: 0.2.0
   espressif/esp_websocket_client:
     component_hash: 3fb288702517ef4d75bf933a115f1056ee0c2540d964f9e1d856e0bb67e1dfeb
     dependencies:
@@ -15,6 +33,10 @@ dependencies:
     version: 5.5.3
 direct_dependencies:
 - espressif/esp_websocket_client
-manifest_hash: d4d28905c199ed26840932bab4e869a879311695c202342a4190d1b29315bf7d
+- idf
+- m5stack/M5HAL
+- m5stack/M5UnitUnified
+- m5stack/M5Utility
+manifest_hash: 70d6abf8d3c4f12e8de7d80d4635d63c3f55b4671eccd85f7b03b2740860688b
 target: esp32s3
 version: 2.0.0

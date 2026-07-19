@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "ホストリンク (USB CDC 行プロトコル + Improv 振り分け) / RS232 (FC-1200) / LAN スタブ"
 
+[features]
+# Unit NFC (ST25R3916) 検証 (issue #84)。ルート components/nfc_shim の extern "C" を呼ぶ
+nfc-verify = []
+
 [dependencies]
 alc-hub-core = { path = "../hub-core" }
 alc-hub-common = { path = "../hub-common" }

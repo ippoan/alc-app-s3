@@ -1,0 +1,452 @@
+/*
+ * SPDX-FileCopyrightText: 2024 M5Stack Technology CO LTD
+ *
+ * SPDX-License-Identifier: MIT
+ */
+/*!
+  @file adapter_i2c.hpp
+  @brief Adapter for I2C to treat M5HAL, TwoWire, and I2C_Class in the same way
+*/
+#ifndef M5_UNIT_COMPONENT_ADAPTER_I2C_HPP
+#define M5_UNIT_COMPONENT_ADAPTER_I2C_HPP
+
+#include "adapter_base.hpp"
+#include "pin.hpp"
+#if defined(ESP_PLATFORM) && __has_include(<driver/i2c_master.h>)
+#include <driver/i2c_master.h>
+#elif defined(ESP_PLATFORM)
+#include <driver/i2c.h>
+#endif
+#include <vector>
+
+class TwoWire;
+
+namespace m5 {
+class I2C_Class;
+namespace unit {
+
+/*!
+  @class m5::unit::AdapterI2C
+  @brief I2C access adapter
+ */
+class AdapterI2C : public Adapter {
+public:
+    //! @brief I2C implementation type
+    enum class ImplType : uint8_t {
+        Unknown,   //!< Unknown
+        TwoWire,   //!< Arduino TwoWire
+        Bus,       //!< M5HAL Bus (including SoftwareI2C)
+        I2CClass,  //!< m5::I2C_Class (m5gfx::i2c)
+#if defined(ESP_PLATFORM) && __has_include(<driver/i2c_master.h>)
+        ESPIDFMasterBus,  //!< ESP-IDF native i2c_master_bus_handle_t
+#elif defined(ESP_PLATFORM)
+        ESPIDFLegacyBus,  //!< ESP-IDF legacy driver/i2c.h (pre-installed port)
+#endif
+    };
+
+    class I2CImpl : public Adapter::Impl {
+    public:
+        I2CImpl() = default;
+        I2CImpl(const uint8_t addr, const uint32_t clock) : Adapter::Impl(), _addr(addr), _clock(clock)
+        {
+        }
+
+        virtual ~I2CImpl() = default;
+
+        inline uint8_t address() const
+        {
+            return _addr;
+        }
+        inline virtual void setAddress(const uint8_t addr)
+        {
+            _addr = addr;
+        }
+
+        inline uint32_t clock() const
+        {
+            return _clock;
+        }
+
+        inline virtual void setClock(const uint32_t clock)
+        {
+            _clock = clock;
+        }
+
+        //
+        virtual int16_t scl() const
+        {
+            return -1;
+        }
+        virtual int16_t sda() const
+        {
+            return -1;
+        }
+
+        //
+        virtual bool begin()
+        {
+            return false;
+        }
+        virtual bool end()
+        {
+            return false;
+        }
+        virtual m5::hal::error::error_t wakeup()
+        {
+            return m5::hal::error::error_t::UNKNOWN_ERROR;
+        }
+
+        //
+        virtual I2CImpl* duplicate(const uint8_t addr)
+        {
+            return new I2CImpl(addr, _clock);
+        }
+
+        //! @brief Gets the implementation type
+        virtual ImplType implType() const
+        {
+            return ImplType::Unknown;
+        }
+
+        virtual TwoWire* getWire()
+        {
+            return nullptr;
+        }
+        virtual m5::hal::bus::Bus* getBus()
+        {
+            return nullptr;
+        }
+        virtual m5::I2C_Class* getI2CClass()
+        {
+            return nullptr;
+        }
+
+    protected:
+        uint8_t _addr{};
+        uint32_t _clock{100 * 1000U};
+    };
+
+#if defined(ESP_PLATFORM) && __has_include(<driver/i2c_master.h>)
+    class ESPIDFMasterBusImpl : public I2CImpl {
+    public:
+        ESPIDFMasterBusImpl(i2c_master_bus_handle_t bus, const uint8_t addr, const uint32_t clock);
+        inline virtual ImplType implType() const override
+        {
+            return ImplType::ESPIDFMasterBus;
+        }
+        inline virtual void setAddress(const uint8_t addr) override
+        {
+            if (_addr != addr) {
+                end();
+            }
+            I2CImpl::setAddress(addr);
+        }
+        inline virtual void setClock(const uint32_t clock) override
+        {
+            if (_clock != clock) {
+                end();
+            }
+            I2CImpl::setClock(clock);
+        }
+        virtual bool begin() override;
+        virtual bool end() override;
+        virtual I2CImpl* duplicate(const uint8_t addr) override;
+        virtual m5::hal::error::error_t readWithTransaction(uint8_t* data, const size_t len) override;
+        virtual m5::hal::error::error_t writeWithTransaction(const uint8_t* data, const size_t len,
+                                                             const uint32_t stop) override;
+        virtual m5::hal::error::error_t writeWithTransaction(const uint8_t reg, const uint8_t* data, const size_t len,
+                                                             const uint32_t stop) override;
+        virtual m5::hal::error::error_t writeWithTransaction(const uint16_t reg, const uint8_t* data, const size_t len,
+                                                             const uint32_t stop) override;
+        virtual m5::hal::error::error_t generalCall(const uint8_t* data, const size_t len) override;
+        virtual m5::hal::error::error_t wakeup() override;
+
+    protected:
+        m5::hal::error::error_t ensure_device();
+        m5::hal::error::error_t transmit(const uint8_t* data, const size_t len);
+        void set_pending_write(const uint8_t* data, const size_t len);
+
+    private:
+        i2c_master_bus_handle_t _bus{};
+        i2c_master_dev_handle_t _dev{};
+        std::vector<uint8_t> _pending_write{};
+    };
+#elif defined(ESP_PLATFORM)
+    class ESPIDFLegacyBusImpl : public I2CImpl {
+    public:
+        ESPIDFLegacyBusImpl(const i2c_port_t port, const gpio_num_t sda, const gpio_num_t scl, const uint8_t addr,
+                            const uint32_t clock);
+        inline virtual ImplType implType() const override
+        {
+            return ImplType::ESPIDFLegacyBus;
+        }
+        inline virtual int16_t scl() const override
+        {
+            return _scl;
+        }
+        inline virtual int16_t sda() const override
+        {
+            return _sda;
+        }
+        inline virtual void setClock(const uint32_t clock) override
+        {
+            if (_clock != clock) {
+                I2CImpl::setClock(clock);
+                apply_clock();
+            }
+        }
+        virtual bool begin() override;
+        virtual bool end() override;
+        virtual I2CImpl* duplicate(const uint8_t addr) override;
+        virtual m5::hal::error::error_t readWithTransaction(uint8_t* data, const size_t len) override;
+        virtual m5::hal::error::error_t writeWithTransaction(const uint8_t* data, const size_t len,
+                                                             const uint32_t stop) override;
+        virtual m5::hal::error::error_t writeWithTransaction(const uint8_t reg, const uint8_t* data, const size_t len,
+                                                             const uint32_t stop) override;
+        virtual m5::hal::error::error_t writeWithTransaction(const uint16_t reg, const uint8_t* data, const size_t len,
+                                                             const uint32_t stop) override;
+        virtual m5::hal::error::error_t generalCall(const uint8_t* data, const size_t len) override;
+        virtual m5::hal::error::error_t wakeup() override;
+
+    protected:
+        void apply_clock();
+        m5::hal::error::error_t write_with_transaction(const uint8_t addr, const uint8_t* data, const size_t len,
+                                                       const uint32_t stop);
+
+    private:
+        i2c_port_t _port{I2C_NUM_0};
+        int16_t _sda{-1}, _scl{-1};
+        int _high{0}, _low{0};
+    };
+#endif
+
+    //
+#if defined(ARDUINO)
+    class WireImpl : public I2CImpl {
+    public:
+        WireImpl(TwoWire& wire, const uint8_t addr, const uint32_t clock);
+        inline virtual ImplType implType() const override
+        {
+            return ImplType::TwoWire;
+        }
+        inline virtual TwoWire* getWire() override
+        {
+            return _wire;
+        }
+        inline virtual int16_t scl() const override
+        {
+            return _scl;
+        }
+        inline virtual int16_t sda() const override
+        {
+            return _sda;
+        }
+        virtual bool begin() override;
+        virtual bool end() override;
+        virtual m5::hal::error::error_t readWithTransaction(uint8_t* data, const size_t len) override;
+        virtual m5::hal::error::error_t writeWithTransaction(const uint8_t* data, const size_t len,
+                                                             const uint32_t stop) override;
+        virtual m5::hal::error::error_t writeWithTransaction(const uint8_t reg, const uint8_t* data, const size_t len,
+                                                             const uint32_t stop) override;
+        virtual m5::hal::error::error_t writeWithTransaction(const uint16_t reg, const uint8_t* data, const size_t len,
+                                                             const uint32_t stop) override;
+        virtual I2CImpl* duplicate(const uint8_t addr) override;
+        virtual m5::hal::error::error_t generalCall(const uint8_t* data, const size_t len) override;
+        virtual m5::hal::error::error_t wakeup() override;
+
+    protected:
+        m5::hal::error::error_t write_with_transaction(const uint8_t addr, const uint8_t* data, const size_t len,
+                                                       const uint32_t stop);
+
+    private:
+        TwoWire* _wire{};
+        int16_t _sda{}, _scl{};
+    };
+#endif
+
+    class BusImpl : public I2CImpl {
+    public:
+        BusImpl(m5::hal::bus::Bus* bus, const uint8_t addr, const uint32_t clock);
+        inline virtual ImplType implType() const override
+        {
+            return ImplType::Bus;
+        }
+        inline virtual m5::hal::bus::Bus* getBus() override
+        {
+            return _bus;
+        }
+        inline virtual int16_t scl() const override
+        {
+            return _scl;
+        }
+        inline virtual int16_t sda() const override
+        {
+            return _sda;
+        }
+
+        inline virtual void setAddress(const uint8_t addr) override
+        {
+            I2CImpl::setAddress(addr);
+            _access_cfg.i2c_addr = addr;
+        }
+        inline virtual void setClock(const uint32_t clock) override
+        {
+            I2CImpl::setClock(clock);
+            _access_cfg.freq = clock;
+        }
+        virtual bool begin() override
+        {
+            return true;
+        }
+        virtual bool end() override
+        {
+            return true;
+        }
+        virtual I2CImpl* duplicate(const uint8_t addr) override;
+        virtual m5::hal::error::error_t readWithTransaction(uint8_t* data, const size_t len) override;
+        virtual m5::hal::error::error_t writeWithTransaction(const uint8_t* data, const size_t len,
+                                                             const uint32_t stop) override;
+
+        virtual m5::hal::error::error_t writeWithTransaction(const uint8_t reg, const uint8_t* data, const size_t len,
+                                                             const uint32_t stop) override;
+        virtual m5::hal::error::error_t writeWithTransaction(const uint16_t reg, const uint8_t* data, const size_t len,
+                                                             const uint32_t stop) override;
+        virtual m5::hal::error::error_t generalCall(const uint8_t* data, const size_t len) override;
+        virtual m5::hal::error::error_t wakeup() override;
+
+    protected:
+        m5::hal::error::error_t write_with_transaction(const m5::hal::bus::I2CMasterAccessConfig& cfg,
+                                                       const uint8_t* data, const size_t len, const uint32_t stop);
+
+    private:
+        m5::hal::bus::Bus* _bus{};
+        m5::hal::bus::I2CMasterAccessConfig _access_cfg{};
+        int16_t _sda{-1}, _scl{-1};
+    };
+
+    class I2CClassImpl : public I2CImpl {
+    public:
+        I2CClassImpl(m5::I2C_Class& i2c, const uint8_t addr, const uint32_t clock);
+        inline virtual ImplType implType() const override
+        {
+            return ImplType::I2CClass;
+        }
+        inline virtual m5::I2C_Class* getI2CClass() override
+        {
+            return _i2c;
+        }
+        inline virtual int16_t scl() const override
+        {
+            return _scl;
+        }
+        inline virtual int16_t sda() const override
+        {
+            return _sda;
+        }
+        virtual bool begin() override;
+        virtual bool end() override;
+        virtual m5::hal::error::error_t readWithTransaction(uint8_t* data, const size_t len) override;
+        virtual m5::hal::error::error_t writeWithTransaction(const uint8_t* data, const size_t len,
+                                                             const uint32_t stop) override;
+        virtual m5::hal::error::error_t writeWithTransaction(const uint8_t reg, const uint8_t* data, const size_t len,
+                                                             const uint32_t stop) override;
+        virtual m5::hal::error::error_t writeWithTransaction(const uint16_t reg, const uint8_t* data, const size_t len,
+                                                             const uint32_t stop) override;
+        virtual I2CImpl* duplicate(const uint8_t addr) override;
+        virtual m5::hal::error::error_t generalCall(const uint8_t* data, const size_t len) override;
+        virtual m5::hal::error::error_t wakeup() override;
+
+    private:
+        m5::I2C_Class* _i2c{};
+        int16_t _sda{-1}, _scl{-1};
+        bool _in_transaction{false};
+    };
+
+#if defined(ARDUINO)
+    AdapterI2C(TwoWire& wire, uint8_t addr, const uint32_t clock);
+#endif
+    AdapterI2C(m5::hal::bus::Bus* bus, const uint8_t addr, const uint32_t clock);
+    AdapterI2C(m5::I2C_Class& i2c, const uint8_t addr, const uint32_t clock);
+#if defined(ESP_PLATFORM) && __has_include(<driver/i2c_master.h>)
+    AdapterI2C(i2c_master_bus_handle_t bus, const uint8_t addr, const uint32_t clock);
+#elif defined(ESP_PLATFORM)
+    AdapterI2C(const i2c_port_t port, const gpio_num_t sda, const gpio_num_t scl, const uint8_t addr,
+               const uint32_t clock);
+#endif
+    AdapterI2C(m5::hal::bus::Bus& bus, const uint8_t addr, const uint32_t clock) : AdapterI2C(&bus, addr, clock)
+    {
+    }
+
+    inline I2CImpl* impl()
+    {
+        return static_cast<I2CImpl*>(_impl.get());
+    }
+    inline const I2CImpl* impl() const
+    {
+        return static_cast<I2CImpl*>(_impl.get());
+    }
+
+    inline uint8_t address() const
+    {
+        return impl()->address();
+    }
+    inline void setAddress(const uint8_t addr)
+    {
+        impl()->setAddress(addr);
+    }
+
+    inline uint32_t clock() const
+    {
+        return impl()->clock();
+    }
+
+    inline void setClock(const uint32_t clock)
+    {
+        impl()->setClock(clock);
+    }
+
+    //! @brief Gets the I2C implementation type
+    inline ImplType implType() const
+    {
+        return impl()->implType();
+    }
+
+    inline int16_t scl() const
+    {
+        return impl()->scl();
+    }
+    inline int16_t sda() const
+    {
+        return impl()->sda();
+    }
+
+    virtual Adapter* duplicate(const uint8_t addr) override;
+
+    /// @warning Functionality required for a specific unit
+    /// @warning Will be improved when integrated with M5HAL
+    /// @name Temporary API
+    ///@{
+    inline bool begin()
+    {
+        return impl()->begin();
+    }
+    inline bool end()
+    {
+        return impl()->end();
+    }
+    bool pushPin();
+    bool popPin();
+    ///@}
+
+protected:
+    AdapterI2C() : Adapter(Adapter::Type::I2C, new I2CImpl())
+    {
+    }
+
+protected:
+    gpio::pin_backup_t _backupSCL{-1}, _backupSDA{-1};
+};
+
+}  // namespace unit
+}  // namespace m5
+#endif
