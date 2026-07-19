@@ -395,7 +395,7 @@ fn handle_downlink(
                         let ev = ev_tx.clone();
                         let cid = id.clone();
                         let sink: crate::ota::ProgressSink =
-                            Box::new(move |payload: String| {
+                            std::sync::Arc::new(move |payload: String| {
                                 if let Ok(frame) = command_result_frame(&cid, &payload) {
                                     let _ = ev.send(WsEvent::Outbound(frame));
                                 }

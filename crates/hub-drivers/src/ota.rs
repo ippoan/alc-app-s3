@@ -46,7 +46,10 @@ const PROGRESS_STEP: usize = 64 * 1024;
 /// OTA 進捗の送出先 (JSON payload 文字列を受け取る)。WS 経路では
 /// command_result フレームに包んで送り返すために使う (ws_uplink.rs)。
 /// シリアル (host_link) 経由の OTA では None。
-pub type ProgressSink = Box<dyn Fn(String) + Send>;
+/// `Arc` (Box ではなく): スレッド起動失敗時 (spawn_update 参照) に、
+/// 起動スレッドへ move した後でも呼び出し元スコープ側から同じシンクで
+/// エラー通知を送れるようにするため (clone して両方に配る)。
+pub type ProgressSink = std::sync::Arc<dyn Fn(String) + Send + Sync>;
 
 /// 現在実行中のパーティションラベル ("ota_0" 等)。
 pub fn running_slot() -> String {
@@ -66,10 +69,19 @@ pub fn running_slot() -> String {
 /// 現行 FW のまま続行する。`progress` は WS 経路での遠隔進捗表示用 (シリアル
 /// 経路では None、進捗は EVT OTA_* のみ)。
 pub fn spawn_update(url: String, status: SharedStatus, progress: Option<ProgressSink>) {
+    // スレッド本体へ move するのは clone の方。起動失敗 (spawn Err) 時に
+    // 呼び出し元スコープの `progress` でエラー通知を送るため元を残す
+    // (以前は progress を直接 move していたため、スレッド起動自体が失敗すると
+    // クロージャごと破棄され WS 側に何も通知されず Web が無限に「開始しました」
+    // のままタイムアウトする抜け穴があった)
+    let progress_for_thread = progress.clone();
+    let status_for_thread = status.clone();
     let spawned = std::thread::Builder::new()
         .name("ota".into())
         .stack_size(20 * 1024)
         .spawn(move || {
+            let status = status_for_thread;
+            let progress = progress_for_thread;
             println!("EVT OTA_START slot={} url={url}", running_slot());
             if let Ok(mut st) = status.lock() {
                 st.push_event(now_ms(), "OTA 更新開始");
@@ -110,6 +122,15 @@ pub fn spawn_update(url: String, status: SharedStatus, progress: Option<Progress
         });
     if spawned.is_err() {
         println!("EVT OTA NG スレッド起動失敗 (メモリ不足)");
+        if let Ok(mut st) = status.lock() {
+            st.push_event(now_ms(), "OTA 失敗 (メモリ不足)");
+        }
+        // WS 経路 (progress Some) では、ここで通知しないと web 側は何の
+        // 進捗も受け取れないまま pollOta の 5 分タイムアウトまで
+        // 「更新を開始しました...」の表示で固まる (実際に発生した障害)
+        if let Some(s) = progress.as_ref() {
+            s(r#"{"phase":"error","message":"OTA 用スレッドの起動に失敗しました (メモリ不足)"}"#.to_string());
+        }
     }
 }
 
