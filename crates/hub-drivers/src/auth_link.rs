@@ -8,6 +8,10 @@
 //! HTTP は blocking (esp_http_client + 証明書バンドル)。TLS ハンドシェイクを
 //! 呼び出しスレッドのスタックで行うため、専用スレッドは大きめに確保する。
 //!
+//! `hub_token()` / `introspect()` は GW (alc-gw) との相互認証ハンドシェイク
+//! (ippoan/alc-app-s3#83) 用。`gw_link` から同期的に呼ばれ、新規 TLS チャネルを
+//! 常設するわけではなく `mint_token()` と同じく都度 `post_json` する。
+//!
 //! # ホストへのイベント出力
 //!
 //! | イベント | 意味 |
@@ -15,7 +19,11 @@
 //! | `EVT AUTH_TOKEN OK <expires_in_s>` | `AUTH TOKEN` 自己診断成功 |
 //! | `EVT AUTH_TOKEN NG <理由>` | 同 失敗 |
 
-use alc_hub_core::pairing::{parse_token_response, token_request_body, DeviceToken};
+use alc_hub_core::pairing::{
+    hub_token_request_body, introspect_request_body, parse_hub_token_response,
+    parse_introspect_response, parse_token_response, token_request_body, DeviceToken, HubToken,
+    IntrospectResult,
+};
 use anyhow::{Context, Result};
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
@@ -93,6 +101,39 @@ pub fn mint_token(base: &str, device_id: &str, device_secret: &str) -> Result<De
     )
     .map_err(|e| e.to_string())
     .and_then(|(_, body)| parse_token_response(&body))
+}
+
+/// GW の `auth_challenge` nonce を束縛した短命 hub-token を mint する
+/// (ippoan/alc-app-s3#83、ippoan/auth-worker#406)。gw_link がハンドシェイクの
+/// 「自分の hub-token を用意する」段で同期的に呼ぶ。
+pub fn hub_token(
+    base: &str,
+    device_id: &str,
+    device_secret: &str,
+    nonce: &str,
+) -> Result<HubToken, String> {
+    post_json(
+        &format!("{base}/device/hub-token"),
+        &hub_token_request_body(device_id, device_secret, nonce),
+    )
+    .map_err(|e| e.to_string())
+    .and_then(|(_, body)| parse_hub_token_response(&body))
+}
+
+/// GW から届いた `auth_ok` の token を検証する (ippoan/alc-app-s3#83)。
+/// ESP32 側に JWKS 検証は実装しない設計のため、この REST 呼び出しで代替する。
+pub fn introspect(
+    base: &str,
+    device_id: &str,
+    device_secret: &str,
+    token: &str,
+) -> Result<IntrospectResult, String> {
+    post_json(
+        &format!("{base}/device/introspect"),
+        &introspect_request_body(device_id, device_secret, token),
+    )
+    .map_err(|e| e.to_string())
+    .and_then(|(_, body)| parse_introspect_response(&body))
 }
 
 /// JSON POST (blocking)。応答の (HTTP status, body) を返す。

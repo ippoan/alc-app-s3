@@ -4,7 +4,7 @@
 //! 仕様は alc-gw README「CoreS3 連携」節が正。I/O・再接続・状態管理は
 //! firmware 側 (hub-drivers::gw_link) が担う。
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 /// 接続直後に送る自己紹介。GW はこれで readers 表示のデバイス名を確定する
 pub fn hello_frame(device: &str, fw: &str) -> String {
@@ -44,6 +44,23 @@ pub enum GwDownlink {
     /// `{"src":"gw","type":"fc1200_command","command":"reset"}` — FC-1200 操作
     /// (点呼UI の測定開始が "reset" として届く)
     Fc1200Command(String),
+    /// `{"src":"gw","type":"auth_challenge","nonce":"..."}` — 相互認証の開始
+    /// (ippoan/alc-app-s3#83)。CoreS3 はこの nonce で `POST /device/hub-token`
+    /// を mint し `auth_frame` を返す
+    AuthChallenge(String),
+    /// `{"src":"gw","type":"auth_ok","token":"..."}` — GW 自身の hub-token。
+    /// `POST /device/introspect` で検証するまでデータフレームは送らない
+    AuthOk(String),
+    /// `{"src":"gw","type":"auth_fail","reason":"..."}` — GW 側が明示的に
+    /// 認証失敗を通知 (timeout 以外の即時失敗経路)
+    AuthFail(String),
+}
+
+/// 相互認証: `auth_challenge` の nonce で mint した自分の hub-token を GW へ返す
+/// (ippoan/alc-app-s3#83)。GW 側の `auth_ok` を introspect で検証完了するまで、
+/// この後は measurement/ble_status 等のデータフレームを送らない
+pub fn auth_frame(token: &str) -> String {
+    json!({"src": "cores3", "type": "auth", "token": token}).to_string()
 }
 
 /// GW 自動発見ビーコン (UDP 9001) を解析して WS ハブ URL を返す。
@@ -66,19 +83,27 @@ pub fn parse_beacon(text: &str) -> Result<String, String> {
     Ok(ws.to_string())
 }
 
-/// GW からの下りフレームを解析する
+/// 必須の文字列フィールドを取り出す (空文字列も不可)。
+fn require_str(obj: &Map<String, Value>, key: &str) -> Result<String, String> {
+    obj.get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{key} (文字列) がありません"))
+}
+
+/// GW からの下りフレームを解析する。`type` ごとに必須フィールドが異なるため
+/// (ble_command/fc1200_command は `command`、auth 系は `nonce`/`token`/`reason`)、
+/// まず `type` で分岐してから対応するフィールドを取り出す
 pub fn parse_downlink(text: &str) -> Result<GwDownlink, String> {
     let v: Value = serde_json::from_str(text).map_err(|e| format!("JSON 解析失敗: {e}"))?;
     let obj = v.as_object().ok_or("JSON オブジェクトではありません")?;
-    let command = obj
-        .get("command")
-        .and_then(|c| c.as_str())
-        .filter(|c| !c.is_empty())
-        .ok_or("command (文字列) がありません")?
-        .to_string();
     match obj.get("type").and_then(|t| t.as_str()) {
-        Some("ble_command") => Ok(GwDownlink::BleCommand(command)),
-        Some("fc1200_command") => Ok(GwDownlink::Fc1200Command(command)),
+        Some("ble_command") => Ok(GwDownlink::BleCommand(require_str(obj, "command")?)),
+        Some("fc1200_command") => Ok(GwDownlink::Fc1200Command(require_str(obj, "command")?)),
+        Some("auth_challenge") => Ok(GwDownlink::AuthChallenge(require_str(obj, "nonce")?)),
+        Some("auth_ok") => Ok(GwDownlink::AuthOk(require_str(obj, "token")?)),
+        Some("auth_fail") => Ok(GwDownlink::AuthFail(require_str(obj, "reason")?)),
         Some(other) => Err(format!("不明な type: {other}")),
         None => Err("type がありません".into()),
     }
@@ -174,5 +199,41 @@ mod tests {
         assert!(parse_downlink(r#"{"type":"ble_command","command":""}"#).is_err());
         assert!(parse_downlink(r#"{"type":"nfc_command","command":"x"}"#).is_err());
         assert!(parse_downlink(r#"{"command":"reset"}"#).is_err());
+    }
+
+    #[test]
+    fn auth_frame_shape() {
+        assert_eq!(
+            auth_frame("eyJ..."),
+            r#"{"src":"cores3","token":"eyJ...","type":"auth"}"#,
+        );
+    }
+
+    #[test]
+    fn parse_downlink_auth_challenge() {
+        assert_eq!(
+            parse_downlink(r#"{"src":"gw","type":"auth_challenge","nonce":"abc123"}"#),
+            Ok(GwDownlink::AuthChallenge("abc123".into())),
+        );
+        assert!(parse_downlink(r#"{"src":"gw","type":"auth_challenge"}"#).is_err());
+        assert!(parse_downlink(r#"{"src":"gw","type":"auth_challenge","nonce":""}"#).is_err());
+    }
+
+    #[test]
+    fn parse_downlink_auth_ok() {
+        assert_eq!(
+            parse_downlink(r#"{"src":"gw","type":"auth_ok","token":"eyJ..."}"#),
+            Ok(GwDownlink::AuthOk("eyJ...".into())),
+        );
+        assert!(parse_downlink(r#"{"src":"gw","type":"auth_ok"}"#).is_err());
+    }
+
+    #[test]
+    fn parse_downlink_auth_fail() {
+        assert_eq!(
+            parse_downlink(r#"{"src":"gw","type":"auth_fail","reason":"invalid_nonce"}"#),
+            Ok(GwDownlink::AuthFail("invalid_nonce".into())),
+        );
+        assert!(parse_downlink(r#"{"src":"gw","type":"auth_fail"}"#).is_err());
     }
 }
