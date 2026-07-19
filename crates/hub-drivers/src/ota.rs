@@ -111,9 +111,15 @@ pub fn spawn_update(url: String, status: SharedStatus, progress: Option<Progress
             // 何の手がかりも無かった (デバイスが本当にコマンドを受け取り処理を
             // 始めたのか、単にネットワーク上で消えたのかが区別できない)。
             // download 開始前にここで一度 "started" を送り、以後は download の
-            // 進捗 (64KB毎) が続く前提を web 側が示せるようにする
+            // 進捗 (64KB毎) が続く前提を web 側が示せるようにする。
+            // `message` に表示用テキストを直接載せる: auth-worker (web) 側は
+            // download/ok/error 以外の phase を「message があればそのまま表示、
+            // 無ければ phase 名を表示」という汎用フォールバックで扱う設計にして
+            // あるため、今後 phase を増やしても web 側の追加対応は不要になる
+            // (progress bar 表示など download 同等の特別な UI が要る場合のみ
+            // web 側の対応が要る)
             if let Some(s) = progress.as_ref() {
-                s(r#"{"phase":"started"}"#.to_string());
+                s(r#"{"phase":"started","message":"デバイスが更新処理を開始しました — ダウンロード準備中..."}"#.to_string());
             }
             // OTA 中は UI ループが 10s 以上 feed できず task_wdt が誤リセットする
             // (更新が毎回中断する実害、Refs #55)。UI タスクの WDT 監視を download の
