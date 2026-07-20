@@ -55,7 +55,8 @@ const I2C_PORT_NFC: i32 = 0;
 const PIN_SDA: i32 = 2;
 const PIN_SCL: i32 = 1;
 
-const POLL_INTERVAL_MS: u32 = 200;
+// タップ運用 (かざしてすぐ離す) のため空白時間を最小化 (2026-07-21)
+const POLL_INTERVAL_MS: u32 = 20;
 
 // デバッグのため一時的にかなり明るくして「見えているか」自体を確認する
 // (元は暗め (0,0,8) だったが実機で無点灯と報告あり、2026-07-20)
@@ -93,6 +94,14 @@ fn main() -> Result<()> {
     // -2 (カード無し) はループの大半で発生する定常状態なのでログしない。
     // 未実行を表すセンチネルとして i32::MIN を使う
     let mut last_license_rc = i32::MIN;
+    // 読み取り成功後の緑 LED 維持時間。RF リンクは per-exchange で確率的に
+    // 落ちるため (issue #96)、成功直後の一時的な -2 で即座にアイドル表示へ
+    // 戻すとユーザーには「不安定」に見える。点呼用途は提示毎に1回読めれば
+    // 十分なので、成功表示をしばらくラッチする
+    let mut last_ok_at: Option<std::time::Instant> = None;
+    // LED が緑表示中かどうか (同色の再送出を抑えつつ、青へ戻す判定を毎サイクル行う)
+    let mut led_is_ok = false;
+    const OK_LATCH: Duration = Duration::from_secs(1);
 
     // デバッグ用: 検出試行が実際に走っているか確認するためのハートビート
     // (無反応の実機報告を受け一時追加、2026-07-20。原因判明後に削除予定)
@@ -150,10 +159,25 @@ fn main() -> Result<()> {
                     log::warn!("免許証 読み取り失敗 rc={rc} ({})", license_rc_reason(rc));
                 }
             }
-            set_led(&mut led, if rc == 0 { LED_OK } else { LED_ERR });
-        } else if last_license_rc != -2 && last_idm.is_none() {
-            // 免許証も交通系IDmも今は無し = 待受アイドルへ戻す
+            if rc == 0 {
+                last_ok_at = Some(std::time::Instant::now());
+                if !led_is_ok {
+                    set_led(&mut led, LED_OK);
+                    led_is_ok = true;
+                }
+            }
+            // 読み取り途中死 (-4/-5/-6/-7) では LED を変えない (2026-07-21 ユーザー指示):
+            // タップ後にカードを離した瞬間の正常な中断と本物の失敗を区別できず、
+            // 運用は「緑になるまで再試行」で足りる。失敗理由は上の warn ログで追える
+        } else if led_is_ok
+            && last_idm.is_none()
+            && last_ok_at.map_or(true, |t| t.elapsed() > OK_LATCH)
+        {
+            // ラッチ満了かつカード反応なし = 待受アイドルへ戻す。
+            // 「直前サイクルが -2 でないとき」を条件にしていた旧実装は、最初の -2 が
+            // ラッチ内に来ると以後青へ戻る機会を永久に失い緑が固着した (2026-07-21)
             set_led(&mut led, LED_IDLE);
+            led_is_ok = false;
         }
         last_license_rc = rc;
 

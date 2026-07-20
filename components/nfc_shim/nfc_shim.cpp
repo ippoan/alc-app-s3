@@ -58,14 +58,40 @@ void ensure_mode(m5::nfc::NFC mode)
 
 // 失敗セッション後の復旧 (2026-07-21 実機で確認): ATTRIB や APDU が FWT 内
 // 無応答で死ぬと、カード側は READY/ACTIVE 状態のまま残り、以後の WUPB を
-// 全て無視して延々 rc=-2 になる (カードを一度フィールドから外すまで復帰
-// しない)。configureNFCMode() は CMD_STOP_ALL_ACTIVITIES + フィールド再始動
-// を行うため、カードを電源リセットして IDLE に戻せる。次の呼び出しまでは
-// ポーリング間隔 (≥200ms) が空くので、カードの再起動時間は十分足りる
+// 全て無視して延々 rc=-2 になる (カードを一度フィールドから外すまで復帰しない)。
+// 復旧はカード側とチップ側の両方が必要 (どちらか片方では直らないことを実機で確認):
+//  1. 本物のフィールド断 (OP レジスタの tx_en/rx_en を直接落とし ≥5ms 待つ) で
+//     カードを電源リセットして IDLE へ。configureNFCMode() 単体ではフィールドは
+//     切れない (nfc_initial_field_on が "Already tx_en" で false を返すだけ)
+//  2. フィールド OFF の状態で configureNFCMode(B) を呼び、STOP_ALL_ACTIVITIES +
+//     全レジスタ再設定で失敗セッションのチップ状態 (NRT/FIFO 等) をクリアする。
+//     フィールドが落ちているので今度は nfc_initial_field_on の正規経路
+//     (CMD_NFC_INITIAL_FIELD_ON → tx_en|rx_en) が成功しフィールドも復帰する
+// 呼び出し側は再設定後 100ms 以上空けてから WUPB を再開すること (再設定直後
+// ~20ms での WUPB は全滅する事象を実機確認。旧実装が偶然動いていたのは
+// ポーリング間隔 200ms が空いていたため)
+// RF レギュレータ電圧を最大化する (2026-07-21 実験): configure_nfc_b() は
+// reg 0x2C に 0xD0 (reg_s=1 手動・中間値) を書くが、Grove 5V 供給なので
+// 上限 0xF8 (rege=1111, 目標 5.1V、実際は供給-ドロップアウトでクランプ) まで
+// 上げてフィールド振幅=結合マージンを稼ぐ。TX ドライバ抵抗 (d_res) は既に
+// 最小=最大出力のため、レジスタで上げられる残りはここだけ
+void boost_rf_power()
+{
+    g_unit.writeRegulatorVoltageControl(0xF8);
+}
+
 void reset_rf_field()
 {
-    g_unit.configureNFCMode(m5::nfc::NFC::B);
+    uint8_t op = 0;
+    if (g_unit.readOperationControl(op)) {
+        const auto rf_bits =
+            static_cast<uint8_t>(m5::unit::st25r3916::regval::tx_en | m5::unit::st25r3916::regval::rx_en);
+        g_unit.writeOperationControl(static_cast<uint8_t>(op & static_cast<uint8_t>(~rf_bits)));
+        m5::utility::delay(10);
+    }
+    g_unit.configureNFCMode(m5::nfc::NFC::B);  // 0x2C が 0xD0 に戻るので直後に boost し直す
     g_configured_mode = m5::nfc::NFC::B;
+    boost_rf_power();
 }
 
 // EF 2F01 (共通データ要素) の READ BINARY レスポンス内オフセット。
@@ -136,6 +162,7 @@ extern "C" int nfc_shim_init(int i2c_port, int sda_gpio, int scl_gpio)
         return -3;
     }
     g_configured_mode = m5::nfc::NFC::B;  // begin() が cfg.mode(=B) を反映済み
+    boost_rf_power();
     g_nfc_f = std::make_unique<m5::nfc::NFCLayerF>(g_unit);
     g_nfc_a = std::make_unique<m5::nfc::NFCLayerA>(g_unit);
     g_nfc_b = std::make_unique<m5::nfc::NFCLayerB>(g_unit);
@@ -191,77 +218,62 @@ extern "C" int nfc_shim_poll_nfca_uid(char* out_hex, int out_cap)
     return len;
 }
 
-extern "C" int nfc_shim_read_license_expiry(char* out_issue, int issue_cap, char* out_expiry, int expiry_cap)
+namespace {
+
+// 1 セッション試行: select (WUPB→ATTRIB) → SELECT MF → SELECT EF 2F01 → READ BINARY。
+// issue #96 で確定した要点:
+//  - detect() は使わない (検出直後の HLTB でカードが HALT に落ち、免許証は WUPB
+//    起床に応答しない)。select() の WUPB は IDLE も起こすので存在検出を兼ねる
+//  - ATTRIB 応答には ATQB の FWI (実測 FWI=12 → FWT≈1.24s) が適用されるため
+//    select() の既定 TIMEOUT_ATTRIB=50ms では取りこぼす → 1300ms
+//  - ATTRIB 後の APDU は ISO-DEP (I-block) フレーミング必須。NFCBFileSystem の
+//    構築副作用で activatedPICC の FWI/FSC から isoDEP config を設定し、
+//    AlcoholChecker (NfcReader.kt) 実績のバイト列を transceiveAPDU で送る
+int try_read_license_once(char* out_issue, char* out_expiry)
 {
-    if (!g_ready || issue_cap < 9 || expiry_cap < 9) {
-        return -1;
-    }
-    g_units.update();  // 理由は nfc_shim_poll_felica_idm のコメント参照
-    ensure_mode(m5::nfc::NFC::B);
-
-    // issue #96 続報 (2026-07-21 実機ログで判明): M5_LOG_LEVEL=4 で観測した結果、
-    // detect() 自体は本番経路でも成功していた (PUPI ログあり)。ところが detect()
-    // は検出直後に内部で HLTB を送ってカードを HALT に落とすため、続く select()
-    // 内の WUPB (HALT からの起床) に免許証が一度も応答せず rc=-3 になっていた
-    // (wakeup 成功時に出るはずの ATQB protocol ログが皆無)。
-    // そこで detect()+select() をやめ、select() (WUPB→ATTRIB) だけを予算内で回す。
-    // WUPB は IDLE のカードも起こすので存在検出を兼ねられ、HLTB を送らないため
-    // HALT 復帰問題そのものを回避できる
     m5::nfc::b::PICC picc{};
-    bool selected         = false;
-    const auto timeout_at = m5::utility::millis() + 1000U;
-    do {
-        // ATTRIB の応答にも ATQB の FWI (実測 FWI=12 → FWT≈1.2s) が適用されるが、
-        // select() の既定タイムアウトは TIMEOUT_ATTRIB=50ms しかなく、実機で
-        // 「ATQB 成功 → 54ms 後に Failed to select: rx_len=0」の取りこぼしを
-        // 確認 (2026-07-21)。FWT 相当まで待つ
-        if (g_nfc_b->select(picc, /*timeout_ms=*/1300U)) {
-            selected = true;
-            break;
-        }
-    } while (m5::utility::millis() <= timeout_at);
-    if (!selected) {
-        // ATTRIB 途中失敗でカードが READY のまま固まっている可能性もあるので、
-        // カード無しの定常経路でも毎回フィールドを再始動して次回に備える
-        // (フィールド再始動はカード不在時は実質無害。次の WUPB まで ≥200ms)
-        reset_rf_field();
-        return -2;  // カード無し (WUPB 無応答) または ATTRIB 失敗 (ログで区別可)
+    const auto t0 = m5::utility::millis();
+    // ATTRIB 待ちは 100ms (2026-07-21 短縮): 応答するカードは数十 ms で返す一方、
+    // 応答しないケースは FWT (FWI=12 → 1.24s) まで待っても来ないことを実測済み。
+    // 早く見切って即リセット→再試行した方がトータルの検出が速い
+    if (!g_nfc_b->select(picc, /*timeout_ms=*/50U)) {
+        // 失敗の種別を所要時間で判別する (2026-07-21、静止カードが無反応になる
+        // 問題の対策): WUPB 無応答なら req timeout 5ms 前後で即戻るが、ATQB を
+        // 受信して ATTRIB 応答待ち (FWT≈1.3s) で死んだ場合は長くかかる。後者の
+        // カードは READY 状態でスタックし以後 WUPB を無視するため (ISO 14443-3:
+        // READY は REQB/WUPB に応答しない)、-3 を返して呼び出し元に即リセット
+        // させる。カードを動かすと反応するのはフィールド出入りの再起動で
+        // IDLE に戻るため — 静止時は明示リセットが必須
+        return (m5::utility::millis() - t0 >= 30U) ? -3 : -2;
     }
 
-    // issue #96 続報 (2026-07-21 実機で判明): ATTRIB 後の APDU は ISO-DEP
-    // (I-block, PCB 0x02/0x03) フレーミングが必須。生 APDU を transceive すると
-    // 先頭バイト CLA=0x00 が PCB として解釈不能でカードが無視し、全てタイム
-    // アウトしていた (rc=-4)。さらに ATQB の FWI=12 → FWT≈1.2s のため既定の
-    // fwt_ms=100 では不足。NFCBFileSystem の構築副作用で activatedPICC の
-    // FWI/FSC から isoDEP config を正しく設定し、APDU 自体は AlcoholChecker
-    // (Android, NfcReader.kt) で実績のあるバイト列を transceiveAPDU で送る
     m5::nfc::NFCBFileSystem fs_cfg(*g_nfc_b);
     (void)fs_cfg;
     auto* dep = g_nfc_b->isoDEP();
+    // APDU の FWT も 100ms に短縮 (理由は select と同じ)。カードが S(WTX) で
+    // 延長要求してきた場合は wtx_max まで自動で待つので安全
+    const m5::nfc::isodep::policy_t fast_policy{/*fwt_ms=*/50U, /*wtx_max_ms=*/2000U, /*max_retries=*/0};
 
     uint8_t rx[64];
     uint16_t rx_len;
 
     rx_len = sizeof(rx);
-    if (!dep->transceiveAPDU(rx, rx_len, kApduSelectMf, sizeof(kApduSelectMf)) || !sw_ok(rx, rx_len)) {
+    if (!dep->transceiveAPDU(rx, rx_len, kApduSelectMf, sizeof(kApduSelectMf), &fast_policy) || !sw_ok(rx, rx_len)) {
         g_nfc_b->deactivate();
-        reset_rf_field();  // 途中死したカードを IDLE に戻す
         return -4;  // SELECT MF 失敗 (免許証以外の Type-B カードの可能性)
     }
 
     rx_len = sizeof(rx);
-    if (!dep->transceiveAPDU(rx, rx_len, kApduSelectEf2F01, sizeof(kApduSelectEf2F01)) || !sw_ok(rx, rx_len)) {
+    if (!dep->transceiveAPDU(rx, rx_len, kApduSelectEf2F01, sizeof(kApduSelectEf2F01), &fast_policy) || !sw_ok(rx, rx_len)) {
         g_nfc_b->deactivate();
-        reset_rf_field();  // 途中死したカードを IDLE に戻す
         return -5;  // SELECT EF 2F01 失敗
     }
 
     // EF は全17バイトなので Le=0x11 の一発読みで交付日・期限とも取れる
     // (Le=0x20 だと実カードが不安定になる事象を実機で確認済み)
     rx_len = sizeof(rx);
-    if (!dep->transceiveAPDU(rx, rx_len, kApduReadBinary1, sizeof(kApduReadBinary1)) || !sw_ok(rx, rx_len)) {
+    if (!dep->transceiveAPDU(rx, rx_len, kApduReadBinary1, sizeof(kApduReadBinary1), &fast_policy) || !sw_ok(rx, rx_len)) {
         g_nfc_b->deactivate();
-        reset_rf_field();  // 途中死したカードを IDLE に戻す
         return -6;  // READ BINARY 失敗
     }
     g_nfc_b->deactivate();
@@ -274,4 +286,61 @@ extern "C" int nfc_shim_read_license_expiry(char* out_issue, int issue_cap, char
     bcd4_to_yyyymmdd(rx + kIssueDateOffset, out_issue);
     bcd4_to_yyyymmdd(rx + kExpiryDateOffset, out_expiry);
     return 0;
+}
+
+}  // namespace
+
+extern "C" int nfc_shim_read_license_expiry(char* out_issue, int issue_cap, char* out_expiry, int expiry_cap)
+{
+    if (!g_ready || issue_cap < 9 || expiry_cap < 9) {
+        return -1;
+    }
+    g_units.update();  // 理由は nfc_shim_poll_felica_idm のコメント参照
+    ensure_mode(m5::nfc::NFC::B);
+
+    // 安定化リトライ (2026-07-21 実機計測): 1回の呼び出し内で予算いっぱいまで
+    // セッション全体を再試行する。リセットの方針が肝:
+    //  - WUPB 無応答 (-2) ではリセットしない。フィールドを連続維持した方が
+    //    カードの電源が安定し検出が速い (診断コードはリセット無しで安定検出。
+    //    逆に -2 のたびにフィールド断を入れる方式は、設置中のカードの起動を
+    //    繰り返し中断してしまい、数秒〜十数秒の全滅区間を作ることを実機確認)
+    //  - セッション途中死 (-4/-5/-6) の直後だけリセットする (カードが
+    //    READY/ACTIVE で固まり、チップ状態も汚れるため。リセット無しの
+    //    再試行は無意味なことを実機確認)
+    //  - 全滅のまま予算を使い切ったら最後に1回だけリセット (ATTRIB 失敗で
+    //    READY スタックしたカードの保険。次の呼び出しまで ≥200ms 空くので
+    //    再設定直後 WUPB 全滅問題は踏まない)
+    constexpr uint32_t kBudgetMs = 500;
+    const auto budget_end = m5::utility::millis() + kBudgetMs;
+    int last_rc = -2;
+
+    while (m5::utility::millis() <= budget_end) {
+        const int rc = try_read_license_once(out_issue, out_expiry);
+        if (rc == 0) {
+            // 成功後もリセットしてカードを即 IDLE に戻す (2026-07-21): 読み取り後の
+            // カードは deactivate に失敗して ACTIVE のまま沈黙するため、リセット
+            // しないと次の検出まで丸2呼び出し (≒2秒) の死角ができる。リセット
+            // すれば置きっぱなしのカードは毎サイクル再読取りでき (緑が維持される)、
+            // 連続タップにも即応する
+            reset_rf_field();
+            return 0;
+        }
+        if (rc != -2) {
+            last_rc = rc;  // 途中死の理由は最後のものを返す
+            reset_rf_field();
+            m5::utility::delay(60);  // 再設定直後の WUPB 不感時間の実験値 (100ms は安全確認済み、60ms を試行中)
+        }
+    }
+    if (last_rc == -2) {
+        // READY スタック解除の保険リセットは間引く (2026-07-21 実機で確認):
+        // 毎呼び出し末尾に入れると、再設定後の不感時間 (数百 ms) が 0.5s
+        // サイクルの大半を食い潰し、カードを置いていても十数秒 ATQB ゼロの
+        // 無反応区間ができる。約3.5秒に1回で保険としては十分
+        static uint32_t s_idle_calls = 0;
+        if (++s_idle_calls >= 6) {
+            s_idle_calls = 0;
+            reset_rf_field();
+        }
+    }
+    return last_rc;
 }
