@@ -34,12 +34,15 @@ extern "C" {
         out_expiry: *mut u8,
         expiry_cap: i32,
     ) -> i32;
+    fn nfc_shim_measure_amplitude() -> i32;
+    fn nfc_shim_measure_phase() -> i32;
 }
 
-/// true の間、F/A ポーリングをスキップして NFC-B (免許証) だけに専念させ、
-/// read_license_expiry() の rc を毎回ログする (2026-07-20、issue #96 の
-/// 本番経路切り分け用。原因判明後に false に戻すか削除する)
-const SKIP_FA_POLL_FOR_B_DIAGNOSIS: bool = true;
+/// 存在検知 (アンテナ振幅) のトリガ閾値。カード無しのベースラインは完全に
+/// 安定 (実測: 60サンプル連続で 32、ノイズ0)、カード接近で 2 下がる (実測 30)。
+/// |amp - baseline| がこの値以上で「何かかざされた」と判定し、B→F→A の
+/// 逐次ポーリングを開始する (2026-07-21、issue #96 続き)
+const PRESENCE_DELTA: i32 = 2;
 
 /// 2026-07-20 時点では I2C_NUM_1 だったが、issue #96 の切り分けで
 /// I2C_NUM_0 (動作確認済みの診断コードが M5Unified wiring::addI2C 経由で実際
@@ -87,106 +90,148 @@ fn main() -> Result<()> {
             FreeRtos::delay_ms(1000);
         }
     }
-    log::info!("NFC 待受開始");
+    log::info!("NFC 待受開始 (存在検知ゲート + B→F→A 逐次ポーリング)");
 
     let mut last_idm: Option<String> = None;
     let mut last_uid: Option<String> = None;
-    // -2 (カード無し) はループの大半で発生する定常状態なのでログしない。
-    // 未実行を表すセンチネルとして i32::MIN を使う
+    // -2 (カード無し) は定常状態なのでログしない。未実行センチネルは i32::MIN
     let mut last_license_rc = i32::MIN;
-    // 読み取り成功後の緑 LED 維持時間。RF リンクは per-exchange で確率的に
-    // 落ちるため (issue #96)、成功直後の一時的な -2 で即座にアイドル表示へ
-    // 戻すとユーザーには「不安定」に見える。点呼用途は提示毎に1回読めれば
-    // 十分なので、成功表示をしばらくラッチする
+    // 読み取り成功後の緑 LED 維持時間。RF リンクは per-exchange で確率的に落ちる
+    // ため、成功直後の一時的な失敗で表示を戻すと「不安定」に見える (issue #96)
     let mut last_ok_at: Option<std::time::Instant> = None;
     // LED が緑表示中かどうか (同色の再送出を抑えつつ、青へ戻す判定を毎サイクル行う)
     let mut led_is_ok = false;
     const OK_LATCH: Duration = Duration::from_secs(1);
 
-    // デバッグ用: 検出試行が実際に走っているか確認するためのハートビート
-    // (無反応の実機報告を受け一時追加、2026-07-20。原因判明後に削除予定)
+    // 存在検知のベースライン (-1 = 未較正、初回測定値で初期化)。
+    // 振幅はカード系、位相はスマホ系 (モバイルSuica 等、振幅に出にくい) を拾う
+    let mut baseline: i32 = -1;
+    let mut baseline_ph: i32 = -1;
+    // トリガ固着の保険: トリガが立ったまま何も読めない状態が続いたら再較正する
+    let mut triggered_since: Option<std::time::Instant> = None;
+    const TRIGGER_STUCK: Duration = Duration::from_secs(3);
     let mut tick: u32 = 0;
 
     loop {
-        // F/A ポーリングは一時的にスキップ (2026-07-20): 診断用サンプルテストで
-        // NFC-B は F/A を挟まず専念させたときに確実に検出できた実績があり、
-        // 本番ループの F→A→B 周回が NFC-B の検出を妨げていないか切り分け中
-        if !SKIP_FA_POLL_FOR_B_DIAGNOSIS {
-            match poll_felica_idm() {
-                Ok(Some(idm)) => {
-                    if last_idm.as_deref() != Some(idm.as_str()) {
-                        log::info!("NFC IDm={idm}");
-                        last_idm = Some(idm);
-                    }
-                    set_led(&mut led, LED_OK);
-                }
-                Ok(None) => {
-                    if last_idm.is_some() {
-                        set_led(&mut led, LED_IDLE);
-                    }
-                    last_idm = None;
-                }
-                Err(e) => log::warn!("nfc: FeliCa poll error: {e:#}"),
+        tick += 1;
+
+        // --- 待機: プロトコル非依存の存在検知 (アンテナ振幅) ---
+        // モード切替もポーリングも行わず振幅だけを見る。ベースラインは
+        // 非トリガ時のみ ±1 ずつ追従させ温度ドリフトを吸収する (カードが
+        // 載っている間は追従しないので、置きっぱなしでも基準が汚れない)
+        let amp = unsafe { nfc_shim_measure_amplitude() };
+        let ph = unsafe { nfc_shim_measure_phase() };
+        let mut triggered = false;
+        if amp >= 0 {
+            if baseline < 0 {
+                baseline = amp;
+            }
+            if (amp - baseline).abs() >= PRESENCE_DELTA {
+                triggered = true;
+            } else {
+                baseline += (amp - baseline).signum();
+            }
+        } else {
+            triggered = true; // 測定失敗時は常時ポーリングへフォールバック (安全側)
+        }
+        if ph >= 0 {
+            if baseline_ph < 0 {
+                baseline_ph = ph;
+            }
+            if (ph - baseline_ph).abs() >= PRESENCE_DELTA {
+                triggered = true;
+            } else {
+                baseline_ph += (ph - baseline_ph).signum();
+            }
+        }
+
+        if tick % 100 == 0 {
+            log::info!(
+                "heartbeat tick={tick} amp={amp}/{baseline} ph={ph}/{baseline_ph} last_rc={last_license_rc}"
+            );
+        }
+
+        if !triggered {
+            triggered_since = None;
+            if led_is_ok && last_ok_at.map_or(true, |t| t.elapsed() > OK_LATCH) {
+                set_led(&mut led, LED_IDLE);
+                led_is_ok = false;
             }
             FreeRtos::delay_ms(POLL_INTERVAL_MS);
+            continue;
+        }
+        // トリガ固着の保険: 何も読めないまま3秒続いたら誤トリガとみなし再較正
+        // (温度ドリフト等でベースラインが実態とずれたケースの自己回復)
+        match triggered_since {
+            None => triggered_since = Some(std::time::Instant::now()),
+            Some(t0) if t0.elapsed() > TRIGGER_STUCK => {
+                log::info!("presence: 再較正 amp={amp} ph={ph} (トリガ固着 {TRIGGER_STUCK:?})");
+                baseline = amp;
+                baseline_ph = ph;
+                triggered_since = None;
+                FreeRtos::delay_ms(POLL_INTERVAL_MS);
+                continue;
+            }
+            _ => {}
+        }
 
-            // NTAG213 等 Type-A の既知良品カードでの切り分け用 (2026-07-20 追加)
+        // --- 何かかざされた: F (交通系IDm、日常の主役) → A (HCE/UID) → B (免許証) ---
+        // 軽い単発交換 (F/A の検出は数ms) を先に、重い APDU セッション (B) を
+        // 最後に試す。主要経路の交通系タップが最速になる並び (2026-07-21)
+        let mut got = false;
+
+        match poll_felica_idm() {
+            Ok(Some(idm)) => {
+                if last_idm.as_deref() != Some(idm.as_str()) {
+                    log::info!("NFC IDm={idm}");
+                }
+                last_idm = Some(idm);
+                got = true;
+            }
+            Ok(None) => last_idm = None,
+            Err(e) => log::warn!("nfc: FeliCa poll error: {e:#}"),
+        }
+
+        if !got {
             match poll_nfca_uid() {
                 Ok(Some(uid)) => {
                     if last_uid.as_deref() != Some(uid.as_str()) {
                         log::info!("NFC-A UID={uid}");
-                        last_uid = Some(uid);
                     }
-                    set_led(&mut led, LED_OK);
+                    last_uid = Some(uid);
+                    got = true;
                 }
                 Ok(None) => last_uid = None,
                 Err(e) => log::warn!("nfc: NFC-A poll error: {e:#}"),
             }
-            FreeRtos::delay_ms(POLL_INTERVAL_MS);
         }
 
-        let (rc, issue, expiry) = read_license_expiry();
-        // 診断中は rc を毎回ログする (通常は -2=カード無し が定常状態なので
-        // 変化時のみログしていたが、どのステップで失敗しているか見るため)
-        if SKIP_FA_POLL_FOR_B_DIAGNOSIS {
-            log::info!("read_license_expiry rc={rc} ({})", license_rc_reason(rc));
-        }
-        if rc != -2 {
-            if rc != last_license_rc {
-                if rc == 0 {
-                    log::info!("免許証 交付 {issue} 期限 {expiry}");
-                } else {
-                    log::warn!("免許証 読み取り失敗 rc={rc} ({})", license_rc_reason(rc));
-                }
-            }
+        if !got {
+            let (rc, issue, expiry) = read_license_expiry();
             if rc == 0 {
-                last_ok_at = Some(std::time::Instant::now());
-                if !led_is_ok {
-                    set_led(&mut led, LED_OK);
-                    led_is_ok = true;
+                if last_license_rc != 0 {
+                    log::info!("免許証 交付 {issue} 期限 {expiry}");
                 }
+                got = true;
+            } else if rc != -2 && rc != last_license_rc {
+                // 途中死はカード引き抜き等でも出る。ログのみ (LED は変えない)
+                log::warn!("免許証 読み取り失敗 rc={rc} ({})", license_rc_reason(rc));
             }
-            // 読み取り途中死 (-4/-5/-6/-7) では LED を変えない (2026-07-21 ユーザー指示):
-            // タップ後にカードを離した瞬間の正常な中断と本物の失敗を区別できず、
-            // 運用は「緑になるまで再試行」で足りる。失敗理由は上の warn ログで追える
-        } else if led_is_ok
-            && last_idm.is_none()
-            && last_ok_at.map_or(true, |t| t.elapsed() > OK_LATCH)
-        {
-            // ラッチ満了かつカード反応なし = 待受アイドルへ戻す。
-            // 「直前サイクルが -2 でないとき」を条件にしていた旧実装は、最初の -2 が
-            // ラッチ内に来ると以後青へ戻る機会を永久に失い緑が固着した (2026-07-21)
+            last_license_rc = rc;
+        }
+
+        if got {
+            triggered_since = None;
+            last_ok_at = Some(std::time::Instant::now());
+            if !led_is_ok {
+                set_led(&mut led, LED_OK);
+                led_is_ok = true;
+            }
+        } else if led_is_ok && last_ok_at.map_or(true, |t| t.elapsed() > OK_LATCH) {
             set_led(&mut led, LED_IDLE);
             led_is_ok = false;
         }
-        last_license_rc = rc;
 
-        tick += 1;
-        if tick % 10 == 0 {
-            log::info!(
-                "heartbeat tick={tick} idm={last_idm:?} uid={last_uid:?} license_rc={last_license_rc}"
-            );
-        }
         FreeRtos::delay_ms(POLL_INTERVAL_MS);
     }
 }

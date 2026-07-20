@@ -44,16 +44,38 @@ std::unique_ptr<m5::nfc::NFCLayerB> g_nfc_b;
 // 動作確認済みの診断コードは起動時に1回設定するだけでフィールドを継続させていた)
 m5::nfc::NFC g_configured_mode = m5::nfc::NFC::None;
 
+void boost_rf_power();  // 前方宣言 (定義は reset_rf_field の直前)
+
+// フィールドを物理的に落とす (OP レジスタの tx_en/rx_en 直接クリア + 10ms)。
+// configureNFCMode をフィールド ON のまま呼ぶと nfc_initial_field_on が
+// "Already tx_en" で失敗し、_nfcMode が更新されないまま (→ CHECK_MODE が
+// Illegal mode) になるため、モード再設定の前には必ずこれを呼ぶ (2026-07-21 実機)
+void rf_field_off()
+{
+    uint8_t op = 0;
+    if (g_unit.readOperationControl(op)) {
+        const auto rf_bits =
+            static_cast<uint8_t>(m5::unit::st25r3916::regval::tx_en | m5::unit::st25r3916::regval::rx_en);
+        g_unit.writeOperationControl(static_cast<uint8_t>(op & static_cast<uint8_t>(~rf_bits)));
+        m5::utility::delay(10);
+    }
+}
+
 void ensure_mode(m5::nfc::NFC mode)
 {
     if (g_configured_mode == mode) {
         return;
     }
+    rf_field_off();  // ON のままだと configureNFCMode の field-on 段が失敗する
     auto cfg = g_unit.config();
     cfg.mode = mode;
     g_unit.config(cfg);
     g_unit.configureNFCMode(mode);
     g_configured_mode = mode;
+    // configureNFCMode は 0x2C (レギュレータ電圧) をモード既定値へ書き戻すため
+    // 切替のたびにブーストし直し、再設定直後の WUPB/REQ 不感時間もここで払う
+    boost_rf_power();
+    m5::utility::delay(60);
 }
 
 // 失敗セッション後の復旧 (2026-07-21 実機で確認): ATTRIB や APDU が FWT 内
@@ -82,15 +104,11 @@ void boost_rf_power()
 
 void reset_rf_field()
 {
-    uint8_t op = 0;
-    if (g_unit.readOperationControl(op)) {
-        const auto rf_bits =
-            static_cast<uint8_t>(m5::unit::st25r3916::regval::tx_en | m5::unit::st25r3916::regval::rx_en);
-        g_unit.writeOperationControl(static_cast<uint8_t>(op & static_cast<uint8_t>(~rf_bits)));
-        m5::utility::delay(10);
-    }
-    g_unit.configureNFCMode(m5::nfc::NFC::B);  // 0x2C が 0xD0 に戻るので直後に boost し直す
-    g_configured_mode = m5::nfc::NFC::B;
+    rf_field_off();
+    // 現在モードを維持したまま再設定 (0x2C が既定値に戻るので直後に boost し直す)
+    const auto mode = (g_configured_mode == m5::nfc::NFC::None) ? m5::nfc::NFC::B : g_configured_mode;
+    g_unit.configureNFCMode(mode);
+    g_configured_mode = mode;
     boost_rf_power();
 }
 
@@ -181,9 +199,9 @@ extern "C" int nfc_shim_poll_felica_idm(char* out_hex, int out_cap)
     g_units.update();
     ensure_mode(m5::nfc::NFC::F);
     m5::nfc::f::PICC picc{};
-    // timeout_ms: detect(PICC&) の既定は100msだが、動作確認済みのdetect(vector&)
-    // の既定1000msに揃える (issue #96: 短いタイムアウトが検出漏れの原因と判明)
-    if (!g_nfc_f->detect(picc, /*timeout_ms=*/1000U)) {
+    // 存在検知ゲート方式では「かざされている」ことが分かってから呼ばれるため、
+    // 短い予算で足りる (検出自体は数ms。存在が続く限り外側ループが再試行する)
+    if (!g_nfc_f->detect(picc, /*timeout_ms=*/60U)) {
         return 0;  // 未検出 (エラーではない)
     }
     const std::string idm = picc.idmAsString();
@@ -206,7 +224,7 @@ extern "C" int nfc_shim_poll_nfca_uid(char* out_hex, int out_cap)
     ensure_mode(m5::nfc::NFC::A);
     m5::nfc::a::PICC picc{};
     // 理由は nfc_shim_poll_felica_idm のコメント参照
-    if (!g_nfc_a->detect(picc, /*timeout_ms=*/1000U)) {
+    if (!g_nfc_a->detect(picc, /*timeout_ms=*/60U)) {
         return 0;  // 未検出 (エラーではない)
     }
     const std::string uid = picc.uidAsString();
@@ -290,6 +308,44 @@ int try_read_license_once(char* out_issue, char* out_expiry)
 
 }  // namespace
 
+// アンテナ振幅の実測 (0-255、失敗時 -1)。カード接近によるアンテナ離調で値が
+// 変わるなら「プロトコル非依存の存在検知」に使える (ST25R3916 wake-up mode /
+// AN5320 と同じ測定系)。issue #96 初期に「カード有無で不変」の記録があるが、
+// それはブリングアップが壊れていた時期の観測のため、正常構成で再検証する
+// (2026-07-21)。存在検知が成立すれば、待機は測定のみ・提示時だけ F→A→B を
+// 逐次ポーリングする方式にでき、モード切替コストを提示時に限定できる
+namespace {
+int measure_ad(uint8_t cmd)
+{
+    if (!g_ready) {
+        return -1;
+    }
+    if (!g_unit.writeDirectCommand(cmd)) {
+        return -1;
+    }
+    m5::utility::delay(1);  // 測定完了 (I_dct) は数十µs、余裕を持って 1ms
+    uint8_t v = 0;
+    if (!g_unit.readADConverterOutput(v)) {
+        return -1;
+    }
+    return static_cast<int>(v);
+}
+}  // namespace
+
+extern "C" int nfc_shim_measure_amplitude(void)
+{
+    return measure_ad(m5::unit::st25r3916::command::CMD_MEASURE_AMPLITUDE);
+}
+
+// 位相測定 (RFO-RFI 間の位相差、0-255)。スマホ (モバイルSuica 等) は NFC
+// アンテナが小さくフェライトシールド付きで振幅にはほぼ出ないため、位相も
+// 併用して存在検知する (AN5320 の wake-up mode が振幅/位相/静電容量の3系統を
+// 持つのはこのため。2026-07-21)
+extern "C" int nfc_shim_measure_phase(void)
+{
+    return measure_ad(m5::unit::st25r3916::command::CMD_MEASURE_PHASE);
+}
+
 extern "C" int nfc_shim_read_license_expiry(char* out_issue, int issue_cap, char* out_expiry, int expiry_cap)
 {
     if (!g_ready || issue_cap < 9 || expiry_cap < 9) {
@@ -310,7 +366,9 @@ extern "C" int nfc_shim_read_license_expiry(char* out_issue, int issue_cap, char
     //  - 全滅のまま予算を使い切ったら最後に1回だけリセット (ATTRIB 失敗で
     //    READY スタックしたカードの保険。次の呼び出しまで ≥200ms 空くので
     //    再設定直後 WUPB 全滅問題は踏まない)
-    constexpr uint32_t kBudgetMs = 500;
+    // 存在検知ゲート方式では B が空でもすぐ F/A に順番を回したいので短め
+    // (存在が続く限り外側ループが B→F→A 掃引を繰り返す)
+    constexpr uint32_t kBudgetMs = 150;
     const auto budget_end = m5::utility::millis() + kBudgetMs;
     int last_rc = -2;
 
