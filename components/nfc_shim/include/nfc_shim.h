@@ -27,6 +27,13 @@ int nfc_shim_init(int i2c_port, int sda_gpio, int scl_gpio);
 int nfc_shim_poll_felica_idm(char* out_hex, int out_cap);
 
 /**
+ * NFC-A (Type-A, NTAG21x/MIFARE 等) を1回ポーリングする。UID を16進文字列で
+ * out_hex に書き込み、書き込んだ文字数 (NUL抜き) を返す。未検出は 0、エラーは負値。
+ * 既知良品カード (スマホの Web NFC で反応確認済み等) での動作切り分け用
+ */
+int nfc_shim_poll_nfca_uid(char* out_hex, int out_cap);
+
+/**
  * 従来 IC 運転免許証の MF 直下 EF 2F01 (共通データ要素) を PIN なしで読み、
  * 交付日・有効期限を "YYYYMMDD" 形式の文字列で返す (plan/nfc-card-identity.md の
  * BCD デコード規則、ippoan/AlcoholChecker の NfcReader.kt と同じ APDU シーケンス)。

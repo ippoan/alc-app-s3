@@ -1,0 +1,50 @@
+# AtomS3 Lite + Unit NFC (ST25R3916) ベンチ検証機 (issue #84 / plan/nfc-card-identity.md)。
+#
+# CoreS3 統合ハブから NFC 検証だけを切り出した独立バイナリ。CoreS3 側は
+# LAN/RS232 モジュール併用時に内蔵スピーカー(I2S DATA_OUT=G13)と LAN CS ジャンパの
+# 逃げ場が無い競合があり (plan/cores3-hub-consolidation.md 参照)、AtomS3 Lite
+# (LAN/RS232 非搭載) へ切り出した。通知は PC 側 scripts/nfc_serial_beep.py が
+# シリアルログを監視してビープを鳴らす方式なので、本体は log::info! を出すのみ。
+#
+# 本 crate をビルドするときは `ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-nfc` を
+# 指定して本 crate の metadata (下記) を使わせること (atoms3-print と同じ理由)。
+[package]
+name = "alc-hub-atoms3-nfc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "AtomS3 Lite + Unit NFC ベンチ検証機 — 交通系IDm/免許証EF2F01読み取りをシリアルログに出す"
+
+[[bin]]
+name = "alc-hub-atoms3-nfc"
+harness = false
+
+[dependencies]
+anyhow = "1"
+log = "0.4"
+esp-idf-svc = { version = "0.52", default-features = false, features = [
+    "native",
+    "std",
+    "alloc",
+    "binstart",
+] }
+# 本体 LED (WS2812, GPIO38) をカード検知の色変えに使う。ws2812-esp32-rmt-driver
+# crate は esp-idf-sys ^0.36 に固定されており esp-idf-svc 0.52 (esp-idf-hal 0.46)
+# と `links = "esp_idf_hal"/"esp_idf"` が衝突してビルド不能 (実機で確認 2026-07-20)。
+# esp-idf-hal 自体の legacy RMT ドライバ (rmt-legacy feature) を直接使う
+esp-idf-hal = { version = "0.46", features = ["rmt-legacy"] }
+
+[build-dependencies]
+embuild = "0.33"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+glob = "0.3"
+
+[package.metadata.esp-idf-sys]
+# 相対パスはワークスペースルート基準で解決される (atoms3-print と同じ仕様)
+esp_idf_sdkconfig_defaults = "crates/atoms3-nfc/sdkconfig.defaults"
+
+# components/ 配下に vendor した M5Unit-NFC 系4ライブラリ + nfc_shim を取り込む
+# (ルート alc-hub-cores3 の nfc-verify 用宣言と同一。component_dirs はワークスペース
+# ルート基準のため crate 側からも同じ文字列で参照できる)
+[[package.metadata.esp-idf-sys.extra_components]]
+component_dirs = ["../../components"]

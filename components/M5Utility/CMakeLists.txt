@@ -14,3 +14,11 @@ idf_component_register(
     INCLUDE_DIRS "src"
     PRIV_REQUIRES esp_timer
 )
+
+# M5_LOG_LEVEL 未定義だと library_log.hpp の logOutputLevel が None になり、
+# M5_LIB_LOGE 含む M5 系ライブラリの全ログ (nfcbTransmit の "Illegal mode"、
+# wait_for_FIFO の "Error: IRQ" 等) がコンパイル時に完全に消えて失敗が沈黙する
+# (issue #96 の調査を長期化させた根本要因、2026-07-21)。PUBLIC 指定で本ヘッダを
+# include する M5Unit-NFC / M5UnitUnified / nfc_shim にも波及させる。
+# 1=Error のみ。診断時は 4=Debug に上げると REQB 毎の Timeout まで見える
+target_compile_definitions(${COMPONENT_LIB} PUBLIC M5_LOG_LEVEL=1)

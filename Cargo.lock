@@ -12,6 +12,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "alc-hub-atoms3-nfc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "embuild",
+ "esp-idf-hal",
+ "esp-idf-svc",
+ "glob",
+ "log",
+]
+
+[[package]]
 name = "alc-hub-atoms3-print"
 version = "0.1.0"
 dependencies = [
