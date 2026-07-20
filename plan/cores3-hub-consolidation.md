@@ -119,3 +119,28 @@ CoreS3 実 GPIO はスタック互換ツールで確定:
       LCD との SPI バス共有 + G35 二役対応は `hub-board/src/display.rs` 参照)
 - [x] 実機で RS232 受信を確認 (FC-1200B の `RQCNFC-1200B` 受信、2026-07-15)
 - [ ] 実機で LAN リンクアップと RS232 受信の同時動作を確認
+
+## 次期構成: CoreS3 SE + Base LAN PoE v1.2 (2026-07-21 ピンマップ検討で確定)
+
+上記までの一次情報は CoreS3 + **LAN Module 13.2** のスタック構成で、LAN CS ジャンパが
+G5(=G1) / G15(=G13) の二択しかなく **内蔵スピーカー (I2S DOUT=G13 固定) と逃げ場なく
+競合**していた (NFC 検証を AtomS3 Lite へ逃がした理由の一つ)。
+
+**Base LAN PoE v1.2** は CS が **G9** に出ており、この競合が解消する。スタック互換
+ツールのピンマップ (CoreS3 SE + Module13.2 RS232M + Base LAN PoE v1.2) で確認した割当:
+
+| 機能 | ピン | 備考 |
+|---|---|---|
+| スピーカー (I2S) | DOUT=G13 / LRCK=G0 | **使用可**。RS232M ジャンパと LAN DB9 を避けること |
+| LAN (W5500, PoE) | SPI G37/G35/G36 + CS=G9 + RST=G7 + INT=G14 | PoE 給電でケーブル1本運用 |
+| FC-1200 (RS232M) | TX=G10 / RX=G6 | **現行 G17/G18 からジャンパ移動 + rs232.rs のピン変更** |
+| NFC (I2C1) | **Port C = G17/G18** | RS232M 退去で空く。Port A は将来の I2C 周辺機器用に温存 |
+| 犠牲 | マイク (G14=LAN INT)、内蔵バッテリー (SE) | 常設 PoE 給電機なら実害なし |
+
+- **G13/G0 (スピーカー) を空ける条件**: RS232M の RX ジャンパを G13/G0 以外 (G6) に
+  すること、Base LAN の DB9 (RS232/RS485、RX=G13 / TX=G1) を使わないこと
+- **CoreS3 SE で削られるもの** (IMU/磁気/RTC/バッテリー) は hub 用途では未使用。
+  バッテリーレスは充放電管理からの解放であり、時刻は起動時 NTP (SNTP) 同期で RTC レス運用
+- 停電 = 即断となるため、点呼常設機としては PoE スイッチ側 UPS 等のインフラ側考慮が必要
+- NFC の Port C 移行・rs232.rs のピン変更は `plan/nfc-card-identity.md` の
+  「CoreS3 還元計画」セクション参照
