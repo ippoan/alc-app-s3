@@ -1,0 +1,36 @@
+# alc-hub-atoms3-nfc (M5Stack AtomS3 Lite / ESP32-S3FN8)
+#
+# atoms3-print と同じ理由で PSRAM 無し (C124 = ESP32-S3FN8 は物理非搭載)。
+# BLE/Ethernet/TLS を一切使わないミニマル構成 (NFC 検証専用)。
+
+# ログ出力はネイティブ USB-C の USB Serial/JTAG コンソール経由
+# (scripts/nfc_serial_beep.py が監視する対象)
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_FREERTOS_HZ=1000
+
+# M5UnitUnified の vendor コード (pin.cpp 等) が旧 driver/i2c.h のシンボルを
+# 参照しており、nfc_shim (新 driver/i2c_master.h) と同一バイナリにリンクされると
+# ESP-IDF 起動直後の __attribute__((constructor)) チェックで即 abort する
+# ("CONFLICT! driver_ng is not allowed to be used with this old driver",
+#  components/driver/i2c/i2c.c の check_i2c_driver_conflict、実機で確認 2026-07-20)。
+# 実際に i2c_driver_install() (旧 API) を呼ぶ経路は使っていない (nfc_shim.cpp は
+# i2c_new_master_bus のみ使用) ため、ESP-IDF 公式の回避オプションでこのチェックを
+# 無効化する。旧 API を実際に併用する変更をした場合はこの前提が崩れるので要再検討
+CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
+
+# 同じ理由で RMT も legacy (esp-idf-hal "rmt-legacy" feature, WS2812 LED 用) と
+# 新ドライバの両方がリンクされて check_rmt_legacy_driver_conflict で abort する
+# (実機で確認 2026-07-20)。新 RMT API は未使用のため無効化する
+CONFIG_RMT_SKIP_LEGACY_CONFLICT_CHECK=y
+
+# 2026-07-20, issue #96: 公式サンプル共通設定 (M5Unit-NFC
+# examples/UnitUnified/common/sdkconfig.defaults) より。ST25R3916 ドライバの
+# detect() 内部ポーリングはタイトなビジーウェイトで、Arduino では loop() が
+# 常に Core1 (APP_CPU) で走るのに対し、ESP-IDF native の既定タスク配置は
+# 未指定 (実質 Core0 寄り) になりうる。Arduino と同じ Core1 に固定し、
+# IDLE1 のウォッチドッグ監視を止める (ビジーウェイトが IDLE1 を飢餓させるのは
+# Arduino下でも同じで無害、との公式コメント通り)
+CONFIG_ESP_MAIN_TASK_AFFINITY_CPU1=y
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n

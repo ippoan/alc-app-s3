@@ -1,0 +1,6 @@
+# AtomS3 Lite (8MB flash) 用パーティションテーブル。ベンチ検証機なので
+# OTA は不要 — factory 単一スロット (atoms3-print の OTA 2 スロット構成より単純)。
+# Name,   Type, SubType,  Offset,   Size,
+nvs,      data, nvs,      0x9000,   0x6000,
+phy_init, data, phy,      0xf000,   0x1000,
+factory,  app,  factory,  0x10000,  3M,
