@@ -41,6 +41,18 @@ int nfc_shim_poll_nfca_uid(char* out_hex, int out_cap);
  */
 int nfc_shim_read_license_expiry(char* out_issue, int issue_cap, char* out_expiry, int expiry_cap);
 
+/**
+ * アンテナ振幅を1回測定して返す (0-255、失敗時 -1)。カード接近の存在検知
+ * 実験用 (issue #96 続き、2026-07-21)
+ */
+int nfc_shim_measure_amplitude(void);
+
+/**
+ * RFO-RFI 位相差を1回測定して返す (0-255、失敗時 -1)。スマホ等の振幅に
+ * 出にくい対象の存在検知用 (2026-07-21)
+ */
+int nfc_shim_measure_phase(void);
+
 #ifdef __cplusplus
 }
 #endif
