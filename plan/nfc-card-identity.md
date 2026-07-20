@@ -299,17 +299,23 @@ CoreS3 (`crates/hub-drivers/src/nfc.rs`) への還元は以下の構成:
    から移植)。待機は振幅+位相測定のみ (~21ms 周期)、Δ≥2 で掃引開始。
    ベースラインは非トリガ時のみ ±1 追従、トリガ固着 3 秒で自動再較正
 2. 免許証読み取りを掃引に常時組み込み (dead_code 解消)
-3. 配線変更: NFC を Port B (G8/G9) → **Port C (G17/G18)** へ (新ハード構成で G9 が
-   LAN CS と衝突するため)。FC-1200 (rs232.rs) は G17/G18 → **G10/G6** へ
-   (RS232M 物理ジャンパ移動とセット)。詳細は `plan/cores3-hub-consolidation.md` の
-   「次期構成」セクション
-4. 通知は既存どおり `push_event` 3種 (IDm / UID / 免許証)。WS uplink `card_scan`
+3. 配線変更: NFC を Port B (G8/G9) → **Port A (G1/G2)** へ。**LAN Module 13.2 を
+   取り外す構成 (第一段)** なら LAN CS (G13) が消えて内蔵スピーカーが復活し、
+   G1 の衝突も無くなる。SDA=G2 / SCL=G1 は AtomS3 ベンチと同一ピン番号のため
+   ベンチの定数がそのまま使える。ネットワークは WiFi 継続。
+   有線 LAN + PoE が必要になった段階で Base LAN PoE v1.2 構成 (将来段、NFC=Port C) へ
+   移行する — 詳細は `plan/cores3-hub-consolidation.md`
+4. **スピーカー連携 (第一段の主目的)**: 読み取り成功/失敗のビープ。AW88298
+   (内部 I2C0, addr 0x36) + I2S (DOUT=G13 / BCK=G34 / WS=G33) の Rust ドライバを
+   hub-board に追加し、NFC 読み取り結果と連携する
+5. 通知は既存どおり `push_event` 3種 (IDm / UID / 免許証)。WS uplink `card_scan`
    イベント化・`nfc-verify` の本番昇格・スマホ HCE 本人識別セッションは**別 issue**
 
 ### リスク
 
-- Port C (G17/G18) の SDA/SCL 対応未確定 → ack しなければ入替再試行 (AtomS3 で経験済み)
-- RS232M ジャンパ移動を忘れると FC-1200 と NFC が同一ピンを取り合う → 作業手順に明記
+- 第一段 (LAN 取り外し) では有線 LAN が使えない — WiFi 到達性が悪い拠点は将来段
+  (Base LAN PoE) を先行させる判断もあり得る
+- Port A の SDA/SCL (G2/G1) で ack しなければ入替再試行 (AtomS3 で経験済み)
 - CoreS3 環境 (電源系・周辺金属) での存在検知ベースラインノイズは要実測
   (AtomS3 ではノイズゼロ。閾値 Δ2 は実測後に確定)
 - レギュレータ最大 (0xF8) + 常時フィールド ON の発熱/消費電流は長時間未評価
