@@ -27,7 +27,12 @@ const AW9523_ADDR: u8 = 0x58;
 /// AW9523 P0 出力レジスタ。bit2 = アンプ有効化 (M5Unified `_speaker_enabled_cb_cores3`)
 const AW9523_REG_P0_OUTPUT: u8 = 0x02;
 const AW9523_AMP_ENABLE_BIT: u8 = 0b0000_0100;
-const SAMPLE_RATE_HZ: u32 = 44_100;
+/// 48kHz 固定 (issue #102 実機切り分けで確定)。44.1kHz だと ESP32-S3 の
+/// 分数分周 (160MHz/(44.1k×256)=14+76/441) の補正が約 5.8 サイクルごとに入る
+/// 高ジッタ BCK になり、AW88298 の PLL がロックできず完全無音になる
+/// (SYSST.PLLS が立たない)。48kHz (13+1/48、補正が 48 サイクルに 1 回) なら
+/// 安定ロックし発音する。Arduino (M5Unified) が鳴っていたのも 48kHz
+const SAMPLE_RATE_HZ: u32 = 48_000;
 
 fn aw88298_write_reg(i2c: &mut I2cDriver, reg: u8, value: u16) -> Result<()> {
     // M5Unified 同様ビッグエンディアンで書く (aw88298_write_reg の __builtin_bswap16 相当)
@@ -68,9 +73,10 @@ fn reg0x06_value(sample_rate_hz: u32) -> u16 {
 
 /// AW88298 を I2S 入力・フル音量で有効化する (起動時に一度だけ呼ぶ)。
 /// `i2c` は内部 I2C0 (main.rs で `board::power::init` に渡すのと同じハンドル) —
-/// UI ループ (タッチ用) に move する前に済ませること。**`Speaker::new` で I2S
-/// (BCK/WS) を起動した後に呼ぶこと** — I2SEN=1 (reg 0x04) をクロック無しの
-/// 状態で書くとアンプの内部 PLL がロックしない疑いがある (2026-07-21 実機で無音を確認)
+/// UI ループ (タッチ用) に move する前に済ませること。**`Speaker::new` +
+/// `feed_silence` で BCK/WS を実際に流した後に呼ぶこと** (issue #102)。
+/// 新 I2S ドライバは FIFO 空で BCK を止めるため `tx_enable()` だけでは
+/// クロックが出ず、クロック無しで初期化するとアンプの PLL がロックしない
 pub fn init_amp(i2c: &mut I2cDriver) -> Result<()> {
     aw9523_bit_on(i2c, AW9523_REG_P0_OUTPUT, AW9523_AMP_ENABLE_BIT)?;
     // ソフトリセット (fable diag, 2026-07-21): 何度もリフラッシュ/リセットを繰り返した
@@ -98,6 +104,11 @@ pub fn init_amp(i2c: &mut I2cDriver) -> Result<()> {
         Err(e) => log::warn!("speaker: AW88298 VDD 読み出し失敗: {e:#}"),
     }
     Ok(())
+}
+
+/// SYSST (reg 0x01) を単発で読む (issue #102: PLL ロック安定性の診断用)
+pub fn read_sysst(i2c: &mut I2cDriver) -> Result<u16> {
+    aw88298_read_reg(i2c, 0x01)
 }
 
 /// AW88298 の全主要レジスタ (0x00-0x14, 0x60-0x61) をログへダンプする。
@@ -135,16 +146,34 @@ impl Speaker {
         Ok(Self { i2s })
     }
 
+    /// 無音を `duration_ms` 分流して BCK/WS を供給する (issue #102)。
+    /// ESP-IDF 新 I2S ドライバは FIFO が空だと BCK を止める (TX_STOP_EN=1) ため、
+    /// `tx_enable()` だけではクロックが出ない。`init_amp` の前に呼んで
+    /// 「クロック供給下でアンプを初期化する」条件 (Arduino/M5Unified と同じ) を作る
+    pub fn feed_silence(&mut self, duration_ms: u32) -> Result<()> {
+        let n_samples = (SAMPLE_RATE_HZ * duration_ms / 1000) as usize;
+        let buf = vec![0u8; n_samples * 4];
+        self.i2s.write_all(&buf, BLOCK)?;
+        Ok(())
+    }
+
     /// 矩形波 (簡易ビープ音) を鳴らす。呼び出し元スレッドを `duration_ms` 分ブロックする
     /// (NFC ポーリングスレッドからの呼び出し想定 — カード検知直後の1回のみなので許容)
     pub fn beep(&mut self, freq_hz: f32, duration_ms: u32) -> Result<()> {
         let n_samples = (SAMPLE_RATE_HZ * duration_ms / 1000) as usize;
         let half_period = (SAMPLE_RATE_HZ as f32 / freq_hz / 2.0) as usize;
         let half_period = half_period.max(1);
+        // 先頭 50ms は無音: FIFO 空で BCK が止まっていた場合の AW88298 PLL
+        // 再ロック時間を確保する (issue #102。ロックは数 ms、余裕を見て 50ms)
+        let lead_in = (SAMPLE_RATE_HZ / 20) as usize;
         // ステレオ (L/R 同値) 16bit PCM の矩形波。half_period サンプルごとに極性反転
-        let mut buf = Vec::with_capacity(n_samples * 4);
+        let mut buf = Vec::with_capacity((lead_in + n_samples) * 4);
+        buf.resize(lead_in * 4, 0);
+        // 振幅 6000 ≒ フルスケール比 -12dB。矩形波 24000 は実機でかなり大きく
+        // 常設運用にはうるさい (2026-07-21 実機確認)。音量はここで調整する
+        // (レジスタ 0x0C は 0dB のまま)
         for n in 0..n_samples {
-            let sample: i16 = if (n / half_period) % 2 == 0 { 24000 } else { -24000 };
+            let sample: i16 = if (n / half_period) % 2 == 0 { 6000 } else { -6000 };
             buf.extend_from_slice(&sample.to_le_bytes());
             buf.extend_from_slice(&sample.to_le_bytes());
         }

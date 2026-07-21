@@ -167,25 +167,26 @@ fn main() -> Result<()> {
     // feature 参照)。読み取りビープは issue #101 PR2
     #[cfg(feature = "nfc-verify")]
     {
-        // I2S (BCK/WS) を先に起動してから AW88298 の I2SEN=1 を書く。逆順だと
-        // アンプの内部 PLL がクロック無しの状態で "有効" 遷移を見てロックしない
-        // 疑いがある (2026-07-21 実機で無音、fable diag で指摘)
+        // 発音の成立条件 (issue #102 実機切り分けで確定):
+        //   1. サンプルレートは 48kHz (44.1kHz は分数分周ジッタで AW88298 の
+        //      PLL がロックせず完全無音。speaker.rs の SAMPLE_RATE_HZ 参照)
+        //   2. アンプ初期化はクロック供給下で行う — 新 I2S ドライバは FIFO 空で
+        //      BCK を止めるため、init_amp の前に feed_silence で実際に流す
         let mut speaker = alc_hub_drivers::speaker::Speaker::new(
             p.i2s1,
             p.pins.gpio34.into(),
             p.pins.gpio33.into(),
             p.pins.gpio13.into(),
         )?;
+        speaker.feed_silence(300)?;
         alc_hub_drivers::speaker::init_amp(&mut i2c)?;
-        // 起動時セルフテスト音 (issue #101 PR2 実機デバッグ、2026-07-21): カード検知を
-        // 待たずに起動直後に鳴らして I2S/AW88298 経路の疎通を切り分ける
-        log::info!("speaker: 起動セルフテスト音再生");
-        if let Err(e) = speaker.beep(1000.0, 500) {
-            log::warn!("speaker: セルフテスト音 失敗: {e:#}");
+        // 起動時セルフテスト音は鳴らさない (開発中は起動のたびに鳴って邪魔、
+        // 2026-07-21 実機で発音経路は確認済み)。疎通は SYSST のログで代替:
+        // feed_silence 中に PLL がロックしていれば bit0=PLLS / bit4=CLKS が立つ
+        match alc_hub_drivers::speaker::read_sysst(&mut i2c) {
+            Ok(v) => log::info!("speaker: SYSST(初期化後)=0x{v:04X}"),
+            Err(e) => log::warn!("speaker: SYSST 読み出し失敗: {e:#}"),
         }
-        // 再生後 (=BCK が 500ms 走った後) の全レジスタダンプ (issue #102)。
-        // Arduino (M5Unified) で音が出ている状態の同ダンプと突き合わせる
-        alc_hub_drivers::speaker::dump_regs(&mut i2c);
         alc_hub_drivers::nfc::start(
             p.pins.gpio2.into(),
             p.pins.gpio1.into(),
