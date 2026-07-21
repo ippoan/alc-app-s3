@@ -159,6 +159,10 @@ fn run(sda_num: i32, scl_num: i32, status: SharedStatus) {
         match poll_felica_idm() {
             Ok(Some(idm)) => {
                 if last_idm.as_deref() != Some(idm.as_str()) {
+                    // push_event はイベントログ (UI/WS) 行のみで serial には出ない。
+                    // log::info! を並置して scripts/nfc_serial_beep.py (COM 監視、
+                    // 既定 --match "NFC|免許|IDm") で検知音を鳴らせるようにする (issue #101)
+                    log::info!("NFC IDm={idm}");
                     push_event(&status, &format!("NFC IDm={idm}"));
                 }
                 last_idm = Some(idm);
@@ -172,6 +176,7 @@ fn run(sda_num: i32, scl_num: i32, status: SharedStatus) {
             match poll_nfca_uid() {
                 Ok(Some(uid)) => {
                     if last_uid.as_deref() != Some(uid.as_str()) {
+                        log::info!("NFC-A UID={uid}");
                         push_event(&status, &format!("NFC-A UID={uid}"));
                     }
                     last_uid = Some(uid);
@@ -186,6 +191,7 @@ fn run(sda_num: i32, scl_num: i32, status: SharedStatus) {
             let (rc, issue, expiry) = read_license_expiry();
             if rc == 0 {
                 if last_license_rc != 0 {
+                    log::info!("免許証 交付 {issue} 期限 {expiry}");
                     push_event(&status, &format!("免許証 交付 {issue} 期限 {expiry}"));
                 }
                 got = true;
