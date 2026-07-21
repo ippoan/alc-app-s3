@@ -6,6 +6,8 @@
 #ifndef ALC_HUB_NFC_SHIM_H
 #define ALC_HUB_NFC_SHIM_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -40,6 +42,24 @@ int nfc_shim_poll_nfca_uid(char* out_hex, int out_cap);
  * 戻り値: 0=成功、非0=失敗 (カード無し/免許証以外/読み取り失敗)。
  */
 int nfc_shim_read_license_expiry(char* out_issue, int issue_cap, char* out_expiry, int expiry_cap);
+
+/**
+ * Type-A (ISO14443-4/ISO-DEP) の汎用 APDU 送受信 (issue #105)。
+ * WUPA→SELECT(RATS 込み)→APDU 送受信→HLTA を1セッションとして行い、
+ * ISO14443-4 対応カード (RATS に応答するもの) にのみ動作する。
+ * `cmd`/`cmd_len` に送信 APDU、`out`/`out_cap` に受信バッファを渡す —
+ * AID 等プロトコル固有のバイト列は Rust 側が組み立てる (C++ 側にはハード
+ * コードしない、Plan agent レビュー結果を反映)。
+ * `nfc_shim_poll_nfca_uid()` の detect() は毎回 HLTA で終わり ISO-DEP
+ * セッションが残らないため、この用途には使えない (新規セッションが必要)。
+ * 実機確認の結果、電子車検証はこの Type-A 経路で応答することを確認した
+ * (Android 実装 ippoan/AlcoholChecker の一次情報は Type-B 想定だったが
+ * 実機の挙動と異なっていた)。
+ * 戻り値: >=0 (受信バイト数、SW1SW2 込み) で成功、負値は失敗
+ *   (-1=引数不正/未初期化, -2=カード無し, -3=SELECT/RATS 失敗,
+ *    -4=ISO14443-4 非対応, -5=APDU 送受信失敗)。
+ */
+int nfc_shim_transceive_apdu_a(const uint8_t* cmd, int cmd_len, uint8_t* out, int out_cap);
 
 /**
  * アンテナ振幅を1回測定して返す (0-255、失敗時 -1)。カード接近の存在検知

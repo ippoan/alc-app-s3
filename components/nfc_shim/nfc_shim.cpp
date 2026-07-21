@@ -306,6 +306,38 @@ int try_read_license_once(char* out_issue, char* out_expiry)
     return 0;
 }
 
+// 1 セッション試行 (Type-A ISO-DEP 汎用 APDU、issue #105)。
+// WUPA (IDLE/HALT→READY) → select() (anti-collision→ACTIVE。picc が
+// ISO14443-4 対応なら select() 内部で RATS まで実施し isoDEP() の
+// FSC/FWT を ATS から自動設定する、nfc_layer_a.cpp 参照) → transceiveAPDU
+// → deactivate (HLTA)。免許証 (Type-B) の try_read_license_once と違い
+// APDU の中身 (どの AID を SELECT するか等) はここに持たず呼び出し元
+// (Rust) から受け取る — 車検証以外の AID/APDU にも使い回せる汎用プリミティブ
+int try_transceive_apdu_a_once(const uint8_t* cmd, uint16_t cmd_len, uint8_t* rx, uint16_t& rx_len)
+{
+    uint16_t atqa = 0;
+    // タイムアウト/リセット方針は try_read_license_once (Type-B) と同型:
+    // 応答が無いカード無し (-2) は即戻り、READY 相当でスタックしうる途中死
+    // (-3/-4) は呼び出し元でリセット判断させる
+    if (!g_nfc_a->wakeup(atqa)) {
+        return -2;  // カード無し
+    }
+    m5::nfc::a::PICC picc{};
+    if (!g_nfc_a->select(picc)) {
+        return -3;  // anti-collision/SELECT (RATS 含む) 失敗
+    }
+    if (!picc.isISO14443_4()) {
+        g_nfc_a->deactivate();
+        return -4;  // ISO14443-4 非対応 (単純メモリタグ等、車検証ではあり得ない)
+    }
+
+    auto* dep = g_nfc_a->isoDEP();
+    const m5::nfc::isodep::policy_t fast_policy{/*fwt_ms=*/50U, /*wtx_max_ms=*/2000U, /*max_retries=*/0};
+    const bool ok = dep->transceiveAPDU(rx, rx_len, cmd, cmd_len, &fast_policy);
+    g_nfc_a->deactivate();
+    return ok ? 0 : -5;  // APDU 送受信失敗
+}
+
 }  // namespace
 
 // アンテナ振幅の実測 (0-255、失敗時 -1)。カード接近によるアンテナ離調で値が
@@ -398,6 +430,39 @@ extern "C" int nfc_shim_read_license_expiry(char* out_issue, int issue_cap, char
         if (++s_idle_calls >= 6) {
             s_idle_calls = 0;
             reset_rf_field();
+        }
+    }
+    return last_rc;
+}
+
+// Type-A ISO-DEP 汎用 APDU transceive (issue #105)。AID や解釈は呼び出し元
+// (Rust) が cmd/out で自由に指定できる — プロトコル固有のバイト列を C++ 側に
+// ハードコードしない設計 (Plan agent レビュー結果を反映、2026-07-21)。
+// WUPA→SELECT(RATS込み)→APDU→HLTA を実機で調整済みのリトライ/リセット方針
+// (免許証セッションと同型) で行う。
+extern "C" int nfc_shim_transceive_apdu_a(const uint8_t* cmd, int cmd_len, uint8_t* out, int out_cap)
+{
+    if (!g_ready || cmd == nullptr || cmd_len <= 0 || out == nullptr || out_cap < 2) {
+        return -1;
+    }
+    g_units.update();  // 理由は nfc_shim_poll_felica_idm のコメント参照
+    ensure_mode(m5::nfc::NFC::A);
+
+    constexpr uint32_t kBudgetMs = 100;
+    const auto budget_end = m5::utility::millis() + kBudgetMs;
+    int last_rc = -2;
+
+    while (m5::utility::millis() <= budget_end) {
+        uint16_t rx_len = static_cast<uint16_t>(out_cap);
+        const int rc = try_transceive_apdu_a_once(cmd, static_cast<uint16_t>(cmd_len), out, rx_len);
+        if (rc == 0) {
+            reset_rf_field();  // 理由は nfc_shim_read_license_expiry と同じ
+            return static_cast<int>(rx_len);
+        }
+        if (rc != -2) {
+            last_rc = rc;
+            reset_rf_field();
+            m5::utility::delay(60);
         }
     }
     return last_rc;
