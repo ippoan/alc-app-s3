@@ -38,6 +38,12 @@ extern "C" {
     ) -> i32;
     fn nfc_shim_measure_amplitude() -> i32;
     fn nfc_shim_measure_phase() -> i32;
+    fn nfc_shim_transceive_apdu_a(
+        cmd: *const u8,
+        cmd_len: i32,
+        out: *mut u8,
+        out_cap: i32,
+    ) -> i32;
 }
 
 /// I2C_NUM_1 (ESP-IDF)。main.rs の内部バス (I2C_NUM_0, G12/G11) とは別ポート
@@ -93,6 +99,9 @@ fn run(sda_num: i32, scl_num: i32, status: SharedStatus, speaker: std::sync::mps
     let mut last_uid: Option<String> = None;
     // -2 (カード無し) は定常状態なのでログしない。未実行センチネルは i32::MIN
     let mut last_license_rc = i32::MIN;
+    // 電子車検証を「置きっぱなし」で毎サイクル検知し続けても再ビープしない
+    // ための dedupe (issue #105)。免許証確定時にリセットする
+    let mut last_car_inspection = false;
 
     // 存在検知のベースライン (-1 = 未較正、初回測定値で初期化)。
     // 振幅はカード系、位相はスマホ系 (モバイルSuica 等、振幅に出にくい) を拾う
@@ -183,15 +192,35 @@ fn run(sda_num: i32, scl_num: i32, status: SharedStatus, speaker: std::sync::mps
         if !got {
             match poll_nfca_uid() {
                 Ok(Some(uid)) => {
-                    if last_uid.as_deref() != Some(uid.as_str()) {
-                        log::info!("NFC-A UID={uid}");
-                        push_event(&status, &format!("NFC-A UID={uid}"));
-                        beep_ok(&speaker);
+                    // 電子車検証は Type-A + ISO14443-4 (ISO-DEP、RATS 応答あり) で
+                    // 応答することを実機確認済み (issue #105)。UID が取れた時点で
+                    // このカードがただの UID タグ (NTAG 等) かスマートカードかを
+                    // SELECT MF で追加確認する (詳細は detect_car_inspection_a
+                    // のコメント参照)。tap のたびに ISO-DEP セッション1回分の
+                    // コストが乗るが、非対応カードは RATS 非対応で即座に弾かれる
+                    // ため実害は小さい
+                    if detect_car_inspection_a() {
+                        if !last_car_inspection {
+                            log::info!("電子車検証 検知 (UID={uid})");
+                            push_event(&status, "電子車検証 検知");
+                            beep_ok(&speaker);
+                        }
+                        last_car_inspection = true;
+                    } else {
+                        last_car_inspection = false;
+                        if last_uid.as_deref() != Some(uid.as_str()) {
+                            log::info!("NFC-A UID={uid}");
+                            push_event(&status, &format!("NFC-A UID={uid}"));
+                            beep_ok(&speaker);
+                        }
                     }
                     last_uid = Some(uid);
                     got = true;
                 }
-                Ok(None) => last_uid = None,
+                Ok(None) => {
+                    last_uid = None;
+                    last_car_inspection = false;
+                }
                 Err(e) => log::warn!("nfc: NFC-A poll error: {e:#}"),
             }
         }
@@ -231,6 +260,37 @@ fn beep_ok(speaker: &std::sync::mpsc::Sender<Sound>) {
     // 全検知パス共通。本来の再生タイミングは登録フロー実装時にそちらへ移す
     let _ = speaker.send(Sound::BeepOk);
     let _ = speaker.send(Sound::Registered);
+}
+
+/// SELECT MF (`00 A4 00 00`)。実機診断の結果 (issue #105、2026-07-21):
+/// AlcoholChecker (ippoan/AlcoholChecker) の AID ベース SELECT DF
+/// (`78 77 81 02 80 00`) は実機で SW=6A82 (該当ファイル無し) となり誤りだった
+/// — 電子車検証は AID ベース選択ではなく、免許証 (Type-B) と同じ伝統的な
+/// MF/EF 階層構造で、SELECT MF が SW=9000 で成功することを確認した。
+/// ⚠ 現状は「Type-A ISO14443-4 対応カードで SELECT MF が成功する」ことのみを
+/// 車検証の判定条件にしている簡易ヒューリスティクスであり、他の Type-A
+/// スマートカード (MF/EF構造を持つもの) との誤判定リスクはゼロではない。
+/// 車検証固有の EF (免許証の EF 2F01 に相当するもの) を特定し SELECT できれば
+/// より確実な判定になる — 未特定のため followup 課題として残す
+const APDU_SELECT_MF: [u8; 4] = [0x00, 0xA4, 0x00, 0x00];
+
+/// Type-A ISO-DEP 経由で電子車検証 (簡易判定: SELECT MF 成功) を確認する。
+/// ISO14443-4 非対応カード (単純メモリタグ等) では通信自体が成立せず false
+fn detect_car_inspection_a() -> bool {
+    let mut out = [0u8; 16];
+    let n = unsafe {
+        nfc_shim_transceive_apdu_a(
+            APDU_SELECT_MF.as_ptr(),
+            APDU_SELECT_MF.len() as i32,
+            out.as_mut_ptr(),
+            out.len() as i32,
+        )
+    };
+    if n < 2 {
+        return false; // カード無し/セッション失敗/SW未満の短いレスポンス
+    }
+    let n = n as usize;
+    out[n - 2] == 0x90 && out[n - 1] == 0x00
 }
 
 fn poll_felica_idm() -> Result<Option<String>> {
