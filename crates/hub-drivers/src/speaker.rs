@@ -100,6 +100,22 @@ pub fn init_amp(i2c: &mut I2cDriver) -> Result<()> {
     Ok(())
 }
 
+/// AW88298 の全主要レジスタ (0x00-0x14, 0x60-0x61) をログへダンプする。
+/// esp_codec_dev の aw88298_dump() と同じ範囲 (issue #102 診断)。
+/// ビープ再生後に呼ぶと SYSST (0x01) の PLLS/CLKS を「クロック供給が十分
+/// 安定した後」の値で読み直せる (init_amp 内の読み出しはリセット直後で
+/// PLL ロック前の可能性があり、リフラッシュごとに値がばらついていた)。
+/// Arduino (M5Unified) で音が出ている状態の同範囲ダンプと突き合わせ、
+/// 差分レジスタを特定するのが目的
+pub fn dump_regs(i2c: &mut I2cDriver) {
+    for reg in (0x00u8..=0x14).chain(0x60..=0x61) {
+        match aw88298_read_reg(i2c, reg) {
+            Ok(v) => log::info!("speaker: AW88298[0x{reg:02X}]=0x{v:04X}"),
+            Err(e) => log::warn!("speaker: AW88298[0x{reg:02X}] 読み出し失敗: {e:#}"),
+        }
+    }
+}
+
 pub struct Speaker {
     i2s: I2sDriver<'static, I2sTx>,
 }

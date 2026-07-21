@@ -183,6 +183,9 @@ fn main() -> Result<()> {
         if let Err(e) = speaker.beep(1000.0, 500) {
             log::warn!("speaker: セルフテスト音 失敗: {e:#}");
         }
+        // 再生後 (=BCK が 500ms 走った後) の全レジスタダンプ (issue #102)。
+        // Arduino (M5Unified) で音が出ている状態の同ダンプと突き合わせる
+        alc_hub_drivers::speaker::dump_regs(&mut i2c);
         alc_hub_drivers::nfc::start(
             p.pins.gpio2.into(),
             p.pins.gpio1.into(),
