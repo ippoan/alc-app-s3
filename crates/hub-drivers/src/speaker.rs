@@ -127,6 +127,38 @@ pub fn dump_regs(i2c: &mut I2cDriver) {
     }
 }
 
+/// 再生依頼 (issue #101/#102)。`start_player` のキュー経由で再生スレッドに渡す
+pub enum Sound {
+    /// 検知成功ビープ (2kHz 40ms)
+    BeepOk,
+    /// 「登録完了しました」音声 (~1.5 秒)
+    Registered,
+}
+
+/// 再生専用スレッドを立て、送信ハンドルを返す (issue #102)。
+/// I2S の write はブロッキングのため、NFC ポーリング等の呼び出し元スレッドで
+/// 直接再生すると音声 1.5 秒ぶんポーリングが止まる (実機で反応悪化を確認)。
+/// M5Unified の spk_task と同じく再生はスレッドに分離し、呼び出し側は
+/// キュー投入だけで即座に戻る。再生中に届いた依頼は順次再生される
+pub fn start_player(mut speaker: Speaker) -> Result<std::sync::mpsc::Sender<Sound>> {
+    let (tx, rx) = std::sync::mpsc::channel::<Sound>();
+    std::thread::Builder::new()
+        .name("speaker".into())
+        .stack_size(8 * 1024)
+        .spawn(move || {
+            while let Ok(sound) = rx.recv() {
+                let r = match sound {
+                    Sound::BeepOk => speaker.beep(2000.0, 40),
+                    Sound::Registered => speaker.play_registered(),
+                };
+                if let Err(e) = r {
+                    log::warn!("speaker: 再生失敗: {e:#}");
+                }
+            }
+        })?;
+    Ok(tx)
+}
+
 pub struct Speaker {
     i2s: I2sDriver<'static, I2sTx>,
 }
@@ -159,9 +191,62 @@ impl Speaker {
     /// `tx_enable()` だけではクロックが出ない。`init_amp` の前に呼んで
     /// 「クロック供給下でアンプを初期化する」条件 (Arduino/M5Unified と同じ) を作る
     pub fn feed_silence(&mut self, duration_ms: u32) -> Result<()> {
-        let n_samples = (SAMPLE_RATE_HZ * duration_ms / 1000) as usize;
+        // black_box: 呼び出し元の定数 duration がインライン畳み込みされると
+        // 特定長 (例 3840 バイト) で xtensa LLVM の ISel バグを踏む (beep 同様)
+        let n_samples = core::hint::black_box((SAMPLE_RATE_HZ * duration_ms / 1000) as usize);
         let buf = vec![0u8; n_samples * 4];
         self.i2s.write_all(&buf, BLOCK)?;
+        Ok(())
+    }
+
+    /// 「登録完了しました」音声を再生する (再生完了までブロック、約 1.5 秒)。
+    /// 音源は Windows SAPI (Microsoft Haruka) で生成した 16kHz mono s16le PCM
+    /// (`assets/touroku_kanryo_16k_s16le.raw`、無音トリム済み 45KB)
+    pub fn play_registered(&mut self) -> Result<()> {
+        const VOICE: &[u8] = include_bytes!("../assets/touroku_kanryo_16k_s16le.raw");
+        self.play_pcm_16k_mono(VOICE)
+    }
+
+    /// 16kHz mono s16le PCM を 3 倍線形補間で 48kHz 化しステレオ再生する。
+    /// 100ms 単位のチャンク処理で一時バッファを ~19KB に抑える (PSRAM 大確保回避)
+    fn play_pcm_16k_mono(&mut self, pcm: &[u8]) -> Result<()> {
+        // 200ms: PLL 再ロック + アンプ安定待ちに加え、直前のビープから
+        // ワンテンポ置いてから話し始める間 (2026-07-21 実機フィードバック)
+        self.feed_silence(200)?;
+        const CHUNK_IN: usize = 1600; // 入力 100ms 分
+        let n_in = pcm.len() / 2;
+        let sample_at = |i: usize| -> i32 {
+            let b = &pcm[i * 2..i * 2 + 2];
+            i16::from_le_bytes([b[0], b[1]]) as i32
+        };
+        // 先頭 10ms (16kHz で 160 サンプル) の短いフェードイン: 立ち上がりの
+        // クリック除去のみ。40ms だと立ち上がりがにじんで「ひきずる」聞こえ方に
+        // なる (2026-07-21 実機)。子音のやわらかさは素材側 (ローパス済み) で担保
+        let fade_len = core::hint::black_box(160usize);
+        let mut buf = Vec::with_capacity(CHUNK_IN * 3 * 4);
+        let mut idx = 0usize;
+        while idx < n_in {
+            buf.clear();
+            let end = (idx + CHUNK_IN).min(n_in);
+            for n in idx..end {
+                let s0 = sample_at(n);
+                let s1 = if n + 1 < n_in { sample_at(n + 1) } else { s0 };
+                for k in 0..3i32 {
+                    // ×1/2 ≒ ピーク 27632→13800: フルスケール近くで再生すると
+                    // 内蔵 1W スピーカーが振り切れて音割れする (2026-07-21 実機、
+                    // 「とうろく」の頭が割れるフィードバック → ×3/5 でも残った)
+                    let mut v = (s0 + (s1 - s0) * k / 3) / 2;
+                    if n < fade_len {
+                        v = v * n as i32 / fade_len as i32;
+                    }
+                    let v = v as i16;
+                    buf.extend_from_slice(&v.to_le_bytes());
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            self.i2s.write_all(&buf, BLOCK)?;
+            idx = end;
+        }
         Ok(())
     }
 
@@ -181,14 +266,22 @@ impl Speaker {
         // レジスタ 0x0C は 0dB のまま)。
         // 注: リードインを Vec::resize(定数長, 0) で書くと xtensa LLVM の
         // "Cannot select: Constant" ISel エラーになるため 1 ループに畳んでいる
+        // 終端 50ms はフェードアウト (n_samples 以下にクランプ): 矩形波を
+        // ぶつ切りにするとクリックが乗る。40ms ビープでは実質全体が減衰
+        // エンベロープになり、やわらかい「ポン」という鳴りになる (実機調整)
+        let fade_out = core::hint::black_box((SAMPLE_RATE_HZ / 20) as usize).min(n_samples.max(1));
         let mut buf = Vec::with_capacity((lead_in + n_samples) * 4);
         for n in 0..lead_in + n_samples {
             let sample: i16 = if n < lead_in {
                 0
-            } else if ((n - lead_in) / half_period) % 2 == 0 {
-                6000
             } else {
-                -6000
+                let t = n - lead_in;
+                let mut v: i32 = if (t / half_period) % 2 == 0 { 6000 } else { -6000 };
+                let remain = n_samples - t;
+                if remain <= fade_out {
+                    v = v * remain as i32 / fade_out as i32;
+                }
+                v as i16
             };
             buf.extend_from_slice(&sample.to_le_bytes());
             buf.extend_from_slice(&sample.to_le_bytes());

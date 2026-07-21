@@ -187,11 +187,14 @@ fn main() -> Result<()> {
             Ok(v) => log::info!("speaker: SYSST(初期化後)=0x{v:04X}"),
             Err(e) => log::warn!("speaker: SYSST 読み出し失敗: {e:#}"),
         }
+        // 再生専用スレッドに分離 (issue #102): I2S write はブロッキングのため
+        // NFC スレッドで直接再生すると音声 1.5 秒ぶんポーリングが止まる
+        let speaker_tx = alc_hub_drivers::speaker::start_player(speaker)?;
         alc_hub_drivers::nfc::start(
             p.pins.gpio2.into(),
             p.pins.gpio1.into(),
             Arc::clone(&status),
-            speaker,
+            speaker_tx,
         )?;
     }
     // LAN Module 13.2 (W5500): CS=G13 (RS232M 併用ジャンパ) / RST=G0 / INT=G10 未使用。

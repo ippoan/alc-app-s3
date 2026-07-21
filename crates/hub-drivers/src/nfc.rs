@@ -24,7 +24,7 @@ use esp_idf_svc::hal::gpio::{AnyIOPin, Pin};
 
 use alc_hub_common::status::{now_ms, SharedStatus};
 
-use crate::speaker::Speaker;
+use crate::speaker::Sound;
 
 extern "C" {
     fn nfc_shim_init(i2c_port: i32, sda_gpio: i32, scl_gpio: i32) -> i32;
@@ -61,7 +61,7 @@ pub fn start(
     sda: AnyIOPin,
     scl: AnyIOPin,
     status: SharedStatus,
-    speaker: Speaker,
+    speaker: std::sync::mpsc::Sender<Sound>,
 ) -> Result<()> {
     // Pin::pin() は PinId (u8) を返す。ownership は FFI 側 (C++/M5HAL) が握るため
     // 番号だけ取り出して drop する (esp-idf-hal 側では未使用)
@@ -78,7 +78,7 @@ pub fn start(
     Ok(())
 }
 
-fn run(sda_num: i32, scl_num: i32, status: SharedStatus, mut speaker: Speaker) {
+fn run(sda_num: i32, scl_num: i32, status: SharedStatus, speaker: std::sync::mpsc::Sender<Sound>) {
     let rc = unsafe { nfc_shim_init(I2C_PORT_NFC, sda_num, scl_num) };
     if rc != 0 {
         push_event(
@@ -171,7 +171,7 @@ fn run(sda_num: i32, scl_num: i32, status: SharedStatus, mut speaker: Speaker) {
                     // 既定 --match "NFC|免許|IDm") で検知音を鳴らせるようにする (issue #101)
                     log::info!("NFC IDm={idm}");
                     push_event(&status, &format!("NFC IDm={idm}"));
-                    beep_ok(&mut speaker);
+                    beep_ok(&speaker);
                 }
                 last_idm = Some(idm);
                 got = true;
@@ -186,7 +186,7 @@ fn run(sda_num: i32, scl_num: i32, status: SharedStatus, mut speaker: Speaker) {
                     if last_uid.as_deref() != Some(uid.as_str()) {
                         log::info!("NFC-A UID={uid}");
                         push_event(&status, &format!("NFC-A UID={uid}"));
-                        beep_ok(&mut speaker);
+                        beep_ok(&speaker);
                     }
                     last_uid = Some(uid);
                     got = true;
@@ -202,7 +202,7 @@ fn run(sda_num: i32, scl_num: i32, status: SharedStatus, mut speaker: Speaker) {
                 if last_license_rc != 0 {
                     log::info!("免許証 交付 {issue} 期限 {expiry}");
                     push_event(&status, &format!("免許証 交付 {issue} 期限 {expiry}"));
-                    beep_ok(&mut speaker);
+                    beep_ok(&speaker);
                 }
                 got = true;
             } else if rc != -2 && rc != last_license_rc {
@@ -223,10 +223,14 @@ fn run(sda_num: i32, scl_num: i32, status: SharedStatus, mut speaker: Speaker) {
 /// 検知成功ビープ (issue #101 PR2)。2kHz 40ms の短い「ピッ」(100ms は長いと
 /// 実機フィードバック、2026-07-21)。I2S write はブロッキングだが PLL リード
 /// イン込み ~60ms ならポーリング間隔への影響は許容範囲
-fn beep_ok(speaker: &mut Speaker) {
-    if let Err(e) = speaker.beep(2000.0, 40) {
-        log::warn!("nfc: beep failed: {e:#}");
-    }
+fn beep_ok(speaker: &std::sync::mpsc::Sender<Sound>) {
+    // 再生はスレッド分離済み (speaker::start_player) — キュー投入のみで
+    // ポーリングはブロックしない (issue #102、同期再生だと音声 1.5 秒ぶん
+    // NFC の反応が止まる)。
+    // Registered は音声フィードバックの動作確認用の仮配線 (2026-07-21):
+    // 全検知パス共通。本来の再生タイミングは登録フロー実装時にそちらへ移す
+    let _ = speaker.send(Sound::BeepOk);
+    let _ = speaker.send(Sound::Registered);
 }
 
 fn poll_felica_idm() -> Result<Option<String>> {
