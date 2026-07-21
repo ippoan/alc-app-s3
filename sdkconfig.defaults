@@ -28,6 +28,16 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # vendor コード内で不使用のため無効のまま。バイナリ増分・ヒープ影響は mem-hud で要実測
 CONFIG_COMPILER_CXX_EXCEPTIONS=y
 
+# M5UnitUnified の vendor コード (pin.cpp 等) が旧 driver/i2c.h のシンボルを
+# 参照しており、nfc_shim (新 driver/i2c_master.h) と同一バイナリにリンクされると
+# ESP-IDF 起動直後の __attribute__((constructor)) チェックで即 abort する
+# ("CONFLICT! driver_ng is not allowed to be used with this old driver"、
+# crates/atoms3-nfc/sdkconfig.defaults で issue #96 時に確認済みの同一事象を
+# issue #101 の CoreS3 実機フラッシュで再確認、2026-07-21)。nfc_shim.cpp は
+# i2c_new_master_bus のみ使用 (旧 i2c_driver_install() は未使用) のため
+# ESP-IDF 公式の回避オプションでこのチェックを無効化する
+CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
+
 # Wi-Fi (Improv で設定) と BLE の同時使用のため SW コエグジストを明示的に有効化
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 
