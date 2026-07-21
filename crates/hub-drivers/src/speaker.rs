@@ -18,7 +18,7 @@ use esp_idf_svc::hal::delay::{FreeRtos, BLOCK};
 use esp_idf_svc::hal::gpio::AnyIOPin;
 use esp_idf_svc::hal::i2c::I2cDriver;
 use esp_idf_svc::hal::i2s::{
-    config::{DataBitWidth, StdConfig},
+    config::{Config, DataBitWidth, SlotMode, StdClkConfig, StdConfig, StdGpioConfig, StdSlotConfig},
     I2sDriver, I2sTx, I2S1,
 };
 
@@ -140,7 +140,15 @@ impl Speaker {
         ws: AnyIOPin<'static>,
         dout: AnyIOPin<'static>,
     ) -> Result<Self> {
-        let cfg = StdConfig::philips(SAMPLE_RATE_HZ, DataBitWidth::Bits16);
+        // auto_clear=true が必須 (issue #102): 既定 false のままだと DMA が
+        // アンダーラン後も最後のバッファを繰り返し送り続け、ビープが永久に
+        // 止まらなくなる (M5Unified / esp-bsp とも明示的に true)
+        let cfg = StdConfig::new(
+            Config::default().auto_clear(true),
+            StdClkConfig::from_sample_rate_hz(SAMPLE_RATE_HZ),
+            StdSlotConfig::philips_slot_default(DataBitWidth::Bits16, SlotMode::Stereo),
+            StdGpioConfig::default(),
+        );
         let mut i2s = I2sDriver::new_std_tx(i2s1, &cfg, bck, dout, AnyIOPin::none(), ws)?;
         i2s.tx_enable()?;
         Ok(Self { i2s })
