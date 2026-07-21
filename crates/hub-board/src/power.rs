@@ -20,10 +20,20 @@ fn write_reg(i2c: &mut I2cDriver, addr: u8, reg: u8, value: u8) -> Result<()> {
 pub fn init(i2c: &mut I2cDriver) -> Result<()> {
     // --- AXP2101: LDO 有効化と電圧設定 (M5Unified CoreS3 シーケンス準拠) ---
     write_reg(i2c, AXP2101_ADDR, 0x90, LDO_ENABLE_ALL)?; // LDO 有効化 (bit7 = DLDO1: LCD バックライト)
-    write_reg(i2c, AXP2101_ADDR, 0x92, 13)?; // ALDO1 1.8V (AW88298 スピーカー AMP)
+    // ALDO1 1.8V (AW88298 スピーカー AMP)。M5Unified Power_Class.cpp が
+    // 「ALDO1 set to 1.8v // for AW88298」と明記し、Espressif の CoreS3 BSP
+    // (esp-bsp bsp_feature_en.c) も speaker codec = ALDO1 = 1800mV で一致。
+    // Arduino (M5Unified) では同じ 1.8V で音が出るため、UVLS=1 を疑って
+    // 3.3V に上げた実験 (2026-07-21) は根拠なしと判断し既知動作値へ戻す。
+    // AW88298 の 1.8V ドメインに 3.3V を掛け続けるのは過電圧リスクでもある
+    write_reg(i2c, AXP2101_ADDR, 0x92, 13)?;
     write_reg(i2c, AXP2101_ADDR, 0x93, 28)?; // ALDO2 3.3V (ES7210 マイク ADC)
     write_reg(i2c, AXP2101_ADDR, 0x94, 28)?; // ALDO3 3.3V (カメラ)
     write_reg(i2c, AXP2101_ADDR, 0x95, 28)?; // ALDO4 3.3V (TF カード)
+    // BLDO1/2 は書かない (M5Unified/M5GFX とも未使用のまま EFUSE 既定値)。
+    // 実体はカメラ GC0308 の AVDD 2.8V / DVDD 1.5V (ESPHome CoreS3 既知動作値)
+    // であり、スピーカーとは無関係。3.3V に上げた実験 (2026-07-21) はカメラの
+    // 定格超過リスクがあるため撤回
     write_reg(i2c, AXP2101_ADDR, 0x27, 0x00)?; // PowerKey Hold=1s / PowerOff=4s
     write_reg(i2c, AXP2101_ADDR, 0x69, 0x11)?; // CHGLED 設定
     write_reg(i2c, AXP2101_ADDR, 0x10, 0x30)?; // PMU 共通設定

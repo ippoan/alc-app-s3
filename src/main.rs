@@ -24,7 +24,9 @@ use alc_hub_common::{
     settings::Settings,
     status::{HubStatus, SharedStatus},
 };
-use alc_hub_drivers::{crashlog, gw_link, heap, host_link, lan, ntp, recorder, rs232, ws_uplink};
+#[cfg(feature = "lan")]
+use alc_hub_drivers::lan;
+use alc_hub_drivers::{crashlog, gw_link, heap, host_link, ntp, recorder, rs232, ws_uplink};
 use alc_hub_ui as ui;
 use alc_hub_wifi::{improv, wifi};
 use anyhow::Result;
@@ -157,16 +159,48 @@ fn main() -> Result<()> {
         meas_tx.clone(),
         tx.clone(),
     )?;
-    // Unit NFC (ST25R3916) 検証 (issue #84)。DIN Base Port B (G8/G9) に配線。
+    // Unit NFC (ST25R3916) (issue #84 / #101)。DIN Base Port A (SDA=G2 / SCL=G1)
+    // に配線 (AtomS3 ベンチと同一ピン番号、issue #101 の LAN Module 取り外し構成が前提)。
     // I2C1 は C++ 側 (components/nfc_shim → M5HAL) が所有するため p.i2c1 は take しない
-    // (I2C0=内部バス G12/G11 電源IC/タッチとは完全に別ポート)
+    // (I2C0=内部バス G12/G11 電源IC/タッチとは完全に別ポート)。
+    // 内蔵スピーカー (I2S DOUT=G13) は LAN Module の CS と同一ピンのため排他 (`lan`
+    // feature 参照)。読み取りビープは issue #101 PR2
     #[cfg(feature = "nfc-verify")]
-    alc_hub_drivers::nfc::start(
-        p.pins.gpio8.into(),
-        p.pins.gpio9.into(),
-        Arc::clone(&status),
-    )?;
-    // LAN Module 13.2 (W5500): CS=G13 (RS232M 併用ジャンパ) / RST=G0 / INT=G10 未使用
+    {
+        // 発音の成立条件 (issue #102 実機切り分けで確定):
+        //   1. サンプルレートは 48kHz (44.1kHz は分数分周ジッタで AW88298 の
+        //      PLL がロックせず完全無音。speaker.rs の SAMPLE_RATE_HZ 参照)
+        //   2. アンプ初期化はクロック供給下で行う — 新 I2S ドライバは FIFO 空で
+        //      BCK を止めるため、init_amp の前に feed_silence で実際に流す
+        let mut speaker = alc_hub_drivers::speaker::Speaker::new(
+            p.i2s1,
+            p.pins.gpio34.into(),
+            p.pins.gpio33.into(),
+            p.pins.gpio13.into(),
+        )?;
+        speaker.feed_silence(300)?;
+        alc_hub_drivers::speaker::init_amp(&mut i2c)?;
+        // 起動時セルフテスト音は鳴らさない (開発中は起動のたびに鳴って邪魔、
+        // 2026-07-21 実機で発音経路は確認済み)。疎通は SYSST のログで代替:
+        // feed_silence 中に PLL がロックしていれば bit0=PLLS / bit4=CLKS が立つ
+        match alc_hub_drivers::speaker::read_sysst(&mut i2c) {
+            Ok(v) => log::info!("speaker: SYSST(初期化後)=0x{v:04X}"),
+            Err(e) => log::warn!("speaker: SYSST 読み出し失敗: {e:#}"),
+        }
+        // 再生専用スレッドに分離 (issue #102): I2S write はブロッキングのため
+        // NFC スレッドで直接再生すると音声 1.5 秒ぶんポーリングが止まる
+        let speaker_tx = alc_hub_drivers::speaker::start_player(speaker)?;
+        alc_hub_drivers::nfc::start(
+            p.pins.gpio2.into(),
+            p.pins.gpio1.into(),
+            Arc::clone(&status),
+            speaker_tx,
+        )?;
+    }
+    // LAN Module 13.2 (W5500): CS=G13 (RS232M 併用ジャンパ) / RST=G0 / INT=G10 未使用。
+    // G13 は内蔵スピーカーの I2S DOUT と共用のため、LAN Module 取り外し構成
+    // (issue #101) では `lan` feature を無効化する (既定 off)
+    #[cfg(feature = "lan")]
     lan::start(
         spi,
         p.pins.gpio13.into(),
