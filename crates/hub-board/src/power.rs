@@ -20,10 +20,20 @@ fn write_reg(i2c: &mut I2cDriver, addr: u8, reg: u8, value: u8) -> Result<()> {
 pub fn init(i2c: &mut I2cDriver) -> Result<()> {
     // --- AXP2101: LDO 有効化と電圧設定 (M5Unified CoreS3 シーケンス準拠) ---
     write_reg(i2c, AXP2101_ADDR, 0x90, LDO_ENABLE_ALL)?; // LDO 有効化 (bit7 = DLDO1: LCD バックライト)
-    write_reg(i2c, AXP2101_ADDR, 0x92, 13)?; // ALDO1 1.8V (AW88298 スピーカー AMP)
+    // ALDO1 3.3V (AW88298 スピーカー AMP)。元は 1.8V だったが、実機で AW88298
+    // SYSST.UVLS (VDD<2.8V) が終始立ったまま (BLDO1/2 を 3.3V に上げても変化なし)
+    // だったため、AW88298 の VDD/DVDD ピンは ALDO1 (この既存コメントの通り) の
+    // 可能性が高いと判断し 3.3V に引き上げる実験 (issue #101 PR2、2026-07-21)
+    write_reg(i2c, AXP2101_ADDR, 0x92, 28)?;
     write_reg(i2c, AXP2101_ADDR, 0x93, 28)?; // ALDO2 3.3V (ES7210 マイク ADC)
     write_reg(i2c, AXP2101_ADDR, 0x94, 28)?; // ALDO3 3.3V (カメラ)
     write_reg(i2c, AXP2101_ADDR, 0x95, 28)?; // ALDO4 3.3V (TF カード)
+    // BLDO1/2: 電圧レジスタ (0x96/0x97) を明示せず EFUSE 既定値 (datasheet Table 6-1:
+    // BLDO1=1.8V, BLDO2=2.8V) のままだった。BLDO2 の 2.8V は AW88298 の UVLS 閾値
+    // (VDD<2.8V で undervoltage) ぎりぎりで、実機で SYSST.UVLS=1 (無音) を確認
+    // (issue #101 PR2、2026-07-21)。安全側の 3.3V に上げる
+    write_reg(i2c, AXP2101_ADDR, 0x96, 28)?; // BLDO1 3.3V
+    write_reg(i2c, AXP2101_ADDR, 0x97, 28)?; // BLDO2 3.3V (AW88298 スピーカー AMP VDD の疑い)
     write_reg(i2c, AXP2101_ADDR, 0x27, 0x00)?; // PowerKey Hold=1s / PowerOff=4s
     write_reg(i2c, AXP2101_ADDR, 0x69, 0x11)?; // CHGLED 設定
     write_reg(i2c, AXP2101_ADDR, 0x10, 0x30)?; // PMU 共通設定

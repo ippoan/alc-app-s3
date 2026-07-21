@@ -24,7 +24,9 @@ use alc_hub_common::{
     settings::Settings,
     status::{HubStatus, SharedStatus},
 };
-use alc_hub_drivers::{crashlog, gw_link, heap, host_link, lan, ntp, recorder, rs232, ws_uplink};
+#[cfg(feature = "lan")]
+use alc_hub_drivers::lan;
+use alc_hub_drivers::{crashlog, gw_link, heap, host_link, ntp, recorder, rs232, ws_uplink};
 use alc_hub_ui as ui;
 use alc_hub_wifi::{improv, wifi};
 use anyhow::Result;
@@ -160,14 +162,38 @@ fn main() -> Result<()> {
     // Unit NFC (ST25R3916) (issue #84 / #101)。DIN Base Port A (SDA=G2 / SCL=G1)
     // に配線 (AtomS3 ベンチと同一ピン番号、issue #101 の LAN Module 取り外し構成が前提)。
     // I2C1 は C++ 側 (components/nfc_shim → M5HAL) が所有するため p.i2c1 は take しない
-    // (I2C0=内部バス G12/G11 電源IC/タッチとは完全に別ポート)
+    // (I2C0=内部バス G12/G11 電源IC/タッチとは完全に別ポート)。
+    // 内蔵スピーカー (I2S DOUT=G13) は LAN Module の CS と同一ピンのため排他 (`lan`
+    // feature 参照)。読み取りビープは issue #101 PR2
     #[cfg(feature = "nfc-verify")]
-    alc_hub_drivers::nfc::start(
-        p.pins.gpio2.into(),
-        p.pins.gpio1.into(),
-        Arc::clone(&status),
-    )?;
-    // LAN Module 13.2 (W5500): CS=G13 (RS232M 併用ジャンパ) / RST=G0 / INT=G10 未使用
+    {
+        // I2S (BCK/WS) を先に起動してから AW88298 の I2SEN=1 を書く。逆順だと
+        // アンプの内部 PLL がクロック無しの状態で "有効" 遷移を見てロックしない
+        // 疑いがある (2026-07-21 実機で無音、fable diag で指摘)
+        let mut speaker = alc_hub_drivers::speaker::Speaker::new(
+            p.i2s1,
+            p.pins.gpio34.into(),
+            p.pins.gpio33.into(),
+            p.pins.gpio13.into(),
+        )?;
+        alc_hub_drivers::speaker::init_amp(&mut i2c)?;
+        // 起動時セルフテスト音 (issue #101 PR2 実機デバッグ、2026-07-21): カード検知を
+        // 待たずに起動直後に鳴らして I2S/AW88298 経路の疎通を切り分ける
+        log::info!("speaker: 起動セルフテスト音再生");
+        if let Err(e) = speaker.beep(1000.0, 500) {
+            log::warn!("speaker: セルフテスト音 失敗: {e:#}");
+        }
+        alc_hub_drivers::nfc::start(
+            p.pins.gpio2.into(),
+            p.pins.gpio1.into(),
+            Arc::clone(&status),
+            speaker,
+        )?;
+    }
+    // LAN Module 13.2 (W5500): CS=G13 (RS232M 併用ジャンパ) / RST=G0 / INT=G10 未使用。
+    // G13 は内蔵スピーカーの I2S DOUT と共用のため、LAN Module 取り外し構成
+    // (issue #101) では `lan` feature を無効化する (既定 off)
+    #[cfg(feature = "lan")]
     lan::start(
         spi,
         p.pins.gpio13.into(),

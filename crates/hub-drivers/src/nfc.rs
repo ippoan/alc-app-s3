@@ -24,6 +24,8 @@ use esp_idf_svc::hal::gpio::{AnyIOPin, Pin};
 
 use alc_hub_common::status::{now_ms, SharedStatus};
 
+use crate::speaker::Speaker;
+
 extern "C" {
     fn nfc_shim_init(i2c_port: i32, sda_gpio: i32, scl_gpio: i32) -> i32;
     fn nfc_shim_poll_felica_idm(out_hex: *mut u8, out_cap: i32) -> i32;
@@ -55,7 +57,12 @@ const POLL_INTERVAL_MS: u32 = 20;
 /// (温度ドリフト等でベースラインが実態とずれたケースの自己回復)
 const TRIGGER_STUCK: Duration = Duration::from_secs(3);
 
-pub fn start(sda: AnyIOPin, scl: AnyIOPin, status: SharedStatus) -> Result<()> {
+pub fn start(
+    sda: AnyIOPin,
+    scl: AnyIOPin,
+    status: SharedStatus,
+    speaker: Speaker,
+) -> Result<()> {
     // Pin::pin() は PinId (u8) を返す。ownership は FFI 側 (C++/M5HAL) が握るため
     // 番号だけ取り出して drop する (esp-idf-hal 側では未使用)
     let sda_num = sda.pin() as i32;
@@ -67,11 +74,11 @@ pub fn start(sda: AnyIOPin, scl: AnyIOPin, status: SharedStatus) -> Result<()> {
         .name("nfc".into())
         // APDU 組立 (String) + FFI 経由の hex 文字列バッファがあるため rs232.rs と同等
         .stack_size(8 * 1024)
-        .spawn(move || run(sda_num, scl_num, status))?;
+        .spawn(move || run(sda_num, scl_num, status, speaker))?;
     Ok(())
 }
 
-fn run(sda_num: i32, scl_num: i32, status: SharedStatus) {
+fn run(sda_num: i32, scl_num: i32, status: SharedStatus, mut speaker: Speaker) {
     let rc = unsafe { nfc_shim_init(I2C_PORT_NFC, sda_num, scl_num) };
     if rc != 0 {
         push_event(
@@ -164,6 +171,7 @@ fn run(sda_num: i32, scl_num: i32, status: SharedStatus) {
                     // 既定 --match "NFC|免許|IDm") で検知音を鳴らせるようにする (issue #101)
                     log::info!("NFC IDm={idm}");
                     push_event(&status, &format!("NFC IDm={idm}"));
+                    beep_ok(&mut speaker);
                 }
                 last_idm = Some(idm);
                 got = true;
@@ -178,6 +186,7 @@ fn run(sda_num: i32, scl_num: i32, status: SharedStatus) {
                     if last_uid.as_deref() != Some(uid.as_str()) {
                         log::info!("NFC-A UID={uid}");
                         push_event(&status, &format!("NFC-A UID={uid}"));
+                        beep_ok(&mut speaker);
                     }
                     last_uid = Some(uid);
                     got = true;
@@ -193,6 +202,7 @@ fn run(sda_num: i32, scl_num: i32, status: SharedStatus) {
                 if last_license_rc != 0 {
                     log::info!("免許証 交付 {issue} 期限 {expiry}");
                     push_event(&status, &format!("免許証 交付 {issue} 期限 {expiry}"));
+                    beep_ok(&mut speaker);
                 }
                 got = true;
             } else if rc != -2 && rc != last_license_rc {
@@ -207,6 +217,14 @@ fn run(sda_num: i32, scl_num: i32, status: SharedStatus) {
         }
 
         FreeRtos::delay_ms(POLL_INTERVAL_MS);
+    }
+}
+
+/// 検知成功ビープ (issue #101 PR2)。2kHz 100ms 矩形波。I2S write は
+/// ブロッキングだが 100ms 程度ならポーリング間隔への影響は許容範囲
+fn beep_ok(speaker: &mut Speaker) {
+    if let Err(e) = speaker.beep(2000.0, 100) {
+        log::warn!("nfc: beep failed: {e:#}");
     }
 }
 

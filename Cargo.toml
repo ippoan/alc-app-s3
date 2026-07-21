@@ -32,6 +32,9 @@ mem-hud = ["alc-hub-ui/mem-hud"]
 # components/nfc_shim 経由の C++ FFI を使う。dev(mem-hud) チャネルのみに相乗りし
 # 本番 manifest.json の -app.bin には含めない (.github/workflows/build.yml 参照)
 nfc-verify = ["alc-hub-drivers/nfc-verify"]
+# LAN Module 13.2 (W5500)。CS=G13 が内蔵スピーカー I2S DOUT と共用のため、
+# LAN Module 取り外し構成 (issue #101 第一段) では既定 off にする
+lan = []
 
 [profile.release]
 opt-level = "s"
