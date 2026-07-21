@@ -157,13 +157,14 @@ fn main() -> Result<()> {
         meas_tx.clone(),
         tx.clone(),
     )?;
-    // Unit NFC (ST25R3916) 検証 (issue #84)。DIN Base Port B (G8/G9) に配線。
+    // Unit NFC (ST25R3916) (issue #84 / #101)。DIN Base Port A (SDA=G2 / SCL=G1)
+    // に配線 (AtomS3 ベンチと同一ピン番号、issue #101 の LAN Module 取り外し構成が前提)。
     // I2C1 は C++ 側 (components/nfc_shim → M5HAL) が所有するため p.i2c1 は take しない
     // (I2C0=内部バス G12/G11 電源IC/タッチとは完全に別ポート)
     #[cfg(feature = "nfc-verify")]
     alc_hub_drivers::nfc::start(
-        p.pins.gpio8.into(),
-        p.pins.gpio9.into(),
+        p.pins.gpio2.into(),
+        p.pins.gpio1.into(),
         Arc::clone(&status),
     )?;
     // LAN Module 13.2 (W5500): CS=G13 (RS232M 併用ジャンパ) / RST=G0 / INT=G10 未使用
