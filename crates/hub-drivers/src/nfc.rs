@@ -220,10 +220,11 @@ fn run(sda_num: i32, scl_num: i32, status: SharedStatus, mut speaker: Speaker) {
     }
 }
 
-/// 検知成功ビープ (issue #101 PR2)。2kHz 100ms 矩形波。I2S write は
-/// ブロッキングだが 100ms 程度ならポーリング間隔への影響は許容範囲
+/// 検知成功ビープ (issue #101 PR2)。2kHz 40ms の短い「ピッ」(100ms は長いと
+/// 実機フィードバック、2026-07-21)。I2S write はブロッキングだが PLL リード
+/// イン込み ~60ms ならポーリング間隔への影響は許容範囲
 fn beep_ok(speaker: &mut Speaker) {
-    if let Err(e) = speaker.beep(2000.0, 100) {
+    if let Err(e) = speaker.beep(2000.0, 40) {
         log::warn!("nfc: beep failed: {e:#}");
     }
 }

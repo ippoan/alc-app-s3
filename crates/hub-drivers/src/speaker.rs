@@ -163,17 +163,25 @@ impl Speaker {
         let n_samples = (SAMPLE_RATE_HZ * duration_ms / 1000) as usize;
         let half_period = (SAMPLE_RATE_HZ as f32 / freq_hz / 2.0) as usize;
         let half_period = half_period.max(1);
-        // 先頭 50ms は無音: FIFO 空で BCK が止まっていた場合の AW88298 PLL
-        // 再ロック時間を確保する (issue #102。ロックは数 ms、余裕を見て 50ms)
-        let lead_in = (SAMPLE_RATE_HZ / 20) as usize;
-        // ステレオ (L/R 同値) 16bit PCM の矩形波。half_period サンプルごとに極性反転
+        // 先頭 20ms は無音: FIFO 空で BCK が止まっていた場合の AW88298 PLL
+        // 再ロック時間を確保する (issue #102。ロック自体は数 ms)。
+        // black_box: 定数 960 (×4=3840) が畳み込まれると xtensa LLVM の
+        // "Cannot select: Constant<3840>" ISel エラーでコンパイルが落ちる
+        let lead_in = core::hint::black_box((SAMPLE_RATE_HZ / 50) as usize);
+        // ステレオ (L/R 同値) 16bit PCM の矩形波。half_period サンプルごとに極性反転。
+        // 振幅 6000 ≒ -12dB (フル音量矩形波は実機でうるさい、2026-07-21。
+        // レジスタ 0x0C は 0dB のまま)。
+        // 注: リードインを Vec::resize(定数長, 0) で書くと xtensa LLVM の
+        // "Cannot select: Constant" ISel エラーになるため 1 ループに畳んでいる
         let mut buf = Vec::with_capacity((lead_in + n_samples) * 4);
-        buf.resize(lead_in * 4, 0);
-        // 振幅 6000 ≒ フルスケール比 -12dB。矩形波 24000 は実機でかなり大きく
-        // 常設運用にはうるさい (2026-07-21 実機確認)。音量はここで調整する
-        // (レジスタ 0x0C は 0dB のまま)
-        for n in 0..n_samples {
-            let sample: i16 = if (n / half_period) % 2 == 0 { 6000 } else { -6000 };
+        for n in 0..lead_in + n_samples {
+            let sample: i16 = if n < lead_in {
+                0
+            } else if ((n - lead_in) / half_period) % 2 == 0 {
+                6000
+            } else {
+                -6000
+            };
             buf.extend_from_slice(&sample.to_le_bytes());
             buf.extend_from_slice(&sample.to_le_bytes());
         }
