@@ -199,31 +199,35 @@ impl Speaker {
         Ok(())
     }
 
-    /// 「登録完了しました」音声を再生する (再生完了までブロック、約 1.5 秒)。
-    /// 音源は Windows SAPI (Microsoft Haruka) で生成した 16kHz mono s16le PCM
-    /// (`assets/touroku_kanryo_16k_s16le.raw`、無音トリム済み 45KB)
+    /// 「登録完了しました」音声を再生する (再生完了までブロック、約 1.6 秒)。
+    /// 音源は VOICEVOX:四国めたん (ノーマル、話速 0.9) の 24kHz mono s16le PCM
+    /// (`assets/touroku_kanryo_24k_s16le.raw`、無音トリムのみ 78KB)。
+    /// 24kHz は VOICEVOX の内部ネイティブレート — エンジン側で 48kHz を要求
+    /// するとリサンプルでシャリつきが乗り、ピーク正規化 (増幅) はノイズ床を
+    /// 持ち上げる、のいずれも実機/PC で確認したため「無加工」で持つ (2026-07-21)。
+    /// レベルは素のまま (ピーク ~12600) で音割れ閾値以下、等倍再生
     pub fn play_registered(&mut self) -> Result<()> {
-        const VOICE: &[u8] = include_bytes!("../assets/touroku_kanryo_16k_s16le.raw");
-        self.play_pcm_16k_mono(VOICE)
+        const VOICE: &[u8] = include_bytes!("../assets/touroku_kanryo_24k_s16le.raw");
+        self.play_pcm_24k_mono(VOICE)
     }
 
-    /// 16kHz mono s16le PCM を 3 倍線形補間で 48kHz 化しステレオ再生する。
+    /// 24kHz mono s16le PCM を ×2 線形補間で 48kHz 化しステレオ再生する。
     /// 100ms 単位のチャンク処理で一時バッファを ~19KB に抑える (PSRAM 大確保回避)
-    fn play_pcm_16k_mono(&mut self, pcm: &[u8]) -> Result<()> {
+    fn play_pcm_24k_mono(&mut self, pcm: &[u8]) -> Result<()> {
         // 200ms: PLL 再ロック + アンプ安定待ちに加え、直前のビープから
         // ワンテンポ置いてから話し始める間 (2026-07-21 実機フィードバック)
         self.feed_silence(200)?;
-        const CHUNK_IN: usize = 1600; // 入力 100ms 分
+        const CHUNK_IN: usize = 2400; // 入力 100ms 分
         let n_in = pcm.len() / 2;
         let sample_at = |i: usize| -> i32 {
             let b = &pcm[i * 2..i * 2 + 2];
             i16::from_le_bytes([b[0], b[1]]) as i32
         };
-        // 先頭 10ms (16kHz で 160 サンプル) の短いフェードイン: 立ち上がりの
+        // 先頭 10ms (24kHz で 240 サンプル) の短いフェードイン: 立ち上がりの
         // クリック除去のみ。40ms だと立ち上がりがにじんで「ひきずる」聞こえ方に
-        // なる (2026-07-21 実機)。子音のやわらかさは素材側 (ローパス済み) で担保
-        let fade_len = core::hint::black_box(160usize);
-        let mut buf = Vec::with_capacity(CHUNK_IN * 3 * 4);
+        // なる (2026-07-21 実機)
+        let fade_len = core::hint::black_box(240usize);
+        let mut buf = Vec::with_capacity(CHUNK_IN * 2 * 4);
         let mut idx = 0usize;
         while idx < n_in {
             buf.clear();
@@ -231,11 +235,8 @@ impl Speaker {
             for n in idx..end {
                 let s0 = sample_at(n);
                 let s1 = if n + 1 < n_in { sample_at(n + 1) } else { s0 };
-                for k in 0..3i32 {
-                    // ×1/2 ≒ ピーク 27632→13800: フルスケール近くで再生すると
-                    // 内蔵 1W スピーカーが振り切れて音割れする (2026-07-21 実機、
-                    // 「とうろく」の頭が割れるフィードバック → ×3/5 でも残った)
-                    let mut v = (s0 + (s1 - s0) * k / 3) / 2;
+                for k in 0..2i32 {
+                    let mut v = s0 + (s1 - s0) * k / 2;
                     if n < fade_len {
                         v = v * n as i32 / fade_len as i32;
                     }
