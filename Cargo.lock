@@ -66,6 +66,7 @@ version = "0.1.0"
 dependencies = [
  "alc-hub-core",
  "anyhow",
+ "enumset",
  "esp-idf-svc",
  "log",
 ]

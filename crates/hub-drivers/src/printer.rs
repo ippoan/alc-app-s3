@@ -39,6 +39,7 @@ const PROGRESS_STEP: usize = 64 * 1024;
 /// コンソール/WS からの手動トリガーのみなので未対策)。
 pub fn spawn_print(url: String, printer_addr: String, status: SharedStatus) {
     // LAN 待ちは印刷スレッド内で行う (console スレッドを最大 20 秒ブロックしない)。
+    crate::task::name_next(c"print");
     let spawned = std::thread::Builder::new()
         .name("print".into())
         .stack_size(20 * 1024)

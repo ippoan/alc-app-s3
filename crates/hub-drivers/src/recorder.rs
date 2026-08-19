@@ -37,6 +37,7 @@ pub fn start(
     ws_tx: Sender<UplinkRecord>,
     gw_tx: Sender<UplinkRecord>,
 ) -> Result<()> {
+    crate::task::name_next(c"recorder");
     std::thread::Builder::new()
         .name("recorder".into())
         .stack_size(8 * 1024)

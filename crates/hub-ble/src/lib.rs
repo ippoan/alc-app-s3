@@ -114,6 +114,7 @@ pub fn start(
     pair_flag: PairFlag,
 ) -> Result<()> {
     let meas_tx: MeasTx = Arc::new(Mutex::new(meas_tx));
+    alc_hub_common::task::name_next(c"ble");
     std::thread::Builder::new()
         .name("ble".into())
         .stack_size(16 * 1024)

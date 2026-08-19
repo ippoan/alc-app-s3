@@ -5,11 +5,10 @@
 //!
 //! - RS232M Module 13.2 → DB9 → FC-1200: TX=G17 / RX=G18 (DIP スイッチ候補)。
 //!   G13/G0/G14 は CoreS3 内蔵 I2S が使用済みのため使用不可。
-//!   LAN Module のデフォルト INT (G10) との競合を避けるため G17/G18 を選択。
 //!   シルク印刷の番号とコードの GPIO 番号が一致しない実例あり
 //!   (M5Stack Community #5581) — 実機で要確認。
-//! - LAN Module 13.2 (W5500): CS=G1 / RST=G0 / INT=G10 (LinkStatus.ino 既定)。
-//!   ジャンパで INT=G34 / RST=G13 / CS=G15 へ変更可。
+//! - Base LAN PoE v1.2 (W5500): CS=G9 / RST=G7 / INT=G14 (未使用)。
+//!   本体 DB9 (RX=G13 / TX=G1) はスピーカー・NFC と衝突するため使わない。
 
 pub const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
 

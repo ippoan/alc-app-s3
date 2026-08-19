@@ -21,6 +21,7 @@ pub mod ota;
 pub mod printer;
 pub mod recorder;
 pub mod rs232;
+pub mod task;
 #[cfg(feature = "nfc-verify")]
 pub mod speaker;
 pub mod ws_uplink;

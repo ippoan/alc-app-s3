@@ -116,6 +116,7 @@ pub fn start(
     status: SharedStatus,
     settings: Settings,
 ) -> Result<()> {
+    crate::task::name_next_psram(c"gw_link", 12 * 1024);
     std::thread::Builder::new()
         .name("gw_link".into())
         .stack_size(12 * 1024)

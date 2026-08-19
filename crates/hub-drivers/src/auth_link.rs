@@ -49,6 +49,7 @@ const NETWORK_WAIT_MS: u64 = 45_000;
 /// 未接続で、待たずに叩くと「リクエスト送信に失敗」になる。待機はデバイスの
 /// 責務 — ホスト側にポーリングさせない)。
 pub fn spawn_mint_test(settings: Settings, status: SharedStatus) {
+    crate::task::name_next(c"auth_mint");
     let spawned = std::thread::Builder::new()
         .name("auth_mint".into())
         .stack_size(20 * 1024)

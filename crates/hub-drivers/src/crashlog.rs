@@ -108,6 +108,31 @@ pub fn note(line: &str) {
     ring_write(b"\n");
 }
 
+/// リングの現在内容をホストへ吐き出す (`LOG DUMP`)。
+///
+/// クラッシュ由来のリセットを待たずに読めるのが `report()` との違い。
+/// 「LAN が切れたが再起動はしていない」ような、事象後に誰も繋いでいなかった
+/// 障害の原因を後から取りに行くための口 (Refs #74)。
+/// 応答は `LOGDUMP BEGIN` / `LOGDUMP <行>` … / `LOGDUMP END <行数>`。
+pub fn dump() {
+    let text = unsafe {
+        let r = ring_ptr();
+        if (*r).magic == MAGIC && pure::ring_valid(RING_CAP, (*r).pos, (*r).len) {
+            let raw = pure::ring_snapshot(&(*r).data, (*r).pos, (*r).len);
+            pure::sanitize_log(&raw)
+        } else {
+            String::new()
+        }
+    };
+    println!("LOGDUMP BEGIN");
+    let mut n = 0usize;
+    for line in text.lines() {
+        println!("LOGDUMP {line}");
+        n += 1;
+    }
+    println!("LOGDUMP END {n}");
+}
+
 /// esp_log の vprintf hook。1 回の vsnprintf で整形し、リング追記と
 /// コンソール出力 (stdout = USB Serial/JTAG) の両方へ流す。
 /// va_list は一度しか消費できない (va_copy は Rust から使えない) ため、

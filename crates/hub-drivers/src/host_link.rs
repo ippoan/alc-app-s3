@@ -27,6 +27,7 @@
 //! | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` を返す |
 //! | `HEAP` | `HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> TOTAL_INT=<n> TOTAL_PSRAM=<n>` を返す (Refs #27) |
 //! | `HEAP DUMP` | `HEAPDUMP ...` 複数行 (ヒープブロック概況 + タスク別スタック余裕) |
+//! | `LOG DUMP` | `LOGDUMP ...` 複数行 (`.noinit` リングの直近ログ。事象の事後解析用) |
 //!
 //! # 送信イベント (CoreS3 → ホスト)
 //!
@@ -85,6 +86,7 @@ pub fn start(
         sys::esp_vfs_usb_serial_jtag_use_driver();
     }
 
+    crate::task::name_next(c"host_link");
     std::thread::Builder::new()
         .name("host_link".into())
         .stack_size(12 * 1024)
@@ -335,6 +337,9 @@ fn handle_line(
         }
         // ヒープ詳細: ブロック概況 + タスク別スタック余裕 (heap.rs 参照)
         HostCommand::HeapDump => crate::heap::dump(),
+        // 直近ログ: .noinit リングの現在内容 (crashlog.rs 参照)。
+        // 事象の後から原因を取りに行くための口
+        HostCommand::LogDump => crate::crashlog::dump(),
         // OTA 更新 (進捗・結果は EVT OTA_* で届く。シリアル経路は WS 進捗 sink
         // 無し = None。ota.rs 参照)
         HostCommand::Ota { url } => {
