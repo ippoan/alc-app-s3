@@ -155,6 +155,7 @@ pub fn start(status: SharedStatus) -> Result<()> {
         }
     }
 
+    crate::task::name_next(c"heap_mon");
     std::thread::Builder::new()
         .name("heap_mon".into())
         .stack_size(3 * 1024)

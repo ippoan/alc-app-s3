@@ -54,7 +54,12 @@ CONFIG_SPIRAM_USE_MALLOC=y
 # 4KB 未満の割当 (頻繁アクセスの小物・ドライバ周り) は内蔵 SRAM に残す
 # (2048 も実機で試したが削減効果は ±2KB で誤差 — 残る内部RAM 消費はタスク
 # スタック / BT controller / Wi-Fi ドライバ本体で、この閾値では動かない)
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+# 4096 だと 4KB 以下の malloc が全部内部RAM に載り、NFC (nfc-verify) を
+# 有効にすると ws_uplink の TLS ゲート (内部RAM 60KB) を満たせなくなる
+# (実測 FREE_INT=38871 / largest_free=28672 で接続延期が続いた)。
+# DMA/ISR 用は heap_caps 側で明示的に内部RAM を要求するため、素の malloc を
+# PSRAM へ逃がしても安全。
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
 # DMA / 内蔵必須の割当が枯渇しないよう内蔵側に 64KB 予約
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 # PSRAM 初期化失敗時も abort せず PSRAM なしで boot 継続 (fail-safe)

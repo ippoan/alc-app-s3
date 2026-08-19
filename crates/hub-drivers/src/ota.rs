@@ -88,9 +88,12 @@ pub fn spawn_update(url: String, status: SharedStatus, progress: Option<Progress
     // (戻し忘れると呼び出し元スレッド — ws_uplink の run() ループ等 — が
     // その後 spawn する別処理 — printer.rs の spawn_print 等 — も
     // 意図せず PSRAM スタックになってしまう)
+    // 名前もここで一緒に指定する。別途 task::name_next を呼ぶと設定ごと
+    // 上書きされ、PSRAM スタックの指定が消えてしまう
     if let Err(e) = (ThreadSpawnConfiguration {
+        name: Some(c"ota"),
         stack_size: 20 * 1024,
-        stack_alloc_caps: EnumSet::only(MallocCap::Spiram),
+        stack_alloc_caps: MallocCap::Spiram | MallocCap::Cap8bit,
         ..Default::default()
     }
     .set())

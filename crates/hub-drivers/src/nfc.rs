@@ -6,8 +6,9 @@
 //! I2C1 (NFC 専用) を完全分離し、Rust/C++ 二重の I2C ドライバ install を避ける。
 //!
 //! 配線: DIN Base Port A (SDA=G2 / SCL=G1、AtomS3 ベンチ (crates/atoms3-nfc) と
-//! 同一ピン番号)。issue #101 の LAN Module 13.2 取り外し構成が前提 — Port B
-//! (旧配線 G8/G9) は issue #84 検討時の暫定割当だった。ack しなければ
+//! 同一ピン番号)。Port B (旧配線 G8/G9) は issue #84 検討時の暫定割当で、
+//! G9 は Base LAN PoE v1.2 の W5500 CS が使うため戻せない。SCL=G1 は Base
+//! 本体の DB9 (TX=G1) と衝突するので、その DB9 は使わないこと。ack しなければ
 //! `sda`/`scl` の実引数を入替えて再試行すること。
 //!
 //! 存在検知ゲート + F(交通系IDm)→A(HCE/UID)→B(免許証) 逐次掃引は
@@ -76,6 +77,7 @@ pub fn start(
     drop(sda);
     drop(scl);
 
+    crate::task::name_next_psram(c"nfc", 8 * 1024);
     std::thread::Builder::new()
         .name("nfc".into())
         // APDU 組立 (String) + FFI 経由の hex 文字列バッファがあるため rs232.rs と同等

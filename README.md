@@ -18,7 +18,7 @@ CoreS3
   ├─ 内蔵 BLE → NT-100B / NBP-1BLE            ← 実装済み (hub-ble,
   │                                             ble-medical-gateway 移植)
   ├─ 内蔵 Wi-Fi (2.4GHz)                       ← Improv 設定 + 自動再接続 (hub-wifi)
-  └─ LAN Module 13.2 (W5500, PoE)             ← 未実装スタブ (hub-drivers/lan.rs)
+  └─ Base LAN PoE v1.2 (W5500, PoE)           ← `lan` feature (hub-drivers/lan.rs)
 ```
 
 想定フロー (Windows 排除案): タブレットで顔認証 → ホストが `QR <token>` を送信 →
@@ -52,6 +52,7 @@ Idle ─タップ→ Menu                                         自動/タッ�
 | `RESET` | 待機画面へ |
 | `ROTATE <0\|90\|180\|270>` | 画面向き変更 (NVS 保存、再起動後も維持) |
 | `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0` 応答 |
+| `LOG DUMP` | 直近ログ (`.noinit` リング) を `LOGDUMP ...` で吸い出す。事象の後から原因を追う用 |
 | `CFG GET` | 現在の設定を 1 行 JSON でエクスポート |
 | `CFG SET <json>` | 設定 (画面向き + Wi-Fi) を検証して NVS へインポート |
 | `WIFI TEST` | 保存済み Wi-Fi 設定で接続テスト (失敗時は原因を切り分け) |
@@ -93,7 +94,7 @@ ESP-IDF のログが同じコンソールに混在するため、ホスト側は
 | LCD SPI2 | SCLK=G36 / MOSI=G37 / CS=G3 / DC=G35 | M5GFX CoreS3 定義準拠。RST=AW9523 P1_1, BL=AXP2101 DLDO1 |
 | タッチ I2C | SDA=G12 / SCL=G11 (0x38) | AXP2101(0x34) / AW9523(0x58) と共用 |
 | RS232M | TX=G17 / RX=G18 | DIP スイッチ候補。**シルク番号≠GPIO 番号の実例あり (Community #5581)、実機で要確認** |
-| LAN Module | CS=G1 / RST=G0 / INT=G10 | 未実装。G10 は RS232M 候補と競合し得る (ジャンパで回避可) |
+| Base LAN PoE v1.2 | CS=G9 / RST=G7 / INT=G14 | `lan` feature。INT は未使用 (polling)。本体 DB9 (RX=G13 / TX=G1) は使わない |
 
 G13 / G0 / G14 は CoreS3 内蔵 I2S が使用済みのため RS232M では使用不可。
 

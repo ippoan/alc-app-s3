@@ -9,5 +9,6 @@ pub mod control;
 pub mod measurement;
 pub mod settings;
 pub mod status;
+pub mod task;
 pub mod ui_api;
 pub mod wdt;

@@ -55,6 +55,7 @@ pub fn start(
         &cfg,
     )?;
 
+    crate::task::name_next_psram(c"rs232", 8 * 1024);
     std::thread::Builder::new()
         .name("rs232".into())
         // プロトコル処理 (String 組み立て) が乗るため passthrough 時代の 4096 から増量

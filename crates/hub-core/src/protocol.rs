@@ -52,6 +52,10 @@ pub enum HostCommand {
     /// ヒープ詳細ダンプ: タスク別スタック余裕 + ヒープブロック概況
     /// (`HEAPDUMP ...` 複数行を応答)
     HeapDump,
+    /// 直近ログの吸い出し: `.noinit` リング (crashlog.rs) の現在内容を
+    /// `LOGDUMP ...` 複数行で応答する。クラッシュしていなくても呼べるため、
+    /// 「LAN が切れた後に原因を取りに行く」用途に使う
+    LogDump,
     /// OTA 更新: firmware (app 単体イメージ) の URL からダウンロードして
     /// もう一方の OTA スロットへ書き込み、再起動する (`EVT OTA_* ...` を出力)
     Ota { url: String },
@@ -123,6 +127,11 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
             None => HostCommand::Heap,
             Some("DUMP") => HostCommand::HeapDump,
             _ => return Err("ERR HEAP: 引数は DUMP のみ (無引数 = 概況)".into()),
+        },
+        // 直近ログの吸い出し (障害の事後解析用。crashlog.rs のリング)
+        "LOG" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+            Some("DUMP") => HostCommand::LogDump,
+            _ => return Err("ERR LOG: 引数は DUMP のみ".into()),
         },
         // OTA 更新 (URL は大文字小文字を保持)
         "OTA" => match it.next() {
@@ -347,6 +356,15 @@ mod tests {
         assert_eq!(parse_line("HEAP DUMP", T), Ok(Some(HostCommand::HeapDump)));
         assert_eq!(parse_line("heap dump", T), Ok(Some(HostCommand::HeapDump)));
         assert!(parse_line("HEAP FULL", T).is_err());
+    }
+
+    #[test]
+    fn log_dump() {
+        assert_eq!(parse_line("LOG DUMP", T), Ok(Some(HostCommand::LogDump)));
+        assert_eq!(parse_line("log dump", T), Ok(Some(HostCommand::LogDump)));
+        // 無引数・未知の引数はどちらもエラー (HEAP と違い無引数の意味は無い)
+        assert!(parse_line("LOG", T).is_err());
+        assert!(parse_line("LOG TAIL", T).is_err());
     }
 
     #[test]

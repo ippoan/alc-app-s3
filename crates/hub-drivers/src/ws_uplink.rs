@@ -64,6 +64,12 @@ const TOKEN_REFRESH_MARGIN_S: u64 = 120;
 /// 測定不能になる (実機で確認) ため、余裕がない間は接続を延期する。
 /// 実測: Wi-Fi + BLE + UI 起動後の定常空きは約 70KB (バッファ削減後)、
 /// TLS ハンドシェイクのピークは DYNAMIC_BUFFER 有効で約 30KB
+///
+/// NFC (nfc-verify) を積むと定常空きが下がりこの値を割るが、**ゲートは
+/// 下げない**。下げると BLE 側が Malloc failed で測定不能になる条件へ
+/// 近づくだけで、原因 (内部RAM の食い過ぎ) は残る。実空きを増やして
+/// 満たすこと — スタック削減 (下記) と `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`
+/// の引き下げが効く。
 const MIN_FREE_HEAP_FOR_TLS: u32 = 60 * 1024;
 
 /// WS イベントコールバック → 送信スレッドへの通知
@@ -83,6 +89,7 @@ pub fn start(
     settings: Settings,
 ) -> Result<()> {
     // TLS ハンドシェイクが呼び出しスレッドのスタックを使うため大きめ
+    crate::task::name_next(c"ws_uplink");
     std::thread::Builder::new()
         .name("ws_uplink".into())
         .stack_size(20 * 1024)

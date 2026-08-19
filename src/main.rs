@@ -61,7 +61,7 @@ fn main() -> Result<()> {
 
     // 電源 (LCD バックライト・リセット含む) → LCD の順で初期化。
     // M-Bus/SPI2 バス (SCK=G36 / MISO=G35 / MOSI=G37) は LCD (CS=G3) と
-    // LAN Module 13.2 の W5500 (CS=G13、lan.rs) が共有する。G35 は LCD の
+    // Base LAN PoE v1.2 の W5500 (CS=G9、lan.rs) が共有する。G35 は LCD の
     // DC と二役 (display.rs SharedDcInterface 参照)。DMA 必須 — 無効だと
     // Ethernet フレーム転送が 64 バイト上限で全滅する (atoms3-print の実機知見)
     board::power::init(&mut i2c)?;
@@ -101,6 +101,7 @@ fn main() -> Result<()> {
         // 起動時接続 + 切断検出時の自動再接続を常駐スレッドで維持する。
         // (単発接続だと BLE との電波競合や AP 瞬断で一度切れると復帰しない)
         let wifi = wifi.clone();
+        alc_hub_drivers::task::name_next(c"wifi_keepalive");
         std::thread::Builder::new()
             .name("wifi_keepalive".into())
             .stack_size(8 * 1024)
@@ -160,11 +161,12 @@ fn main() -> Result<()> {
         tx.clone(),
     )?;
     // Unit NFC (ST25R3916) (issue #84 / #101)。DIN Base Port A (SDA=G2 / SCL=G1)
-    // に配線 (AtomS3 ベンチと同一ピン番号、issue #101 の LAN Module 取り外し構成が前提)。
+    // に配線 (AtomS3 ベンチと同一ピン番号)。SCL=G1 は Base LAN PoE v1.2 本体の
+    // DB9 (TX=G1) と衝突するため、その DB9 は使わない。
     // I2C1 は C++ 側 (components/nfc_shim → M5HAL) が所有するため p.i2c1 は take しない
     // (I2C0=内部バス G12/G11 電源IC/タッチとは完全に別ポート)。
-    // 内蔵スピーカー (I2S DOUT=G13) は LAN Module の CS と同一ピンのため排他 (`lan`
-    // feature 参照)。読み取りビープは issue #101 PR2
+    // 内蔵スピーカー (I2S DOUT=G13) は Base LAN PoE v1.2 (CS=G9) とは競合しない。
+    // 読み取りビープは issue #101 PR2
     #[cfg(feature = "nfc-verify")]
     {
         // 発音の成立条件 (issue #102 実機切り分けで確定):
@@ -197,14 +199,15 @@ fn main() -> Result<()> {
             speaker_tx,
         )?;
     }
-    // LAN Module 13.2 (W5500): CS=G13 (RS232M 併用ジャンパ) / RST=G0 / INT=G10 未使用。
-    // G13 は内蔵スピーカーの I2S DOUT と共用のため、LAN Module 取り外し構成
-    // (issue #101) では `lan` feature を無効化する (既定 off)
+    // Base LAN PoE v1.2 (W5500): CS=G9 / RST=G7 / INT=G14 未使用。
+    // 旧 LAN Module 13.2 は CS ジャンパが G1/G13 の二択で、G13 が内蔵スピーカーの
+    // I2S DOUT と固定で競合していた。Base LAN PoE v1.2 は CS が G9 に出るため
+    // スピーカーと排他にする必要がない (plan/cores3-hub-consolidation.md「次期構成」)
     #[cfg(feature = "lan")]
     lan::start(
         spi,
-        p.pins.gpio13.into(),
-        p.pins.gpio0.into(),
+        p.pins.gpio9.into(),
+        p.pins.gpio7.into(),
         sysloop,
         Arc::clone(&status),
     )?;

@@ -56,6 +56,7 @@ pub fn start(
     sysloop: EspSystemEventLoop,
     status: SharedStatus,
 ) -> Result<()> {
+    crate::task::name_next_psram(c"eth_w5500", 8 * 1024);
     std::thread::Builder::new()
         .name("eth_w5500".into())
         // TCP/IP イベント + ドライバ初期化を考慮して余裕を持たせる
@@ -128,6 +129,10 @@ fn monitor_loop(
                     Ok(i) => println!("EVT ETH_CONNECTED {ip} subnet={:?}", i.subnet),
                     Err(e) => println!("EVT ETH_CONNECTED {ip} (ip_info 取得失敗: {e})"),
                 }
+                // println! は vprintf hook を通らないためリングに残らない。
+                // 事後解析 (`LOG DUMP`) で「いつ繋がって いつ切れたか」を
+                // 追えるよう明示的に残す (crashlog.rs 参照)
+                crate::crashlog::note(&format!("EVT ETH_CONNECTED {ip} up_ms={}", now_ms()));
                 if let Ok(mut st) = status.lock() {
                     st.lan_link = true;
                     st.lan_ip = ip.clone();
@@ -135,6 +140,16 @@ fn monitor_loop(
                 }
             } else {
                 println!("EVT ETH_DISCONNECTED");
+                // 切断時は「そのとき何が枯れていたか」まで残す。ヒープ不足と
+                // SPI 競合のどちらなのかを、後から `LOG DUMP` だけで切り分ける
+                let h = crate::heap::stats();
+                crate::crashlog::note(&format!(
+                    "EVT ETH_DISCONNECTED up_ms={} free_int={} min_int={} free_psram={}",
+                    now_ms(),
+                    h.free_int,
+                    h.min_int,
+                    h.free_psram,
+                ));
                 if let Ok(mut st) = status.lock() {
                     st.lan_link = false;
                     st.lan_ip.clear();

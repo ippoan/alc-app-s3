@@ -9,9 +9,10 @@
 //! レジスタ値は M5Unified (`M5Unified.cpp` の `_speaker_enabled_cb_cores3`、
 //! MIT license) の CoreS3 初期化シーケンスを移植したもの。
 //!
-//! I2S DOUT=G13 は LAN Module 13.2 の CS (`lan.rs`) と同一ピンのため、内蔵
-//! スピーカーを使う構成では LAN Module を取り外す (issue #101 の前提、
-//! `main.rs` の `lan` feature を無効化)。
+//! I2S DOUT=G13 は旧 LAN Module 13.2 の CS と同一ピンで排他だったが、
+//! Base LAN PoE v1.2 (CS=G9、`lan.rs`) では競合しないため `lan` feature と
+//! 同時に有効化できる。ただし Base 本体の DB9 (RS232/RS485 RX=G13) を
+//! 使うと再び衝突する。
 
 use anyhow::Result;
 use esp_idf_svc::hal::delay::{FreeRtos, BLOCK};
@@ -142,6 +143,7 @@ pub enum Sound {
 /// キュー投入だけで即座に戻る。再生中に届いた依頼は順次再生される
 pub fn start_player(mut speaker: Speaker) -> Result<std::sync::mpsc::Sender<Sound>> {
     let (tx, rx) = std::sync::mpsc::channel::<Sound>();
+    crate::task::name_next_psram(c"speaker", 8 * 1024);
     std::thread::Builder::new()
         .name("speaker".into())
         .stack_size(8 * 1024)

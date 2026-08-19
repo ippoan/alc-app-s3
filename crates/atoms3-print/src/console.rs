@@ -112,6 +112,7 @@ fn handle_line(line: &str, status: &SharedStatus, settings: &Settings) {
             );
         }
         HostCommand::HeapDump => heap::dump(),
+        HostCommand::LogDump => alc_hub_drivers::crashlog::dump(),
         // オンラインアップデート (進捗・結果は EVT OTA_*)。
         // LAN 確立前に lwip を叩くと assert リブートするためガードする
         // (printer::spawn_print と同じ理由)
