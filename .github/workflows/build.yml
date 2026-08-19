@@ -144,7 +144,7 @@ jobs:
             esp-idf-tools-${{ runner.os }}-
 
       # esp ツールチェーン (数百MB) のダウンロードを毎回やらない。
-      # 新しい Rust ESP リリースに上げたい時は key の -v1 を上げて invalidate
+      # 新しい Rust ESP リリースに上げたい時は key の -v2 を上げて invalidate
       - name: Cache Xtensa Rust toolchain
         id: cache-xtensa
         uses: actions/cache@v4
@@ -152,10 +152,27 @@ jobs:
           path: |
             ~/.rustup/toolchains/esp
             ~/.cargo/bin/ldproxy
-          key: xtensa-rust-${{ runner.os }}-v1
+          key: xtensa-rust-${{ runner.os }}-v2
+
+      # cache hit でも中身が揃っているとは限らない。実際 2026-08-19 に
+      # `~/.rustup/toolchains/esp` はあるが `~/.cargo/bin/ldproxy` が無い
+      # キャッシュが復元され、Install をスキップした結果
+      # `error: linker ldproxy not found` で main の firmware ビルドが
+      # 2 バイナリとも落ちた (再実行しても同じキャッシュを引くので復旧しない)。
+      # 実体を見て欠けていたら Install に倒す。
+      - name: Verify cached toolchain (ldproxy)
+        id: verify-xtensa
+        if: steps.cache-xtensa.outputs.cache-hit == 'true'
+        run: |
+          if [ -x "$HOME/.cargo/bin/ldproxy" ]; then
+            echo "ldproxy=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::キャッシュに ldproxy が無いためツールチェーンを再インストールします"
+            echo "ldproxy=missing" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Install Xtensa Rust toolchain
-        if: steps.cache-xtensa.outputs.cache-hit != 'true'
+        if: steps.cache-xtensa.outputs.cache-hit != 'true' || steps.verify-xtensa.outputs.ldproxy != 'ok'
         uses: esp-rs/xtensa-toolchain@v1.7.0
         with:
           default: true
@@ -168,7 +185,7 @@ jobs:
       # (PR #5-#7 で実測)。キャッシュ済みツールチェーン内の xtensa 対応
       # libclang を探して設定する
       - name: Export LIBCLANG_PATH (cache hit)
-        if: steps.cache-xtensa.outputs.cache-hit == 'true'
+        if: steps.cache-xtensa.outputs.cache-hit == 'true' && steps.verify-xtensa.outputs.ldproxy == 'ok'
         run: |
           LIBCLANG_FILE=$(find "$HOME/.rustup/toolchains/esp" -name 'libclang.so*' -type f 2>/dev/null | head -1)
           if [ -z "$LIBCLANG_FILE" ]; then
@@ -277,7 +294,7 @@ jobs:
             esp-idf-tools-${{ runner.os }}-
 
       # esp ツールチェーン (数百MB) のダウンロードを毎回やらない。
-      # 新しい Rust ESP リリースに上げたい時は key の -v1 を上げて invalidate
+      # 新しい Rust ESP リリースに上げたい時は key の -v2 を上げて invalidate
       - name: Cache Xtensa Rust toolchain
         id: cache-xtensa
         uses: actions/cache@v4
@@ -285,10 +302,27 @@ jobs:
           path: |
             ~/.rustup/toolchains/esp
             ~/.cargo/bin/ldproxy
-          key: xtensa-rust-${{ runner.os }}-v1
+          key: xtensa-rust-${{ runner.os }}-v2
+
+      # cache hit でも中身が揃っているとは限らない。実際 2026-08-19 に
+      # `~/.rustup/toolchains/esp` はあるが `~/.cargo/bin/ldproxy` が無い
+      # キャッシュが復元され、Install をスキップした結果
+      # `error: linker ldproxy not found` で main の firmware ビルドが
+      # 2 バイナリとも落ちた (再実行しても同じキャッシュを引くので復旧しない)。
+      # 実体を見て欠けていたら Install に倒す。
+      - name: Verify cached toolchain (ldproxy)
+        id: verify-xtensa
+        if: steps.cache-xtensa.outputs.cache-hit == 'true'
+        run: |
+          if [ -x "$HOME/.cargo/bin/ldproxy" ]; then
+            echo "ldproxy=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::キャッシュに ldproxy が無いためツールチェーンを再インストールします"
+            echo "ldproxy=missing" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Install Xtensa Rust toolchain
-        if: steps.cache-xtensa.outputs.cache-hit != 'true'
+        if: steps.cache-xtensa.outputs.cache-hit != 'true' || steps.verify-xtensa.outputs.ldproxy != 'ok'
         uses: esp-rs/xtensa-toolchain@v1.7.0
         with:
           default: true
@@ -301,7 +335,7 @@ jobs:
       # (PR #5-#7 で実測)。キャッシュ済みツールチェーン内の xtensa 対応
       # libclang を探して設定する
       - name: Export LIBCLANG_PATH (cache hit)
-        if: steps.cache-xtensa.outputs.cache-hit == 'true'
+        if: steps.cache-xtensa.outputs.cache-hit == 'true' && steps.verify-xtensa.outputs.ldproxy == 'ok'
         run: |
           LIBCLANG_FILE=$(find "$HOME/.rustup/toolchains/esp" -name 'libclang.so*' -type f 2>/dev/null | head -1)
           if [ -z "$LIBCLANG_FILE" ]; then
