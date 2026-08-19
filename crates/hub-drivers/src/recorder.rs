@@ -29,6 +29,15 @@ fn epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// 進行中の点呼セッション ID を読む (Refs #112)。
+///
+/// 発番は UI スレッド (点呼の開始/終了を知っているのは画面状態機械) で、
+/// ここは現在値を読むだけ。ロックが取れなければ None — セッションの紐づけを
+/// 失うだけで測定そのものは送る (fail-open)。
+fn current_session_id(status: &SharedStatus) -> Option<String> {
+    status.lock().ok().and_then(|st| st.session_id.clone())
+}
+
 pub fn start(
     meas_rx: Receiver<Measurement>,
     ui_tx: Sender<UiCommand>,
@@ -80,6 +89,7 @@ pub fn start(
                             kind: "temperature",
                             payload: json,
                             recorded_at_ms: epoch_ms(),
+                            session_id: current_session_id(&status),
                         };
                         let _ = gw_tx.send(rec.clone());
                         let _ = ws_tx.send(rec);
@@ -118,6 +128,7 @@ pub fn start(
                             kind: "blood_pressure",
                             payload: json,
                             recorded_at_ms: epoch_ms(),
+                            session_id: current_session_id(&status),
                         };
                         let _ = gw_tx.send(rec.clone());
                         let _ = ws_tx.send(rec);
@@ -145,6 +156,7 @@ pub fn start(
                             kind: "alcohol",
                             payload: json,
                             recorded_at_ms: epoch_ms(),
+                            session_id: current_session_id(&status),
                         };
                         let _ = gw_tx.send(rec.clone());
                         let _ = ws_tx.send(rec);

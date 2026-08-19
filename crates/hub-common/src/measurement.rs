@@ -16,6 +16,10 @@ pub struct UplinkRecord {
     pub payload: String,
     /// 記録時刻 (epoch ms、NTP 未同期時は稼働時間由来の値になり得る)
     pub recorded_at_ms: u64,
+    /// 1 回の点呼を束ねる識別子 (Refs #112)。点呼中 (UI が Measuring) の測定にだけ
+    /// 載り、待機画面で届いた単発計測では None。発番は UI スレッド、ここへは
+    /// recorder が `HubStatus` 経由で読んだ現在値が入る。
+    pub session_id: Option<String>,
 }
 
 /// 1 回の測定結果 (alloc 不要の Copy 型)

@@ -96,6 +96,7 @@ pub fn run(
     rx: Receiver<UiCommand>,
     status: SharedStatus,
     initial_rotation: u16,
+    boot_id: u32,
 ) -> ! {
     screens::draw_boot(&mut display);
 
@@ -107,6 +108,12 @@ pub fn run(
     alc_hub_common::wdt::subscribe_current_as_ui();
 
     let mut rotation = initial_rotation;
+    // 点呼セッションの発番器 (Refs #112)。**UI だけが発番する** — 点呼の開始と
+    // 終了を知っているのはこの状態機械だけで、recorder は HubStatus 経由で
+    // 現在値を読むだけ。boot_id は NVS 永続の起動カウンタで、再起動をまたいだ
+    // ID の再利用 (= 別々の点呼がサーバ側で融合する) を防ぐ。
+    let mut session_gen = alc_hub_core::session::SessionIdGen::new(boot_id);
+    let mut in_session = false;
     let mut screen = Screen::Idle;
     let mut entered = now_ms();
     let mut dirty = true;
@@ -412,6 +419,26 @@ pub fn run(
                     screens::draw_tenko_spinner(&mut display, kind, spin_phase);
                     last_spin = now;
                 }
+            }
+        }
+
+        // --- 点呼セッションの同期 (Refs #112) ---
+        // 遷移箇所ごとに書くのではなく「今 Measuring にいるか」を毎周見て差分で
+        // 更新する。Measuring への入口 (MEASURE コマンド / メニューのタップ) も
+        // 出口 (RESET / 自動クローズ / タイムアウト / タッチ) も複数あり、
+        // 個別に捕まえると必ずどこかで取りこぼすため。
+        let now_in_session = matches!(screen, Screen::Measuring { .. });
+        if now_in_session != in_session {
+            in_session = now_in_session;
+            let session_id = if now_in_session {
+                let id = session_gen.next();
+                println!("EVT TENKO_SESSION {id}");
+                Some(id)
+            } else {
+                None
+            };
+            if let Ok(mut st) = status.lock() {
+                st.session_id = session_id;
             }
         }
 

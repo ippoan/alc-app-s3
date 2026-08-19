@@ -3,6 +3,8 @@
 //! フレーム形式は cf-alc-recorder/README.md (ippoan/alc-app#108) が正:
 //!
 //! - 上り: `{"type":"measurement","seq":N,"recorded_at_ms":T,"kind":K,"payload":{..}}`
+//!   (点呼中の測定にはさらに `"session_id":"<boot>-<n>"` が載る、Refs #112。
+//!    点呼外の単発計測では **key ごと省く** = 旧フレームと同一)
 //!   → `{"type":"ack","seq":N}` / `{"type":"error","seq":N,"message":".."}`
 //! - 上り: `{"type":"command_result","id":"..","payload":{..}}` / `{"type":"ping"}`
 //! - 下り: `{"type":"connected"}` / `{"type":"pong"}` /
@@ -29,6 +31,10 @@ pub struct QueueEntry {
     pub recorded_at_ms: u64,
     pub kind: String,
     pub payload: String,
+    /// 1 回の点呼を束ねる識別子 (Refs #112)。点呼外の単発計測では None。
+    /// **None のときはフレームにも NVS にも出さない** — 旧サーバ / 旧 NVS データとの
+    /// 互換を保つため (受け側は欠落を「セッション不明」として扱う)。
+    pub session_id: Option<String>,
 }
 
 /// 下り (server → CoreS3) フレーム
@@ -59,14 +65,18 @@ fn payload_object(payload: &str) -> Result<Value, String> {
 /// 上り measurement フレームを組み立てる
 pub fn measurement_frame(entry: &QueueEntry) -> Result<String, String> {
     let payload = payload_object(&entry.payload)?;
-    Ok(json!({
+    let mut frame = json!({
         "type": "measurement",
         "seq": entry.seq,
         "recorded_at_ms": entry.recorded_at_ms,
         "kind": entry.kind,
         "payload": payload,
-    })
-    .to_string())
+    });
+    // None のときは key ごと省く (旧フレームと 1 バイトも変わらない形にする)
+    if let Some(session_id) = &entry.session_id {
+        frame["session_id"] = json!(session_id);
+    }
+    Ok(frame.to_string())
 }
 
 /// 上り command_result フレームを組み立てる
@@ -268,6 +278,11 @@ impl UplinkQueue {
             recorded_at_ms: obj.get("recorded_at_ms")?.as_u64()?,
             kind: obj.get("kind")?.as_str()?.to_string(),
             payload: obj.get("payload").filter(|p| p.is_object())?.to_string(),
+            // 旧フォーマット (session_id を持たない NVS データ) は None で復元する
+            session_id: obj
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         })
     }
 
@@ -278,13 +293,16 @@ impl UplinkQueue {
             .map(|e| {
                 // payload は restore/push で検証済みのため必ずオブジェクト
                 let payload: Value = serde_json::from_str(&e.payload).expect("validated payload");
-                json!({
+                let mut line = json!({
                     "seq": e.seq,
                     "recorded_at_ms": e.recorded_at_ms,
                     "kind": e.kind,
                     "payload": payload,
-                })
-                .to_string()
+                });
+                if let Some(session_id) = &e.session_id {
+                    line["session_id"] = json!(session_id);
+                }
+                line.to_string()
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -298,6 +316,18 @@ impl UplinkQueue {
         recorded_at_ms: u64,
         payload: &str,
     ) -> Result<(u64, Option<u64>), String> {
+        self.push_with_session(kind, recorded_at_ms, payload, None)
+    }
+
+    /// 点呼セッション付きで積む (Refs #112)。`session_id` が None なら
+    /// [`Self::push`] と完全に同じ (点呼外の単発計測)。
+    pub fn push_with_session(
+        &mut self,
+        kind: &str,
+        recorded_at_ms: u64,
+        payload: &str,
+        session_id: Option<&str>,
+    ) -> Result<(u64, Option<u64>), String> {
         // 正規化して保存する (serialize/restore の roundtrip をキー順に依らず
         // 一致させるため。measurement_frame にもこの正規化済み文字列が渡る)
         let payload = payload_object(payload)?.to_string();
@@ -308,6 +338,7 @@ impl UplinkQueue {
             recorded_at_ms,
             kind: kind.to_string(),
             payload,
+            session_id: session_id.map(str::to_string),
         });
         let dropped = if self.entries.len() > self.max {
             self.entries.pop_front().map(|e| e.seq)
@@ -355,6 +386,7 @@ mod tests {
             recorded_at_ms: 1_752_300_000_000,
             kind: "temperature".into(),
             payload: PAYLOAD.into(),
+            session_id: None,
         };
         let f = measurement_frame(&e).unwrap();
         let v: Value = serde_json::from_str(&f).unwrap();
@@ -366,12 +398,63 @@ mod tests {
     }
 
     #[test]
+    fn measurement_frame_omits_session_id_when_absent_and_emits_it_when_present() {
+        // 点呼外の単発計測: key ごと出さない (旧フレームと同一 = 旧サーバでも壊れない)
+        let mut e = QueueEntry {
+            seq: 3,
+            recorded_at_ms: 1_752_300_000_000,
+            kind: "temperature".into(),
+            payload: PAYLOAD.into(),
+            session_id: None,
+        };
+        let v: Value = serde_json::from_str(&measurement_frame(&e).unwrap()).unwrap();
+        assert!(v.as_object().unwrap().get("session_id").is_none());
+
+        // 点呼中: そのまま載る
+        e.session_id = Some("7-1".into());
+        let v: Value = serde_json::from_str(&measurement_frame(&e).unwrap()).unwrap();
+        assert_eq!(v["session_id"], "7-1");
+    }
+
+    #[test]
+    fn push_with_session_roundtrips_through_nvs_serialize() {
+        let (mut q, _) = UplinkQueue::restore(0, "", 10);
+        q.push_with_session("alcohol", 100, PAYLOAD, Some("7-1"))
+            .unwrap();
+        q.push_with_session("temperature", 200, PAYLOAD, Some("7-1"))
+            .unwrap();
+        // 点呼外の単発は None のまま
+        q.push("temperature", 300, PAYLOAD).unwrap();
+
+        let (restored, skipped) = UplinkQueue::restore(0, &q.serialize(), 10);
+        assert_eq!(skipped, 0);
+        let ids: Vec<Option<String>> = restored.entries().map(|e| e.session_id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![Some("7-1".into()), Some("7-1".into()), None],
+            "NVS 復元でセッションが失われてはならない"
+        );
+    }
+
+    #[test]
+    fn restore_accepts_old_lines_without_session_id() {
+        // session_id を知らない旧ファームが書いた NVS データを復元しても壊れない
+        let line =
+            format!(r#"{{"seq":1,"recorded_at_ms":100,"kind":"alcohol","payload":{PAYLOAD}}}"#);
+        let (q, skipped) = UplinkQueue::restore(0, &line, 10);
+        assert_eq!(skipped, 0);
+        assert_eq!(q.entries().count(), 1);
+        assert_eq!(q.entries().next().unwrap().session_id, None);
+    }
+
+    #[test]
     fn measurement_frame_rejects_bad_payload() {
         let mut e = QueueEntry {
             seq: 1,
             recorded_at_ms: 0,
             kind: "k".into(),
             payload: "{oops".into(),
+            session_id: None,
         };
         assert!(measurement_frame(&e).is_err());
         e.payload = "[1,2]".into();

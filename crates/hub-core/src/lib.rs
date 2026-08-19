@@ -18,6 +18,7 @@ pub mod layout;
 pub mod pairing;
 pub mod printer;
 pub mod protocol;
+pub mod session;
 pub mod uplink;
 pub mod vitals;
 pub mod wdt_gate;

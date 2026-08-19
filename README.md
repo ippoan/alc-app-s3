@@ -74,6 +74,7 @@ crates/hub-core/src/improv.rs)。
 | `FC1200 <hex>` | RS232 (FC-1200) 受信データのパススルー |
 | `EVT QR_TIMEOUT` / `EVT RESULT_CLOSED` | 画面の自動遷移通知 |
 | `EVT TENKO_START` | 画面メニューから点呼が開始された |
+| `EVT TENKO_SESSION <id>` | 点呼セッション ID を発番した (この点呼で採れた測定に載る、Refs #112) |
 | `EVT WIFI_TEST OK\|NG <詳細>` | `WIFI TEST` の結果 (NG は原因を切り分け) |
 | `EVT PAIR_CLEARED` | BLE ボンド消去完了 |
 | `EVT WS_CONNECTED` / `EVT WS_DISCONNECTED` | cf-alc-recorder への WS 接続状態 |
