@@ -101,6 +101,10 @@ pub fn start(
 struct Conn {
     client: EspWebSocketClient<'static>,
     connected: bool,
+    /// WS 接続が成立した時刻 [ms]。破棄ログに「どれだけ保ったか」を出すために持つ
+    /// — 即切れ (認証・経路の問題) と長時間後の切断 (hibernation・アイドル) は
+    /// 原因が別なので、ログだけで見分けられるようにする。None = 未成立。
+    connected_at: Option<u64>,
 }
 
 /// WS push 印刷 (#38) の TcpStream 書き込みタイムアウト。fetch_and_send と同値
@@ -191,15 +195,19 @@ fn run(
                 WsEvent::Connected => {
                     if let Some(c) = conn.as_mut() {
                         c.connected = true;
+                        c.connected_at = Some(now_ms());
                     }
                     connect_warned = false;
                     println!("EVT WS_CONNECTED");
+                    crate::crashlog::note("EVT WS_CONNECTED");
                     last_flush = 0; // 接続直後にキューを流す
                     dirty = true;
                 }
                 WsEvent::Disconnected => {
-                    if conn.take().is_some() {
+                    if conn.is_some() {
+                        drop_conn(&mut conn, "サーバ側から切断", &queue);
                         println!("EVT WS_DISCONNECTED");
+                        crate::crashlog::note("EVT WS_DISCONNECTED");
                     }
                     // 印刷中の切断は未完なので破棄 (drop で 9100 を閉じる)
                     print_session = None;
@@ -293,7 +301,7 @@ fn run(
                 }
             }
             if failed {
-                conn = None;
+                drop_conn(&mut conn, "測定の送信失敗", &queue);
                 backoff_until = now + RECONNECT_BACKOFF_MS;
                 publish_status(&status, &queue, false);
                 continue;
@@ -303,10 +311,14 @@ fn run(
 
         // --- 5. keep-alive ping (キューが空の間も下り command を受けるため) ---
         if now.saturating_sub(last_ping) >= PING_INTERVAL_MS {
-            let c = conn.as_mut().expect("connected implies conn");
-            if let Err(e) = c.client.send(FrameType::Text(false), PING_FRAME.as_bytes()) {
+            // 借用を send の間だけに閉じる (この後 drop_conn が &mut conn を取る)
+            let sent = {
+                let c = conn.as_mut().expect("connected implies conn");
+                c.client.send(FrameType::Text(false), PING_FRAME.as_bytes())
+            };
+            if let Err(e) = sent {
                 log::warn!("ws_uplink: ping 失敗: {e:?}");
-                conn = None;
+                drop_conn(&mut conn, "keep-alive ping の失敗", &queue);
                 backoff_until = now + RECONNECT_BACKOFF_MS;
                 publish_status(&status, &queue, false);
                 continue;
@@ -333,6 +345,38 @@ fn heap_headroom_ok(now: u64, last_log: &mut u64) -> bool {
         return false;
     }
     true
+}
+
+/// WS 接続を破棄して再接続へ回す。**破棄の直前に必ず 1 行残す**。
+///
+/// esp-idf-svc の `Drop for EspWebSocketClient` は
+/// `esp_websocket_client_close(..).unwrap()` を呼ぶため、**既に切断済みの
+/// client を drop すると ESP_FAIL で panic する** (実機で観測、`ws/client.rs:623`)。
+/// その場合 crash_log の末尾に残る最後の行がここになるので、どの経路で捨てたのか
+/// と、そのときのキューの状態が 1 行で分かる形にしておく。
+///
+/// `EVT WS_DISCONNECTED` (println!) は **crashlog の vprintf hook を通らない**
+/// ため、以前はイベント経由の破棄が痕跡ゼロだった (2026-08-19 の panic では
+/// 直前 0.5 秒に ws_uplink 由来の行が 1 つも残っていなかった)。
+fn drop_conn(conn: &mut Option<Conn>, reason: &str, queue: &UplinkQueue) {
+    let Some(c) = conn.as_ref() else {
+        return;
+    };
+    // 接続が成立していなければ "-" (接続試行の途中で捨てた場合)
+    let held = match c.connected_at {
+        Some(at) => format!("{}s", now_ms().saturating_sub(at) / 1000),
+        None => "-".to_string(),
+    };
+    let line = format!(
+        "ws_uplink: 接続を破棄 ({reason}) held={held} queue={} last_seq={}",
+        queue.len(),
+        queue.last_seq()
+    );
+    log::warn!("{line}");
+    // log::warn! は EspLogger 経由で crash リングに入るが、この行は panic 直前の
+    // 最後の手がかりになるので note() でも明示的に残す (取りこぼしを避ける)。
+    crate::crashlog::note(&line);
+    *conn = None;
 }
 
 /// 測定をキューへ積み NVS へ永続化する
@@ -664,5 +708,6 @@ fn connect(
     Ok(Conn {
         client,
         connected: false,
+        connected_at: None,
     })
 }
