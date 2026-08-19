@@ -30,6 +30,8 @@ const KEY_AUTH_URL: &str = "auth_url";
 const KEY_WS_QUEUE: &str = "ws_queue";
 /// seq 採番カウンタ。ack 後も再利用しない (サーバ側 UNIQUE 冪等化のため)
 const KEY_WS_SEQ: &str = "ws_seq";
+/// 起動カウンタ (点呼セッション ID の前置に使う、Refs #112)
+const KEY_BOOT_ID: &str = "boot_id";
 /// cf-alc-recorder WS URL の上書き (`WS URL` コマンド)
 const KEY_WS_URL: &str = "ws_url";
 /// プリンター宛先 host:port (印刷ブリッジ、`PRINTER ADDR` コマンド。#38)
@@ -210,6 +212,27 @@ impl Settings {
         if let Err(e) = nvs.set_str(KEY_WS_QUEUE, lines) {
             log::warn!("settings: WS キュー保存失敗: {e:?}");
         }
+    }
+
+    /// 起動カウンタを 1 つ進めて返す (Refs #112)。
+    ///
+    /// 点呼セッション ID の前置に使う。**起動のたびに必ず 1 回だけ呼ぶ** —
+    /// これを飛ばすと再起動後のセッション ID が前回起動分と衝突し、サーバ側で
+    /// 別々の点呼が 1 つに融合して見える。NVS 書き込みに失敗したら 0 を返す
+    /// (その起動だけ ID が前回と重なり得るが、UI と測定は止めない = fail-open)。
+    pub fn next_boot_id(&self) -> u32 {
+        let Ok(nvs) = self.nvs.lock() else { return 0 };
+        let next = nvs
+            .get_u32(KEY_BOOT_ID)
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+            .saturating_add(1);
+        if let Err(e) = nvs.set_u32(KEY_BOOT_ID, next) {
+            log::warn!("settings: boot_id 保存失敗: {e:?}");
+            return 0;
+        }
+        next
     }
 
     /// WS 送信の seq 採番カウンタ (未保存は 0)

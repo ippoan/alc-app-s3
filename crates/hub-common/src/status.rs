@@ -25,6 +25,12 @@ pub struct HubStatus {
     /// 直近イベント (新しいものが末尾)。ログ確認画面に表示する
     pub events: VecDeque<String>,
 
+    /// 進行中の点呼セッションの識別子 (Refs #112)。点呼画面 (Measuring) に
+    /// いる間だけ Some で、待機画面へ戻ると None に戻る。**発番と更新は UI
+    /// スレッドだけが行い、recorder は読むだけ** — 点呼の開始/終了を知って
+    /// いるのは画面状態機械のため。
+    pub session_id: Option<String>,
+
     /// LAN Module 13.2 (W5500) のリンク状態 (lan.rs — 未実装のため常に false)。
     /// AtomS3 印刷ブリッジでは eth_w5500.rs が更新する
     pub lan_link: bool,

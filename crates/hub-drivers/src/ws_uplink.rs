@@ -337,7 +337,12 @@ fn heap_headroom_ok(now: u64, last_log: &mut u64) -> bool {
 
 /// 測定をキューへ積み NVS へ永続化する
 fn enqueue(queue: &mut UplinkQueue, settings: &Settings, rec: &UplinkRecord) {
-    match queue.push(rec.kind, rec.recorded_at_ms, &rec.payload) {
+    match queue.push_with_session(
+        rec.kind,
+        rec.recorded_at_ms,
+        &rec.payload,
+        rec.session_id.as_deref(),
+    ) {
         Ok((_, dropped)) => {
             if let Some(seq) = dropped {
                 log::warn!("ws_uplink: キュー上限で seq={seq} を破棄");

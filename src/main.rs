@@ -66,6 +66,10 @@ fn main() -> Result<()> {
     // Ethernet フレーム転送が 64 バイト上限で全滅する (atoms3-print の実機知見)
     board::power::init(&mut i2c)?;
     let rotation = settings.rotation();
+    // 起動カウンタを 1 つ進める (点呼セッション ID の前置、Refs #112)。
+    // **起動ごとに 1 回だけ** — 再起動をまたいだ session_id の再利用を防ぐ。
+    // settings は後段の host_link へ move されるので、ここで取っておく。
+    let boot_id = settings.next_boot_id();
     let spi = SpiDriver::new(
         p.spi2,
         p.pins.gpio36,
@@ -226,5 +230,5 @@ fn main() -> Result<()> {
     alc_hub_drivers::ota::mark_boot_valid();
 
     // UI ループ (メインタスクを占有, 戻らない)
-    ui::run(display, i2c, rx, status, rotation)
+    ui::run(display, i2c, rx, status, rotation, boot_id)
 }
