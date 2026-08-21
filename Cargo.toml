@@ -24,6 +24,7 @@ name = "alc-hub-cores3"
 harness = false
 
 [features]
+default = ["lan"]
 # 開発用メモリ HUD (ステータスバーに RAM/PSRAM 使用率、hub-ui に伝搬)。
 # 本番ビルドには入れない。有効化: cargo build --release --features mem-hud
 # (local/flash.ps1 が付与する)
@@ -33,8 +34,13 @@ mem-hud = ["alc-hub-ui/mem-hud"]
 # 本番 manifest.json の -app.bin には含めない (.github/workflows/build.yml 参照)
 nfc-verify = ["alc-hub-drivers/nfc-verify"]
 # Base LAN PoE v1.2 (W5500)。CS=G9 / RST=G7 で内蔵スピーカー (I2S DOUT=G13) とは
-# 競合しないため、旧 LAN Module 13.2 のような排他制約は無い。Base を積まない
-# 構成でも動かせるよう既定 off のままにする
+# 競合しないため、旧 LAN Module 13.2 のような排他制約は無い (Refs #111)。
+#
+# **既定 on にした**: off のままだと CI の firmware ビルド (本番 `-app.bin` /
+# dev `-dev-app.bin` とも feature 未指定) に LAN が入らず、**OTA で更新するたびに
+# 実機の LAN が消える**。実際それでネットワークごと失い (`STATUS LAN=0`)、WS も
+# 繋がらず OTA では復旧できないため USB 書き込みが必要になった。
+# Base を積まない構成では `--no-default-features` で外す。
 lan = []
 
 [profile.release]
