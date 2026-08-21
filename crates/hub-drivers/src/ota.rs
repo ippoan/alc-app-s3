@@ -38,17 +38,17 @@ use alc_hub_common::status::{now_ms, SharedStatus};
 /// ダウンロードのタイムアウト (チャンク毎)
 const HTTP_TIMEOUT_S: u64 = 30;
 
-/// OTA の TLS ハンドシェイクを始めるのに必要な内部RAM の空き (Refs #116)。
-/// ws_uplink の `MIN_FREE_HEAP_FOR_TLS` と同根拠 — ハンドシェイクのピークが
-/// 約 30KB で、そこに HTTP バッファと OTA の書き込み経路が乗る。
-const MIN_FREE_HEAP_FOR_OTA: u32 = 60 * 1024;
+/// OTA を始めるのに最低限必要な内部RAM の空き。
+///
+/// **60KB から下げた。** OTA が落ちていた原因はヒープではなく PSRAM スタックで、
+/// TLS の確立自体は空き 62KB でも成功している (実測)。高い閾値のままだと、
+/// 起動直後などメモリが落ち着く前に更新をかけたときに `内部RAM 不足` で
+/// 弾いてしまう (実際 62,607 バイトで通っており 60KB は際どかった)。
+/// ここは「明らかに異常なときだけ止める」水準に置く。
+const MIN_FREE_HEAP_FOR_OTA: u32 = 40 * 1024;
 
-/// WS が畳まれるのを待つ上限。ws_uplink のループは 500ms 周期。
-const WS_RELEASE_WAIT_MS: u64 = 6_000;
-
-/// WS を畳んだ後、BLE の scan 1 周期 (5 秒) が終わって NimBLE がヒープを
-/// 手放すまでの待ち。scan の途中では pause 判定に入らないため、ここは
-/// 状態を見るのではなく固定で置く。
+/// BLE の scan 1 周期 (5 秒) が終わって NimBLE がヒープと電波を手放すまでの
+/// 待ち。scan の途中では pause 判定に入らないため、状態を見るのではなく固定で置く。
 const BLE_SETTLE_MS: u32 = 5_500;
 
 /// 内部RAM の空き [bytes]。PSRAM を含む総量で見ると TLS のガードが素通りする
@@ -65,26 +65,20 @@ fn set_ota_active(status: &SharedStatus, active: bool) {
     }
 }
 
-/// WS / BLE が退いて内部RAM が戻るのを待つ。戻り値は待った後の空き。
+/// BLE が退くのを待ってから空きを測る。戻り値は待った後の空き。
 ///
-/// **空きバイト数で待つのではなく、WS が実際に畳まれたかで待つ。**
-/// 定常空き (約 74KB) は既に閾値 (60KB) を超えているため、量で判定すると
-/// 一度も待たずに TLS を張ってしまい、WS の TLS と OTA の TLS のピークが
-/// 重なって落ちる (実機で発生: `Certificate validated` の後に
-/// `接続を破棄 (OTA のため内部RAM を譲る)` が並ぶ順序になっていた)。
-fn wait_for_heap(status: &SharedStatus) -> u32 {
-    let deadline = now_ms() + WS_RELEASE_WAIT_MS;
-    while now_ms() < deadline {
-        let ws_up = status.lock().map(|st| st.ws_connected).unwrap_or(false);
-        if !ws_up {
-            break;
-        }
-        FreeRtos::delay_ms(100);
-    }
-    // BLE の scan 1 周期ぶん待って NimBLE にもヒープを手放させる
+/// **WS は切らない。** 以前は「WS の TLS が内部RAM を食っている」と考えて
+/// 畳んでいたが、それは誤診断だった: mbedTLS は `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC`
+/// で PSRAM 割当になっており、畳んでも内部RAM はほとんど戻らない (実測
+/// 74KB → 83KB)。OTA が落ちていた本当の原因は PSRAM スタックでの flash 書き込みで、
+/// TLS の確立自体は毎回成功していた。WS を維持すれば**進捗 (download phase) を
+/// web へ送り続けられる**ので、切る理由がない。
+fn wait_for_heap() -> u32 {
+    // BLE の scan 1 周期ぶん待って NimBLE に電波とヒープを手放させる
     FreeRtos::delay_ms(BLE_SETTLE_MS);
     let free = free_internal();
     println!("EVT OTA_HEAP free_int={free}");
+    crate::crashlog::note(&format!("EVT OTA_HEAP free_int={free}"));
     free
 }
 /// 受信チャンク。8KB (>4KB) なので PSRAM に確保される
@@ -193,14 +187,11 @@ pub fn spawn_update(url: String, status: SharedStatus, progress: Option<Progress
             // (実機で確認: `esp-x509-crt-bundle: Certificate validated` の直後に
             // panic し、OTA が一度も完走しなかった)。
             //
-            // **この通知は WS が切れる前に送る** — 以後 progress は届かない。
-            // web 側は "started" のまま待ち、更新が済めば端末が再起動して
-            // 新しいバージョンで再接続するので、それで完了が分かる。
             if let Some(s) = progress.as_ref() {
-                s(r#"{"phase":"started","message":"通信を一時停止してダウンロードします (完了後に自動で再接続します)"}"#.to_string());
+                s(r#"{"phase":"started","message":"BLE を止めて準備しています..."}"#.to_string());
             }
             set_ota_active(&status, true);
-            let free = wait_for_heap(&status);
+            let free = wait_for_heap();
             if free < MIN_FREE_HEAP_FOR_OTA {
                 // ここで落とさず明示的に失敗させる。以前はガードが無く、
                 // TLS ハンドシェイクの途中で無言のまま panic していた
