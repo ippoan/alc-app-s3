@@ -25,9 +25,8 @@
 //! | `EVT OTA NG <理由>` | 失敗 (現行 FW のまま続行) |
 
 use anyhow::{bail, Context, Result};
-use enumset::EnumSet;
 use esp_idf_svc::hal::delay::FreeRtos;
-use esp_idf_svc::hal::task::thread::{MallocCap, ThreadSpawnConfiguration};
+use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
 use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
 use esp_idf_svc::http::Method;
 use esp_idf_svc::io::Write;
@@ -140,15 +139,28 @@ pub fn spawn_update(url: String, status: SharedStatus, progress: Option<Progress
     // 意図せず PSRAM スタックになってしまう)
     // 名前もここで一緒に指定する。別途 task::name_next を呼ぶと設定ごと
     // 上書きされ、PSRAM スタックの指定が消えてしまう
+    // **スタックは内蔵SRAM に置く。PSRAM にしてはいけない。**
+    //
+    // flash への書き込み (OTA の `update.write_all`) はキャッシュを凍結する。
+    // 凍結中は外部 SPI RAM に触れないため、ESP-IDF は「スタックが PSRAM に
+    // 載っているタスクから呼ばれたら」assert で止める:
+    //
+    //   assert failed: esp_cache_freeze_caches_disable_interrupts
+    //   esp_cache_utils.c:96 (s_task_stack_is_sane_when_cache_frozen())
+    //
+    // 以前は `stack_alloc_caps: Spiram | Cap8bit` を指定していたため、TLS 確立の
+    // 直後 (= 最初の flash 書き込み) で必ず落ち、**OTA が一度も完走しなかった**
+    // (実機のシリアルで上記 assert を確認、crash_log には ESP の abort ダンプが
+    // 残らないため長く原因不明だった)。内蔵SRAM 20KB を積む余裕はある —
+    // OTA 直前の実測で空き 83KB (`EVT OTA_HEAP`)。
     if let Err(e) = (ThreadSpawnConfiguration {
         name: Some(c"ota"),
         stack_size: 20 * 1024,
-        stack_alloc_caps: MallocCap::Spiram | MallocCap::Cap8bit,
         ..Default::default()
     }
     .set())
     {
-        log::warn!("ota: PSRAM スタック設定に失敗 ({e:?})。内蔵SRAMのまま起動を試みる");
+        log::warn!("ota: スレッド設定に失敗 ({e:?})");
     }
     let spawned = std::thread::Builder::new()
         .name("ota".into())
