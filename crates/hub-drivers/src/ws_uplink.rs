@@ -59,6 +59,13 @@ const RESEND_INTERVAL_MS: u64 = 15_000;
 const RECONNECT_BACKOFF_MS: u64 = 20_000;
 /// device JWT の残り有効期間がこれを切ったら再 mint
 const TOKEN_REFRESH_MARGIN_S: u64 = 120;
+
+/// 切断のまま自動再接続が来ない場合に端末を再起動するまでの時間。
+///
+/// client を drop して作り直せないため (esp-idf-svc の Drop が切断済み client で
+/// panic する)、復帰手段は再起動しかない。**panic による再起動と違い、これは
+/// クリーンな再起動**で crash_log も出ない。キューは NVS 永続なので測定は失わない。
+const WS_STALE_RESTART_MS: u64 = 5 * 60 * 1000;
 /// TLS ハンドシェイク (mint + WSS) を始めるのに必要な空きヒープ。
 /// BLE (NimBLE) と同時にヒープを食い合うと BLE 側が Malloc failed で
 /// 測定不能になる (実機で確認) ため、余裕がない間は接続を延期する。
@@ -101,6 +108,9 @@ pub fn start(
 struct Conn {
     client: EspWebSocketClient<'static>,
     connected: bool,
+    /// 切断を検知した時刻 [ms]。自動再接続が効かないまま放置されるのを
+    /// 見張るために持つ (`WS_STALE_RESTART_MS`)。
+    disconnected_at: Option<u64>,
     /// WS 接続が成立した時刻 [ms]。破棄ログに「どれだけ保ったか」を出すために持つ
     /// — 即切れ (認証・経路の問題) と長時間後の切断 (hibernation・アイドル) は
     /// 原因が別なので、ログだけで見分けられるようにする。None = 未成立。
@@ -196,6 +206,7 @@ fn run(
                     if let Some(c) = conn.as_mut() {
                         c.connected = true;
                         c.connected_at = Some(now_ms());
+                        c.disconnected_at = None;
                     }
                     connect_warned = false;
                     println!("EVT WS_CONNECTED");
@@ -205,7 +216,7 @@ fn run(
                 }
                 WsEvent::Disconnected => {
                     if conn.is_some() {
-                        drop_conn(&mut conn, "サーバ側から切断", &queue);
+                        mark_disconnected(&mut conn, "サーバ側から切断", &queue);
                         println!("EVT WS_DISCONNECTED");
                         crate::crashlog::note("EVT WS_DISCONNECTED");
                     }
@@ -257,6 +268,24 @@ fn run(
         // BLE 測定中は 2.4GHz を医療機器に譲る (新規接続もハンドシェイク分の
         // 電波を使うため控える)。切断は行わず既存接続は維持する。
         // 空きヒープが少ない間も延期する (TLS と BLE のヒープ食い合い対策)
+        // 自動再接続が来ないまま放置されていないか見張る。
+        // client を捨てて張り直す手が使えない以上、復帰手段は再起動しかない。
+        if let Some(at) = conn.as_ref().and_then(|c| (!c.connected).then_some(c.disconnected_at)).flatten() {
+            if now.saturating_sub(at) > WS_STALE_RESTART_MS {
+                let line = format!(
+                    "ws_uplink: 自動再接続が {}分来ないため再起動します queue={}",
+                    WS_STALE_RESTART_MS / 60_000,
+                    queue.len()
+                );
+                log::warn!("{line}");
+                crate::crashlog::note(&line);
+                println!("EVT WS_STALE_RESTART");
+                settings.set_ws_last_seq(queue.last_seq());
+                std::thread::sleep(core::time::Duration::from_millis(300));
+                unsafe { esp_idf_svc::sys::esp_restart() };
+            }
+        }
+
         if conn.is_none()
             && net_up
             && !ble_busy
@@ -301,7 +330,7 @@ fn run(
                 }
             }
             if failed {
-                drop_conn(&mut conn, "測定の送信失敗", &queue);
+                mark_disconnected(&mut conn, "測定の送信失敗", &queue);
                 backoff_until = now + RECONNECT_BACKOFF_MS;
                 publish_status(&status, &queue, false);
                 continue;
@@ -311,14 +340,14 @@ fn run(
 
         // --- 5. keep-alive ping (キューが空の間も下り command を受けるため) ---
         if now.saturating_sub(last_ping) >= PING_INTERVAL_MS {
-            // 借用を send の間だけに閉じる (この後 drop_conn が &mut conn を取る)
+            // 借用を send の間だけに閉じる (この後 mark_disconnected が &mut conn を取る)
             let sent = {
                 let c = conn.as_mut().expect("connected implies conn");
                 c.client.send(FrameType::Text(false), PING_FRAME.as_bytes())
             };
             if let Err(e) = sent {
                 log::warn!("ws_uplink: ping 失敗: {e:?}");
-                drop_conn(&mut conn, "keep-alive ping の失敗", &queue);
+                mark_disconnected(&mut conn, "keep-alive ping の失敗", &queue);
                 backoff_until = now + RECONNECT_BACKOFF_MS;
                 publish_status(&status, &queue, false);
                 continue;
@@ -347,36 +376,39 @@ fn heap_headroom_ok(now: u64, last_log: &mut u64) -> bool {
     true
 }
 
-/// WS 接続を破棄して再接続へ回す。**破棄の直前に必ず 1 行残す**。
+/// WS の接続を「切れた」状態にする。**client は drop しない。**
 ///
 /// esp-idf-svc の `Drop for EspWebSocketClient` は
-/// `esp_websocket_client_close(..).unwrap()` を呼ぶため、**既に切断済みの
-/// client を drop すると ESP_FAIL で panic する** (実機で観測、`ws/client.rs:623`)。
-/// その場合 crash_log の末尾に残る最後の行がここになるので、どの経路で捨てたのか
-/// と、そのときのキューの状態が 1 行で分かる形にしておく。
+/// `esp_websocket_client_close(..).unwrap()` を呼ぶが、**既に切断済みの client
+/// では ESP_FAIL が返って panic する** (`ws/client.rs:623`、実機で頻発)。
+/// サーバ (cf-alc-recorder の Durable Object) は hibernation やアイドルで
+/// TCP FIN を送ってくるので、これは異常系ではなく定常的に起きる — 実測で
+/// 接続が 30 秒しか保たずに落ちた例がある。
 ///
-/// `EVT WS_DISCONNECTED` (println!) は **crashlog の vprintf hook を通らない**
-/// ため、以前はイベント経由の破棄が痕跡ゼロだった (2026-08-19 の panic では
-/// 直前 0.5 秒に ws_uplink 由来の行が 1 つも残っていなかった)。
-fn drop_conn(conn: &mut Option<Conn>, reason: &str, queue: &UplinkQueue) {
-    let Some(c) = conn.as_ref() else {
+/// esp-idf 側は切断を検知すると `Reconnect after 10000 ms` と**自動再接続を
+/// 予定する**。こちらから client を捨てる必要はないので、フラグだけ倒して
+/// 再接続イベント (`WsEvent::Connected`) を待つ。
+fn mark_disconnected(conn: &mut Option<Conn>, reason: &str, queue: &UplinkQueue) {
+    let Some(c) = conn.as_mut() else {
         return;
     };
-    // 接続が成立していなければ "-" (接続試行の途中で捨てた場合)
+    if !c.connected {
+        return;
+    }
     let held = match c.connected_at {
         Some(at) => format!("{}s", now_ms().saturating_sub(at) / 1000),
         None => "-".to_string(),
     };
     let line = format!(
-        "ws_uplink: 接続を破棄 ({reason}) held={held} queue={} last_seq={}",
+        "ws_uplink: 接続断 ({reason}) held={held} queue={} last_seq={} — 自動再接続を待つ",
         queue.len(),
         queue.last_seq()
     );
     log::warn!("{line}");
-    // log::warn! は EspLogger 経由で crash リングに入るが、この行は panic 直前の
-    // 最後の手がかりになるので note() でも明示的に残す (取りこぼしを避ける)。
     crate::crashlog::note(&line);
-    *conn = None;
+    c.connected = false;
+    c.connected_at = None;
+    c.disconnected_at = Some(now_ms());
 }
 
 /// 測定をキューへ積み NVS へ永続化する
@@ -709,5 +741,6 @@ fn connect(
         client,
         connected: false,
         connected_at: None,
+        disconnected_at: None,
     })
 }
