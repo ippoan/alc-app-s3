@@ -257,6 +257,19 @@ fn run(
         // BLE 測定中は 2.4GHz を医療機器に譲る (新規接続もハンドシェイク分の
         // 電波を使うため控える)。切断は行わず既存接続は維持する。
         // 空きヒープが少ない間も延期する (TLS と BLE のヒープ食い合い対策)
+        // OTA 中は WS の TLS を畳んで内部RAM を譲る (Refs #116)。
+        // OTA は HTTPS をもう 1 本張るが、WS を張ったままだと 2 本ぶんの
+        // ハンドシェイクピークで内部RAM が枯渇して落ちる。
+        // **接続を試みるより前に置く** — 後ろに置くと OTA 中に一度 TLS を
+        // 張ってから切ることになり、まさに枯渇させたいピークを踏む。
+        let ota_active = status.lock().map(|st| st.ota_active).unwrap_or(false);
+        if ota_active {
+            drop_conn(&mut conn, "OTA のため内部RAM を譲る", &queue);
+            // 再接続は OTA 完了 (= 成功なら再起動) 後に自然に行われる。
+            // ループ先頭の recv_timeout が 500ms 刻むので待ちは要らない
+            continue;
+        }
+
         if conn.is_none()
             && net_up
             && !ble_busy

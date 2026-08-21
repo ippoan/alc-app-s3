@@ -167,7 +167,11 @@ async fn task(
 
         // Wi-Fi の接続/スキャン中 + Improv セッション中は BLE スキャンを
         // 止め、コエグジストの電波取り合いで Wi-Fi 側が失敗しないようにする
-        while coex.ble_should_pause(now_ms()) {
+        // OTA 中は scan を止めて内部RAM を譲る (Refs #116)。coex の pause と
+        // 同じ止め方で、OTA が終われば (成功なら再起動で) 自然に再開する。
+        while coex.ble_should_pause(now_ms())
+            || status.lock().map(|st| st.ota_active).unwrap_or(false)
+        {
             FreeRtos::delay_ms(200);
         }
 

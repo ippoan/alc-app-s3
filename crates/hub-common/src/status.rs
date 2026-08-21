@@ -25,6 +25,15 @@ pub struct HubStatus {
     /// 直近イベント (新しいものが末尾)。ログ確認画面に表示する
     pub events: VecDeque<String>,
 
+    /// OTA (firmware 更新) の実行中フラグ (Refs #116)。
+    ///
+    /// **OTA は HTTPS の TLS をもう 1 本張る**が、内部RAM の定常空きは約 72KB しか
+    /// なく、WS の TLS が張られたままだとハンドシェイクのピーク (約 30KB) で
+    /// 枯渇して落ちる (実機で確認: `esp-x509-crt-bundle: Certificate validated`
+    /// の直後に panic)。ここが true の間、ws_uplink は接続を切って張り直さず、
+    /// BLE は scan を止めてヒープを譲る。
+    pub ota_active: bool,
+
     /// 進行中の点呼セッションの識別子 (Refs #112)。点呼画面 (Measuring) に
     /// いる間だけ Some で、待機画面へ戻ると None に戻る。**発番と更新は UI
     /// スレッドだけが行い、recorder は読むだけ** — 点呼の開始/終了を知って
