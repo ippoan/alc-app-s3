@@ -38,6 +38,56 @@ use alc_hub_common::status::{now_ms, SharedStatus};
 
 /// ダウンロードのタイムアウト (チャンク毎)
 const HTTP_TIMEOUT_S: u64 = 30;
+
+/// OTA の TLS ハンドシェイクを始めるのに必要な内部RAM の空き (Refs #116)。
+/// ws_uplink の `MIN_FREE_HEAP_FOR_TLS` と同根拠 — ハンドシェイクのピークが
+/// 約 30KB で、そこに HTTP バッファと OTA の書き込み経路が乗る。
+const MIN_FREE_HEAP_FOR_OTA: u32 = 60 * 1024;
+
+/// WS が畳まれるのを待つ上限。ws_uplink のループは 500ms 周期。
+const WS_RELEASE_WAIT_MS: u64 = 6_000;
+
+/// WS を畳んだ後、BLE の scan 1 周期 (5 秒) が終わって NimBLE がヒープを
+/// 手放すまでの待ち。scan の途中では pause 判定に入らないため、ここは
+/// 状態を見るのではなく固定で置く。
+const BLE_SETTLE_MS: u32 = 5_500;
+
+/// 内部RAM の空き [bytes]。PSRAM を含む総量で見ると TLS のガードが素通りする
+/// ため、ws_uplink と同じく内部RAM 専用に測る。
+fn free_internal() -> u32 {
+    unsafe { sys::heap_caps_get_free_size(sys::MALLOC_CAP_INTERNAL as _) as u32 }
+}
+
+/// OTA 実行中フラグを立てる/降ろす。ws_uplink は true の間 WS を張らず、
+/// BLE は scan を止める。
+fn set_ota_active(status: &SharedStatus, active: bool) {
+    if let Ok(mut st) = status.lock() {
+        st.ota_active = active;
+    }
+}
+
+/// WS / BLE が退いて内部RAM が戻るのを待つ。戻り値は待った後の空き。
+///
+/// **空きバイト数で待つのではなく、WS が実際に畳まれたかで待つ。**
+/// 定常空き (約 74KB) は既に閾値 (60KB) を超えているため、量で判定すると
+/// 一度も待たずに TLS を張ってしまい、WS の TLS と OTA の TLS のピークが
+/// 重なって落ちる (実機で発生: `Certificate validated` の後に
+/// `接続を破棄 (OTA のため内部RAM を譲る)` が並ぶ順序になっていた)。
+fn wait_for_heap(status: &SharedStatus) -> u32 {
+    let deadline = now_ms() + WS_RELEASE_WAIT_MS;
+    while now_ms() < deadline {
+        let ws_up = status.lock().map(|st| st.ws_connected).unwrap_or(false);
+        if !ws_up {
+            break;
+        }
+        FreeRtos::delay_ms(100);
+    }
+    // BLE の scan 1 周期ぶん待って NimBLE にもヒープを手放させる
+    FreeRtos::delay_ms(BLE_SETTLE_MS);
+    let free = free_internal();
+    println!("EVT OTA_HEAP free_int={free}");
+    free
+}
 /// 受信チャンク。8KB (>4KB) なので PSRAM に確保される
 const CHUNK: usize = 8 * 1024;
 /// app 単体イメージとして妥当な最小サイズ (これ未満は誤 URL とみなす)
@@ -122,7 +172,37 @@ pub fn spawn_update(url: String, status: SharedStatus, progress: Option<Progress
             // (progress bar 表示など download 同等の特別な UI が要る場合のみ
             // web 側の対応が要る)
             if let Some(s) = progress.as_ref() {
-                s(r#"{"phase":"started","message":"デバイスが更新処理を開始しました — ダウンロード準備中..."}"#.to_string());
+                s(r#"{"phase":"started","message":"デバイスが更新処理を開始しました — 通信を整理しています..."}"#.to_string());
+            }
+
+            // --- 内部RAM を空ける (Refs #116) ---
+            // OTA は HTTPS の TLS をもう 1 本張る。定常空きは約 72KB しかなく、
+            // WS の TLS を張ったままだとハンドシェイクのピークで枯渇して落ちる
+            // (実機で確認: `esp-x509-crt-bundle: Certificate validated` の直後に
+            // panic し、OTA が一度も完走しなかった)。
+            //
+            // **この通知は WS が切れる前に送る** — 以後 progress は届かない。
+            // web 側は "started" のまま待ち、更新が済めば端末が再起動して
+            // 新しいバージョンで再接続するので、それで完了が分かる。
+            if let Some(s) = progress.as_ref() {
+                s(r#"{"phase":"started","message":"通信を一時停止してダウンロードします (完了後に自動で再接続します)"}"#.to_string());
+            }
+            set_ota_active(&status, true);
+            let free = wait_for_heap(&status);
+            if free < MIN_FREE_HEAP_FOR_OTA {
+                // ここで落とさず明示的に失敗させる。以前はガードが無く、
+                // TLS ハンドシェイクの途中で無言のまま panic していた
+                set_ota_active(&status, false);
+                println!("EVT OTA NG 内部RAM 不足 ({free} bytes)");
+                if let Ok(mut st) = status.lock() {
+                    st.push_event(now_ms(), "OTA 失敗 (内部RAM 不足)");
+                }
+                if let Some(s) = progress.as_ref() {
+                    s(format!(
+                        r#"{{"phase":"error","message":"内部RAM 不足のため更新を中止しました ({free} bytes)"}}"#
+                    ));
+                }
+                return;
             }
             // OTA 中は UI ループが 10s 以上 feed できず task_wdt が誤リセットする
             // (更新が毎回中断する実害、Refs #55)。UI タスクの WDT 監視を download の
@@ -146,6 +226,8 @@ pub fn spawn_update(url: String, status: SharedStatus, progress: Option<Progress
                     unsafe { sys::esp_restart() };
                 }
                 Err(e) => {
+                    // WS / BLE を元に戻す (成功時は再起動するので不要)
+                    set_ota_active(&status, false);
                     println!("EVT OTA NG {e:#}");
                     if let Ok(mut st) = status.lock() {
                         st.push_event(now_ms(), "OTA 失敗");
