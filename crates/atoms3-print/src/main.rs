@@ -66,7 +66,10 @@ fn main() -> Result<()> {
     // 接続しないだけで無害)
     let (ws_meas_tx, ws_meas_rx) = mpsc::channel();
     let (ui_tx, _ui_rx) = mpsc::channel();
-    ws_uplink::start(ws_meas_rx, ui_tx, Arc::clone(&status), settings.clone())?;
+    // boot_id は NTP 未同期で記録した測定の時刻補正に使う (ws_uplink.rs)。
+    // この機は crash_log しか積まないが、CoreS3 と同じ口なので同じ値を渡す
+    let boot_id = settings.next_boot_id();
+    ws_uplink::start(ws_meas_rx, ui_tx, Arc::clone(&status), settings.clone(), boot_id)?;
 
     // 前回がクラッシュ由来なら panic 前ログを kind=crash_log で送信キューへ
     // (CoreS3 と同じ。ws_meas_tx は main が保持し続けるので channel も閉じない)
