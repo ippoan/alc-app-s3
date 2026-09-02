@@ -34,7 +34,7 @@
 
 mod screens;
 
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 
 use alc_hub_core::device::DeviceKind;
 use alc_hub_core::layout::map_touch;
@@ -48,6 +48,7 @@ use alc_hub_board::{
 };
 use alc_hub_common::{
     config,
+    measurement::Measurement,
     status::{now_ms, SharedStatus},
 };
 use esp_idf_svc::hal::{delay::FreeRtos, i2c::I2cDriver};
@@ -118,6 +119,7 @@ pub fn run(
     status: SharedStatus,
     initial_rotation: u16,
     boot_id: u32,
+    meas_tx: Sender<Measurement>,
 ) -> ! {
     screens::draw_boot(&mut display);
 
@@ -155,6 +157,9 @@ pub fn run(
     // 残り秒数表示は 1 秒刻みの部分更新で追従させる (last_lock_secs)
     let mut log_lock = LogLock::new();
     let mut last_lock_secs = 0u64;
+    // 点呼確認画面の「点呼を開始」で始めた点呼の札。session_id を発番した直後に
+    // Measurement::License として recorder へ渡す (同じ session_id が付く、#125)
+    let mut pending_license: Option<LicenseCard> = None;
 
     loop {
         let now = now_ms();
@@ -434,6 +439,10 @@ pub fn run(
                 log_lock.is_locked(now),
                 current_items(&status),
             ) {
+                // 免許証から始めた点呼: 札を控えておき、session_id 発番時に送る
+                if let (Screen::Confirm { card, .. }, Screen::Measuring { .. }) = (&screen, &next) {
+                    pending_license = Some(card.clone());
+                }
                 screen = next;
                 entered = now;
                 dirty = true;
@@ -528,6 +537,19 @@ pub fn run(
             };
             if let Ok(mut st) = status.lock() {
                 st.session_id = session_id;
+            }
+            // session_id を status に載せた後で送る (recorder はそれを読んで付ける)。
+            // メニューから始めた点呼では札が無いので何も送らない
+            if let Some(card) = pending_license.take() {
+                if now_in_session {
+                    if let (Ok(issue), Ok(expiry)) = (card.issue.parse::<u32>(), card.expiry.parse::<u32>()) {
+                        let _ = meas_tx.send(Measurement::License {
+                            issue,
+                            expiry,
+                            at_ms: now,
+                        });
+                    }
+                }
             }
         }
 

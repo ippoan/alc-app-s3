@@ -141,6 +141,28 @@ pub fn start(
                             pulse,
                         });
                     }
+                    // 点呼開始時の免許証: 測定と同じ session_id で kind="license" を
+                    // 送る (サーバが nfc_id で乗務員に結合する、#125)。画面通知や
+                    // イベントログは不要 (読取時に nfc.rs が出している)。GW (alc-gw)
+                    // には送らない (測定の生中継先で、license は解釈しない)
+                    Measurement::License {
+                        issue,
+                        expiry,
+                        at_ms,
+                    } => {
+                        let card = alc_hub_core::tenko_prompt::LicenseCard {
+                            issue: format!("{issue:08}"),
+                            expiry: format!("{expiry:08}"),
+                        };
+                        let rec = UplinkRecord {
+                            kind: "license",
+                            payload: card.payload_json(),
+                            recorded_at_ms: epoch_ms(),
+                            at_ms,
+                            session_id: current_session_id(&status),
+                        };
+                        let _ = ws_tx.send(rec);
+                    }
                     Measurement::Alcohol {
                         result,
                         centi_mg_per_l,
