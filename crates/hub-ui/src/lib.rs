@@ -15,7 +15,8 @@
 //!
 //! 免許証 (NFC-B) をかざすとメニューを飛ばして点呼確認 (Confirm) へ直行する。
 //! かざしてから LOG_LOCK_MS (15 秒) はメニューの「ログ確認」を押せなくする
-//! (hub-core tenko_prompt::LogLock、ボタンは残り秒数付きでグレー表示)。
+//! (hub-core tenko_prompt::LogLock)。残り秒数はメニューの下段ボタン・待機画面の
+//! 最下行・点呼確認画面のキャンセル側に 1 秒ごとに出す。
 //!
 //! 点呼 (Measuring) 中の BLE 測定・ホスト RESULT は画面遷移せず、同一画面の
 //! 体温 (上段) / 血圧 (中段) / アルコール (最下段) の欄を直接更新する。
@@ -446,10 +447,11 @@ pub fn run(
             last_lock_secs = lock_secs;
             dirty = false;
         } else {
-            // メニューのログ確認ボタン: ロック残り秒数の変化だけ部分更新
-            // (全面クリアしない — 点呼ボタン側を blink させない)
-            if matches!(screen, Screen::Menu) && lock_secs != last_lock_secs {
-                screens::draw_menu_log_zone(&mut display, lock_secs);
+            // ログ確認ロックの残り秒数: 変化した秒だけ画面ごとの定位置を部分更新
+            // (メニュー下段 / 待機の最下行 / 点呼確認のキャンセル側。全面クリア
+            // しないので他の要素は blink しない)
+            if lock_secs != last_lock_secs {
+                screens::draw_lock_countdown(&mut display, &screen, lock_secs);
                 last_lock_secs = lock_secs;
             }
             if now.saturating_sub(last_bar) >= 1000 {
