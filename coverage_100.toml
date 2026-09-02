@@ -63,6 +63,10 @@ path = "crates/hub-core/src/session.rs"
 type = "unit"
 
 [[file]]
+path = "crates/hub-core/src/tenko.rs"
+type = "unit"
+
+[[file]]
 path = "crates/hub-core/src/tenko_prompt.rs"
 type = "unit"
 

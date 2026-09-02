@@ -46,6 +46,10 @@ pub enum HostCommand {
     GwUrl { url: String },
     /// GW 接続の状態問い合わせ (`GW CONNECTED=1 URL=...` を応答)
     GwStatus,
+    /// 点呼に血圧を含めるか (`TENKO BP ON|OFF`。NVS 保存、既定 OFF = 保留)
+    TenkoBp { enabled: bool },
+    /// 点呼構成の問い合わせ (`TENKO BP=0` を応答)
+    TenkoStatus,
     /// ヒープ状態の問い合わせ
     /// (`HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> ...` を応答、Refs #27)
     Heap,
@@ -207,6 +211,16 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                 _ => return Err("ERR GW: URL には ws(s):// で始まる URL が必要です".into()),
             },
             _ => return Err("ERR GW: URL|STATUS が必要です".into()),
+        },
+        // 点呼の構成 (血圧はオプション、tenko.rs)
+        "TENKO" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+            Some("STATUS") => HostCommand::TenkoStatus,
+            Some("BP") => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+                Some("ON") | Some("1") => HostCommand::TenkoBp { enabled: true },
+                Some("OFF") | Some("0") => HostCommand::TenkoBp { enabled: false },
+                _ => return Err("ERR TENKO: BP には ON|OFF が必要です".into()),
+            },
+            _ => return Err("ERR TENKO: BP|STATUS が必要です".into()),
         },
         // `PAIR` または `BLE PAIR`
         "PAIR" => HostCommand::BlePair,
@@ -599,6 +613,35 @@ mod tests {
                 url: "wss://gw.example:9000".into(),
             }))
         );
+    }
+
+    #[test]
+    fn tenko_subcommands() {
+        assert_eq!(parse_line("TENKO STATUS", T), Ok(Some(HostCommand::TenkoStatus)));
+        assert_eq!(
+            parse_line("tenko bp on", T),
+            Ok(Some(HostCommand::TenkoBp { enabled: true }))
+        );
+        assert_eq!(
+            parse_line("TENKO BP 1", T),
+            Ok(Some(HostCommand::TenkoBp { enabled: true }))
+        );
+        assert_eq!(
+            parse_line("TENKO BP OFF", T),
+            Ok(Some(HostCommand::TenkoBp { enabled: false }))
+        );
+        assert_eq!(
+            parse_line("TENKO BP 0", T),
+            Ok(Some(HostCommand::TenkoBp { enabled: false }))
+        );
+    }
+
+    #[test]
+    fn tenko_errors() {
+        assert!(parse_line("TENKO", T).is_err());
+        assert!(parse_line("TENKO TEMP ON", T).is_err());
+        assert!(parse_line("TENKO BP", T).is_err());
+        assert!(parse_line("TENKO BP MAYBE", T).is_err());
     }
 
     #[test]

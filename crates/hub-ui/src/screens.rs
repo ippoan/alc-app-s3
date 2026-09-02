@@ -10,6 +10,7 @@
 
 use alc_hub_core::device::DeviceKind;
 use alc_hub_core::layout::{fmt_uptime, qr_scale, wrap_chars};
+use alc_hub_core::tenko::{TenkoItems, TenkoRow};
 use alc_hub_core::tenko_prompt::{confirm_remaining_secs, fmt_yyyymmdd, ExpiryState, LicenseCard};
 use alc_hub_core::vitals;
 use embedded_graphics::{
@@ -272,12 +273,13 @@ pub fn draw_full(
             draw_qr(d, payload, remain_s);
         }
         Screen::Measuring {
+            items,
             temp,
             bp,
             alcohol,
             alc_stage,
             ..
-        } => draw_tenko(d, *temp, *bp, alcohol, *alc_stage),
+        } => draw_tenko(d, *items, *temp, *bp, alcohol, *alc_stage),
         Screen::Result { ok, value } => draw_result(d, *ok, value),
         Screen::Error { message } => draw_error(d, message),
         Screen::Temperature { celsius } => draw_temperature(d, *celsius),
@@ -485,27 +487,36 @@ pub fn draw_qr_countdown(d: &mut Cs3Display, remain_s: u64) {
 }
 
 // --- 点呼画面レイアウト (基準 320x240) ---
-// 3 段構成 (上から 体温 / 血圧 / アルコール)。ラベルは左寄せ、値は右寄せ。
-// 各段 74px (= (240 - ステータスバー 18) / 3)
-const TENKO_ROW_H: i32 = 74;
-const TENKO_TEMP_Y: i32 = BAR_H;
-const TENKO_BP_Y: i32 = BAR_H + TENKO_ROW_H;
-const TENKO_ALC_Y: i32 = BAR_H + TENKO_ROW_H * 2;
+// 段構成は点呼の構成 (tenko::TenkoItems) で決まる: 血圧 ON = 3 段 (体温 / 血圧 /
+// アルコール、各 74px)、OFF = 2 段 (体温 / アルコール、各 111px)。各段の縦位置は
+// TenkoItems::row_span (ステータスバー直下〜画面下端を等分)。段内は縦中央揃え
 const TENKO_LABEL_X: i32 = 4;
 /// スピナー中心 X (ラベル 2 文字 = 64px の右外側)
 const TENKO_SPIN_X: i32 = 92;
 
-/// 未計測欄の「計測待ち」(4 文字 = 128px) を右寄せで描く
-fn tenko_waiting(d: &mut Cs3Display, row_y: i32) {
-    let (w, _) = dims(d);
-    jp2x_left(d, "計測待ち", w - 136, row_y + 20, C_MUTED, C_BG);
+/// 段の (y, 高さ)。構成に無い段は呼ばれない前提 (None は 0 サイズにして描かない)
+fn tenko_row(d: &Cs3Display, items: TenkoItems, row: TenkoRow) -> (i32, i32) {
+    let (_, h) = dims(d);
+    items.row_span(row, BAR_H, h).unwrap_or((BAR_H, 0))
 }
 
-/// 点呼画面: 体温 / 血圧 / アルコールを同一画面で計測・確認する (3 段)。
+/// 2 倍ラベル (32px 高) を段の縦中央に置く y
+fn tenko_label_y(row_y: i32, row_h: i32) -> i32 {
+    row_y + row_h / 2 - 16
+}
+
+/// 未計測欄の「計測待ち」(4 文字 = 128px) を右寄せで描く
+fn tenko_waiting(d: &mut Cs3Display, row_y: i32, row_h: i32) {
+    let (w, _) = dims(d);
+    jp2x_left(d, "計測待ち", w - 136, tenko_label_y(row_y, row_h), C_MUTED, C_BG);
+}
+
+/// 点呼画面: 体温 / (血圧) / アルコールを同一画面で計測・確認する。
 /// 未計測の欄は「計測待ち」。取得中スピナーは draw_tenko_spinner (部分更新)。
 /// アルコール欄は FC-1200 の進行状態 (準備中/吹込待ち/判定中) をライブ表示する
 fn draw_tenko(
     d: &mut Cs3Display,
+    items: TenkoItems,
     temp: Option<f32>,
     bp: Option<(f32, f32, Option<f32>)>,
     alcohol: &Option<(bool, String)>,
@@ -514,110 +525,107 @@ fn draw_tenko(
     let (w, _) = dims(d);
     clear(d);
 
-    // 段の区切り線
-    fill(d, 8, TENKO_BP_Y - 1, (w - 16) as u32, 2, C_BAR_BG);
-    fill(d, 8, TENKO_ALC_Y - 1, (w - 16) as u32, 2, C_BAR_BG);
+    // 段の区切り線 (2 段目以降の上端)
+    for row in items.rows().iter().skip(1) {
+        let (y, _) = tenko_row(d, items, *row);
+        fill(d, 8, y - 1, (w - 16) as u32, 2, C_BAR_BG);
+    }
 
-    // --- 上段: 体温 ---
-    jp2x_left(d, "体温", TENKO_LABEL_X, TENKO_TEMP_Y + 20, C_ACCENT, C_BG);
+    // --- 体温 ---
+    let (ty, th) = tenko_row(d, items, TenkoRow::Temp);
+    let label_y = tenko_label_y(ty, th);
+    jp2x_left(d, "体温", TENKO_LABEL_X, label_y, C_ACCENT, C_BG);
     match temp {
         Some(celsius) => {
-            // ℃ の幅の分だけ左に寄せて右端を揃える
+            // ℃ の幅の分だけ左に寄せて右端を揃える。BIG42 (42px) を段の縦中央に
+            let vy = ty + th / 2 - 21;
             let rect = text(
                 d,
                 &BIG42,
                 &vitals::temp_value(celsius),
                 w - 40,
-                TENKO_TEMP_Y + 14,
+                vy,
                 C_TEXT,
                 HorizontalAlignment::Right,
             );
             if let Some(r) = rect {
                 let ux = r.top_left.x + r.size.width as i32 + 8;
-                text(d, &JP16, "℃", ux, TENKO_TEMP_Y + 36, C_TEXT, HorizontalAlignment::Left);
+                text(d, &JP16, "℃", ux, vy + 22, C_TEXT, HorizontalAlignment::Left);
             }
         }
-        None => tenko_waiting(d, TENKO_TEMP_Y),
+        None => tenko_waiting(d, ty, th),
     }
 
-    // --- 中段: 血圧 ---
-    jp2x_left(d, "血圧", TENKO_LABEL_X, TENKO_BP_Y + 8, C_ACCENT, C_BG);
-    match bp {
-        Some((systolic, diastolic, pulse)) => {
-            // 収縮期 / 拡張期 は別々に描き '/' は線で手描き (draw_blood_pressure
-            // と同じ理由: BIG42 に無いグリフ混在で全体が消えるのを回避)
-            let y = TENKO_BP_Y + 14;
-            let pivot = w - 96;
-            text(
-                d,
-                &BIG42,
-                &format!("{systolic:.0}"),
-                pivot - 12,
-                y,
-                C_TEXT,
-                HorizontalAlignment::Right,
-            );
-            text(
-                d,
-                &BIG42,
-                &format!("{diastolic:.0}"),
-                pivot + 12,
-                y,
-                C_TEXT,
-                HorizontalAlignment::Left,
-            );
-            let _ = Line::new(Point::new(pivot - 7, y + 44), Point::new(pivot + 7, y))
-                .into_styled(PrimitiveStyle::with_stroke(C_TEXT, 4))
-                .draw(d);
-            // 脈拍はラベルの下 (左列) に小さく
-            if let Some(p) = pulse {
-                if p > 0.0 {
-                    text(
-                        d,
-                        &JP16,
-                        &vitals::pulse_value(p),
-                        TENKO_LABEL_X + 4,
-                        TENKO_BP_Y + 50,
-                        C_MUTED,
-                        HorizontalAlignment::Left,
-                    );
+    // --- 血圧 (構成に含むときだけ) ---
+    if items.bp {
+        let (by, bh) = tenko_row(d, items, TenkoRow::Bp);
+        // ラベルは少し上 (脈拍をその下に出す)
+        jp2x_left(d, "血圧", TENKO_LABEL_X, by + bh / 2 - 29, C_ACCENT, C_BG);
+        match bp {
+            Some((systolic, diastolic, pulse)) => {
+                // 収縮期 / 拡張期 は別々に描き '/' は線で手描き (draw_blood_pressure
+                // と同じ理由: BIG42 に無いグリフ混在で全体が消えるのを回避)
+                let y = by + bh / 2 - 23;
+                let pivot = w - 96;
+                text(
+                    d,
+                    &BIG42,
+                    &format!("{systolic:.0}"),
+                    pivot - 12,
+                    y,
+                    C_TEXT,
+                    HorizontalAlignment::Right,
+                );
+                text(
+                    d,
+                    &BIG42,
+                    &format!("{diastolic:.0}"),
+                    pivot + 12,
+                    y,
+                    C_TEXT,
+                    HorizontalAlignment::Left,
+                );
+                let _ = Line::new(Point::new(pivot - 7, y + 44), Point::new(pivot + 7, y))
+                    .into_styled(PrimitiveStyle::with_stroke(C_TEXT, 4))
+                    .draw(d);
+                // 脈拍はラベルの下 (左列) に小さく
+                if let Some(p) = pulse {
+                    if p > 0.0 {
+                        text(
+                            d,
+                            &JP16,
+                            &vitals::pulse_value(p),
+                            TENKO_LABEL_X + 4,
+                            by + bh / 2 + 13,
+                            C_MUTED,
+                            HorizontalAlignment::Left,
+                        );
+                    }
                 }
             }
+            None => tenko_waiting(d, by, bh),
         }
-        None => tenko_waiting(d, TENKO_BP_Y),
     }
 
-    // --- 最下段: アルコール (ホストの RESULT で更新。表示のみ) ---
-    jp2x_left(d, "アルコール", TENKO_LABEL_X, TENKO_ALC_Y + 20, C_ACCENT, C_BG);
+    // --- アルコール (ホストの RESULT / FC-1200 で更新。点呼完了の必須項目) ---
+    let (ay, ah) = tenko_row(d, items, TenkoRow::Alcohol);
+    let label_y = tenko_label_y(ay, ah);
+    jp2x_left(d, "アルコール", TENKO_LABEL_X, label_y, C_ACCENT, C_BG);
     match alcohol {
         Some((ok, value)) => {
             let color = if *ok { C_OK } else { C_NG };
             if value.is_empty() {
                 // 値なし (RESULT OK/NG のみ) → 判定だけ表示
-                jp2x_left(
-                    d,
-                    if *ok { "OK" } else { "NG" },
-                    w - 72,
-                    TENKO_ALC_Y + 20,
-                    color,
-                    C_BG,
-                );
+                jp2x_left(d, if *ok { "OK" } else { "NG" }, w - 72, label_y, color, C_BG);
             } else {
-                text(
-                    d,
-                    &BIG42,
-                    value,
-                    w - 8,
-                    TENKO_ALC_Y + 8,
-                    color,
-                    HorizontalAlignment::Right,
-                );
+                let vy = ay + ah / 2 - 27;
+                text(d, &BIG42, value, w - 8, vy, color, HorizontalAlignment::Right);
                 text(
                     d,
                     &JP16,
                     "mg/L",
                     w - 8,
-                    TENKO_ALC_Y + 54,
+                    vy + 46,
                     C_MUTED,
                     HorizontalAlignment::Right,
                 );
@@ -627,27 +635,34 @@ fn draw_tenko(
         // 吹込待ちはユーザー操作を促す段階なので強調色にする
         None => match alc_stage {
             Some(AlcoholStage::Warming) => {
-                jp2x_left(d, "準備中", w - 104, TENKO_ALC_Y + 20, C_MUTED, C_BG);
+                jp2x_left(d, "準備中", w - 104, label_y, C_MUTED, C_BG);
             }
             Some(AlcoholStage::BlowWaiting) => {
-                jp2x_left(d, "吹込待ち", w - 136, TENKO_ALC_Y + 20, C_ACCENT, C_BG);
+                jp2x_left(d, "吹込待ち", w - 136, label_y, C_ACCENT, C_BG);
             }
             Some(AlcoholStage::Measuring) => {
-                jp2x_left(d, "判定中", w - 104, TENKO_ALC_Y + 20, C_ACCENT, C_BG);
+                jp2x_left(d, "判定中", w - 104, label_y, C_ACCENT, C_BG);
             }
-            None => tenko_waiting(d, TENKO_ALC_Y),
+            None => tenko_waiting(d, ay, ah),
         },
     }
 }
 
 /// 点呼画面: 取得中機器のラベル横ミニスピナー (部分更新)。8 ドット。
 /// BLE 接続開始 (BleAcquiring) 中のみ UI ループが 150ms ごとに呼ぶ
-pub fn draw_tenko_spinner(d: &mut Cs3Display, kind: DeviceKind, phase: u8) {
+/// (構成に無い段 = 血圧 OFF の血圧計は呼び出し側で弾く)
+pub fn draw_tenko_spinner(d: &mut Cs3Display, items: TenkoItems, kind: DeviceKind, phase: u8) {
     let cx = TENKO_SPIN_X as f32;
-    // ラベル (32px 高) の縦中央に合わせる
+    // ラベル (32px 高) の縦中央に合わせる (血圧のラベルは段の中央より 13px 上)
     let cy = match kind {
-        DeviceKind::Thermometer => TENKO_TEMP_Y + 36,
-        DeviceKind::BloodPressure => TENKO_BP_Y + 24,
+        DeviceKind::Thermometer => {
+            let (y, h) = tenko_row(d, items, TenkoRow::Temp);
+            y + h / 2
+        }
+        DeviceKind::BloodPressure => {
+            let (y, h) = tenko_row(d, items, TenkoRow::Bp);
+            y + h / 2 - 13
+        }
     } as f32;
     const R: f32 = 11.0;
     for i in 0..8u8 {

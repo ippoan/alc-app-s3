@@ -46,6 +46,9 @@ Idle ─タップ→ Menu                                         自動/タッ�
   グレー表示)。確認画面の「キャンセル」や待機画面の下半分を続けて叩いたときに
   ログ画面へ流れ込む誤操作を防ぐ (`crates/hub-core/src/tenko_prompt.rs`)
 
+- **点呼画面は体温 + アルコールの 2 段が基本**。血圧は運用オプション (`TENKO BP ON`) で、
+  ON のときだけ 3 段目に出て完了条件にも入る。OFF のときは血圧計の測定を画面では無視する
+  (ログ・WS 送信には残る)。必須項目が揃うと 5 秒後に待機画面へ戻る
 - 基準文字サイズは 16px フォントの 2 倍拡大描画 (実効 32px)。数値は Logisoso42
 - 全画面上部にステータスバー (LAN / 232 / BLE / WiFi + 稼働時間、18px・小サイズ)。
   毎秒の時計更新は背景色付きテキストの上書きのみで blink しない
@@ -72,6 +75,7 @@ Idle ─タップ→ Menu                                         自動/タッ�
 | `AUTH TOKEN` | device JWT 取得の自己診断 (`EVT AUTH_TOKEN OK\|NG ...`) |
 | `AUTH URL <url>` / `WS URL <url>` | auth-worker / cf-alc-recorder の URL 上書き (staging テスト用、NVS 保存) |
 | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` 応答 (測定データ WS 送信の状態) |
+| `TENKO BP ON\|OFF` / `TENKO STATUS` | 点呼に血圧を含めるか (NVS 保存、**既定 OFF** = 体温 + アルコールの 2 段)。`TENKO BP=0` 応答 |
 | `GW URL <ws://...>` | Windows GW (alc-gw) ハブ URL の手動オーバーライド (NVS)。**通常は不要** — GW の UDP beacon (9001) を自動発見して接続する。WS 下り command `{action:"gw_url",url}` / `{action:"gw_status"}` (auth-worker /device/setup) でも遠隔で設定・確認できる |
 | `GW STATUS` | `GW CONNECTED=1 URL=UNSET DISCOVERED=ws://192.168.11.5:9000` 応答 |
 

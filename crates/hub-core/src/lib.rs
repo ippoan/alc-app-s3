@@ -20,6 +20,7 @@ pub mod pairing;
 pub mod printer;
 pub mod protocol;
 pub mod session;
+pub mod tenko;
 pub mod tenko_prompt;
 pub mod uplink;
 pub mod vitals;

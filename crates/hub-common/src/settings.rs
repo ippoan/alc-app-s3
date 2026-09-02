@@ -38,6 +38,8 @@ const KEY_WS_URL: &str = "ws_url";
 const KEY_PRINTER_ADDR: &str = "printer_addr";
 /// Windows GW (alc-gw) ハブの WS URL (`GW URL` コマンド。alc-app#120)
 const KEY_GW_URL: &str = "gw_url";
+/// 点呼に血圧を含めるか (u8 0/1。未設定 = 0 = 保留、tenko.rs)
+const KEY_TENKO_BP: &str = "tenko_bp";
 
 #[derive(Clone)]
 pub struct Settings {
@@ -305,6 +307,21 @@ impl Settings {
         );
         let nvs = self.nvs.lock().expect("settings nvs lock");
         nvs.set_str(KEY_GW_URL, url)?;
+        Ok(())
+    }
+
+    /// 点呼に血圧を含めるか (`TENKO BP ON|OFF`)。未設定は false (体温 + アルコールのみ)
+    pub fn tenko_bp(&self) -> bool {
+        self.nvs
+            .lock()
+            .ok()
+            .and_then(|nvs| nvs.get_u8(KEY_TENKO_BP).ok().flatten())
+            .map_or(false, |v| v != 0)
+    }
+
+    pub fn set_tenko_bp(&self, enabled: bool) -> Result<()> {
+        let nvs = self.nvs.lock().expect("settings nvs lock");
+        nvs.set_u8(KEY_TENKO_BP, u8::from(enabled))?;
         Ok(())
     }
 
