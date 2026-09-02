@@ -4,6 +4,7 @@
 //! この enum を送るだけ。UI 側の Screen 遷移規則は src/ui/mod.rs を参照。
 
 use alc_hub_core::device::DeviceKind;
+pub use alc_hub_core::tenko_prompt::LicenseCard;
 
 /// FC-1200 (RS232) の測定進行状態。点呼画面のアルコール欄に
 /// 「計測待ち」の代わりのライブ表示を出すために rs232.rs が送る
@@ -51,4 +52,7 @@ pub enum UiCommand {
     /// FC-1200 の測定進行状態 (None = 待機へ戻った: タイムアウト等)。
     /// 点呼画面表示中のみアルコール欄に反映される
     AlcoholStage(Option<AlcoholStage>),
+    /// 運転免許証 (IC) を読み取った (nfc.rs)。待機系の画面なら点呼確認画面へ
+    /// 直行し、以後 LOG_LOCK_MS の間ログ確認を封じる (tenko_prompt 参照)
+    License(LicenseCard),
 }

@@ -24,7 +24,7 @@ use std::sync::mpsc::Sender;
 
 use anyhow::Result;
 use esp_idf_svc::hal::{
-    gpio::{AnyIOPin, Gpio17, Gpio18},
+    gpio::{AnyIOPin, InputPin, OutputPin},
     uart::{config::Config as UartConfig, UartDriver, UART1},
     units::Hertz,
 };
@@ -39,8 +39,10 @@ use alc_hub_core::fc1200::{Event, IncomingCommand, LineParser, StateMachine};
 
 pub fn start(
     uart: UART1<'static>,
-    tx_pin: Gpio17<'static>,
-    rx_pin: Gpio18<'static>,
+    // ピンは呼び出し側 (main.rs) が構成で選ぶ: 現行 TX=G17/RX=G18、
+    // 次期構成 (cores3-se feature) は TX=G10/RX=G6
+    tx_pin: impl OutputPin + 'static,
+    rx_pin: impl InputPin + 'static,
     status: SharedStatus,
     meas_tx: Sender<Measurement>,
     ui_tx: Sender<UiCommand>,

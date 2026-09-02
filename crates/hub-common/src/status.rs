@@ -25,6 +25,10 @@ pub struct HubStatus {
     /// 直近イベント (新しいものが末尾)。ログ確認画面に表示する
     pub events: VecDeque<String>,
 
+    /// ボード種別 (CoreS3 / CoreS3 SE)。main.rs が起動時に内部 I2C を probe
+    /// して確定する (`STATUS BOARD=` / Log 画面に表示)。SE はバッテリーが無い
+    pub board: alc_hub_core::board::BoardKind,
+
     /// OTA (firmware 更新) の実行中フラグ (Refs #116)。
     ///
     /// **OTA は HTTPS の TLS をもう 1 本張る**が、内部RAM の定常空きは約 72KB しか
@@ -85,6 +89,9 @@ pub struct HubStatus {
 
     /// AXP2101 を一度でも読めたか (バッテリー系表示のゲート。ui が更新、Refs #50)
     pub power_read: bool,
+    /// バッテリーが接続されているか (AXP2101 0x00 bit3)。CoreS3 SE は常に false
+    /// なので、残量/充電状態の表示はこれでゲートする
+    pub battery_present: bool,
     /// バッテリー残量 [%] (AXP2101 フューエルゲージ 0xA4。255 = 未測定/電池なし)
     pub battery_percent: u8,
     /// バッテリー電圧 [mV] (AXP2101 ADC。0 = 未計測)

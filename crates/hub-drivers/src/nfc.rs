@@ -13,9 +13,11 @@
 //!
 //! 存在検知ゲート + F(交通系IDm)→A(HCE/UID)→B(免許証) 逐次掃引は
 //! crates/atoms3-nfc/src/main.rs (issue #96 で実機確認済み) の移植。
-//! 通知は `SharedStatus::push_event` のみ (「ログ確認」画面に既存の rs232.rs
-//! 等と同じ形式で表示される)。Measurement 化・recorder fan-out・WS uplink
-//! 連携・スピーカービープ (issue #101 PR2) は将来スコープ。
+//! 通知は `SharedStatus::push_event` (「ログ確認」画面に既存の rs232.rs
+//! 等と同じ形式で表示される) に加え、**免許証だけは `UiCommand::License` を
+//! UI へ送る** — 待機画面なら点呼確認画面へ直行させるため (hub-ui /
+//! hub-core tenko_prompt)。交通系 IDm / NFC-A UID / 車検証は引き続きログ通知
+//! のみ。Measurement 化・recorder fan-out・WS uplink 連携は将来スコープ。
 
 use std::time::{Duration, Instant};
 
@@ -24,6 +26,7 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::gpio::{AnyIOPin, Pin};
 
 use alc_hub_common::status::{now_ms, SharedStatus};
+use alc_hub_common::ui_api::{LicenseCard, UiCommand};
 
 use crate::speaker::Sound;
 
@@ -69,6 +72,7 @@ pub fn start(
     scl: AnyIOPin,
     status: SharedStatus,
     speaker: std::sync::mpsc::Sender<Sound>,
+    ui_tx: std::sync::mpsc::Sender<UiCommand>,
 ) -> Result<()> {
     // Pin::pin() は PinId (u8) を返す。ownership は FFI 側 (C++/M5HAL) が握るため
     // 番号だけ取り出して drop する (esp-idf-hal 側では未使用)
@@ -82,11 +86,17 @@ pub fn start(
         .name("nfc".into())
         // APDU 組立 (String) + FFI 経由の hex 文字列バッファがあるため rs232.rs と同等
         .stack_size(8 * 1024)
-        .spawn(move || run(sda_num, scl_num, status, speaker))?;
+        .spawn(move || run(sda_num, scl_num, status, speaker, ui_tx))?;
     Ok(())
 }
 
-fn run(sda_num: i32, scl_num: i32, status: SharedStatus, speaker: std::sync::mpsc::Sender<Sound>) {
+fn run(
+    sda_num: i32,
+    scl_num: i32,
+    status: SharedStatus,
+    speaker: std::sync::mpsc::Sender<Sound>,
+    ui_tx: std::sync::mpsc::Sender<UiCommand>,
+) {
     let rc = unsafe { nfc_shim_init(I2C_PORT_NFC, sda_num, scl_num) };
     if rc != 0 {
         push_event(
@@ -234,6 +244,12 @@ fn run(sda_num: i32, scl_num: i32, status: SharedStatus, speaker: std::sync::mps
                     log::info!("免許証 交付 {issue} 期限 {expiry}");
                     push_event(&status, &format!("免許証 交付 {issue} 期限 {expiry}"));
                     beep_ok(&speaker);
+                    // ホストにも通知 (画面遷移は UI が判断する)
+                    println!("EVT NFC_LICENSE issue={issue} expiry={expiry}");
+                    let _ = ui_tx.send(UiCommand::License(LicenseCard {
+                        issue: issue.clone(),
+                        expiry: expiry.clone(),
+                    }));
                 }
                 got = true;
             } else if rc != -2 && rc != last_license_rc {

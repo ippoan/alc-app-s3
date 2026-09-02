@@ -42,6 +42,13 @@ nfc-verify = ["alc-hub-drivers/nfc-verify"]
 # 繋がらず OTA では復旧できないため USB 書き込みが必要になった。
 # Base を積まない構成では `--no-default-features` で外す。
 lan = []
+# 次期構成 CoreS3 SE + Base LAN PoE v1.2 のピンマップ (plan/cores3-hub-consolidation.md
+# 「次期構成」)。RS232M のジャンパを TX=G10 / RX=G6 へ移し、空いた Port C (G17/G18)
+# を Unit NFC に使う。**実機のジャンパ位置とセットで切り替える** (ずれると FC-1200 と
+# NFC が同じピンを取り合う)。板種別 (SE か否か) は feature ではなく起動時の I2C
+# probe で判定する (STATUS BOARD=) ので、SE 本体に現行配線のまま載せるなら不要。
+# CI は PR の check で `cargo check --features cores3-se,nfc-verify` を通す (実機未検証)
+cores3-se = []
 
 [profile.release]
 opt-level = "s"
@@ -54,6 +61,8 @@ opt-level = "z"
 alc-hub-ble = { path = "crates/hub-ble" }
 alc-hub-board = { path = "crates/hub-board" }
 alc-hub-common = { path = "crates/hub-common" }
+# ボード種別判定 (board::BoardKind::from_probe) を main の配線で呼ぶため
+alc-hub-core = { path = "crates/hub-core" }
 alc-hub-drivers = { path = "crates/hub-drivers" }
 alc-hub-ui = { path = "crates/hub-ui" }
 alc-hub-wifi = { path = "crates/hub-wifi" }

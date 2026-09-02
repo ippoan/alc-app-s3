@@ -109,6 +109,9 @@ jobs:
           - { name: drivers, cmd: "cargo build --release --locked -p alc-hub-drivers", cache_key: build }
           - { name: ui,      cmd: "cargo build --release --locked -p alc-hub-ui",      cache_key: build }
           - { name: bin,     cmd: "cargo check --release --locked -p alc-hub-cores3",  cache_key: build }
+          # 次期構成 (CoreS3 SE + Base LAN PoE v1.2) のピンマップ。実機はまだ無いので
+          # コンパイルが通ることだけを担保する (nfc-verify も含めて NFC の Port C 配線を通す)
+          - { name: bin-se,  cmd: "cargo check --release --locked -p alc-hub-cores3 --features cores3-se,nfc-verify", cache_key: build }
           # atoms3-print は sdkconfig が別 (W5500 有効/PSRAM・BLE 無し) のため
           # esp-idf-sys の設定元を ESP_IDF_SYS_ROOT_CRATE で本 crate に向ける。
           # cores3 系と esp-idf-sys ビルドを共有できない (sdkconfig が違う) ので

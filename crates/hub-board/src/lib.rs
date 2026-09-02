@@ -4,6 +4,7 @@
 //! 移植したもの (机上調査ベース・実機確認は README の TODO 参照)。
 //! 他クレートに依存しない独立葉クレート (並列ビルド可能)。
 
+pub mod board;
 pub mod display;
 pub mod power;
 pub mod touch;
