@@ -10,7 +10,7 @@
 
 use alc_hub_core::device::DeviceKind;
 use alc_hub_core::layout::{fmt_uptime, qr_scale, wrap_chars};
-use alc_hub_core::tenko_prompt::{fmt_yyyymmdd, ExpiryState, LicenseCard};
+use alc_hub_core::tenko_prompt::{confirm_remaining_secs, fmt_yyyymmdd, ExpiryState, LicenseCard};
 use alc_hub_core::vitals;
 use embedded_graphics::{
     mono_font::{ascii::FONT_6X10, MonoTextStyle, MonoTextStyleBuilder},
@@ -261,7 +261,9 @@ pub fn draw_full(
     match screen {
         Screen::Idle => draw_idle(d, lock_secs),
         Screen::Menu => draw_menu(d, lock_secs),
-        Screen::Confirm { card, expiry } => draw_confirm(d, card, *expiry, lock_secs),
+        Screen::Confirm { card, expiry } => {
+            draw_confirm(d, card, *expiry, confirm_remaining_secs(entered, now))
+        }
         Screen::Qr {
             payload,
             timeout_ms,
@@ -322,12 +324,12 @@ fn draw_idle_footer(d: &mut Cs3Display, lock_secs: u64) {
 
 /// ログ確認ロックの残り秒数表示を、画面ごとの定位置だけ部分更新する。
 /// UI ループが秒の変化時に呼ぶ (全面クリアしないので他の要素は blink しない)。
-/// 表示位置: メニュー = 下段ボタン / 待機 = 最下行 / 点呼確認 = キャンセル側の下
+/// 表示位置: メニュー = 下段ボタン / 待機 = 最下行
 pub fn draw_lock_countdown(d: &mut Cs3Display, screen: &Screen, lock_secs: u64) {
     match screen {
         Screen::Menu => draw_menu_log_zone(d, lock_secs),
         Screen::Idle => draw_idle_footer(d, lock_secs),
-        Screen::Confirm { .. } => draw_confirm_footer(d, lock_secs),
+        // 点呼確認は画面自体の残り時間を出す (draw_confirm_countdown、毎秒更新)
         _ => {}
     }
 }
@@ -362,7 +364,7 @@ fn draw_menu_log_zone(d: &mut Cs3Display, lock_secs: u64) {
 /// 点呼確認 (免許証タップ後): ヘッダに交付日・有効期限、下に
 /// 「点呼を開始」/「キャンセル」の 2 ボタン。幾何は tenko_prompt::confirm_hit
 /// (CONFIRM_BUTTONS_TOP から 2 等分) と一致させる
-fn draw_confirm(d: &mut Cs3Display, card: &LicenseCard, expiry: ExpiryState, lock_secs: u64) {
+fn draw_confirm(d: &mut Cs3Display, card: &LicenseCard, expiry: ExpiryState, remain_secs: u64) {
     let (w, h) = dims(d);
     clear(d);
     // ヘッダ: 読み取り結果 (16px 2 行)
@@ -397,18 +399,19 @@ fn draw_confirm(d: &mut Cs3Display, card: &LicenseCard, expiry: ExpiryState, loc
         C_MUTED,
         C_BTN_BOTTOM,
     );
-    draw_confirm_footer(d, lock_secs);
+    draw_confirm_countdown(d, remain_secs);
 }
 
-/// 点呼確認画面のキャンセルボタン下端: ログ確認ロックの残り秒数 (1 秒ごと部分更新)。
-/// キャンセルの 2 倍文字 (中央 ±16px) とは重ならない位置に置く
-fn draw_confirm_footer(d: &mut Cs3Display, lock_secs: u64) {
+/// 「点呼を開始」の直下に確認画面の残り秒数 (あと N秒) を出す。UI ループが毎秒
+/// この行だけ塗り直す (QR の残り秒数と同じ方式)。2 倍文字 (中央 -18..+14) の
+/// 下、ボタン下端との間に収める
+pub fn draw_confirm_countdown(d: &mut Cs3Display, remain_secs: u64) {
     let (w, h) = dims(d);
-    let y = h - 22;
-    fill(d, 0, y - 2, w as u32, 22, C_BTN_BOTTOM);
-    if lock_secs > 0 {
-        jp_center(d, &format!("ログ確認 {lock_secs}秒後"), y, C_MUTED);
-    }
+    let top = CONFIRM_BUTTONS_TOP;
+    let zone_h = (h - top) / 2;
+    let y = top + zone_h / 2 + 20;
+    fill(d, 0, y, w as u32, 20, C_BTN_TOP);
+    jp_center(d, &format!("あと {remain_secs}秒"), y + 2, C_MUTED);
 }
 
 fn draw_qr(d: &mut Cs3Display, payload: &str, remain_s: u64) {

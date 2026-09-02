@@ -16,8 +16,16 @@
 pub const LOG_LOCK_MS: u64 = 15_000;
 
 /// 点呼確認画面を放置したときに待機画面へ戻るまでの時間 [ms]。
-/// かざしただけで立ち去ったケースの後始末
-pub const CONFIRM_TIMEOUT_MS: u64 = 30_000;
+/// かざしただけで立ち去ったケースの後始末。ログ確認ロックと同じ長さにして、
+/// 「点呼を開始」の下に出す残り秒数がそのままロックの残りにもなるようにする
+pub const CONFIRM_TIMEOUT_MS: u64 = LOG_LOCK_MS;
+
+/// 点呼確認画面の残り秒数 (切り上げ、0 で自動クローズ)
+pub fn confirm_remaining_secs(entered_ms: u64, now_ms: u64) -> u64 {
+    CONFIRM_TIMEOUT_MS
+        .saturating_sub(now_ms.saturating_sub(entered_ms))
+        .div_ceil(1000)
+}
 
 /// 読み取れた運転免許証の情報 (PIN なしで読める EF 2F01 の共通データ要素)。
 /// 日付は nfc_shim が返す "YYYYMMDD" のまま持つ
@@ -174,6 +182,14 @@ mod tests {
         assert_eq!(expiry_state("20301231", None), ExpiryState::Unknown);
         assert_eq!(expiry_state("", Some("20260902")), ExpiryState::Unknown);
         assert_eq!(expiry_state("20301231", Some("bad")), ExpiryState::Unknown);
+    }
+
+    #[test]
+    fn confirm_remaining() {
+        assert_eq!(confirm_remaining_secs(1_000, 1_000), 15);
+        assert_eq!(confirm_remaining_secs(1_000, 1_000 + CONFIRM_TIMEOUT_MS - 200), 1);
+        assert_eq!(confirm_remaining_secs(1_000, 1_000 + CONFIRM_TIMEOUT_MS), 0);
+        assert_eq!(confirm_remaining_secs(1_000, 1_000 + CONFIRM_TIMEOUT_MS + 5_000), 0);
     }
 
     #[test]

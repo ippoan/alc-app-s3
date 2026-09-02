@@ -8,15 +8,16 @@
 //! (NFC待機)  └─(下半分タップ)→ Log ─タップ→ Idle                      │
 //!   ↑  ↑ │                                                            │
 //!   │  │ └─免許証タップ→ Confirm ─(上: 点呼を開始)→ Measuring          │
-//!   │  │        (下: キャンセル / 30秒放置 → Idle)                     │
+//!   │  │        (下: キャンセル / 15秒放置 → Idle)                     │
 //!   │  └──────────────────────────────────────────────────────────────┘
 //!   ├─ BLE 測定受信 (待機中のみ) → Temperature / BloodPressure ─タップ/30秒→ Idle
 //!   └─ ホストコマンド: QR / MEASURE / RESULT / ERROR / RESET は従来どおり
 //!
 //! 免許証 (NFC-B) をかざすとメニューを飛ばして点呼確認 (Confirm) へ直行する。
 //! かざしてから LOG_LOCK_MS (15 秒) はメニューの「ログ確認」を押せなくする
-//! (hub-core tenko_prompt::LogLock)。残り秒数はメニューの下段ボタン・待機画面の
-//! 最下行・点呼確認画面のキャンセル側に 1 秒ごとに出す。
+//! (hub-core tenko_prompt::LogLock)。ロックの残り秒数はメニューの下段ボタンと
+//! 待機画面の最下行に出す。点呼確認画面は「点呼を開始」の下に画面自体の残り時間
+//! (あと N秒、15 秒で自動クローズ = ロックと同じ長さ) を出す。
 //!
 //! 点呼 (Measuring) 中の BLE 測定・ホスト RESULT は画面遷移せず、同一画面の
 //! 体温 (上段) / 血圧 (中段) / アルコール (最下段) の欄を直接更新する。
@@ -461,6 +462,13 @@ pub fn run(
                 if let Screen::Qr { timeout_ms, .. } = &screen {
                     let remain_s = timeout_ms.saturating_sub(now.saturating_sub(entered)) / 1000;
                     screens::draw_qr_countdown(&mut display, remain_s);
+                }
+                // 点呼確認: 「点呼を開始」の下の残り秒数を毎秒更新
+                if let Screen::Confirm { .. } = &screen {
+                    screens::draw_confirm_countdown(
+                        &mut display,
+                        tenko_prompt::confirm_remaining_secs(entered, now),
+                    );
                 }
                 last_bar = now;
             }

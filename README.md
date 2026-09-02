@@ -32,7 +32,7 @@ Idle ─タップ→ Menu                                         自動/タッ�
 (NFC待機)  └─(下半分タップ)→ Log(ログ確認) ─タップ→ Idle             │
   ↑  ↑ │                                                           │
   │  │ └─免許証タップ→ Confirm(点呼確認) ─(上: 点呼を開始)→ Measuring │
-  │  │        (下: キャンセル / 30秒放置 → Idle)                    │
+  │  │        (下: キャンセル / 15秒放置 → Idle)                    │
   │  └─────────────────────────────────────────────────────────────┘
   ├─ BLE 測定受信 (待機中/点呼中のみ・QR等の操作中は遷移しない) → 体温/血圧 表示 ─タップ/30秒→ Idle
   └─ ホストコマンド: QR / MEASURE / RESULT / ERROR / RESET は従来どおり
@@ -40,7 +40,8 @@ Idle ─タップ→ Menu                                         自動/タッ�
 
 - **免許証 (IC、NFC-B) をかざす**とメニューを飛ばして点呼確認画面へ直行する
   (点呼中・QR 表示中は奪わない)。ヘッダに交付日・有効期限を表示し、NTP 同期済みで
-  期限切れなら赤字 (`EVT LICENSE_EXPIRED`)
+  期限切れなら赤字 (`EVT LICENSE_EXPIRED`)。「点呼を開始」の下に残り秒数 (あと N秒) を
+  出し、15 秒放置で待機画面へ戻る
 - かざしてから **15 秒間はメニューの「ログ確認」を押せない** (ボタンは残り秒数付きで
   グレー表示)。確認画面の「キャンセル」や待機画面の下半分を続けて叩いたときに
   ログ画面へ流れ込む誤操作を防ぐ (`crates/hub-core/src/tenko_prompt.rs`)
@@ -85,7 +86,7 @@ crates/hub-core/src/improv.rs)。
 | `EVT TENKO_START` | 画面 (メニュー or 免許証タップ後の確認画面) から点呼が開始された |
 | `EVT NFC_LICENSE issue=YYYYMMDD expiry=YYYYMMDD` | 運転免許証 (IC) を読み取った (dev ビルド `nfc-verify`) |
 | `EVT LICENSE_EXPIRED <YYYYMMDD>` | 読み取った免許証が期限切れ (NTP 同期済みのときのみ判定) |
-| `EVT TENKO_CANCEL` / `EVT CONFIRM_TIMEOUT` | 点呼確認画面をキャンセル / 30 秒放置で待機へ戻った |
+| `EVT TENKO_CANCEL` / `EVT CONFIRM_TIMEOUT` | 点呼確認画面をキャンセル / 15 秒放置で待機へ戻った |
 | `EVT TENKO_SESSION <id>` | 点呼セッション ID を発番した (この点呼で採れた測定に載る、Refs #112) |
 | `EVT WIFI_TEST OK\|NG <詳細>` | `WIFI TEST` の結果 (NG は原因を切り分け) |
 | `EVT PAIR_CLEARED` | BLE ボンド消去完了 |
