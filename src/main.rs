@@ -256,6 +256,8 @@ fn main() -> Result<()> {
     // NT-100B / NBP-1BLE 読み取り。測定値は meas_tx で recorder へ送る。
     // 接続開始/終了は tx で UI へ通知 (点呼画面の取得中スピナー)。
     // Wi-Fi 接続/Improv セッション中は BLE スキャンを一時停止する (RadioCoex)
+    // UI も Measurement を送る (点呼開始時の免許証 kind=license、#125)
+    let ui_meas_tx = meas_tx.clone();
     ble::start(Arc::clone(&status), meas_tx, tx, coex, pair_flag)?;
 
     // 全サービスの起動に成功 = 正常起動として rollback を確定解除する
@@ -264,5 +266,5 @@ fn main() -> Result<()> {
     alc_hub_drivers::ota::mark_boot_valid();
 
     // UI ループ (メインタスクを占有, 戻らない)
-    ui::run(display, i2c, rx, status, rotation, boot_id)
+    ui::run(display, i2c, rx, status, rotation, boot_id, ui_meas_tx)
 }

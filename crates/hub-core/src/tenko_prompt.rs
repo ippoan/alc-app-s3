@@ -37,6 +37,31 @@ pub struct LicenseCard {
     pub expiry: String,
 }
 
+impl LicenseCard {
+    /// alc-app タブレットと同じ乗務員キー: 交付日 8 桁 + 有効期限 8 桁 = 16 桁
+    /// (rust-alc-api `employees.nfc_id`、`GET /api/employees/by-nfc/{nfc_id}`)。
+    /// どちらかが 8 桁数字でなければ None (キーにできない)
+    pub fn nfc_id(&self) -> Option<String> {
+        if is_yyyymmdd(&self.issue) && is_yyyymmdd(&self.expiry) {
+            Some(format!("{}{}", self.issue, self.expiry))
+        } else {
+            None
+        }
+    }
+
+    /// WS 送信 (kind = "license") の payload。点呼開始時に測定と同じ session_id で
+    /// 送り、サーバ側で nfc_id → 乗務員に結合する (ippoan/alc-app-s3#125)
+    pub fn payload_json(&self) -> String {
+        let nfc = self
+            .nfc_id()
+            .map_or("null".to_string(), |v| format!("\"{v}\""));
+        format!(
+            "{{\"type\":\"license\",\"nfc_id\":{nfc},\"issue\":\"{}\",\"expiry\":\"{}\"}}",
+            self.issue, self.expiry
+        )
+    }
+}
+
 /// 有効期限の判定結果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpiryState {
@@ -164,6 +189,28 @@ mod tests {
         assert_eq!(fmt_yyyymmdd(""), "");
         assert_eq!(fmt_yyyymmdd("2030-12"), "2030-12");
         assert_eq!(fmt_yyyymmdd("2030123X"), "2030123X");
+    }
+
+    #[test]
+    fn license_nfc_id_and_payload() {
+        let c = LicenseCard {
+            issue: "20231117".into(),
+            expiry: "20290107".into(),
+        };
+        assert_eq!(c.nfc_id().as_deref(), Some("2023111720290107"));
+        assert_eq!(
+            c.payload_json(),
+            r#"{"type":"license","nfc_id":"2023111720290107","issue":"20231117","expiry":"20290107"}"#
+        );
+        let broken = LicenseCard {
+            issue: "".into(),
+            expiry: "20290107".into(),
+        };
+        assert_eq!(broken.nfc_id(), None);
+        assert_eq!(
+            broken.payload_json(),
+            r#"{"type":"license","nfc_id":null,"issue":"","expiry":"20290107"}"#
+        );
     }
 
     #[test]

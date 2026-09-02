@@ -10,7 +10,7 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UplinkRecord {
     /// cf-alc-recorder の kind (temperature / blood_pressure / alcohol /
-    /// fc1200_raw / crash_log)
+    /// fc1200_raw / crash_log / license)
     pub kind: &'static str,
     /// ble-medical-gateway 互換 JSON オブジェクト文字列
     pub payload: String,
@@ -42,6 +42,14 @@ pub enum Measurement {
         pulse: Option<f32>,
         /// 機器内蔵時計の測定時刻 (YYYYMMDDHHMMSS)。重複排除に使う
         timestamp: Option<u64>,
+        at_ms: u64,
+    },
+    /// 点呼開始時の免許証 (点呼確認画面で「点呼を開始」を押した札)。UI が
+    /// session_id を発番した直後に送り、recorder が kind="license" で WS へ載せる
+    /// (ippoan/alc-app-s3#125)。日付は YYYYMMDD を u32 で持つ (Copy 型を保つため)
+    License {
+        issue: u32,
+        expiry: u32,
         at_ms: u64,
     },
     /// FC-1200 (RS232) のアルコール測定。値は 0.01mg/L 単位の整数
