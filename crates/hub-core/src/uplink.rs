@@ -35,6 +35,42 @@ pub struct QueueEntry {
     /// **None のときはフレームにも NVS にも出さない** — 旧サーバ / 旧 NVS データとの
     /// 互換を保つため (受け側は欠落を「セッション不明」として扱う)。
     pub session_id: Option<String>,
+    /// 記録時点の稼働時間 [ms] (esp_timer)。NTP 未同期で記録した測定の時刻を、
+    /// 同期後の送信時に `fix_unsynced_times` で実時刻へ補正するための足場。
+    /// NVS には `uptime_ms` として保存 (旧データは None)。フレームには出さない
+    pub uptime_ms: Option<u64>,
+    /// 記録した起動の boot_id。稼働時間は起動ごとに 0 に戻るので、**同じ起動の
+    /// うちだけ**補正できる (再起動をまたいだ古いエントリは補正しない)
+    pub boot_id: Option<u32>,
+}
+
+/// これ未満の epoch ms は「NTP 未同期 (1970 起点の稼働時間)」とみなす
+/// (clock::MIN_SYNCED_SECS と同じ境界)
+pub const MIN_SYNCED_MS: u64 = crate::clock::MIN_SYNCED_SECS as u64 * 1000;
+
+/// NTP 未同期で記録されたエントリの recorded_at_ms を、現在の壁時計と稼働時間の
+/// 差から実時刻に直す。補正できるのは
+///
+/// - エントリが未同期時刻 (< MIN_SYNCED_MS) で、今は同期済み (>= MIN_SYNCED_MS)
+/// - 同じ起動 (boot_id 一致) で、記録時の稼働時間を持っている
+///
+/// のとき。`実時刻 = 今の壁時計 - (今の稼働時間 - 記録時の稼働時間)`。
+/// 稼働時間が逆転している (ありえないが) 場合は補正しない
+pub fn corrected_recorded_at(
+    entry: &QueueEntry,
+    now_epoch_ms: u64,
+    now_uptime_ms: u64,
+    boot_id: u32,
+) -> Option<u64> {
+    if entry.recorded_at_ms >= MIN_SYNCED_MS || now_epoch_ms < MIN_SYNCED_MS {
+        return None;
+    }
+    if entry.boot_id != Some(boot_id) {
+        return None;
+    }
+    let uptime = entry.uptime_ms?;
+    let elapsed = now_uptime_ms.checked_sub(uptime)?;
+    Some(now_epoch_ms.saturating_sub(elapsed))
 }
 
 /// 下り (server → CoreS3) フレーム
@@ -283,6 +319,12 @@ impl UplinkQueue {
                 .get("session_id")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
+            // 同じく旧データは None (補正対象外になるだけ)
+            uptime_ms: obj.get("uptime_ms").and_then(|v| v.as_u64()),
+            boot_id: obj
+                .get("boot_id")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
         })
     }
 
@@ -301,6 +343,12 @@ impl UplinkQueue {
                 });
                 if let Some(session_id) = &e.session_id {
                     line["session_id"] = json!(session_id);
+                }
+                if let Some(uptime_ms) = e.uptime_ms {
+                    line["uptime_ms"] = json!(uptime_ms);
+                }
+                if let Some(boot_id) = e.boot_id {
+                    line["boot_id"] = json!(boot_id);
                 }
                 line.to_string()
             })
@@ -328,6 +376,20 @@ impl UplinkQueue {
         payload: &str,
         session_id: Option<&str>,
     ) -> Result<(u64, Option<u64>), String> {
+        self.push_record(kind, recorded_at_ms, payload, session_id, None, None)
+    }
+
+    /// 時刻補正の足場 (記録時の稼働時間 + boot_id) 付きで積む。firmware の
+    /// 通常経路はこちら (ws_uplink::enqueue)
+    pub fn push_record(
+        &mut self,
+        kind: &str,
+        recorded_at_ms: u64,
+        payload: &str,
+        session_id: Option<&str>,
+        uptime_ms: Option<u64>,
+        boot_id: Option<u32>,
+    ) -> Result<(u64, Option<u64>), String> {
         // 正規化して保存する (serialize/restore の roundtrip をキー順に依らず
         // 一致させるため。measurement_frame にもこの正規化済み文字列が渡る)
         let payload = payload_object(payload)?.to_string();
@@ -339,6 +401,8 @@ impl UplinkQueue {
             kind: kind.to_string(),
             payload,
             session_id: session_id.map(str::to_string),
+            uptime_ms,
+            boot_id,
         });
         let dropped = if self.entries.len() > self.max {
             self.entries.pop_front().map(|e| e.seq)
@@ -346,6 +410,19 @@ impl UplinkQueue {
             None
         };
         Ok((seq, dropped))
+    }
+
+    /// NTP 未同期で記録されたエントリの時刻を実時刻へ直す (corrected_recorded_at)。
+    /// 戻り値は補正した件数。送信の直前に呼び、0 でなければ NVS へ書き戻す
+    pub fn fix_unsynced_times(&mut self, now_epoch_ms: u64, now_uptime_ms: u64, boot_id: u32) -> usize {
+        let mut fixed = 0;
+        for e in self.entries.iter_mut() {
+            if let Some(t) = corrected_recorded_at(e, now_epoch_ms, now_uptime_ms, boot_id) {
+                e.recorded_at_ms = t;
+                fixed += 1;
+            }
+        }
+        fixed
     }
 
     /// ack された seq をキューから消す。該当が無ければ false
@@ -387,6 +464,8 @@ mod tests {
             kind: "temperature".into(),
             payload: PAYLOAD.into(),
             session_id: None,
+            uptime_ms: None,
+            boot_id: None,
         };
         let f = measurement_frame(&e).unwrap();
         let v: Value = serde_json::from_str(&f).unwrap();
@@ -406,6 +485,8 @@ mod tests {
             kind: "temperature".into(),
             payload: PAYLOAD.into(),
             session_id: None,
+            uptime_ms: None,
+            boot_id: None,
         };
         let v: Value = serde_json::from_str(&measurement_frame(&e).unwrap()).unwrap();
         assert!(v.as_object().unwrap().get("session_id").is_none());
@@ -455,6 +536,8 @@ mod tests {
             kind: "k".into(),
             payload: "{oops".into(),
             session_id: None,
+            uptime_ms: None,
+            boot_id: None,
         };
         assert!(measurement_frame(&e).is_err());
         e.payload = "[1,2]".into();
@@ -742,5 +825,85 @@ mod tests {
         let (q, _) = UplinkQueue::restore(0, &lines.join("\n"), 3);
         let seqs: Vec<u64> = q.entries().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![3, 4, 5]);
+    }
+
+    fn entry(recorded_at_ms: u64, uptime_ms: Option<u64>, boot_id: Option<u32>) -> QueueEntry {
+        QueueEntry {
+            seq: 1,
+            recorded_at_ms,
+            kind: "alcohol".into(),
+            payload: PAYLOAD.into(),
+            session_id: None,
+            uptime_ms,
+            boot_id,
+        }
+    }
+
+    const SYNCED: u64 = 1_788_000_000_000; // 2026-08 頃
+
+    #[test]
+    fn corrected_time_uses_uptime_delta_within_same_boot() {
+        // 稼働 5,000ms で記録 (1970 起点 = 未同期)、稼働 65,000ms で同期済み送信
+        let e = entry(5_000, Some(5_000), Some(7));
+        assert_eq!(
+            corrected_recorded_at(&e, SYNCED, 65_000, 7),
+            Some(SYNCED - 60_000)
+        );
+    }
+
+    #[test]
+    fn corrected_time_not_applied_when_already_synced_or_still_unsynced() {
+        let synced_entry = entry(SYNCED - 1_000, Some(5_000), Some(7));
+        assert_eq!(corrected_recorded_at(&synced_entry, SYNCED, 65_000, 7), None);
+        let e = entry(5_000, Some(5_000), Some(7));
+        // 今もまだ未同期 (稼働時間のまま) なら直せない
+        assert_eq!(corrected_recorded_at(&e, 65_000, 65_000, 7), None);
+    }
+
+    #[test]
+    fn corrected_time_requires_same_boot_and_uptime() {
+        let other_boot = entry(5_000, Some(5_000), Some(6));
+        assert_eq!(corrected_recorded_at(&other_boot, SYNCED, 65_000, 7), None);
+        let legacy = entry(5_000, None, None);
+        assert_eq!(corrected_recorded_at(&legacy, SYNCED, 65_000, 7), None);
+        let no_uptime = entry(5_000, None, Some(7));
+        assert_eq!(corrected_recorded_at(&no_uptime, SYNCED, 65_000, 7), None);
+        // 稼働時間が逆転 (記録時 > 今) なら補正しない
+        let future = entry(5_000, Some(70_000), Some(7));
+        assert_eq!(corrected_recorded_at(&future, SYNCED, 65_000, 7), None);
+    }
+
+    #[test]
+    fn queue_fix_unsynced_times_rewrites_only_eligible_entries() {
+        let mut q = UplinkQueue::restore(0, "", 10).0;
+        q.push_record("alcohol", 5_000, PAYLOAD, None, Some(5_000), Some(7))
+            .unwrap();
+        q.push_record("temperature", 9_000, PAYLOAD, Some("7-1"), Some(9_000), Some(6))
+            .unwrap();
+        q.push_record("alcohol", SYNCED, PAYLOAD, None, Some(20_000), Some(7))
+            .unwrap();
+        assert_eq!(q.fix_unsynced_times(SYNCED + 100_000, 65_000, 7), 1);
+        let times: Vec<u64> = q.entries().map(|e| e.recorded_at_ms).collect();
+        assert_eq!(times, vec![SYNCED + 40_000, 9_000, SYNCED]);
+        // 2 回目は補正対象が残っていない
+        assert_eq!(q.fix_unsynced_times(SYNCED + 100_000, 65_000, 7), 0);
+    }
+
+    #[test]
+    fn uptime_and_boot_id_roundtrip_through_nvs_lines() {
+        let mut q = UplinkQueue::restore(0, "", 10).0;
+        q.push_record("alcohol", 5_000, PAYLOAD, None, Some(5_000), Some(7))
+            .unwrap();
+        q.push_with_session("alcohol", 6_000, PAYLOAD, None).unwrap();
+        let text = q.serialize();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].contains("\"uptime_ms\":5000") && lines[0].contains("\"boot_id\":7"));
+        assert!(!lines[1].contains("uptime_ms") && !lines[1].contains("boot_id"));
+        let (restored, skipped) = UplinkQueue::restore(0, &text, 10);
+        assert_eq!(skipped, 0);
+        assert_eq!(restored, q);
+        // フレームには出さない (サーバ形式は据え置き)
+        let frame = measurement_frame(restored.entries().next().unwrap()).unwrap();
+        assert!(!frame.contains("uptime_ms") && !frame.contains("boot_id"));
     }
 }

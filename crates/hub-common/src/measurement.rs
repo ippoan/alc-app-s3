@@ -14,8 +14,11 @@ pub struct UplinkRecord {
     pub kind: &'static str,
     /// ble-medical-gateway 互換 JSON オブジェクト文字列
     pub payload: String,
-    /// 記録時刻 (epoch ms、NTP 未同期時は稼働時間由来の値になり得る)
+    /// 記録時刻 (epoch ms、NTP 未同期時は稼働時間由来の値になり得る —
+    /// その場合 ws_uplink が同期後の送信時に `at_ms` との差で実時刻へ補正する)
     pub recorded_at_ms: u64,
+    /// 記録時点の稼働時間 [ms] (esp_timer)。時刻補正の足場
+    pub at_ms: u64,
     /// 1 回の点呼を束ねる識別子 (Refs #112)。点呼中 (UI が Measuring) の測定にだけ
     /// 載り、待機画面で届いた単発計測では None。発番は UI スレッド、ここへは
     /// recorder が `HubStatus` 経由で読んだ現在値が入る。

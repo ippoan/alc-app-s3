@@ -132,6 +132,15 @@ impl HubStatus {
 
 pub type SharedStatus = Arc<Mutex<HubStatus>>;
 
+/// 現在の壁時計 (epoch ms)。NTP 未同期時は 1970 起点の稼働時間になる
+/// (uplink::MIN_SYNCED_MS 未満)。記録側はそのまま保存し、送信側で補正する
+pub fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// 起動からの経過ミリ秒
 pub fn now_ms() -> u64 {
     unsafe { esp_idf_svc::sys::esp_timer_get_time() as u64 / 1000 }

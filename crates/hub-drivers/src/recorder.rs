@@ -89,6 +89,7 @@ pub fn start(
                             kind: "temperature",
                             payload: json,
                             recorded_at_ms: epoch_ms(),
+                            at_ms,
                             session_id: current_session_id(&status),
                         };
                         let _ = gw_tx.send(rec.clone());
@@ -128,6 +129,7 @@ pub fn start(
                             kind: "blood_pressure",
                             payload: json,
                             recorded_at_ms: epoch_ms(),
+                            at_ms,
                             session_id: current_session_id(&status),
                         };
                         let _ = gw_tx.send(rec.clone());
@@ -156,6 +158,7 @@ pub fn start(
                             kind: "alcohol",
                             payload: json,
                             recorded_at_ms: epoch_ms(),
+                            at_ms,
                             session_id: current_session_id(&status),
                         };
                         let _ = gw_tx.send(rec.clone());

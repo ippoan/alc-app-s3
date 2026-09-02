@@ -244,6 +244,7 @@ pub fn report(snap: &CrashSnapshot, ws_tx: &Sender<UplinkRecord>, status: &Share
         kind: "crash_log",
         payload,
         recorded_at_ms: epoch_ms(),
+        at_ms: now_ms(),
         // クラッシュ復帰レポートは点呼とは無関係 (そもそも前回起動の記録)
         session_id: None,
     });

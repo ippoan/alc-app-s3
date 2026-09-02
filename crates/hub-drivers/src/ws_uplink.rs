@@ -41,7 +41,7 @@ use esp_idf_svc::ws::client::{
 use alc_hub_common::{
     measurement::UplinkRecord,
     settings::Settings,
-    status::{now_ms, SharedStatus},
+    status::{epoch_ms, now_ms, SharedStatus},
     ui_api::UiCommand,
 };
 
@@ -94,13 +94,14 @@ pub fn start(
     ui_tx: Sender<UiCommand>,
     status: SharedStatus,
     settings: Settings,
+    boot_id: u32,
 ) -> Result<()> {
     // TLS ハンドシェイクが呼び出しスレッドのスタックを使うため大きめ
     crate::task::name_next(c"ws_uplink");
     std::thread::Builder::new()
         .name("ws_uplink".into())
         .stack_size(20 * 1024)
-        .spawn(move || run(rx, ui_tx, status, settings))?;
+        .spawn(move || run(rx, ui_tx, status, settings, boot_id))?;
     Ok(())
 }
 
@@ -156,6 +157,7 @@ fn run(
     ui_tx: Sender<UiCommand>,
     status: SharedStatus,
     settings: Settings,
+    boot_id: u32,
 ) {
     let (restored, skipped) =
         UplinkQueue::restore(settings.ws_last_seq(), &settings.ws_queue(), MAX_QUEUE);
@@ -184,9 +186,9 @@ fn run(
         // --- 1. 測定の受け取り (500ms でタイムアウトしループを回す) ---
         match rx.recv_timeout(core::time::Duration::from_millis(500)) {
             Ok(rec) => {
-                enqueue(&mut queue, &settings, &rec);
+                enqueue(&mut queue, &settings, &rec, boot_id);
                 while let Ok(rec) = rx.try_recv() {
-                    enqueue(&mut queue, &settings, &rec);
+                    enqueue(&mut queue, &settings, &rec, boot_id);
                 }
                 publish_status(&status, &queue, conn.as_ref().is_some_and(|c| c.connected));
                 last_flush = 0; // 新規測定は即送信
@@ -311,6 +313,15 @@ fn run(
 
         // --- 4. キューの送信 (BLE 測定中は控える) ---
         if !ble_busy && !queue.is_empty() && now.saturating_sub(last_flush) >= RESEND_INTERVAL_MS {
+            // NTP 未同期 (ネットワーク無し) で記録した測定は recorded_at_ms が 1970 起点
+            // になっている。今は同期済み (接続できている = ネットワークがある) なので、
+            // 記録時と今の稼働時間の差で実時刻へ直してから送る (同じ起動の分だけ)
+            let fixed = queue.fix_unsynced_times(epoch_ms(), now, boot_id);
+            if fixed > 0 {
+                log::info!("ws_uplink: 未同期時刻の測定 {fixed} 件を実時刻へ補正");
+                println!("EVT WS_TIME_FIXED {fixed}");
+                persist(&settings, &queue);
+            }
             // 再送も同じ seq (サーバ冪等)。send 失敗は接続破棄 → 再接続
             let mut failed = false;
             {
@@ -411,13 +422,16 @@ fn mark_disconnected(conn: &mut Option<Conn>, reason: &str, queue: &UplinkQueue)
     c.disconnected_at = Some(now_ms());
 }
 
-/// 測定をキューへ積み NVS へ永続化する
-fn enqueue(queue: &mut UplinkQueue, settings: &Settings, rec: &UplinkRecord) {
-    match queue.push_with_session(
+/// 測定をキューへ積み NVS へ永続化する。記録時の稼働時間と boot_id も持たせ、
+/// NTP 未同期で記録した時刻を送信時に補正できるようにする (fix_unsynced_times)
+fn enqueue(queue: &mut UplinkQueue, settings: &Settings, rec: &UplinkRecord, boot_id: u32) {
+    match queue.push_record(
         rec.kind,
         rec.recorded_at_ms,
         &rec.payload,
         rec.session_id.as_deref(),
+        Some(rec.at_ms),
+        Some(boot_id),
     ) {
         Ok((_, dropped)) => {
             if let Some(seq) = dropped {

@@ -5,7 +5,7 @@
 //! 稼働時間表示へフォールバックする。
 
 /// これ未満の Unix 秒は「時刻未同期」とみなす (2020-09 頃)
-const MIN_SYNCED_SECS: i64 = 1_600_000_000;
+pub const MIN_SYNCED_SECS: i64 = 1_600_000_000;
 
 /// Unix 秒 (UTC) を JST の "MM/DD HH:MM:SS" に整形する。未同期なら None。
 pub fn format_jst(unix_secs: i64) -> Option<String> {
