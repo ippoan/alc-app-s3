@@ -20,11 +20,13 @@
 //! (あと N秒、15 秒で自動クローズ = ロックと同じ長さ) を出す。
 //!
 //! 点呼 (Measuring) 中の BLE 測定・ホスト RESULT は画面遷移せず、同一画面の
-//! 体温 (上段) / 血圧 (中段) / アルコール (最下段) の欄を直接更新する。
-//! BLE 接続開始 (BleAcquiring) でラベル横にスピナーを表示し、どちらを
-//! 取得中かを示す。体温+血圧が揃ってから TENKO_DONE_CLOSE_MS (5秒) で
-//! 待機画面へ戻る (アルコールは表示のみ — 完了条件は運用ごとに異なるため
-//! 今後実装)。無操作時は TENKO_TIMEOUT_MS (長め) で待機画面へ戻る。
+//! 体温 / (血圧) / アルコール の欄を直接更新する。**血圧は運用オプション**
+//! (hub-core tenko::TenkoItems、`TENKO BP ON|OFF`、既定 OFF) で、OFF なら段を
+//! 出さず体温とアルコールの 2 段にし、血圧計の測定は画面では無視する
+//! (ログ・WS 送信には残る)。BLE 接続開始 (BleAcquiring) でラベル横にスピナー
+//! を表示し、どちらを取得中かを示す。必須項目 (体温 + アルコール、血圧 ON なら
+//! 血圧も) が揃ってから TENKO_DONE_CLOSE_MS (5秒) で待機画面へ戻る。無操作時は
+//! TENKO_TIMEOUT_MS (長め) で待機画面へ戻る。
 //! ```
 //!
 //! コマンドは host_link (USB CDC) と ble から mpsc 経由で届く。描画は状態
@@ -36,6 +38,7 @@ use std::sync::mpsc::Receiver;
 
 use alc_hub_core::device::DeviceKind;
 use alc_hub_core::layout::map_touch;
+use alc_hub_core::tenko::TenkoItems;
 use alc_hub_core::tenko_prompt::{
     self, ConfirmChoice, ExpiryState, LicenseCard, LogLock, MenuChoice,
 };
@@ -61,20 +64,21 @@ pub(crate) enum Screen {
         payload: String,
         timeout_ms: u64,
     },
-    /// 点呼: 体温 / 血圧 / アルコールを同一画面で計測・確認する (3 段表示)
+    /// 点呼: 体温 / (血圧) / アルコールを同一画面で計測・確認する
     Measuring {
+        /// 点呼の構成 (血圧を含めるか)。画面に入った時点の設定で固定
+        items: TenkoItems,
         /// 体温 (℃)。None = 未計測
         temp: Option<f32>,
-        /// 血圧 (収縮期, 拡張期, 脈拍)。None = 未計測
+        /// 血圧 (収縮期, 拡張期, 脈拍)。None = 未計測。items.bp が false なら
+        /// 常に None (血圧計の測定が来ても画面では無視する)
         bp: Option<(f32, f32, Option<f32>)>,
         /// アルコール測定結果 (ok, 表示値)。ホストの RESULT または
-        /// FC-1200 (recorder 経由) で更新。表示のみで点呼完了条件には
-        /// 含めない (対面点呼など運用によりアルコールチェッカーの扱いが
-        /// 異なるため — 今後実装)
+        /// FC-1200 (recorder 経由) で更新。点呼完了の必須項目
         alcohol: Option<(bool, String)>,
         /// FC-1200 の測定進行状態 (結果が無い間の「準備中/吹込待ち/判定中」表示)
         alc_stage: Option<alc_hub_common::ui_api::AlcoholStage>,
-        /// 体温+血圧が揃った時刻 [ms]。TENKO_DONE_CLOSE_MS 経過で待機画面へ
+        /// 必須項目が揃った時刻 [ms] (items.complete)。TENKO_DONE_CLOSE_MS 経過で待機画面へ
         done_at: Option<u64>,
     },
     Result {
@@ -213,13 +217,16 @@ pub fn run(
                 // させない (測定値はログとホストへの JSON 出力には常に残る)
                 UiCommand::Temperature { celsius } => {
                     if let Screen::Measuring {
-                        temp, bp, done_at, ..
+                        items,
+                        temp,
+                        bp,
+                        alcohol,
+                        done_at,
+                        ..
                     } = &mut screen
                     {
                         *temp = Some(celsius);
-                        if bp.is_some() && done_at.is_none() {
-                            *done_at = Some(now);
-                        }
+                        mark_done_if_complete(*items, temp, bp, alcohol, done_at, now);
                         if acquiring == Some(DeviceKind::Thermometer) {
                             acquiring = None;
                         }
@@ -232,23 +239,34 @@ pub fn run(
                         log::info!("ui: 体温表示を抑制 (操作中の画面を優先)");
                     }
                 }
+                // 血圧: 点呼の構成に含むときだけ画面に反映する。OFF (保留) なら
+                // 点呼中も待機中も画面は動かさない (測定値はログ・WS には残る)
                 UiCommand::BloodPressure {
                     systolic,
                     diastolic,
                     pulse,
                 } => {
                     if let Screen::Measuring {
-                        temp, bp, done_at, ..
+                        items,
+                        temp,
+                        bp,
+                        alcohol,
+                        done_at,
+                        ..
                     } = &mut screen
                     {
-                        *bp = Some((systolic, diastolic, pulse));
-                        if temp.is_some() && done_at.is_none() {
-                            *done_at = Some(now);
+                        if items.bp {
+                            *bp = Some((systolic, diastolic, pulse));
+                            mark_done_if_complete(*items, temp, bp, alcohol, done_at, now);
+                            dirty = true;
+                        } else {
+                            log::info!("ui: 血圧は点呼の構成外 (TENKO BP OFF) — 画面には出さない");
                         }
                         if acquiring == Some(DeviceKind::BloodPressure) {
                             acquiring = None;
                         }
-                        dirty = true;
+                    } else if !current_items(&status).bp {
+                        log::info!("ui: 血圧表示を抑制 (TENKO BP OFF)");
                     } else if vitals_display_allowed(&screen) {
                         screen = Screen::BloodPressure {
                             systolic,
@@ -282,11 +300,17 @@ pub fn run(
                 // それ以外は従来どおり結果画面へ
                 UiCommand::Result { ok, value } => {
                     if let Screen::Measuring {
-                        alcohol, alc_stage, ..
+                        items,
+                        temp,
+                        bp,
+                        alcohol,
+                        alc_stage,
+                        done_at,
                     } = &mut screen
                     {
                         *alcohol = Some((ok, value));
                         *alc_stage = None;
+                        mark_done_if_complete(*items, temp, bp, alcohol, done_at, now);
                         dirty = true;
                     } else {
                         screen = Screen::Result { ok, value };
@@ -331,13 +355,7 @@ pub fn run(
                             payload,
                             timeout_ms,
                         },
-                        UiCommand::Measure => Screen::Measuring {
-                            temp: None,
-                            bp: None,
-                            alcohol: None,
-                            alc_stage: None,
-                            done_at: None,
-                        },
+                        UiCommand::Measure => new_tenko(current_items(&status)),
                         UiCommand::Error { message } => Screen::Error { message },
                         UiCommand::Reset => Screen::Idle,
                         UiCommand::Rotate(_)
@@ -366,7 +384,7 @@ pub fn run(
                 println!("EVT RESULT_CLOSED");
                 true
             }
-            // 点呼: 体温・血圧の両方が揃ったら 5 秒表示して待機画面へ
+            // 点呼: 必須項目が揃ったら 5 秒表示して待機画面へ
             Screen::Measuring {
                 done_at: Some(done),
                 ..
@@ -409,7 +427,13 @@ pub fn run(
             } else {
                 LCD_H
             };
-            if let Some(next) = on_click(&screen, y, logical_h, log_lock.is_locked(now)) {
+            if let Some(next) = on_click(
+                &screen,
+                y,
+                logical_h,
+                log_lock.is_locked(now),
+                current_items(&status),
+            ) {
                 screen = next;
                 entered = now;
                 dirty = true;
@@ -475,12 +499,14 @@ pub fn run(
             // 点呼画面: BLE 取得中の機器ラベル横スピナーをアニメーション
             // (未取得の項目のみ — tenko_spinner_visible 参照)
             if let Some(kind) = acquiring {
-                if tenko_spinner_visible(&screen, kind)
-                    && now.saturating_sub(last_spin) >= 150
-                {
-                    spin_phase = (spin_phase + 1) % 8;
-                    screens::draw_tenko_spinner(&mut display, kind, spin_phase);
-                    last_spin = now;
+                if let Screen::Measuring { items, .. } = &screen {
+                    if tenko_spinner_visible(&screen, kind)
+                        && now.saturating_sub(last_spin) >= 150
+                    {
+                        spin_phase = (spin_phase + 1) % 8;
+                        screens::draw_tenko_spinner(&mut display, *items, kind, spin_phase);
+                        last_spin = now;
+                    }
                 }
             }
         }
@@ -514,11 +540,47 @@ pub fn run(
 /// 参照) のたびに「取得中」に見えてしまう。測り直しの値は表示だけ更新される
 fn tenko_spinner_visible(screen: &Screen, kind: DeviceKind) -> bool {
     match screen {
-        Screen::Measuring { temp, bp, .. } => match kind {
+        Screen::Measuring {
+            items, temp, bp, ..
+        } => match kind {
             DeviceKind::Thermometer => temp.is_none(),
-            DeviceKind::BloodPressure => bp.is_none(),
+            // 血圧 OFF なら段が無いので回さない
+            DeviceKind::BloodPressure => items.bp && bp.is_none(),
         },
         _ => false,
+    }
+}
+
+/// 現在の点呼構成 (HubStatus 経由。`TENKO BP` で変わる)
+fn current_items(status: &SharedStatus) -> TenkoItems {
+    TenkoItems {
+        bp: status.lock().map(|s| s.tenko_bp).unwrap_or(false),
+    }
+}
+
+/// 点呼画面の初期状態
+fn new_tenko(items: TenkoItems) -> Screen {
+    Screen::Measuring {
+        items,
+        temp: None,
+        bp: None,
+        alcohol: None,
+        alc_stage: None,
+        done_at: None,
+    }
+}
+
+/// 必須項目が揃った瞬間を記録する (揃った後の測り直しでは時刻を動かさない)
+fn mark_done_if_complete(
+    items: TenkoItems,
+    temp: &Option<f32>,
+    bp: &Option<(f32, f32, Option<f32>)>,
+    alcohol: &Option<(bool, String)>,
+    done_at: &mut Option<u64>,
+    now: u64,
+) {
+    if done_at.is_none() && items.complete(temp.is_some(), bp.is_some(), alcohol.is_some()) {
+        *done_at = Some(now);
     }
 }
 
@@ -553,31 +615,32 @@ fn today_yyyymmdd() -> Option<String> {
         .and_then(|d| alc_hub_core::clock::jst_yyyymmdd(d.as_secs() as i64))
 }
 
-/// 点呼開始: ホストへ通知し、体温/血圧/アルコールの測定待ち画面を作る
-fn start_tenko() -> Screen {
+/// 点呼開始: ホストへ通知し、測定待ち画面を作る (構成は現在の設定で固定)
+fn start_tenko(items: TenkoItems) -> Screen {
     println!("EVT TENKO_START");
-    Screen::Measuring {
-        temp: None,
-        bp: None,
-        alcohol: None,
-        alc_stage: None,
-        done_at: None,
-    }
+    new_tenko(items)
 }
 
 /// タップ時の画面遷移先 (None = 変化なし)。y は回転補正済みの論理座標。
-/// `log_locked` は免許証タップ後のログ確認ロック中か (メニュー下段を無効化)
-fn on_click(screen: &Screen, y: i32, logical_h: i32, log_locked: bool) -> Option<Screen> {
+/// `log_locked` は免許証タップ後のログ確認ロック中か (メニュー下段を無効化)。
+/// `items` は点呼を始める場合の構成
+fn on_click(
+    screen: &Screen,
+    y: i32,
+    logical_h: i32,
+    log_locked: bool,
+    items: TenkoItems,
+) -> Option<Screen> {
     match screen {
         Screen::Idle => Some(Screen::Menu),
         // ヒット判定は描画 (screens::draw_menu) と同じ幾何 (バー直下から 2 等分)
         Screen::Menu => match tenko_prompt::menu_hit(y, screens::BAR_H, logical_h, log_locked)? {
-            MenuChoice::Tenko => Some(start_tenko()),
+            MenuChoice::Tenko => Some(start_tenko(items)),
             MenuChoice::Log => Some(Screen::Log),
         },
         Screen::Confirm { .. } => {
             match tenko_prompt::confirm_hit(y, screens::CONFIRM_BUTTONS_TOP, logical_h)? {
-                ConfirmChoice::Start => Some(start_tenko()),
+                ConfirmChoice::Start => Some(start_tenko(items)),
                 ConfirmChoice::Cancel => {
                     println!("EVT TENKO_CANCEL");
                     Some(Screen::Idle)

@@ -94,6 +94,8 @@ fn main() -> Result<()> {
 
     let status: SharedStatus = Arc::new(Mutex::new(HubStatus {
         board: board_kind,
+        // 点呼の構成 (血圧はオプション、既定 OFF)。`TENKO BP` で NVS ごと更新される
+        tenko_bp: settings.tenko_bp(),
         ..HubStatus::default()
     }));
     // ヒープ監視 (OOM 捕捉 + low-water 継続計測、Refs #27)。Wi-Fi/BLE/TLS の

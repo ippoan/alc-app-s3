@@ -25,6 +25,7 @@
 //! | `AUTH TOKEN` | device JWT 取得の自己診断 (`EVT AUTH_TOKEN ...`) |
 //! | `WS URL <url>` | cf-alc-recorder WS URL を上書き (staging テスト用) |
 //! | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` を返す |
+//! | `TENKO BP ON\|OFF` / `TENKO STATUS` | 点呼に血圧を含めるか (NVS、既定 OFF) / `TENKO BP=0` を返す |
 //! | `HEAP` | `HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> TOTAL_INT=<n> TOTAL_PSRAM=<n>` を返す (Refs #27) |
 //! | `HEAP DUMP` | `HEAPDUMP ...` 複数行 (ヒープブロック概況 + タスク別スタック余裕) |
 //! | `LOG DUMP` | `LOGDUMP ...` 複数行 (`.noinit` リングの直近ログ。事象の事後解析用) |
@@ -336,6 +337,20 @@ fn handle_line(
                 if discovered.is_empty() { "NONE".into() } else { discovered },
             );
         }
+        // 点呼の構成: 血圧はオプション (tenko.rs)。NVS に保存し、UI が次の点呼から読む
+        HostCommand::TenkoBp { enabled } => match settings.set_tenko_bp(enabled) {
+            Ok(()) => {
+                if let Ok(mut st) = status.lock() {
+                    st.tenko_bp = enabled;
+                }
+                println!("OK TENKO BP={}", u8::from(enabled));
+            }
+            Err(e) => {
+                log::error!("host_link: TENKO BP 保存失敗: {e:?}");
+                println!("ERR TENKO: 保存に失敗しました");
+            }
+        },
+        HostCommand::TenkoStatus => println!("TENKO BP={}", u8::from(settings.tenko_bp())),
         // ヒープ詳細: ブロック概況 + タスク別スタック余裕 (heap.rs 参照)
         HostCommand::HeapDump => crate::heap::dump(),
         // 直近ログ: .noinit リングの現在内容 (crashlog.rs 参照)。
