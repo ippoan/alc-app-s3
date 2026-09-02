@@ -85,6 +85,7 @@ dependencies = [
  "alc-hub-ble",
  "alc-hub-board",
  "alc-hub-common",
+ "alc-hub-core",
  "alc-hub-drivers",
  "alc-hub-ui",
  "alc-hub-wifi",

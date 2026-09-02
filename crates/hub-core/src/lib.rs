@@ -5,6 +5,7 @@
 //! 本クレートのファイルは `coverage_100.toml` に登録され、PR CI で
 //! ラインカバレッジ 100% が強制される。
 
+pub mod board;
 pub mod cfg;
 pub mod clock;
 pub mod coex;
@@ -19,6 +20,7 @@ pub mod pairing;
 pub mod printer;
 pub mod protocol;
 pub mod session;
+pub mod tenko_prompt;
 pub mod uplink;
 pub mod vitals;
 pub mod wdt_gate;

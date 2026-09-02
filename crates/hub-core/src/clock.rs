@@ -22,6 +22,17 @@ pub fn format_jst(unix_secs: i64) -> Option<String> {
     Some(format!("{m:02}/{d:02} {h:02}:{mi:02}:{s:02}"))
 }
 
+/// Unix 秒 (UTC) を JST の日付 "YYYYMMDD" に整形する。未同期なら None。
+/// 免許証の有効期限 (nfc_shim が返す同形式) との比較用 (tenko_prompt)
+pub fn jst_yyyymmdd(unix_secs: i64) -> Option<String> {
+    if unix_secs < MIN_SYNCED_SECS {
+        return None;
+    }
+    let days = (unix_secs + 9 * 3600).div_euclid(86400);
+    let (y, m, d) = civil_from_days(days);
+    Some(format!("{y:04}{m:02}{d:02}"))
+}
+
 /// 1970-01-01 からの日数 → (年, 月, 日)。Howard Hinnant の civil_from_days。
 /// div_euclid を使い負値でも分岐なしで floor 除算する。
 fn civil_from_days(z: i64) -> (i64, i64, i64) {
@@ -63,6 +74,15 @@ mod tests {
     fn crosses_date_by_jst_offset() {
         // 1767222000 = 2025-12-31 23:00:00 UTC → +9h → 2026-01-01 08:00:00
         assert_eq!(format_jst(1_767_222_000).as_deref(), Some("01/01 08:00:00"));
+    }
+
+    #[test]
+    fn yyyymmdd_jst() {
+        assert_eq!(jst_yyyymmdd(0), None);
+        // 2025-12-31 23:00:00 UTC → JST 2026-01-01
+        assert_eq!(jst_yyyymmdd(1_767_222_000).as_deref(), Some("20260101"));
+        // 2026-07-01 00:00:00 UTC → JST 2026-07-01
+        assert_eq!(jst_yyyymmdd(1_782_864_000).as_deref(), Some("20260701"));
     }
 
     #[test]

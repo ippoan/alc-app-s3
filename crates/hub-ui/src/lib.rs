@@ -6,10 +6,16 @@
 //!            ┌─(上半分タップ)→ Measuring(点呼) ─(RESULT cmd)→ Result ─┐
 //! Idle ─タップ→ Menu                                          自動/タップ│
 //! (NFC待機)  └─(下半分タップ)→ Log ─タップ→ Idle                      │
-//!   ↑  ↑                                                              │
+//!   ↑  ↑ │                                                            │
+//!   │  │ └─免許証タップ→ Confirm ─(上: 点呼を開始)→ Measuring          │
+//!   │  │        (下: キャンセル / 30秒放置 → Idle)                     │
 //!   │  └──────────────────────────────────────────────────────────────┘
 //!   ├─ BLE 測定受信 (待機中のみ) → Temperature / BloodPressure ─タップ/30秒→ Idle
 //!   └─ ホストコマンド: QR / MEASURE / RESULT / ERROR / RESET は従来どおり
+//!
+//! 免許証 (NFC-B) をかざすとメニューを飛ばして点呼確認 (Confirm) へ直行する。
+//! かざしてから LOG_LOCK_MS (15 秒) はメニューの「ログ確認」を押せなくする
+//! (hub-core tenko_prompt::LogLock、ボタンは残り秒数付きでグレー表示)。
 //!
 //! 点呼 (Measuring) 中の BLE 測定・ホスト RESULT は画面遷移せず、同一画面の
 //! 体温 (上段) / 血圧 (中段) / アルコール (最下段) の欄を直接更新する。
@@ -28,6 +34,9 @@ use std::sync::mpsc::Receiver;
 
 use alc_hub_core::device::DeviceKind;
 use alc_hub_core::layout::map_touch;
+use alc_hub_core::tenko_prompt::{
+    self, ConfirmChoice, ExpiryState, LicenseCard, LogLock, MenuChoice,
+};
 use alc_hub_board::{
     display::{self, Cs3Display, LCD_H, LCD_W},
     touch,
@@ -85,6 +94,12 @@ pub(crate) enum Screen {
     },
     /// イベントログ + 機器ステータス
     Log,
+    /// 免許証タップ後の点呼確認 (上: 点呼を開始 / 下: キャンセル)。
+    /// ヘッダに交付日・有効期限 (期限切れなら赤) を出す
+    Confirm {
+        card: LicenseCard,
+        expiry: ExpiryState,
+    },
 }
 
 /// バッテリー/電源状態 (AXP2101) の取得間隔。診断用なので粗くてよい (Refs #50)。
@@ -130,6 +145,10 @@ pub fn run(
     // 即座に復帰する (画面焼け対策の一環)
     let mut last_activity = now_ms();
     let mut backlight_dimmed = false;
+    // 免許証タップ後のログ確認ロック (tenko_prompt)。メニューの下段ボタンの
+    // 残り秒数表示は 1 秒刻みの部分更新で追従させる (last_lock_secs)
+    let mut log_lock = LogLock::new();
+    let mut last_lock_secs = 0u64;
 
     loop {
         let now = now_ms();
@@ -147,11 +166,12 @@ pub fn run(
             match alc_hub_board::power::read_status(&mut i2c) {
                 Ok(ps) => {
                     println!(
-                        "EVT BATT pct={} mv={} vbus={} chg={} adc={:02X} gauge={} vraw={:02X},{:02X} raw={:02X},{:02X}",
+                        "EVT BATT pct={} mv={} vbus={} chg={} bat={} adc={:02X} gauge={} vraw={:02X},{:02X} raw={:02X},{:02X}",
                         ps.battery_percent,
                         ps.battery_mv,
                         ps.vbus_present as u8,
                         ps.charge_state,
+                        ps.battery_present as u8,
                         ps.adc_cfg,
                         ps.gauge_raw,
                         ps.volt_raw.0,
@@ -161,6 +181,7 @@ pub fn run(
                     );
                     if let Ok(mut st) = status.lock() {
                         st.power_read = true;
+                        st.battery_present = ps.battery_present;
                         st.battery_percent = ps.battery_percent;
                         st.battery_mv = ps.battery_mv;
                         st.vbus_present = ps.vbus_present;
@@ -281,6 +302,24 @@ pub fn run(
                         }
                     }
                 }
+                // 免許証タップ: ログ確認を LOG_LOCK_MS 封じ、待機系の画面なら
+                // 点呼確認画面へ直行する。点呼中 (Measuring) と QR 表示中は
+                // 奪わない (点呼中のタップは免許確認として既にログに残っている)
+                UiCommand::License(card) => {
+                    log_lock.arm(now);
+                    if license_prompt_allowed(&screen) {
+                        let expiry =
+                            tenko_prompt::expiry_state(&card.expiry, today_yyyymmdd().as_deref());
+                        if expiry == ExpiryState::Expired {
+                            println!("EVT LICENSE_EXPIRED {}", card.expiry);
+                        }
+                        screen = Screen::Confirm { card, expiry };
+                        entered = now;
+                        dirty = true;
+                    } else {
+                        log::info!("ui: 免許証の点呼確認を抑制 (操作中の画面を優先)");
+                    }
+                }
                 cmd => {
                     screen = match cmd {
                         UiCommand::ShowQr {
@@ -305,6 +344,7 @@ pub fn run(
                         | UiCommand::BleAcquiring { .. }
                         | UiCommand::BleIdle
                         | UiCommand::AlcoholStage(_)
+                        | UiCommand::License(_)
                         | UiCommand::Result { .. } => unreachable!(),
                     };
                     entered = now;
@@ -342,6 +382,11 @@ pub fn run(
             {
                 true
             }
+            // 点呼確認: かざしただけで立ち去ったら待機画面へ
+            Screen::Confirm { .. } if elapsed > tenko_prompt::CONFIRM_TIMEOUT_MS => {
+                println!("EVT CONFIRM_TIMEOUT");
+                true
+            }
             _ => false,
         };
         if auto_close {
@@ -362,7 +407,7 @@ pub fn run(
             } else {
                 LCD_H
             };
-            if let Some(next) = on_click(&screen, y, logical_h) {
+            if let Some(next) = on_click(&screen, y, logical_h, log_lock.is_locked(now)) {
                 screen = next;
                 entered = now;
                 dirty = true;
@@ -392,13 +437,21 @@ pub fn run(
         }
 
         // --- 描画 ---
+        let lock_secs = log_lock.remaining_secs(now);
         if dirty {
             let st = status.lock().map(|s| s.clone()).unwrap_or_default();
-            screens::draw_full(&mut display, &screen, &st, now, entered);
+            screens::draw_full(&mut display, &screen, &st, now, entered, lock_secs);
             last_bar = now;
             last_spin = now;
+            last_lock_secs = lock_secs;
             dirty = false;
         } else {
+            // メニューのログ確認ボタン: ロック残り秒数の変化だけ部分更新
+            // (全面クリアしない — 点呼ボタン側を blink させない)
+            if matches!(screen, Screen::Menu) && lock_secs != last_lock_secs {
+                screens::draw_menu_log_zone(&mut display, lock_secs);
+                last_lock_secs = lock_secs;
+            }
             if now.saturating_sub(last_bar) >= 1000 {
                 let st = status.lock().map(|s| s.clone()).unwrap_or_default();
                 // 時計・インジケータのみの部分更新 (全面クリアしない — blink 防止)
@@ -472,23 +525,53 @@ fn vitals_display_allowed(screen: &Screen) -> bool {
     )
 }
 
+/// 免許証タップで点呼確認画面へ遷移してよい画面か。
+///
+/// - 待機 / メニュー / ログ / バイタル表示 / 結果 / エラー: 遷移する
+///   (ログ確認中でも免許証が来たら点呼確認が優先 — かざした本人が目の前にいる)
+/// - 確認画面: 再タップで情報を更新 (ロックも延長)
+/// - 点呼中 (Measuring) / QR: 奪わない (進行中の点呼・ホスト主導の操作を守る)
+fn license_prompt_allowed(screen: &Screen) -> bool {
+    !matches!(screen, Screen::Measuring { .. } | Screen::Qr { .. })
+}
+
+/// 今日の日付 "YYYYMMDD" (JST)。NTP 未同期なら None (期限判定は Unknown になる)
+fn today_yyyymmdd() -> Option<String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| alc_hub_core::clock::jst_yyyymmdd(d.as_secs() as i64))
+}
+
+/// 点呼開始: ホストへ通知し、体温/血圧/アルコールの測定待ち画面を作る
+fn start_tenko() -> Screen {
+    println!("EVT TENKO_START");
+    Screen::Measuring {
+        temp: None,
+        bp: None,
+        alcohol: None,
+        alc_stage: None,
+        done_at: None,
+    }
+}
+
 /// タップ時の画面遷移先 (None = 変化なし)。y は回転補正済みの論理座標。
-fn on_click(screen: &Screen, y: i32, logical_h: i32) -> Option<Screen> {
+/// `log_locked` は免許証タップ後のログ確認ロック中か (メニュー下段を無効化)
+fn on_click(screen: &Screen, y: i32, logical_h: i32, log_locked: bool) -> Option<Screen> {
     match screen {
         Screen::Idle => Some(Screen::Menu),
-        Screen::Menu => {
-            if y < logical_h / 2 {
-                // 点呼開始をホストへ通知し、体温/血圧/アルコールの測定待ちへ
-                println!("EVT TENKO_START");
-                Some(Screen::Measuring {
-                    temp: None,
-                    bp: None,
-                    alcohol: None,
-                    alc_stage: None,
-                    done_at: None,
-                })
-            } else {
-                Some(Screen::Log)
+        // ヒット判定は描画 (screens::draw_menu) と同じ幾何 (バー直下から 2 等分)
+        Screen::Menu => match tenko_prompt::menu_hit(y, screens::BAR_H, logical_h, log_locked)? {
+            MenuChoice::Tenko => Some(start_tenko()),
+            MenuChoice::Log => Some(Screen::Log),
+        },
+        Screen::Confirm { .. } => {
+            match tenko_prompt::confirm_hit(y, screens::CONFIRM_BUTTONS_TOP, logical_h)? {
+                ConfirmChoice::Start => Some(start_tenko()),
+                ConfirmChoice::Cancel => {
+                    println!("EVT TENKO_CANCEL");
+                    Some(Screen::Idle)
+                }
             }
         }
         Screen::Log

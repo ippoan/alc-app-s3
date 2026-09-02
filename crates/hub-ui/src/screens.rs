@@ -10,6 +10,7 @@
 
 use alc_hub_core::device::DeviceKind;
 use alc_hub_core::layout::{fmt_uptime, qr_scale, wrap_chars};
+use alc_hub_core::tenko_prompt::{fmt_yyyymmdd, ExpiryState, LicenseCard};
 use alc_hub_core::vitals;
 use embedded_graphics::{
     mono_font::{ascii::FONT_6X10, MonoTextStyle, MonoTextStyleBuilder},
@@ -29,7 +30,11 @@ use super::Screen;
 use alc_hub_board::display::Cs3Display;
 use alc_hub_common::{config, status::HubStatus, ui_api::AlcoholStage};
 
-const BAR_H: i32 = 18;
+pub(crate) const BAR_H: i32 = 18;
+
+/// 点呼確認画面のボタン領域の上端。上はカード情報ヘッダ (2 行の 16px テキスト)。
+/// ヒット判定 (tenko_prompt::confirm_hit) と共有する
+pub(crate) const CONFIRM_BUTTONS_TOP: i32 = BAR_H + 52;
 
 const C_BG: Rgb565 = Rgb565::BLACK;
 const C_BAR_BG: Rgb565 = Rgb565::CSS_DARK_SLATE_GRAY;
@@ -41,6 +46,9 @@ const C_OK: Rgb565 = Rgb565::CSS_LIME_GREEN;
 const C_NG: Rgb565 = Rgb565::CSS_ORANGE_RED;
 const C_BTN_TOP: Rgb565 = Rgb565::CSS_MIDNIGHT_BLUE;
 const C_BTN_BOTTOM: Rgb565 = Rgb565::CSS_DARK_SLATE_GRAY;
+/// 無効化中のボタン (免許証タップ後のログ確認ロック)。背景色に近い暗さで
+/// 「押せない」ことを見せる
+const C_BTN_DISABLED: Rgb565 = Rgb565::new(3, 6, 3);
 
 const JP16: FontRenderer = FontRenderer::new::<fonts::u8g2_font_b16_b_t_japanese2>();
 const BIG42: FontRenderer = FontRenderer::new::<fonts::u8g2_font_logisoso42_tr>();
@@ -240,10 +248,20 @@ fn clear(d: &mut Cs3Display) {
 // 全画面描画
 // ---------------------------------------------------------------------------
 
-pub fn draw_full(d: &mut Cs3Display, screen: &Screen, st: &HubStatus, now: u64, entered: u64) {
+/// 全画面描画。`lock_secs` は免許証タップ後のログ確認ロック残り秒 (0 = なし、
+/// メニューの下段ボタン表示にだけ影響する)
+pub fn draw_full(
+    d: &mut Cs3Display,
+    screen: &Screen,
+    st: &HubStatus,
+    now: u64,
+    entered: u64,
+    lock_secs: u64,
+) {
     match screen {
         Screen::Idle => draw_idle(d),
-        Screen::Menu => draw_menu(d),
+        Screen::Menu => draw_menu(d, lock_secs),
+        Screen::Confirm { card, expiry } => draw_confirm(d, card, *expiry),
         Screen::Qr {
             payload,
             timeout_ms,
@@ -291,27 +309,69 @@ fn draw_idle(d: &mut Cs3Display) {
     jp_center(d, "タップでメニュー", h - 24, C_MUTED);
 }
 
-/// メニュー: 上半分 = 点呼 / 下半分 = ログ確認
-fn draw_menu(d: &mut Cs3Display) {
+/// メニュー: 上半分 = 点呼 / 下半分 = ログ確認。
+/// 幾何は tenko_prompt::menu_hit (バー直下から 2 等分) と一致させる
+fn draw_menu(d: &mut Cs3Display, lock_secs: u64) {
     let (w, h) = dims(d);
     clear(d);
     let zone_h = (h - BAR_H) / 2;
     fill(d, 0, BAR_H, w as u32, zone_h as u32, C_BTN_TOP);
-    fill(
-        d,
-        0,
-        BAR_H + zone_h,
-        w as u32,
-        (h - BAR_H - zone_h) as u32,
-        C_BTN_BOTTOM,
-    );
-    fill(d, 0, BAR_H + zone_h - 1, w as u32, 2, C_BG); // 境界線
     jp2x_center(d, "点呼", BAR_H + zone_h / 2 - 18, C_TEXT, C_BTN_TOP);
+    draw_menu_log_zone(d, lock_secs);
+}
+
+/// メニュー下段 (ログ確認) だけを描く。免許証タップ後のロック中は無効表示 +
+/// 残り秒数で、UI ループが 1 秒ごとにこの領域だけ更新する (全面再描画しない)
+pub fn draw_menu_log_zone(d: &mut Cs3Display, lock_secs: u64) {
+    let (w, h) = dims(d);
+    let zone_h = (h - BAR_H) / 2;
+    let top = BAR_H + zone_h;
+    let (bg, fg, label) = if lock_secs > 0 {
+        (C_BTN_DISABLED, C_MUTED, format!("ログ確認 {lock_secs}秒後"))
+    } else {
+        (C_BTN_BOTTOM, C_TEXT, "ログ確認".to_string())
+    };
+    fill(d, 0, top, w as u32, (h - top) as u32, bg);
+    fill(d, 0, top - 1, w as u32, 2, C_BG); // 境界線
+    jp2x_center(d, &label, top + zone_h / 2 - 18, fg, bg);
+}
+
+/// 点呼確認 (免許証タップ後): ヘッダに交付日・有効期限、下に
+/// 「点呼を開始」/「キャンセル」の 2 ボタン。幾何は tenko_prompt::confirm_hit
+/// (CONFIRM_BUTTONS_TOP から 2 等分) と一致させる
+fn draw_confirm(d: &mut Cs3Display, card: &LicenseCard, expiry: ExpiryState) {
+    let (w, h) = dims(d);
+    clear(d);
+    // ヘッダ: 読み取り結果 (16px 2 行)
+    jp_center(d, "免許証を読み取りました", BAR_H + 6, C_ACCENT);
+    let (line, color) = match expiry {
+        ExpiryState::Expired => (
+            format!("期限切れ {}", fmt_yyyymmdd(&card.expiry)),
+            C_NG,
+        ),
+        ExpiryState::Valid | ExpiryState::Unknown => (
+            format!(
+                "期限 {}  交付 {}",
+                fmt_yyyymmdd(&card.expiry),
+                fmt_yyyymmdd(&card.issue)
+            ),
+            C_TEXT,
+        ),
+    };
+    jp_center(d, &line, BAR_H + 28, color);
+
+    // ボタン: 上 = 点呼を開始 / 下 = キャンセル
+    let top = CONFIRM_BUTTONS_TOP;
+    let zone_h = (h - top) / 2;
+    fill(d, 0, top, w as u32, zone_h as u32, C_BTN_TOP);
+    fill(d, 0, top + zone_h, w as u32, (h - top - zone_h) as u32, C_BTN_BOTTOM);
+    fill(d, 0, top + zone_h - 1, w as u32, 2, C_BG); // 境界線
+    jp2x_center(d, "点呼を開始", top + zone_h / 2 - 18, C_TEXT, C_BTN_TOP);
     jp2x_center(
         d,
-        "ログ確認",
-        BAR_H + zone_h + zone_h / 2 - 18,
-        C_TEXT,
+        "キャンセル",
+        top + zone_h + zone_h / 2 - 18,
+        C_MUTED,
         C_BTN_BOTTOM,
     );
 }
@@ -694,9 +754,10 @@ fn draw_log(d: &mut Cs3Display, st: &HubStatus, now: u64) {
     text(d, &JP16, &summary, 6, BAR_H + 2, C_ACCENT, HorizontalAlignment::Left);
     // 2 行目: IP + ヒープ low-water (min<n>K、Refs #27)。heap_min_int == 0 は
     // 未計測 (heap_mon 初回前) なので出さない
-    let mut line2 = String::new();
+    // 先頭にボード種別 (CoreS3 / CoreS3 SE — 不具合報告で板を取り違えない)
+    let mut line2 = st.board.short_name().to_string();
     if st.wifi_connected {
-        line2.push_str(&format!("IP {}", st.wifi_ip));
+        line2.push_str(&format!("  IP {}", st.wifi_ip));
     }
     if st.heap_min_int > 0 {
         if !line2.is_empty() {
@@ -709,13 +770,18 @@ fn draw_log(d: &mut Cs3Display, st: &HubStatus, now: u64) {
         if !line2.is_empty() {
             line2.push_str("  ");
         }
-        let chg = match st.charge_state {
-            1 => "充電",
-            2 => "放電",
-            _ => "待機",
-        };
         let src = if st.vbus_present { "外部" } else { "電池" };
-        line2.push_str(&format!("bat{}% {} {}", st.battery_percent, chg, src));
+        if st.battery_present {
+            let chg = match st.charge_state {
+                1 => "充電",
+                2 => "放電",
+                _ => "待機",
+            };
+            line2.push_str(&format!("bat{}% {} {}", st.battery_percent, chg, src));
+        } else {
+            // CoreS3 SE (バッテリーレス) — 残量/充電状態は意味を持たない
+            line2.push_str(&format!("電池なし {src}"));
+        }
     }
     if !line2.is_empty() {
         text(d, &JP16, &line2, 6, BAR_H + 22, C_MUTED, HorizontalAlignment::Left);

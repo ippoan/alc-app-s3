@@ -9,6 +9,8 @@
 //!   (M5Stack Community #5581) — 実機で要確認。
 //! - Base LAN PoE v1.2 (W5500): CS=G9 / RST=G7 / INT=G14 (未使用)。
 //!   本体 DB9 (RX=G13 / TX=G1) はスピーカー・NFC と衝突するため使わない。
+//! - 次期構成 (`cores3-se` feature、CoreS3 SE + Base LAN PoE v1.2): RS232M を
+//!   TX=G10 / RX=G6 へ、Unit NFC を Port C (G17/G18) へ (main.rs の cfg 分岐)。
 
 pub const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
 

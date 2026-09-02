@@ -3,6 +3,10 @@
 # 新しい純粋ロジックを crates/hub-core に追加したら、ここにも登録すること。
 
 [[file]]
+path = "crates/hub-core/src/board.rs"
+type = "unit"
+
+[[file]]
 path = "crates/hub-core/src/cfg.rs"
 type = "unit"
 
@@ -56,6 +60,10 @@ type = "unit"
 
 [[file]]
 path = "crates/hub-core/src/session.rs"
+type = "unit"
+
+[[file]]
+path = "crates/hub-core/src/tenko_prompt.rs"
 type = "unit"
 
 [[file]]

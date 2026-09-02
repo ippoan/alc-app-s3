@@ -65,6 +65,17 @@ fn main() -> Result<()> {
     // DC と二役 (display.rs SharedDcInterface 参照)。DMA 必須 — 無効だと
     // Ethernet フレーム転送が 64 バイト上限で全滅する (atoms3-print の実機知見)
     board::power::init(&mut i2c)?;
+    // ボード種別 (CoreS3 / CoreS3 SE): SE は RTC (0x51) も IMU (0x69) も無い。
+    // 同じバイナリで動くが、バッテリー表示のゲートと STATUS BOARD= の報告に使う
+    // (plan/cores3-hub-consolidation.md「次期構成: CoreS3 SE + Base LAN PoE v1.2」)
+    let probe = board::board::probe(&mut i2c);
+    let board_kind = alc_hub_core::board::BoardKind::from_probe(probe.rtc_present, probe.imu_present);
+    log::info!(
+        "board: {} (rtc={} imu={})",
+        board_kind.label(),
+        probe.rtc_present,
+        probe.imu_present
+    );
     let rotation = settings.rotation();
     // 起動カウンタを 1 つ進める (点呼セッション ID の前置、Refs #112)。
     // **起動ごとに 1 回だけ** — 再起動をまたいだ session_id の再利用を防ぐ。
@@ -81,7 +92,10 @@ fn main() -> Result<()> {
     let spi: &'static SpiDriver<'static> = Box::leak(Box::new(spi));
     let display = board::display::init(spi, p.pins.gpio3, rotation)?;
 
-    let status: SharedStatus = Arc::new(Mutex::new(HubStatus::default()));
+    let status: SharedStatus = Arc::new(Mutex::new(HubStatus {
+        board: board_kind,
+        ..HubStatus::default()
+    }));
     // ヒープ監視 (OOM 捕捉 + low-water 継続計測、Refs #27)。Wi-Fi/BLE/TLS の
     // 重いアロケーションより先に登録し、初期化中の OOM も捕まえる
     heap::start(Arc::clone(&status))?;
@@ -156,10 +170,19 @@ fn main() -> Result<()> {
         pair_flag.clone(),
         improv,
     )?;
+    // FC-1200 (RS232M Module 13.2) のピン。次期構成 (cores3-se feature) では
+    // RS232M のジャンパを TX=G10 / RX=G6 へ移し、空いた Port C (G17/G18) を NFC
+    // に回す (plan/cores3-hub-consolidation.md「次期構成」)。**feature とジャンパ
+    // 位置がずれると FC-1200 と NFC が同じピンを取り合う** ので、書き込む
+    // バイナリと実機の配線を必ず揃えること
+    #[cfg(not(feature = "cores3-se"))]
+    let (rs232_tx, rs232_rx) = (p.pins.gpio17, p.pins.gpio18);
+    #[cfg(feature = "cores3-se")]
+    let (rs232_tx, rs232_rx) = (p.pins.gpio10, p.pins.gpio6);
     rs232::start(
         p.uart1,
-        p.pins.gpio17,
-        p.pins.gpio18,
+        rs232_tx,
+        rs232_rx,
         Arc::clone(&status),
         meas_tx.clone(),
         tx.clone(),
@@ -196,11 +219,19 @@ fn main() -> Result<()> {
         // 再生専用スレッドに分離 (issue #102): I2S write はブロッキングのため
         // NFC スレッドで直接再生すると音声 1.5 秒ぶんポーリングが止まる
         let speaker_tx = alc_hub_drivers::speaker::start_player(speaker)?;
+        // 現行: Port A (SDA=G2 / SCL=G1)。次期構成 (cores3-se): Port C (G17/G18、
+        // RS232M 退去で空く)。SDA/SCL の対応が未確定なので ack しなければ入替
+        #[cfg(not(feature = "cores3-se"))]
+        let (nfc_sda, nfc_scl) = (p.pins.gpio2.into(), p.pins.gpio1.into());
+        #[cfg(feature = "cores3-se")]
+        let (nfc_sda, nfc_scl) = (p.pins.gpio17.into(), p.pins.gpio18.into());
+        // 免許証の読み取りは UiCommand::License で UI へ届け、点呼確認画面へ直行させる
         alc_hub_drivers::nfc::start(
-            p.pins.gpio2.into(),
-            p.pins.gpio1.into(),
+            nfc_sda,
+            nfc_scl,
             Arc::clone(&status),
             speaker_tx,
+            tx.clone(),
         )?;
     }
     // Base LAN PoE v1.2 (W5500): CS=G9 / RST=G7 / INT=G14 未使用。

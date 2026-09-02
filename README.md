@@ -30,11 +30,20 @@ CoreS3 画面に QR 表示 → 読み取り → `MEASURE` → FC-1200 で測定 
            ┌─(上半分タップ)→ Measuring(点呼) ─(RESULT cmd)→ Result ─┐
 Idle ─タップ→ Menu                                         自動/タップ│
 (NFC待機)  └─(下半分タップ)→ Log(ログ確認) ─タップ→ Idle             │
-  ↑  ↑                                                             │
+  ↑  ↑ │                                                           │
+  │  │ └─免許証タップ→ Confirm(点呼確認) ─(上: 点呼を開始)→ Measuring │
+  │  │        (下: キャンセル / 30秒放置 → Idle)                    │
   │  └─────────────────────────────────────────────────────────────┘
   ├─ BLE 測定受信 (待機中/点呼中のみ・QR等の操作中は遷移しない) → 体温/血圧 表示 ─タップ/30秒→ Idle
   └─ ホストコマンド: QR / MEASURE / RESULT / ERROR / RESET は従来どおり
 ```
+
+- **免許証 (IC、NFC-B) をかざす**とメニューを飛ばして点呼確認画面へ直行する
+  (点呼中・QR 表示中は奪わない)。ヘッダに交付日・有効期限を表示し、NTP 同期済みで
+  期限切れなら赤字 (`EVT LICENSE_EXPIRED`)
+- かざしてから **15 秒間はメニューの「ログ確認」を押せない** (ボタンは残り秒数付きで
+  グレー表示)。確認画面の「キャンセル」や待機画面の下半分を続けて叩いたときに
+  ログ画面へ流れ込む誤操作を防ぐ (`crates/hub-core/src/tenko_prompt.rs`)
 
 - 基準文字サイズは 16px フォントの 2 倍拡大描画 (実効 32px)。数値は Logisoso42
 - 全画面上部にステータスバー (LAN / 232 / BLE / WiFi + 稼働時間、18px・小サイズ)。
@@ -51,7 +60,7 @@ Idle ─タップ→ Menu                                         自動/タッ�
 | `ERROR <message>` | エラー画面 |
 | `RESET` | 待機画面へ |
 | `ROTATE <0\|90\|180\|270>` | 画面向き変更 (NVS 保存、再起動後も維持) |
-| `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0` 応答 |
+| `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0 BOARD=cores3` 応答 (`BOARD` は起動時の I2C probe で `cores3` / `cores3se`) |
 | `LOG DUMP` | 直近ログ (`.noinit` リング) を `LOGDUMP ...` で吸い出す。事象の後から原因を追う用 |
 | `CFG GET` | 現在の設定を 1 行 JSON でエクスポート |
 | `CFG SET <json>` | 設定 (画面向き + Wi-Fi) を検証して NVS へインポート |
@@ -73,7 +82,10 @@ crates/hub-core/src/improv.rs)。
 |---|---|
 | `FC1200 <hex>` | RS232 (FC-1200) 受信データのパススルー |
 | `EVT QR_TIMEOUT` / `EVT RESULT_CLOSED` | 画面の自動遷移通知 |
-| `EVT TENKO_START` | 画面メニューから点呼が開始された |
+| `EVT TENKO_START` | 画面 (メニュー or 免許証タップ後の確認画面) から点呼が開始された |
+| `EVT NFC_LICENSE issue=YYYYMMDD expiry=YYYYMMDD` | 運転免許証 (IC) を読み取った (dev ビルド `nfc-verify`) |
+| `EVT LICENSE_EXPIRED <YYYYMMDD>` | 読み取った免許証が期限切れ (NTP 同期済みのときのみ判定) |
+| `EVT TENKO_CANCEL` / `EVT CONFIRM_TIMEOUT` | 点呼確認画面をキャンセル / 30 秒放置で待機へ戻った |
 | `EVT TENKO_SESSION <id>` | 点呼セッション ID を発番した (この点呼で採れた測定に載る、Refs #112) |
 | `EVT WIFI_TEST OK\|NG <詳細>` | `WIFI TEST` の結果 (NG は原因を切り分け) |
 | `EVT PAIR_CLEARED` | BLE ボンド消去完了 |
@@ -96,6 +108,21 @@ ESP-IDF のログが同じコンソールに混在するため、ホスト側は
 | タッチ I2C | SDA=G12 / SCL=G11 (0x38) | AXP2101(0x34) / AW9523(0x58) と共用 |
 | RS232M | TX=G17 / RX=G18 | DIP スイッチ候補。**シルク番号≠GPIO 番号の実例あり (Community #5581)、実機で要確認** |
 | Base LAN PoE v1.2 | CS=G9 / RST=G7 / INT=G14 | `lan` feature。INT は未使用 (polling)。本体 DB9 (RX=G13 / TX=G1) は使わない |
+| Unit NFC (I2C1) | SDA=G2 / SCL=G1 (Port A) | dev ビルド `nfc-verify`。ack しなければ SDA/SCL 入替 |
+
+### CoreS3 SE への移行準備
+
+CoreS3 SE は CoreS3 から カメラ / IMU / 地磁気 / RTC / 近接センサ / **内蔵バッテリー**
+を削った板で、firmware が使う LCD / タッチ / AXP2101 / AW9523 / スピーカーは共通。
+**同じバイナリがそのまま動く**前提で、以下を先に入れてある:
+
+- 起動時に内部 I2C を probe (RTC 0x51 / IMU 0x69) して板種別を判定し、`STATUS BOARD=`
+  と Log 画面に出す (`crates/hub-board/src/board.rs` → `hub-core/src/board.rs`)
+- バッテリーが無い板では Log 画面の残量/充電表示を「電池なし」に切り替える
+  (AXP2101 の battery-present bit でゲート。`EVT BATT` に `bat=0/1` を追加)
+- 次期スタック (SE + Base LAN PoE v1.2) のピンマップは `cores3-se` feature:
+  RS232M **TX=G10 / RX=G6** (ジャンパ移動が必要)、Unit NFC **Port C (G17/G18)**。
+  実機未検証。CI では `cargo check` のみ通す。SE 本体に現行配線のまま載せる場合は不要
 
 G13 / G0 / G14 は CoreS3 内蔵 I2S が使用済みのため RS232M では使用不可。
 

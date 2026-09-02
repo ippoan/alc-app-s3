@@ -17,7 +17,7 @@
 //! | `ERROR <message>` | エラー画面を表示 |
 //! | `RESET` | 待機画面へ戻す |
 //! | `ROTATE <0\|90\|180\|270>` | 画面向きを変更 (NVS 保存、次回起動も維持) |
-//! | `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0` を返す |
+//! | `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0 BOARD=cores3` を返す |
 //! | `AUTH SET <id> <secret> <tenant>` | device credential を注入 (USB provisioning) |
 //! | `AUTH UNPAIR` | 保存済み device credential を破棄 (ローカルのみ) |
 //! | `AUTH STATUS` | `AUTH PAIRED <tenant> <id>` / `AUTH UNPAIRED` を返す |
@@ -210,12 +210,13 @@ fn handle_line(
         HostCommand::Status => {
             let st = status.lock().map(|s| s.clone()).unwrap_or_default();
             println!(
-                "STATUS LAN={} RS232={} BLE={} WIFI={} ROT={}",
+                "STATUS LAN={} RS232={} BLE={} WIFI={} ROT={} BOARD={}",
                 u8::from(st.lan_link),
                 u8::from(st.rs232_active(now_ms(), config::RS232_ACTIVE_WINDOW_MS)),
                 u8::from(st.ble_connected),
                 u8::from(st.wifi_connected),
                 settings.rotation(),
+                st.board.label(),
             );
         }
         // 設定エクスポート: 1 行 JSON を CFG プレフィックスで返す
