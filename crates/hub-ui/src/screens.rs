@@ -10,7 +10,7 @@
 
 use alc_hub_core::device::DeviceKind;
 use alc_hub_core::layout::{fmt_uptime, qr_scale, wrap_chars};
-use alc_hub_core::tenko_prompt::{fmt_yyyymmdd, ExpiryState, LicenseCard};
+use alc_hub_core::tenko_prompt::{confirm_remaining_secs, fmt_yyyymmdd, ExpiryState, LicenseCard};
 use alc_hub_core::vitals;
 use embedded_graphics::{
     mono_font::{ascii::FONT_6X10, MonoTextStyle, MonoTextStyleBuilder},
@@ -259,9 +259,11 @@ pub fn draw_full(
     lock_secs: u64,
 ) {
     match screen {
-        Screen::Idle => draw_idle(d),
+        Screen::Idle => draw_idle(d, lock_secs),
         Screen::Menu => draw_menu(d, lock_secs),
-        Screen::Confirm { card, expiry } => draw_confirm(d, card, *expiry),
+        Screen::Confirm { card, expiry } => {
+            draw_confirm(d, card, *expiry, confirm_remaining_secs(entered, now))
+        }
         Screen::Qr {
             payload,
             timeout_ms,
@@ -301,12 +303,35 @@ pub fn draw_boot(d: &mut Cs3Display) {
 }
 
 /// 待機画面: NFC カード待ち
-fn draw_idle(d: &mut Cs3Display) {
-    let (_, h) = dims(d);
+fn draw_idle(d: &mut Cs3Display, lock_secs: u64) {
     clear(d);
     jp_center(d, "NFC 待機中", BAR_H + 6, C_MUTED);
     jp2x_lines(d, "カードをかざしてください", 66, C_TEXT, C_BG, 8);
-    jp_center(d, "タップでメニュー", h - 24, C_MUTED);
+    draw_idle_footer(d, lock_secs);
+}
+
+/// 待機画面の最下行。ログ確認ロック中は残り秒数を添える (1 秒ごと部分更新)
+fn draw_idle_footer(d: &mut Cs3Display, lock_secs: u64) {
+    let (w, h) = dims(d);
+    fill(d, 0, h - 26, w as u32, 26, C_BG);
+    let label = if lock_secs > 0 {
+        format!("タップでメニュー  ログ確認 {lock_secs}秒後")
+    } else {
+        "タップでメニュー".to_string()
+    };
+    jp_center(d, &label, h - 24, C_MUTED);
+}
+
+/// ログ確認ロックの残り秒数表示を、画面ごとの定位置だけ部分更新する。
+/// UI ループが秒の変化時に呼ぶ (全面クリアしないので他の要素は blink しない)。
+/// 表示位置: メニュー = 下段ボタン / 待機 = 最下行
+pub fn draw_lock_countdown(d: &mut Cs3Display, screen: &Screen, lock_secs: u64) {
+    match screen {
+        Screen::Menu => draw_menu_log_zone(d, lock_secs),
+        Screen::Idle => draw_idle_footer(d, lock_secs),
+        // 点呼確認は画面自体の残り時間を出す (draw_confirm_countdown、毎秒更新)
+        _ => {}
+    }
 }
 
 /// メニュー: 上半分 = 点呼 / 下半分 = ログ確認。
@@ -322,7 +347,7 @@ fn draw_menu(d: &mut Cs3Display, lock_secs: u64) {
 
 /// メニュー下段 (ログ確認) だけを描く。免許証タップ後のロック中は無効表示 +
 /// 残り秒数で、UI ループが 1 秒ごとにこの領域だけ更新する (全面再描画しない)
-pub fn draw_menu_log_zone(d: &mut Cs3Display, lock_secs: u64) {
+fn draw_menu_log_zone(d: &mut Cs3Display, lock_secs: u64) {
     let (w, h) = dims(d);
     let zone_h = (h - BAR_H) / 2;
     let top = BAR_H + zone_h;
@@ -339,7 +364,7 @@ pub fn draw_menu_log_zone(d: &mut Cs3Display, lock_secs: u64) {
 /// 点呼確認 (免許証タップ後): ヘッダに交付日・有効期限、下に
 /// 「点呼を開始」/「キャンセル」の 2 ボタン。幾何は tenko_prompt::confirm_hit
 /// (CONFIRM_BUTTONS_TOP から 2 等分) と一致させる
-fn draw_confirm(d: &mut Cs3Display, card: &LicenseCard, expiry: ExpiryState) {
+fn draw_confirm(d: &mut Cs3Display, card: &LicenseCard, expiry: ExpiryState, remain_secs: u64) {
     let (w, h) = dims(d);
     clear(d);
     // ヘッダ: 読み取り結果 (16px 2 行)
@@ -374,6 +399,19 @@ fn draw_confirm(d: &mut Cs3Display, card: &LicenseCard, expiry: ExpiryState) {
         C_MUTED,
         C_BTN_BOTTOM,
     );
+    draw_confirm_countdown(d, remain_secs);
+}
+
+/// 「点呼を開始」の直下に確認画面の残り秒数 (あと N秒) を出す。UI ループが毎秒
+/// この行だけ塗り直す (QR の残り秒数と同じ方式)。2 倍文字 (中央 -18..+14) の
+/// 下、ボタン下端との間に収める
+pub fn draw_confirm_countdown(d: &mut Cs3Display, remain_secs: u64) {
+    let (w, h) = dims(d);
+    let top = CONFIRM_BUTTONS_TOP;
+    let zone_h = (h - top) / 2;
+    let y = top + zone_h / 2 + 20;
+    fill(d, 0, y, w as u32, 20, C_BTN_TOP);
+    jp_center(d, &format!("あと {remain_secs}秒"), y + 2, C_MUTED);
 }
 
 fn draw_qr(d: &mut Cs3Display, payload: &str, remain_s: u64) {
