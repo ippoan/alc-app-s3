@@ -31,7 +31,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
 use alc_hub_core::uplink::{
     command_action, command_gw_url, command_ota_url, command_print_chunk, command_print_url,
-    command_result_frame, measurement_frame, parse_downlink, Downlink, UplinkQueue, PING_FRAME,
+    command_result_frame, measurement_frame, parse_downlink, should_wait_for_clock, Downlink,
+    UplinkQueue, PING_FRAME,
 };
 use anyhow::Result;
 use esp_idf_svc::ws::client::{
@@ -169,6 +170,8 @@ fn run(
 
     let (ev_tx, ev_rx) = mpsc::channel::<WsEvent>();
     let mut conn: Option<Conn> = None;
+    // 時計未同期による送信待機を 1 回だけログする (待機中は毎周期ここを通る)
+    let mut clock_wait_logged = false;
     // WS push 印刷 (#38) の進行中セッション (print_begin〜print_end)。フレーム
     // 跨ぎで 9100 の TcpStream を保持する。WS 切断で破棄する (未完印刷は中断)
     let mut print_session: Option<PrintSession> = None;
@@ -312,7 +315,24 @@ fn run(
         }
 
         // --- 4. キューの送信 (BLE 測定中は控える) ---
-        if !ble_busy && !queue.is_empty() && now.saturating_sub(last_flush) >= RESEND_INTERVAL_MS {
+        // 時計がまだ未同期 (WS が NTP より先に繋がった直後) なら、補正できる測定が
+        // ある間は CLOCK_WAIT_MS まで送信を待つ。先に送ると 1970 起点の時刻で
+        // サーバに固定され、直す機会を失う (実測: 起動 23 秒の体温がそうなった)。
+        // NTP が塞がれている環境では超過後に未同期のまま送る (測定を止めない)
+        let connected_for = conn
+            .as_ref()
+            .and_then(|c| c.connected_at)
+            .map_or(0, |at| now.saturating_sub(at));
+        let wait_clock = should_wait_for_clock(epoch_ms(), connected_for, queue.has_correctable(boot_id));
+        if wait_clock && !clock_wait_logged {
+            log::info!("ws_uplink: 時計未同期のため送信を待機 (NTP 同期後に時刻補正して送る)");
+            println!("EVT WS_CLOCK_WAIT");
+            clock_wait_logged = true;
+        }
+        if !wait_clock {
+            clock_wait_logged = false;
+        }
+        if !wait_clock && !ble_busy && !queue.is_empty() && now.saturating_sub(last_flush) >= RESEND_INTERVAL_MS {
             // NTP 未同期 (ネットワーク無し) で記録した測定は recorded_at_ms が 1970 起点
             // になっている。今は同期済み (接続できている = ネットワークがある) なので、
             // 記録時と今の稼働時間の差で実時刻へ直してから送る (同じ起動の分だけ)

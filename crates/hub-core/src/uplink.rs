@@ -48,6 +48,18 @@ pub struct QueueEntry {
 /// (clock::MIN_SYNCED_SECS と同じ境界)
 pub const MIN_SYNCED_MS: u64 = crate::clock::MIN_SYNCED_SECS as u64 * 1000;
 
+/// WS が繋がっても時計が未同期なら、補正できる測定がある間はこの時間まで送信を
+/// 待って NTP 同期を待つ。実測: LAN 直結起動で体温が稼働 23 秒に届き、同期は
+/// 23〜37 秒の間に完了した (それより前に送ると補正の機会を失う)。NTP が塞がれて
+/// いる環境で測定を止めないよう、超過したら未同期のまま送る
+pub const CLOCK_WAIT_MS: u64 = 60_000;
+
+/// 送信を待つべきか: 今の時計が未同期で、補正できる (同じ起動・稼働時間つき・
+/// 未同期時刻の) エントリがあり、接続からまだ CLOCK_WAIT_MS 経っていない
+pub fn should_wait_for_clock(now_epoch_ms: u64, connected_for_ms: u64, has_correctable: bool) -> bool {
+    now_epoch_ms < MIN_SYNCED_MS && has_correctable && connected_for_ms < CLOCK_WAIT_MS
+}
+
 /// NTP 未同期で記録されたエントリの recorded_at_ms を、現在の壁時計と稼働時間の
 /// 差から実時刻に直す。補正できるのは
 ///
@@ -410,6 +422,14 @@ impl UplinkQueue {
             None
         };
         Ok((seq, dropped))
+    }
+
+    /// 時計が同期すれば補正できるエントリ (同じ起動・稼働時間つき・未同期時刻) があるか。
+    /// 送信を NTP 同期まで待つかの判断に使う (should_wait_for_clock)
+    pub fn has_correctable(&self, boot_id: u32) -> bool {
+        self.entries.iter().any(|e| {
+            e.recorded_at_ms < MIN_SYNCED_MS && e.boot_id == Some(boot_id) && e.uptime_ms.is_some()
+        })
     }
 
     /// NTP 未同期で記録されたエントリの時刻を実時刻へ直す (corrected_recorded_at)。
@@ -887,6 +907,27 @@ mod tests {
         assert_eq!(times, vec![SYNCED + 40_000, 9_000, SYNCED]);
         // 2 回目は補正対象が残っていない
         assert_eq!(q.fix_unsynced_times(SYNCED + 100_000, 65_000, 7), 0);
+    }
+
+    #[test]
+    fn has_correctable_and_wait_for_clock() {
+        let mut q = UplinkQueue::restore(0, "", 10).0;
+        assert!(!q.has_correctable(7));
+        // 旧データ (足場なし) / 別起動 / 同期済み は対象外
+        q.push_with_session("alcohol", 5_000, PAYLOAD, None).unwrap();
+        q.push_record("alcohol", 5_000, PAYLOAD, None, Some(5_000), Some(6)).unwrap();
+        q.push_record("alcohol", SYNCED, PAYLOAD, None, Some(5_000), Some(7)).unwrap();
+        assert!(!q.has_correctable(7));
+        q.push_record("temperature", 23_000, PAYLOAD, None, Some(23_000), Some(7)).unwrap();
+        assert!(q.has_correctable(7));
+
+        // 未同期 + 補正候補あり + 接続直後 → 待つ
+        assert!(should_wait_for_clock(23_000, 0, true));
+        assert!(should_wait_for_clock(23_000, CLOCK_WAIT_MS - 1, true));
+        // 待ち時間超過 / 候補なし / 同期済み → 送る
+        assert!(!should_wait_for_clock(23_000, CLOCK_WAIT_MS, true));
+        assert!(!should_wait_for_clock(23_000, 0, false));
+        assert!(!should_wait_for_clock(SYNCED, 0, true));
     }
 
     #[test]
