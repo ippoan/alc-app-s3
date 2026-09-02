@@ -98,6 +98,8 @@ crates/hub-core/src/improv.rs)。
 | `EVT GW_CONNECTED` / `EVT GW_DISCONNECTED` | Windows GW (alc-gw) への WS 接続状態 |
 | `EVT WS_COMMAND <id> <payload>` | サーバからの下り command (MEASURE 指示 / timecard 等) |
 | `EVT WS_DROPPED <seq>` | 送信キュー上限で最古の未送信測定を破棄 |
+| `EVT WS_CLOCK_WAIT` | WS は繋がったが時計が未同期で、補正できる測定があるため送信を最大 60 秒待っている (NTP 同期後に補正して送る) |
+| `EVT WS_TIME_FIXED <n>` | NTP 未同期 (ネットワーク無し) で記録した測定 n 件の `recorded_at_ms` を、送信時に稼働時間の差で実時刻へ補正した (同じ起動の分だけ。再起動をまたいだ分は 1970 起点のまま送る) |
 | `EVT CRASH <reason> log_bytes=<n>` | 前回リセットがクラッシュ由来 (panic/WDT/brownout 等)。panic 前ログを kind=crash_log で自動送信 |
 | `CFG <json>` | `CFG GET` の応答 |
 | `{"type":"temperature",...}` 等 | BLE 測定データ・状態。[ble-medical-gateway](https://github.com/ippoan/ble-medical-gateway) のシリアル JSON 互換 (alc-app 側 `useBleGateway` を流用可能) |

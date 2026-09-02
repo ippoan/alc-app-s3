@@ -136,7 +136,8 @@ fn main() -> Result<()> {
     // 測定データの WS 送信 (cf-alc-recorder)。recorder が fan-out した測定を
     // NVS 永続キュー経由で送る (未ペアリング・圏外でも測定は失わない)
     let (ws_tx, ws_rx) = mpsc::channel();
-    ws_uplink::start(ws_rx, tx.clone(), Arc::clone(&status), settings.clone())?;
+    // boot_id は NTP 未同期で記録した測定の時刻補正にも使う (同じ起動の分だけ直す)
+    ws_uplink::start(ws_rx, tx.clone(), Arc::clone(&status), settings.clone(), boot_id)?;
 
     // 前回がクラッシュ由来のリセットだったら、panic 前ログ + reset reason を
     // kind="crash_log" として送信キューへ積む (NVS 永続なので圏外でも失わない)
