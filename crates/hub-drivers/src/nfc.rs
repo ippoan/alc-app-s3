@@ -177,11 +177,17 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
     // 打刻イベント (#134) では 1 タップが別 seq の 2 行になり、サーバ側の
     // seq 冪等では防げない (別イベントが 2 つ生まれたケースのため) —
     // 1 回かざした人が出勤と退勤を同時に打つ壊れ方になるので端末側で塞ぐ。
-    // 系統ごとに別の gate を持つ (使い回すと交通系の直後の免許証が抑止される)
-    let mut felica_gate = TapGate::default();
-    let mut nfca_gate = TapGate::default();
-    let mut car_gate = TapGate::default();
-    let mut license_gate = TapGate::default();
+    //
+    // **判定の足場は「読めたか」ではなく「載っているか」。** カードが載ったままでも
+    // 読み取りは頻繁に失敗する (実機ログ: Failed to RequestResponse /
+    // SELECT EF 2F01 失敗 / deselect failed が成功の前後に出る)。とくに免許証は
+    // 再読が 3.4〜4.1 秒に 1 回しか成功せず、クールダウンを毎回越えて再発火して
+    // いた (2026-09-04 実機: 1 枚で 7.5 秒に 3 打刻)。そこで**存在検知が立って
+    // いる間は毎周期 touch** し、読み取り失敗を「離れた」と数えない。
+    //
+    // gate は全系統で 1 つ。持ち替えれば key が変わって即発火するので分ける必要が
+    // なく、むしろ同じカードが読み取りの揺れで別経路に落ちても 1 タップ 1 回に収まる
+    let mut tap_gate = TapGate::default();
     // -2 (カード無し) は定常状態なのでログしない。未実行センチネルは i32::MIN。
     // **これは失敗ログの抑止専用** — 成功時の発火判定は license_gate が持つ
     let mut last_license_rc = i32::MIN;
@@ -203,12 +209,17 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
         let amp = unsafe { nfc_shim_measure_amplitude() };
         let ph = unsafe { nfc_shim_measure_phase() };
         let mut triggered = false;
+        // 存在検知が**測定できたうえで**「載っている」と言えたか。
+        // 測定失敗のフォールバック (下の else) は触らない — 測定が壊れている間
+        // ずっと touch し続けると、二度と発火しなくなる
+        let mut present = false;
         if amp >= 0 {
             if baseline < 0 {
                 baseline = amp;
             }
             if (amp - baseline).abs() >= PRESENCE_DELTA {
                 triggered = true;
+                present = true;
             } else {
                 baseline += (amp - baseline).signum();
             }
@@ -221,6 +232,7 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
             }
             if (ph - baseline_ph).abs() >= PRESENCE_DELTA {
                 triggered = true;
+                present = true;
             } else {
                 baseline_ph += (ph - baseline_ph).signum();
             }
@@ -257,7 +269,7 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
 
         match poll_felica_idm() {
             Ok(Some(idm)) => {
-                if felica_gate.should_fire(&idm, now_ms()) {
+                if tap_gate.should_fire(&idm, now_ms()) {
                     // push_event はイベントログ (UI/WS) 行のみで serial には出ない。
                     // log::info! を並置して scripts/nfc_serial_beep.py (COM 監視、
                     // 既定 --match "NFC|免許|IDm") で検知音を鳴らせるようにする (issue #101)
@@ -284,12 +296,12 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
                     // コストが乗るが、非対応カードは RATS 非対応で即座に弾かれる
                     // ため実害は小さい
                     if detect_car_inspection_a() {
-                        if car_gate.should_fire(&uid, now_ms()) {
+                        if tap_gate.should_fire(&uid, now_ms()) {
                             log::info!("電子車検証 検知 (UID={uid})");
                             push_event(&status, "電子車検証 検知");
                             sink.on_event(&NfcEvent::CarInspection { uid });
                         }
-                    } else if nfca_gate.should_fire(&uid, now_ms()) {
+                    } else if tap_gate.should_fire(&uid, now_ms()) {
                         log::info!("NFC-A UID={uid}");
                         push_event(&status, &format!("NFC-A UID={uid}"));
                         sink.on_event(&NfcEvent::NfcaUid { uid });
@@ -307,7 +319,7 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
             if rc == 0 {
                 // 免許証も同じクールダウンに載せる (issue #103)。key は交付日 +
                 // 有効期限 = alc-app タブレットが使う employees.nfc_id と同じ 16 桁
-                if license_gate.should_fire(&format!("{issue}{expiry}"), now_ms()) {
+                if tap_gate.should_fire(&format!("{issue}{expiry}"), now_ms()) {
                     log::info!("免許証 交付 {issue} 期限 {expiry}");
                     push_event(&status, &format!("免許証 交付 {issue} 期限 {expiry}"));
                     // ホストにも通知 (画面遷移は UI が判断する)
@@ -325,6 +337,12 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
 
         if got {
             triggered_since = None;
+        }
+
+        // カードが載っている間は「まだ同じタップ」。**発火判定の後に置くこと** —
+        // 前に置くと、離れていた時間が touch で消えて再タップが抑止される
+        if present {
+            tap_gate.touch(now_ms());
         }
 
         FreeRtos::delay_ms(POLL_INTERVAL_MS);

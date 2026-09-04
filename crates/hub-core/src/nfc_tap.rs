@@ -39,6 +39,19 @@
 //! ポーリングは F→A→B の掃引で 1 周期が可変なので、回数ベースのヒステリシスより
 //! 時間ベースの方が素直 (issue #103 の「対処案」どおり)。
 //!
+//! # 読み取り失敗を「離れた」と数えない
+//!
+//! 検知の成否だけで判断すると足りない。**カードが載ったままでも読み取りは
+//! 頻繁に失敗する** (2026-09-04 実機ログ: `Failed to RequestResponse` /
+//! `SELECT EF 2F01 失敗` / `deselect failed` が成功の前後に出る)。とくに
+//! 免許証 (Type-B の APDU セッション) は**再読が 3.4〜4.1 秒に 1 回しか
+//! 成功しない**ため、1 秒のクールダウンを毎回越えて再発火していた
+//! (実機で 1 枚の免許証が 7.5 秒で 3 打刻)。
+//!
+//! そこで [`TapGate::touch`] を用意し、**アンテナの存在検知が立っている間は
+//! 毎周期「まだ見えている」ことにする**。読めたかどうかではなく
+//! **カードが物理的に載っているか**で「同じタップか」を決める。
+//!
 //! # 残課題: 覚えているのは直近 1 枚だけ
 //!
 //! 1 つの財布に FeliCa が 2 枚入っているなど、**A と B が交互に読まれると
@@ -57,10 +70,12 @@
 /// 長くかかるため打刻し直しも妨げない。
 pub const DEFAULT_COOLDOWN_MS: u64 = 1_000;
 
-/// 1 系統 (FeliCa IDm / NFC-A UID / 免許証…) 分の重複抑止。
+/// タップの重複抑止。
 ///
-/// 系統ごとに 1 つ持つこと。1 つを使い回すと、交通系 IC の直後に免許証を
-/// かざしたときに後者が抑止されてしまう。
+/// **全系統 (FeliCa IDm / NFC-A UID / 免許証 / 車検証) で 1 つを共有する。**
+/// 別のカードに持ち替えれば key が変わって即発火するので分ける必要がない。
+/// むしろ共有した方が、同じカードが F と B の両方で読めるようなケース
+/// (読み取りが揺れて別経路に落ちる) でも 1 タップ 1 回に収まる。
 #[derive(Debug, Clone)]
 pub struct TapGate {
     last: Option<(String, u64)>,
@@ -84,6 +99,18 @@ impl TapGate {
     ///   NTP 同期で時刻が飛ぶとクールダウンが飛ぶ
     ///
     /// 別のカードに変わったときは即座に `true` (かざし替えは待たせない)。
+    /// 「まだ見えている」ことにする (発火はしない)。
+    ///
+    /// **読み取りの成否ではなくカードの存在で判断するための口。**
+    /// アンテナの存在検知が立っている間これを毎周期呼べば、読み取りが
+    /// 失敗し続けても「離れた」と数えられない。まだ何も読んでいない
+    /// (`last` が None) ときは何もしない — 触っても抑止する対象が無い。
+    pub fn touch(&mut self, now_ms: u64) {
+        if let Some((_, last_seen)) = &mut self.last {
+            *last_seen = now_ms;
+        }
+    }
+
     pub fn should_fire(&mut self, key: &str, now_ms: u64) -> bool {
         let fire = match &self.last {
             // 同じカードを最後に見てから cooldown 経っていなければ「まだ同じタップ」
@@ -177,6 +204,45 @@ mod tests {
         let mut g = TapGate::new(1_000);
         assert!(g.should_fire("A", 10_000));
         assert!(!g.should_fire("A", 5_000));
+    }
+
+    /// **`touch` が「離れた」の判定を止める。**
+    /// 免許証のように再読が数秒に 1 回しか成功しない経路でも、載っている間は
+    /// 1 回しか発火しない (実機で 7.5 秒に 3 打刻していたケース)
+    #[test]
+    fn touch_keeps_a_held_card_from_refiring() {
+        let mut g = TapGate::new(1_000);
+        assert!(g.should_fire("2023060920280513", 180_012));
+        // 20ms 周期で存在検知は立ちっぱなし = 毎周期 touch される
+        for t in (180_032..187_500).step_by(20) {
+            g.touch(t);
+        }
+        // 読み取りが 3.4 秒ぶり / 4.1 秒ぶりに成功しても「まだ同じタップ」
+        assert!(!g.should_fire("2023060920280513", 183_392));
+        for t in (183_412..187_460).step_by(20) {
+            g.touch(t);
+        }
+        assert!(!g.should_fire("2023060920280513", 187_464));
+    }
+
+    /// 何も読んでいないうちの `touch` は無害 (抑止する対象が無い)
+    #[test]
+    fn touch_before_any_read_does_nothing() {
+        let mut g = TapGate::new(1_000);
+        g.touch(5_000);
+        assert!(g.should_fire("A", 5_000));
+    }
+
+    /// カードが離れれば touch も止まるので、再びかざせば発火する
+    #[test]
+    fn touch_stops_when_card_leaves_so_next_tap_fires() {
+        let mut g = TapGate::new(1_000);
+        assert!(g.should_fire("A", 0));
+        for t in (20..2_000).step_by(20) {
+            g.touch(t); // 載っている間
+        }
+        // 1_980 で離れた → 存在検知が落ちるので touch されない
+        assert!(g.should_fire("A", 3_000)); // 1 秒以上あけて再タップ
     }
 
     #[test]
