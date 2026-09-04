@@ -16,6 +16,7 @@ pub mod gw;
 pub mod ieee11073;
 pub mod improv;
 pub mod layout;
+pub mod nfc_tap;
 pub mod pairing;
 pub mod printer;
 pub mod protocol;
