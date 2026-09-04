@@ -204,24 +204,39 @@ fn main() -> Result<()> {
         //      PLL がロックせず完全無音。speaker.rs の SAMPLE_RATE_HZ 参照)
         //   2. アンプ初期化はクロック供給下で行う — 新 I2S ドライバは FIFO 空で
         //      BCK を止めるため、init_amp の前に feed_silence で実際に流す
-        let mut speaker = alc_hub_drivers::speaker::Speaker::new(
-            p.i2s1,
-            p.pins.gpio34.into(),
-            p.pins.gpio33.into(),
-            p.pins.gpio13.into(),
-        )?;
-        speaker.feed_silence(300)?;
-        alc_hub_drivers::speaker::init_amp(&mut i2c)?;
-        // 起動時セルフテスト音は鳴らさない (開発中は起動のたびに鳴って邪魔、
-        // 2026-07-21 実機で発音経路は確認済み)。疎通は SYSST のログで代替:
-        // feed_silence 中に PLL がロックしていれば bit0=PLLS / bit4=CLKS が立つ
-        match alc_hub_drivers::speaker::read_sysst(&mut i2c) {
-            Ok(v) => log::info!("speaker: SYSST(初期化後)=0x{v:04X}"),
-            Err(e) => log::warn!("speaker: SYSST 読み出し失敗: {e:#}"),
-        }
-        // 再生専用スレッドに分離 (issue #102): I2S write はブロッキングのため
-        // NFC スレッドで直接再生すると音声 1.5 秒ぶんポーリングが止まる
-        let speaker_tx = alc_hub_drivers::speaker::start_player(speaker)?;
+        //
+        // スピーカー初期化は**致命にしない**。nfc-verify が既定 on になって全機に
+        // 載るため、ここで `?` を返すと AW88298 が黙っている個体が起動不能になり、
+        // WS が上がらないので OTA でも戻せない (USB 復旧が要る)。音が出なくても
+        // NFC の読み取り自体は成立するので、失敗時は受信側を落とした Sender を
+        // 渡して無音で継続する (nfc.rs の beep_ok は send 失敗を無視する)
+        let speaker_tx = match (|| -> Result<_> {
+            let mut speaker = alc_hub_drivers::speaker::Speaker::new(
+                p.i2s1,
+                p.pins.gpio34.into(),
+                p.pins.gpio33.into(),
+                p.pins.gpio13.into(),
+            )?;
+            speaker.feed_silence(300)?;
+            alc_hub_drivers::speaker::init_amp(&mut i2c)?;
+            // 起動時セルフテスト音は鳴らさない (開発中は起動のたびに鳴って邪魔、
+            // 2026-07-21 実機で発音経路は確認済み)。疎通は SYSST のログで代替:
+            // feed_silence 中に PLL がロックしていれば bit0=PLLS / bit4=CLKS が立つ
+            match alc_hub_drivers::speaker::read_sysst(&mut i2c) {
+                Ok(v) => log::info!("speaker: SYSST(初期化後)=0x{v:04X}"),
+                Err(e) => log::warn!("speaker: SYSST 読み出し失敗: {e:#}"),
+            }
+            // 再生専用スレッドに分離 (issue #102): I2S write はブロッキングのため
+            // NFC スレッドで直接再生すると音声 1.5 秒ぶんポーリングが止まる
+            alc_hub_drivers::speaker::start_player(speaker)
+        })() {
+            Ok(tx) => tx,
+            Err(e) => {
+                log::warn!("speaker: 初期化失敗 — NFC は無音で継続する: {e:#}");
+                let (tx, _rx) = mpsc::channel();
+                tx
+            }
+        };
         // 現行: Port A (SDA=G2 / SCL=G1)。次期構成 (cores3-se): Port C (G17/G18、
         // RS232M 退去で空く)。SDA/SCL の対応が未確定なので ack しなければ入替
         #[cfg(not(feature = "cores3-se"))]

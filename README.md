@@ -91,7 +91,7 @@ crates/hub-core/src/improv.rs)。
 | `FC1200 <hex>` | RS232 (FC-1200) 受信データのパススルー |
 | `EVT QR_TIMEOUT` / `EVT RESULT_CLOSED` | 画面の自動遷移通知 |
 | `EVT TENKO_START` | 画面 (メニュー or 免許証タップ後の確認画面) から点呼が開始された |
-| `EVT NFC_LICENSE issue=YYYYMMDD expiry=YYYYMMDD` | 運転免許証 (IC) を読み取った (dev ビルド `nfc-verify`) |
+| `EVT NFC_LICENSE issue=YYYYMMDD expiry=YYYYMMDD` | 運転免許証 (IC) を読み取った |
 | `EVT LICENSE_EXPIRED <YYYYMMDD>` | 読み取った免許証が期限切れ (NTP 同期済みのときのみ判定) |
 | `EVT TENKO_CANCEL` / `EVT CONFIRM_TIMEOUT` | 点呼確認画面をキャンセル / 15 秒放置で待機へ戻った |
 | `EVT TENKO_SESSION <id>` | 点呼セッション ID を発番した (この点呼で採れた測定に載る、Refs #112) |
@@ -118,7 +118,7 @@ ESP-IDF のログが同じコンソールに混在するため、ホスト側は
 | タッチ I2C | SDA=G12 / SCL=G11 (0x38) | AXP2101(0x34) / AW9523(0x58) と共用 |
 | RS232M | TX=G17 / RX=G18 | DIP スイッチ候補。**シルク番号≠GPIO 番号の実例あり (Community #5581)、実機で要確認** |
 | Base LAN PoE v1.2 | CS=G9 / RST=G7 / INT=G14 | `lan` feature。INT は未使用 (polling)。本体 DB9 (RX=G13 / TX=G1) は使わない |
-| Unit NFC (I2C1) | SDA=G2 / SCL=G1 (Port A) | dev ビルド `nfc-verify`。ack しなければ SDA/SCL 入替 |
+| Unit NFC (I2C1) | SDA=G2 / SCL=G1 (Port A) | `nfc-verify` feature (既定 on)。ack しなければ SDA/SCL 入替 |
 
 ### CoreS3 SE への移行準備
 
