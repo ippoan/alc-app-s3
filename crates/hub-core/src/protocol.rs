@@ -3,6 +3,59 @@
 //! I/O・画面遷移・NVS 保存などの副作用は firmware 側 (host_link.rs) が担い、
 //! ここでは「1 行 → コマンド or エラー応答文字列」の変換のみを行う。
 
+/// M-Bus 5V (AW9523 BUS_EN) を Core 側から出すかの設定 (`BUS5V AUTO|ON|OFF`)。
+///
+/// - `Auto` (既定): バッテリーの有無で決める。**電池が無い個体では出さない** —
+///   PoE ベースのように自前で M-Bus 5V を供給するベースと同じレールを取り合い、
+///   突入を吸収できずブラウンアウト再起動を繰り返すため
+/// - `On`: 常に出す。USB 給電のベンチに RS232M / LAN 13.2 を積む構成では必須 (Refs #76)
+/// - `Off`: 常に出さない。ベース側から給電する常設機
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Bus5vMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl Bus5vMode {
+    /// NVS 保存値 (u8) から復元する。未知の値は既定 (`Auto`)
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::On,
+            2 => Self::Off,
+            _ => Self::Auto,
+        }
+    }
+
+    /// NVS 保存値 (u8)
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::Auto => 0,
+            Self::On => 1,
+            Self::Off => 2,
+        }
+    }
+
+    /// 応答・ログ用のラベル
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    /// 実際に M-Bus へ 5V を出すか。`Auto` はバッテリーの有無に従う
+    pub fn resolve(self, battery_present: bool) -> bool {
+        match self {
+            Self::Auto => battery_present,
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+}
+
 /// ホスト (Windows PC / Android タブレット) からのコマンド
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostCommand {
@@ -46,6 +99,11 @@ pub enum HostCommand {
     GwUrl { url: String },
     /// GW 接続の状態問い合わせ (`GW CONNECTED=1 URL=...` を応答)
     GwStatus,
+    /// M-Bus 5V を Core 側から出すか (`BUS5V AUTO|ON|OFF`。NVS 保存、既定 AUTO)。
+    /// 反映は再起動後 (AW9523 は起動時にしか触らない)
+    Bus5v { mode: Bus5vMode },
+    /// M-Bus 5V 設定の問い合わせ (`BUS5V MODE=auto` を応答)
+    Bus5vStatus,
     /// 点呼に血圧を含めるか (`TENKO BP ON|OFF`。NVS 保存、既定 OFF = 保留)
     TenkoBp { enabled: bool },
     /// 点呼構成の問い合わせ (`TENKO BP=0` を応答)
@@ -212,6 +270,15 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
             },
             _ => return Err("ERR GW: URL|STATUS が必要です".into()),
         },
+        // M-Bus 5V を Core 側から出すか (power.rs set_ext_5v_out)。
+        // PoE ベースのように自前で 5V を供給するベースでは OFF にする
+        "BUS5V" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+            Some("STATUS") => HostCommand::Bus5vStatus,
+            Some("AUTO") => HostCommand::Bus5v { mode: Bus5vMode::Auto },
+            Some("ON") | Some("1") => HostCommand::Bus5v { mode: Bus5vMode::On },
+            Some("OFF") | Some("0") => HostCommand::Bus5v { mode: Bus5vMode::Off },
+            _ => return Err("ERR BUS5V: AUTO|ON|OFF|STATUS が必要です".into()),
+        },
         // 点呼の構成 (血圧はオプション、tenko.rs)
         "TENKO" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
             Some("STATUS") => HostCommand::TenkoStatus,
@@ -265,6 +332,24 @@ mod tests {
     use super::*;
 
     const T: u64 = 60_000; // 既定タイムアウト
+
+    #[test]
+    fn bus5v_mode_roundtrip_and_resolve() {
+        for m in [Bus5vMode::Auto, Bus5vMode::On, Bus5vMode::Off] {
+            assert_eq!(Bus5vMode::from_u8(m.to_u8()), m);
+        }
+        // 未知の値と既定は Auto
+        assert_eq!(Bus5vMode::from_u8(99), Bus5vMode::Auto);
+        assert_eq!(Bus5vMode::default(), Bus5vMode::Auto);
+        assert_eq!(Bus5vMode::Auto.label(), "auto");
+        assert_eq!(Bus5vMode::On.label(), "on");
+        assert_eq!(Bus5vMode::Off.label(), "off");
+        // Auto は電池の有無に従う。On/Off は固定
+        assert!(Bus5vMode::Auto.resolve(true));
+        assert!(!Bus5vMode::Auto.resolve(false));
+        assert!(Bus5vMode::On.resolve(false));
+        assert!(!Bus5vMode::Off.resolve(true));
+    }
 
     #[test]
     fn empty_and_whitespace_lines_are_ignored() {
@@ -617,6 +702,18 @@ mod tests {
 
     #[test]
     fn tenko_subcommands() {
+        assert_eq!(parse_line("BUS5V STATUS", T), Ok(Some(HostCommand::Bus5vStatus)));
+        for (line, mode) in [
+            ("BUS5V AUTO", Bus5vMode::Auto),
+            ("BUS5V ON", Bus5vMode::On),
+            ("BUS5V 1", Bus5vMode::On),
+            ("BUS5V OFF", Bus5vMode::Off),
+            ("BUS5V 0", Bus5vMode::Off),
+        ] {
+            assert_eq!(parse_line(line, T), Ok(Some(HostCommand::Bus5v { mode })));
+        }
+        assert!(parse_line("BUS5V", T).is_err());
+        assert!(parse_line("BUS5V MAYBE", T).is_err());
         assert_eq!(parse_line("TENKO STATUS", T), Ok(Some(HostCommand::TenkoStatus)));
         assert_eq!(
             parse_line("tenko bp on", T),
