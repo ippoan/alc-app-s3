@@ -60,7 +60,7 @@ use alc_hub_common::{
 };
 use alc_hub_core::timecard::{payload_json, CardKind};
 use alc_hub_drivers::nfc::NfcEvent;
-use alc_hub_drivers::{crashlog, eth_w5500, heap, nfc, ota, ws_uplink};
+use alc_hub_drivers::{crashlog, eth_w5500, heap, nfc, ntp, ota, ws_uplink};
 use anyhow::Result;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::{
@@ -163,10 +163,22 @@ fn main() -> Result<()> {
     // 起動完了 = OTA rollback 解除 (CoreS3 と同じ安全装置、ota.rs 参照)
     ota::mark_boot_valid();
 
-    // メインループ: LED の反映だけ (ホスト向けイベントは eth_w5500 / heap /
-    // ws_uplink の各スレッドが出す)
+    // SNTP。**打刻端末では必須** — 起動しないとシステム時刻が 1970 のままで、
+    // 打刻の `recorded_at_ms` が 1970 起点で送られる (範囲内なので DB 側で NULL
+    // にもならず、静かに 55 年ずれた打刻が入る)。`ws_uplink` の
+    // `should_wait_for_clock` は 60 秒待って諦め、`fix_unsynced_times` は
+    // 「あとで同期したら補正する」仕組みなので、同期が来なければ永久に発火しない。
+    // **ここで即起動してはいけない** — 理由は ntp::start_when_online の doc
+    let mut sntp = None;
+
+    // メインループ: LED の反映と SNTP の遅延起動だけ (ホスト向けイベントは
+    // eth_w5500 / heap / ws_uplink の各スレッドが出す)
     loop {
         FreeRtos::delay_ms(100);
+        ntp::start_when_online(
+            &mut sntp,
+            status.lock().map(|s| !s.lan_ip.is_empty()).unwrap_or(false),
+        );
         if let Some(led) = led.as_mut() {
             led.tick();
         }
