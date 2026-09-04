@@ -274,11 +274,11 @@ jobs:
             flash_size: 8mb
             partition_table: crates/atoms3-print/partitions.csv
             cache_key: build-atoms3
-          # NFC タイムカード端末 (#134)。**成果物を作るだけで Pages には出さない**
-          # — /device/setup の機種エントリ (auth-worker) と cf-alc-recorder の
-          # device role がまだ無く、role と kind の 1:1 (取り違えを構造的に防ぐ
-          # 既存の設計) が崩れるため。インストーラ公開は第2段階
-          # (assemble-pages は firmware-atoms3-timecard を参照しない)。
+          # NFC タイムカード端末 (#134)。dev チャネルは出さない (dev の実体は
+          # mem-hud = 画面の HUD で、画面を持たない Atom 系には意味がない)。
+          # **配布の前提**: /device/setup の機種エントリ (auth-worker) と
+          # cf-alc-recorder の device-timecard role が揃っていること — role と
+          # kind の 1:1 が崩れると firmware の取り違えを構造的に防げなくなる。
           # 本番機 Atom VoiceS3R (PSRAM 8MB) へ移すときは sdkconfig /
           # partitions / cache_key を作り直すこと (crates/atoms3-timecard/src/main.rs)
           - name: atoms3-timecard
@@ -493,8 +493,9 @@ jobs:
 
   # ------------------------------------------------------------------
   # assemble-pages: 各 build leg の成果物を集めて Pages サイトを組む。
-  # CoreS3 (index.html + manifest.json) と AtomS3 印刷ブリッジ
-  # (atoms3-print.html + manifest-atoms3-print.json) の 2 機種分。
+  # CoreS3 (index.html + manifest.json) / AtomS3 印刷ブリッジ
+  # (atoms3-print.html + manifest-atoms3-print.json) / NFC タイムカード端末
+  # (timecard.html + manifest-timecard.json) の 3 機種分。
   # manifest の version は auth-worker /device/setup の「最新版」照会
   # (機種別) が突き合わせるため、それぞれの crate version + SHA を刻む
   # ------------------------------------------------------------------
@@ -520,13 +521,16 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           ATOMS3_VERSION=$(grep '^version' crates/atoms3-print/Cargo.toml | head -1 | sed 's/version *= *"\(.*\)"/\1/')
           echo "atoms3_version=$ATOMS3_VERSION" >> "$GITHUB_OUTPUT"
-          echo "cores3: $VERSION / atoms3-print: $ATOMS3_VERSION"
+          TIMECARD_VERSION=$(grep '^version' crates/atoms3-timecard/Cargo.toml | head -1 | sed 's/version *= *"\(.*\)"/\1/')
+          echo "timecard_version=$TIMECARD_VERSION" >> "$GITHUB_OUTPUT"
+          echo "cores3: $VERSION / atoms3-print: $ATOMS3_VERSION / timecard: $TIMECARD_VERSION"
 
       - name: Assemble Pages site
         run: |
           mkdir -p _site/firmware
           cp docs/index.html _site/
           cp docs/atoms3-print.html _site/
+          cp docs/timecard.html _site/
           # boot/main = Web インストーラー用 (manifest の parts、NVS 温存 #48)。
           # merged = espflash/esptool で offset 0 に一括書き込みする CLI 用
           # (この経路は従来どおり NVS が消える)。app = OTA 用
@@ -542,6 +546,10 @@ jobs:
           cp alc-hub-atoms3-print-main.bin _site/firmware/
           cp alc-hub-atoms3-print-merged.bin _site/firmware/
           cp alc-hub-atoms3-print-app.bin _site/firmware/
+          cp alc-hub-atoms3-timecard-boot.bin _site/firmware/
+          cp alc-hub-atoms3-timecard-main.bin _site/firmware/
+          cp alc-hub-atoms3-timecard-merged.bin _site/firmware/
+          cp alc-hub-atoms3-timecard-app.bin _site/firmware/
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.version }}+$SHORT_SHA\"/" \
             docs/manifest.json > _site/manifest.json
@@ -554,7 +562,11 @@ jobs:
             docs/manifest.json > _site/manifest-dev.json
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.atoms3_version }}+$SHORT_SHA\"/" \
             docs/manifest-atoms3-print.json > _site/manifest-atoms3-print.json
-          cat _site/manifest.json _site/manifest-dev.json _site/manifest-atoms3-print.json
+          # NFC タイムカード端末 (#134)。**dev チャネルは出さない** — dev バリアントの
+          # 実体は mem-hud (hub-ui の画面 HUD) で、画面を持たない Atom 系には意味がない
+          sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.timecard_version }}+$SHORT_SHA\"/" \
+            docs/manifest-timecard.json > _site/manifest-timecard.json
+          cat _site/manifest.json _site/manifest-dev.json _site/manifest-atoms3-print.json _site/manifest-timecard.json
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
