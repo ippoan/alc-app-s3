@@ -22,7 +22,7 @@ use alc_hub_common::{
     settings::Settings,
     status::{HubStatus, SharedStatus},
 };
-use alc_hub_drivers::{crashlog, eth_w5500, heap, ota, ws_uplink};
+use alc_hub_drivers::{crashlog, eth_w5500, heap, ntp, ota, ws_uplink};
 use anyhow::Result;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::{
@@ -112,10 +112,19 @@ fn main() -> Result<()> {
     // 起動完了 = OTA rollback 解除 (CoreS3 と同じ安全装置、ota.rs 参照)
     ota::mark_boot_valid();
 
-    // メインループ: 状態を LCD に反映 (差分描画)。ホスト向けイベントは
-    // eth_w5500 / heap スレッドが出す
+    // SNTP。起動しないとシステム時刻が 1970 のままで、送信キューに積んだ測定の
+    // `recorded_at_ms` が 1970 起点になる。**即起動は panic する** — 理由は
+    // ntp::start_when_online の doc
+    let mut sntp = None;
+
+    // メインループ: 状態を LCD に反映 (差分描画) と SNTP の遅延起動。
+    // ホスト向けイベントは eth_w5500 / heap スレッドが出す
     loop {
         FreeRtos::delay_ms(500);
+        ntp::start_when_online(
+            &mut sntp,
+            status.lock().map(|s| !s.lan_ip.is_empty()).unwrap_or(false),
+        );
         let Some(screen) = screen.as_mut() else {
             continue;
         };
