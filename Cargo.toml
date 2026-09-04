@@ -24,14 +24,20 @@ name = "alc-hub-cores3"
 harness = false
 
 [features]
-default = ["lan"]
+default = ["lan", "nfc-verify"]
 # 開発用メモリ HUD (ステータスバーに RAM/PSRAM 使用率、hub-ui に伝搬)。
 # 本番ビルドには入れない。有効化: cargo build --release --features mem-hud
 # (local/flash.ps1 が付与する)
 mem-hud = ["alc-hub-ui/mem-hud"]
-# NFC 検証 (Unit NFC / ST25R3916, issue #84 + plan/nfc-card-identity.md)。
-# components/nfc_shim 経由の C++ FFI を使う。dev(mem-hud) チャネルのみに相乗りし
-# 本番 manifest.json の -app.bin には含めない (.github/workflows/build.yml 参照)
+# NFC (Unit NFC / ST25R3916, issue #84 + plan/nfc-card-identity.md)。
+# components/nfc_shim 経由の C++ FFI を使う。
+#
+# **既定 on にした (本番昇格)**: dev(mem-hud) チャネル限定のままだと、本番
+# `-app.bin` に永久に入らず、NFC を使う実機は /device/setup で dev ビルドを
+# 「強制」インストールし直す運用になる (版が同じで「更新」が出ない)。免許証
+# タップからの点呼開始 (#121) は運用上必須なので本番へ載せる。
+# 「NFC を積むと内部RAM が ws_uplink の TLS ゲート (60KB) を割って WS が繋がらない」
+# 問題は #111 で解決済み (実機で空き 40979 → 74627 bytes)。
 nfc-verify = ["alc-hub-drivers/nfc-verify"]
 # Base LAN PoE v1.2 (W5500)。CS=G9 / RST=G7 で内蔵スピーカー (I2S DOUT=G13) とは
 # 競合しないため、旧 LAN Module 13.2 のような排他制約は無い (Refs #111)。

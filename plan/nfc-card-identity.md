@@ -304,7 +304,9 @@ CoreS3 (`crates/hub-drivers/src/nfc.rs`) への還元は以下の構成:
    (RS232M 物理ジャンパ移動とセット)。詳細は `plan/cores3-hub-consolidation.md` の
    「次期構成」セクション
 4. 通知は既存どおり `push_event` 3種 (IDm / UID / 免許証)。WS uplink `card_scan`
-   イベント化・`nfc-verify` の本番昇格・スマホ HCE 本人識別セッションは**別 issue**
+   イベント化・スマホ HCE 本人識別セッションは**別 issue**
+   (`nfc-verify` の本番昇格は完了 — 既定 features に入れ、本番 `-app.bin` に載せた。
+   dev ビルドを「強制」インストールしないと NFC が使えない運用を解消するため)
 
 ### リスク
 
