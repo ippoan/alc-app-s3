@@ -146,8 +146,12 @@ G5(=G1) / G15(=G13) の二択しかなく **内蔵スピーカー (I2S DOUT=G13 
   `setExtOutput(true)` 相当) を立てて Core からも 5V を出すと、同じレールを
   両側から駆動することになり、**バッテリーレスの CoreS3 SE は PoE 単独給電で
   起動できない** (USB を挿すと VBUS が支えるので気づけない。「工場出荷ファームは
-  PoE で動くのに焼いたファームだけ動かない」の正体)。`hub-board/src/power.rs` の
-  `set_ext_5v_out()` を board 種別で切り替えており、SE では立てない。
-  USB 給電のベンチに RS232M/LAN 13.2 を積む構成では逆に必須 (Refs #76)
+  PoE で動くのに焼いたファームだけ動かない」の正体。画面がぱちぱち点滅する)。
+  `hub-board/src/power.rs` の `set_ext_5v_out()` を **AXP2101 の battery-present bit**
+  で切り替えており、電池が無い個体では立てない。USB 給電のベンチに RS232M/LAN 13.2 を
+  積む構成では逆に必須なので、電池付きの個体では従来どおり出す (Refs #76)。
+  ★**board 種別 (rtc/imu probe) では判定しない** — 実機の CoreS3 SE で
+  `BOARD=cores3` と出る個体を確認しており (電池は無いのに RTC/IMU のどちらかが ack
+  する)、SE 判定に賭けると踏み抜く
 - NFC の Port C 移行・rs232.rs のピン変更は `plan/nfc-card-identity.md` の
   「CoreS3 還元計画」セクション参照
