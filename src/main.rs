@@ -76,6 +76,15 @@ fn main() -> Result<()> {
         probe.rtc_present,
         probe.imu_present
     );
+    // M-Bus 5V を Core 側から出すか (AW9523 BUS_EN)。**バッテリーレスの
+    // CoreS3 SE では出さない**。SE は Base LAN PoE v1.2 のように自前で M-Bus 5V を
+    // 供給するベースを履く常設機の構成 (plan/cores3-hub-consolidation.md「次期構成」)
+    // で、両側から同じ 5V レールを駆動すると PoE 単独給電では起動できない
+    // — 電池が無く突入を吸収できないため。USB を挿していると VBUS が支えるので
+    // 気づけず、「工場出荷ファームは PoE で動くのに焼いたファームだけ動かない」
+    // という症状になる。バッテリー付きの CoreS3 は従来どおり Core 側から供給する
+    // (USB 給電のベンチで RS232M/LAN 13.2 に電源が要る、Refs #76)
+    board::power::set_ext_5v_out(&mut i2c, board_kind != alc_hub_core::board::BoardKind::CoreS3Se)?;
     let rotation = settings.rotation();
     // 起動カウンタを 1 つ進める (点呼セッション ID の前置、Refs #112)。
     // **起動ごとに 1 回だけ** — 再起動をまたいだ session_id の再利用を防ぐ。

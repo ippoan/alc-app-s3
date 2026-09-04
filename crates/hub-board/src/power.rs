@@ -47,9 +47,11 @@ pub fn init(i2c: &mut I2cDriver) -> Result<()> {
     write_reg(i2c, AXP2101_ADDR, 0x30, 0x0F)?;
 
     // --- AW9523: ポート初期値・方向 (P1_1 = LCD RST を H で解放) ---
-    // bit1 (BUS_EN) を立てて M-Bus へ 5V を出す (M5Unified setExtOutput(true) 相当)。
-    // 立てないとスタックモジュール (RS232M/LAN 13.2) が無電源になる
-    write_reg(i2c, AW9523_ADDR, 0x02, 0b0000_0111)?; // P0 出力値 (bit1: BUS_EN = H)
+    // **P0 bit1 (BUS_EN) はここでは立てない** — M5Unified の CoreS3/CoreS3SE 初期化
+    // (Power_Class.cpp) も BOOST_EN だけを on にし、BUS_EN は setExtOutput(true) を
+    // 明示的に呼んだときだけ立てる。Core 側から M-Bus へ 5V を出すか否かは
+    // ベースの構成で変わるため、`set_ext_5v_out()` で起動時に選ぶ (main.rs)
+    write_reg(i2c, AW9523_ADDR, 0x02, 0b0000_0101)?; // P0 出力値 (bit1: BUS_EN = L)
     write_reg(i2c, AW9523_ADDR, 0x03, 0b1000_0011)?; // P1 出力値 (bit1: LCD RST = H, bit7: BOOST_EN = H)
     write_reg(i2c, AW9523_ADDR, 0x04, 0b0001_1000)?; // P0 方向 (0 = 出力)
     write_reg(i2c, AW9523_ADDR, 0x05, 0b0000_1100)?; // P1 方向
@@ -58,6 +60,27 @@ pub fn init(i2c: &mut I2cDriver) -> Result<()> {
     write_reg(i2c, AW9523_ADDR, 0x13, 0xFF)?; // P1 LED モード無効
 
     Ok(())
+}
+
+/// M-Bus 5V を **Core 側から出すか** を切り替える (AW9523 P0 bit1 = BUS_EN、
+/// M5Unified `Power_Class::setExtOutput()` 相当)。
+///
+/// - `true`: SY7088 ブーストの 5V を M-Bus へ出す。ベースが自前電源を持たない
+///   構成 (USB 給電のベンチに RS232M/LAN 13.2 を積む等) ではこれが無いと
+///   スタックモジュールが無電源になる (Refs #76)
+/// - `false`: 出さない。**Base LAN PoE v1.2 のように自前で M-Bus 5V を供給する
+///   ベース**を履いているときは必ずこちら。両側から同じ 5V レールを駆動すると、
+///   バッテリーで吸収できない CoreS3 SE では PoE 単独給電で起動できなくなる
+///   (USB を挿していると VBUS が支えるので気づけない)。工場出荷ファームが
+///   PoE で動くのは BUS_EN を立てないため
+///
+/// BOOST_EN (P1 bit7) は init() が常時 on にしたままにする (M5Unified と同じ)。
+pub fn set_ext_5v_out(i2c: &mut I2cDriver, enable: bool) -> Result<()> {
+    let mut buf = [0u8; 1];
+    i2c.write_read(AW9523_ADDR, &[0x02], &mut buf, BLOCK)
+        .context("AW9523 P0 読み出し")?;
+    let p0 = if enable { buf[0] | 0b10 } else { buf[0] & !0b10 };
+    write_reg(i2c, AW9523_ADDR, 0x02, p0)
 }
 
 /// init() が 0x90 (LDO 有効化レジスタ) に書く値。bit7=DLDO1 (LCD バックライト)、
