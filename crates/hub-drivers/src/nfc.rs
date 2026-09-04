@@ -33,6 +33,7 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::gpio::{AnyIOPin, Pin};
 
 use alc_hub_common::status::{now_ms, SharedStatus};
+use alc_hub_core::nfc_tap::TapGate;
 
 extern "C" {
     fn nfc_shim_init(i2c_port: i32, sda_gpio: i32, scl_gpio: i32) -> i32;
@@ -168,13 +169,22 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
     crate::crashlog::note("EVT NFC_READY");
     push_event(&status, "NFC 待受開始 (存在検知ゲート + F→A→B 逐次ポーリング)");
 
-    let mut last_idm: Option<String> = None;
-    let mut last_uid: Option<String> = None;
-    // -2 (カード無し) は定常状態なのでログしない。未実行センチネルは i32::MIN
+    // 重複抑止は **debounce**「離れて N ms 経つまで、まだ同じタップ」
+    // (alc_hub_core::nfc_tap、issue #103)。
+    // 以前は「直前値と違えば発火 / 読めなければ直前値をクリア」のエッジ判定
+    // だったが、モバイル FeliCa は応答が断続的で 20ms ポーリングが 1 回
+    // 空振りしただけで直前値が消え、**1 タップで 2 回発火**していた。
+    // 打刻イベント (#134) では 1 タップが別 seq の 2 行になり、サーバ側の
+    // seq 冪等では防げない (別イベントが 2 つ生まれたケースのため) —
+    // 1 回かざした人が出勤と退勤を同時に打つ壊れ方になるので端末側で塞ぐ。
+    // 系統ごとに別の gate を持つ (使い回すと交通系の直後の免許証が抑止される)
+    let mut felica_gate = TapGate::default();
+    let mut nfca_gate = TapGate::default();
+    let mut car_gate = TapGate::default();
+    let mut license_gate = TapGate::default();
+    // -2 (カード無し) は定常状態なのでログしない。未実行センチネルは i32::MIN。
+    // **これは失敗ログの抑止専用** — 成功時の発火判定は license_gate が持つ
     let mut last_license_rc = i32::MIN;
-    // 電子車検証を「置きっぱなし」で毎サイクル検知し続けても再ビープしない
-    // ための dedupe (issue #105)。免許証確定時にリセットする
-    let mut last_car_inspection = false;
 
     // 存在検知のベースライン (-1 = 未較正、初回測定値で初期化)。
     // 振幅はカード系、位相はスマホ系 (モバイルSuica 等、振幅に出にくい) を拾う
@@ -247,18 +257,19 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
 
         match poll_felica_idm() {
             Ok(Some(idm)) => {
-                if last_idm.as_deref() != Some(idm.as_str()) {
+                if felica_gate.should_fire(&idm, now_ms()) {
                     // push_event はイベントログ (UI/WS) 行のみで serial には出ない。
                     // log::info! を並置して scripts/nfc_serial_beep.py (COM 監視、
                     // 既定 --match "NFC|免許|IDm") で検知音を鳴らせるようにする (issue #101)
                     log::info!("NFC IDm={idm}");
                     push_event(&status, &format!("NFC IDm={idm}"));
-                    sink.on_event(&NfcEvent::Felica { idm: idm.clone() });
+                    sink.on_event(&NfcEvent::Felica { idm });
                 }
-                last_idm = Some(idm);
                 got = true;
             }
-            Ok(None) => last_idm = None,
+            // 読めなかったことを理由に状態をクリアしない (issue #103)。
+            // 空振りで状態が消えることが 2 重発火の原因だった
+            Ok(None) => {}
             Err(e) => log::warn!("nfc: FeliCa poll error: {e:#}"),
         }
 
@@ -273,27 +284,20 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
                     // コストが乗るが、非対応カードは RATS 非対応で即座に弾かれる
                     // ため実害は小さい
                     if detect_car_inspection_a() {
-                        if !last_car_inspection {
+                        if car_gate.should_fire(&uid, now_ms()) {
                             log::info!("電子車検証 検知 (UID={uid})");
                             push_event(&status, "電子車検証 検知");
-                            sink.on_event(&NfcEvent::CarInspection { uid: uid.clone() });
+                            sink.on_event(&NfcEvent::CarInspection { uid });
                         }
-                        last_car_inspection = true;
-                    } else {
-                        last_car_inspection = false;
-                        if last_uid.as_deref() != Some(uid.as_str()) {
-                            log::info!("NFC-A UID={uid}");
-                            push_event(&status, &format!("NFC-A UID={uid}"));
-                            sink.on_event(&NfcEvent::NfcaUid { uid: uid.clone() });
-                        }
+                    } else if nfca_gate.should_fire(&uid, now_ms()) {
+                        log::info!("NFC-A UID={uid}");
+                        push_event(&status, &format!("NFC-A UID={uid}"));
+                        sink.on_event(&NfcEvent::NfcaUid { uid });
                     }
-                    last_uid = Some(uid);
                     got = true;
                 }
-                Ok(None) => {
-                    last_uid = None;
-                    last_car_inspection = false;
-                }
+                // issue #103: 空振りで状態をクリアしない (上の FeliCa と同じ理由)
+                Ok(None) => {}
                 Err(e) => log::warn!("nfc: NFC-A poll error: {e:#}"),
             }
         }
@@ -301,7 +305,9 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
         if !got {
             let (rc, issue, expiry) = read_license_expiry();
             if rc == 0 {
-                if last_license_rc != 0 {
+                // 免許証も同じクールダウンに載せる (issue #103)。key は交付日 +
+                // 有効期限 = alc-app タブレットが使う employees.nfc_id と同じ 16 桁
+                if license_gate.should_fire(&format!("{issue}{expiry}"), now_ms()) {
                     log::info!("免許証 交付 {issue} 期限 {expiry}");
                     push_event(&status, &format!("免許証 交付 {issue} 期限 {expiry}"));
                     // ホストにも通知 (画面遷移は UI が判断する)
