@@ -13,11 +13,18 @@
 //!
 //! 存在検知ゲート + F(交通系IDm)→A(HCE/UID)→B(免許証) 逐次掃引は
 //! crates/atoms3-nfc/src/main.rs (issue #96 で実機確認済み) の移植。
-//! 通知は `SharedStatus::push_event` (「ログ確認」画面に既存の rs232.rs
-//! 等と同じ形式で表示される) に加え、**免許証だけは `UiCommand::License` を
-//! UI へ送る** — 待機画面なら点呼確認画面へ直行させるため (hub-ui /
-//! hub-core tenko_prompt)。交通系 IDm / NFC-A UID / 車検証は引き続きログ通知
-//! のみ。Measurement 化・recorder fan-out・WS uplink 連携は将来スコープ。
+//!
+//! # ボード非依存 (issue #134)
+//!
+//! **本モジュールは CoreS3 専用ではない。** I2C ポート番号はピンと同じく
+//! 引数で受け、検知の通知は [`NfcEvent`] のコールバックで外へ出す。
+//! CoreS3 は「ビープ + 免許証なら `UiCommand::License`」を、NFC タイムカード端末
+//! (crates/atoms3-timecard) は「打刻イベントを WS uplink へ積む + LED」を
+//! それぞれコールバック側で行う。**読み取りループを写して 3 実装目を作らないこと。**
+//!
+//! ログ通知 (`SharedStatus::push_event` — 「ログ確認」画面に既存の rs232.rs 等と
+//! 同じ形式で表示される) と `EVT NFC_LICENSE` のホスト出力はボード非依存なので
+//! 本モジュールに残す。
 
 use std::time::{Duration, Instant};
 
@@ -26,9 +33,6 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::gpio::{AnyIOPin, Pin};
 
 use alc_hub_common::status::{now_ms, SharedStatus};
-use alc_hub_common::ui_api::{LicenseCard, UiCommand};
-
-use crate::speaker::Sound;
 
 extern "C" {
     fn nfc_shim_init(i2c_port: i32, sda_gpio: i32, scl_gpio: i32) -> i32;
@@ -50,8 +54,63 @@ extern "C" {
     ) -> i32;
 }
 
-/// I2C_NUM_1 (ESP-IDF)。main.rs の内部バス (I2C_NUM_0, G12/G11) とは別ポート
-const I2C_PORT_NFC: i32 = 1;
+/// 初期化の再試行間隔。Unit の電源投入直後や活線挿抜では ack しないことがあり、
+/// **1 度で諦めるとスレッドごと終了して再起動するまで NFC が死ぬ**。画面も
+/// スピーカーも無い常設機ではそれに気付けないので、諦めずに待ち続ける
+const INIT_RETRY: Duration = Duration::from_secs(5);
+
+/// 初期化を成功するまで再試行する。戻り値は成功したか (現状 `true` のみ —
+/// 将来この関数に諦める条件を足すときのための口)。
+/// rc が変わったときだけログを出す (5 秒ごとに同じ行を吐き続けない)
+fn init_with_retry(i2c_port: i32, sda_num: i32, scl_num: i32, status: &SharedStatus) -> bool {
+    let mut last_rc = i32::MIN;
+    loop {
+        let rc = unsafe { nfc_shim_init(i2c_port, sda_num, scl_num) };
+        if rc == 0 {
+            return true;
+        }
+        if rc != last_rc {
+            let msg = format!(
+                "NFC 初期化失敗 rc={rc} (配線/バス役割 port={i2c_port} sda={sda_num} scl={scl_num} を確認)"
+            );
+            log::error!("nfc: {msg} — {INIT_RETRY:?} ごとに再試行する");
+            println!("EVT NFC_INIT_NG rc={rc}");
+            crate::crashlog::note(&format!("EVT NFC_INIT_NG rc={rc}"));
+            push_event(status, &msg);
+            last_rc = rc;
+        }
+        FreeRtos::delay_ms(INIT_RETRY.as_millis() as u32);
+    }
+}
+
+/// 検知したカード。`start` に渡したコールバックへ、読めた分岐ごとに 1 回届く
+/// (同じカードを載せっぱなしにしても再通知はしない — dedupe はループ側が持つ)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NfcEvent {
+    /// 交通系 IC 等の FeliCa IDm (8 バイトを大文字 hex 16 文字にしたもの)
+    Felica { idm: String },
+    /// NFC-A の UID (HCE / NTAG 等)
+    NfcaUid { uid: String },
+    /// 電子車検証 (Type-A ISO-DEP + SELECT MF 成功の簡易判定、issue #105)
+    CarInspection { uid: String },
+    /// 従来 IC 運転免許証の PIN なし読み取り (EF 2F01)。日付は YYYYMMDD
+    License { issue: String, expiry: String },
+    /// 何かかざされたが読めなかった (免許証の途中死・カード引き抜き等)。
+    /// rc の意味は [`license_rc_reason`] 参照。カード無し (-2) では届かない
+    ReadFailed { rc: i32 },
+}
+
+/// 検知通知の受け口。`FnMut` を trait object にせず総称で受けると
+/// `start` が呼び出し側ごとに単相化されるだけで済む (vtable も Box も不要)
+pub trait NfcSink: Send + 'static {
+    fn on_event(&mut self, event: &NfcEvent);
+}
+
+impl<F: FnMut(&NfcEvent) + Send + 'static> NfcSink for F {
+    fn on_event(&mut self, event: &NfcEvent) {
+        self(event)
+    }
+}
 
 /// 存在検知 (アンテナ振幅) のトリガ閾値。カード無しのベースラインは完全に
 /// 安定 (AtomS3 実測: 60サンプル連続でノイズ0)、カード接近で 2 下がる。
@@ -67,12 +126,18 @@ const POLL_INTERVAL_MS: u32 = 20;
 /// (温度ドリフト等でベースラインが実態とずれたケースの自己回復)
 const TRIGGER_STUCK: Duration = Duration::from_secs(3);
 
+/// NFC 読み取りスレッドを起動する。
+///
+/// - `i2c_port`: nfc_shim (C++ 側) に立てさせる I2C ポート番号。**Rust 側で
+///   同じポートに `I2cDriver` を作らないこと** (二重 install で abort する)。
+///   CoreS3 は内部バスが I2C_NUM_0 なので 1、AtomS3 系は他に I2C を使わないので 0
+/// - `sink`: 検知の通知先。`|e: &NfcEvent| { ... }` のクロージャで足りる
 pub fn start(
+    i2c_port: i32,
     sda: AnyIOPin,
     scl: AnyIOPin,
     status: SharedStatus,
-    speaker: std::sync::mpsc::Sender<Sound>,
-    ui_tx: std::sync::mpsc::Sender<UiCommand>,
+    sink: impl NfcSink,
 ) -> Result<()> {
     // Pin::pin() は PinId (u8) を返す。ownership は FFI 側 (C++/M5HAL) が握るため
     // 番号だけ取り出して drop する (esp-idf-hal 側では未使用)
@@ -86,25 +151,21 @@ pub fn start(
         .name("nfc".into())
         // APDU 組立 (String) + FFI 経由の hex 文字列バッファがあるため rs232.rs と同等
         .stack_size(8 * 1024)
-        .spawn(move || run(sda_num, scl_num, status, speaker, ui_tx))?;
+        .spawn(move || run(i2c_port, sda_num, scl_num, status, sink))?;
     Ok(())
 }
 
-fn run(
-    sda_num: i32,
-    scl_num: i32,
-    status: SharedStatus,
-    speaker: std::sync::mpsc::Sender<Sound>,
-    ui_tx: std::sync::mpsc::Sender<UiCommand>,
-) {
-    let rc = unsafe { nfc_shim_init(I2C_PORT_NFC, sda_num, scl_num) };
-    if rc != 0 {
-        push_event(
-            &status,
-            &format!("NFC 初期化失敗 rc={rc} (配線/バス役割 sda={sda_num} scl={scl_num} を確認)"),
-        );
+fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink: impl NfcSink) {
+    if !init_with_retry(i2c_port, sda_num, scl_num, &status) {
         return;
     }
+    // 画面を持たない機 (atoms3-timecard) では push_event が誰にも見えないので
+    // シリアルにも出す。ログは USB CDC がホストに掴まれる前 (起動 1 秒以内) の
+    // ぶんが落ちるので、`EVT NFC_READY` は起動後でもコンソールから
+    // `LOG DUMP` で拾える (crashlog リングに載る) ことに意味がある
+    log::info!("nfc: 待受開始 port={i2c_port} sda={sda_num} scl={scl_num}");
+    println!("EVT NFC_READY port={i2c_port} sda={sda_num} scl={scl_num}");
+    crate::crashlog::note("EVT NFC_READY");
     push_event(&status, "NFC 待受開始 (存在検知ゲート + F→A→B 逐次ポーリング)");
 
     let mut last_idm: Option<String> = None;
@@ -192,7 +253,7 @@ fn run(
                     // 既定 --match "NFC|免許|IDm") で検知音を鳴らせるようにする (issue #101)
                     log::info!("NFC IDm={idm}");
                     push_event(&status, &format!("NFC IDm={idm}"));
-                    beep_ok(&speaker);
+                    sink.on_event(&NfcEvent::Felica { idm: idm.clone() });
                 }
                 last_idm = Some(idm);
                 got = true;
@@ -215,7 +276,7 @@ fn run(
                         if !last_car_inspection {
                             log::info!("電子車検証 検知 (UID={uid})");
                             push_event(&status, "電子車検証 検知");
-                            beep_ok(&speaker);
+                            sink.on_event(&NfcEvent::CarInspection { uid: uid.clone() });
                         }
                         last_car_inspection = true;
                     } else {
@@ -223,7 +284,7 @@ fn run(
                         if last_uid.as_deref() != Some(uid.as_str()) {
                             log::info!("NFC-A UID={uid}");
                             push_event(&status, &format!("NFC-A UID={uid}"));
-                            beep_ok(&speaker);
+                            sink.on_event(&NfcEvent::NfcaUid { uid: uid.clone() });
                         }
                     }
                     last_uid = Some(uid);
@@ -243,18 +304,15 @@ fn run(
                 if last_license_rc != 0 {
                     log::info!("免許証 交付 {issue} 期限 {expiry}");
                     push_event(&status, &format!("免許証 交付 {issue} 期限 {expiry}"));
-                    beep_ok(&speaker);
                     // ホストにも通知 (画面遷移は UI が判断する)
                     println!("EVT NFC_LICENSE issue={issue} expiry={expiry}");
-                    let _ = ui_tx.send(UiCommand::License(LicenseCard {
-                        issue: issue.clone(),
-                        expiry: expiry.clone(),
-                    }));
+                    sink.on_event(&NfcEvent::License { issue, expiry });
                 }
                 got = true;
             } else if rc != -2 && rc != last_license_rc {
                 // 途中死はカード引き抜き等でも出る
                 log::warn!("nfc: 免許証 読み取り失敗 rc={rc} ({})", license_rc_reason(rc));
+                sink.on_event(&NfcEvent::ReadFailed { rc });
             }
             last_license_rc = rc;
         }
@@ -265,19 +323,6 @@ fn run(
 
         FreeRtos::delay_ms(POLL_INTERVAL_MS);
     }
-}
-
-/// 検知成功ビープ (issue #101 PR2)。2kHz 40ms の短い「ピッ」(100ms は長いと
-/// 実機フィードバック、2026-07-21)。I2S write はブロッキングだが PLL リード
-/// イン込み ~60ms ならポーリング間隔への影響は許容範囲
-fn beep_ok(speaker: &std::sync::mpsc::Sender<Sound>) {
-    // 再生はスレッド分離済み (speaker::start_player) — キュー投入のみで
-    // ポーリングはブロックしない (issue #102、同期再生だと音声 1.5 秒ぶん
-    // NFC の反応が止まる)。
-    // Registered は音声フィードバックの動作確認用の仮配線 (2026-07-21):
-    // 全検知パス共通。本来の再生タイミングは登録フロー実装時にそちらへ移す
-    let _ = speaker.send(Sound::BeepOk);
-    let _ = speaker.send(Sound::Registered);
 }
 
 /// SELECT MF (`00 A4 00 00`)。実機診断の結果 (issue #105、2026-07-21):
@@ -364,7 +409,7 @@ fn cstr_bytes_to_str(buf: &[u8]) -> String {
 }
 
 /// components/nfc_shim/nfc_shim.cpp の nfc_shim_read_license_expiry() コメント準拠
-fn license_rc_reason(rc: i32) -> &'static str {
+pub fn license_rc_reason(rc: i32) -> &'static str {
     match rc {
         0 => "OK",
         -1 => "初期化未完了 or バッファ不足",

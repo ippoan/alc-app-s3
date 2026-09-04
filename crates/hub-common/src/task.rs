@@ -49,6 +49,15 @@ pub fn name_next(name: &'static CStr) {
 /// (AUTH SET・ROTATE 等の設定保存) / `ble` (`delete_all_bonds` がボンドを
 /// NVS から消す) / `auth_mint` (TLS のため内部RAM が要る)。
 pub fn name_next_psram(name: &'static CStr, stack_size: usize) {
+    // **PSRAM 非搭載機では Spiram 指定でスタックを確保できず、pthread_create が
+    // 丸ごと失敗する** (AtomS3 系 = ESP32-S3FN8。CoreS3 しか無かった頃は起きな
+    // かった)。搭載の有無を実測して、無ければ内部RAM のまま名前だけ付ける
+    if unsafe { esp_idf_svc::sys::heap_caps_get_total_size(esp_idf_svc::sys::MALLOC_CAP_SPIRAM) }
+        == 0
+    {
+        name_next(name);
+        return;
+    }
     let cfg = ThreadSpawnConfiguration {
         name: Some(name),
         stack_size,

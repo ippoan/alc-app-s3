@@ -40,6 +40,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "alc-hub-atoms3-timecard"
+version = "0.1.0"
+dependencies = [
+ "alc-hub-common",
+ "alc-hub-core",
+ "alc-hub-drivers",
+ "anyhow",
+ "embuild",
+ "esp-idf-hal",
+ "esp-idf-svc",
+ "log",
+]
+
+[[package]]
 name = "alc-hub-ble"
 version = "0.1.0"
 dependencies = [

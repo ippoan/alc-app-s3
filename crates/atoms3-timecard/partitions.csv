@@ -1,0 +1,27 @@
+# NFC タイムカード端末 (8MB flash) 用パーティションテーブル。
+# crates/atoms3-print/partitions.csv と同一レイアウト (8MB Flash 機で共通)。
+# nvs/phy_init のオフセットは ESP-IDF 既定互換 + OTA 2 スロット構成。
+#
+# ★ 手焼きでも必ず `--partition-table crates/atoms3-timecard/partitions.csv` を
+#   渡すこと。省略すると espflash 既定の factory 1 スロットになり、OTA が
+#   `esp_ota_ops: not found otadata` → `ESP_ERR_INVALID_ARG` で必ず失敗する
+#   (2026-09-04 に実機で踏んだ、issue #134 のコメント)。
+#
+# ★★ **一度 OTA した機に espflash flash で焼き直すときは otadata も消すこと。**
+#   espflash は app を **ota_0 に書くだけで otadata を触らない**ので、直前の OTA で
+#   ota_1 が有効になっていると、**焼いたはずの新ファームではなく古い方が起動し続ける**。
+#   症状は「焼けたのに挙動が変わらない」— 版数もログも古いままなので気付きにくい
+#   (2026-09-04 に半日ぶんの誤診をした)。
+#       espflash erase-parts --port <port> --partition-table <このファイル> otadata
+#   NVS (0x9000) は別パーティションなので device credential は消えない。
+#
+# NVS の温存について (Refs #48): Web インストーラーは merged を [0x0,0x9000) と
+# [0x10000,末尾) に分割して書くため nvs/phy_init (device credential) は消えない。
+# merged.bin の offset 0 一括書き込み (CLI) は従来どおり消える。
+# nvs=0x9000 / otadata=0x10000 を動かすときは build.yml の Split step も要修正。
+# Name,   Type, SubType, Offset,   Size,   Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+otadata,  data, ota,     0x10000,  0x2000,
+ota_0,    app,  ota_0,   0x20000,  3M,
+ota_1,    app,  ota_1,   0x320000, 3M,

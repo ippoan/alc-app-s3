@@ -173,8 +173,23 @@ hub-board (ボード初期化, 独立葉)   ルート = main の配線のみ
 | [crates/hub-board](crates/hub-board) | CoreS3 ボード初期化 (LCD / 電源 / タッチ) | 低 |
 | [crates/hub-ble](crates/hub-ble) | BLE central (NT-100B / NBP-1BLE) | 低 |
 | [crates/hub-wifi](crates/hub-wifi) | Wi-Fi STA (自動再接続) + Improv Wi-Fi Serial | 低 |
-| [crates/hub-drivers](crates/hub-drivers) | ホストリンク / RS232 / NTP / recorder / LAN スタブ | 低 |
+| [crates/hub-drivers](crates/hub-drivers) | ホストリンク / コンソール共通部 / RS232 / NTP / recorder / NFC / LAN スタブ | 低 |
 | [crates/hub-ui](crates/hub-ui) | 画面処理 (状態機械 + 描画) | **高 (画面遷移の変更はここだけ)** |
+
+`hub-*` を共有する**別バイナリ**が 3 本ある (それぞれ独立した sdkconfig /
+partitions.csv を持ち、`ESP_IDF_SYS_ROOT_CRATE=<crate 名>` を付けてビルドする):
+
+| クレート | 機 | 内容 |
+|---|---|---|
+| [crates/atoms3-print](crates/atoms3-print) | AtomS3 + Atomic PoE Base | 印刷ブリッジ (PDF → プリンター 9100)、Refs #38 |
+| [crates/atoms3-timecard](crates/atoms3-timecard) | AtomS3 系 + PoE Base + Unit NFC | NFC タイムカード端末 (`kind=timecard` を WS uplink へ)、Refs #134 |
+| [crates/atoms3-nfc](crates/atoms3-nfc) | AtomS3 Lite + Unit NFC | NFC ベンチ検証機 (独立実装。読み取りループは `hub-drivers/src/nfc.rs` と重複) |
+
+**NFC の読み取りループ・ホストコンソールを新しい機へ写さないこと。**
+前者は `hub-drivers/src/nfc.rs` (I2C ポートとピンを引数で受け、検知は
+`NfcEvent` のコールバックで返す)、後者は `hub-drivers/src/console.rs`
+(`spawn_reader` + `handle_common`) が共有実装。とくに `AUTH SET`
+(device credential を NVS へ書く口) を機種ごとに増やすと provisioning が割れる。
 
 CI ではワークスペース内クレートが checkout の mtime 変化で毎回再コンパイル
 されるため、内容ベースの **sccache** (GHA バックエンド) で吸収している

@@ -71,6 +71,10 @@ path = "crates/hub-core/src/tenko_prompt.rs"
 type = "unit"
 
 [[file]]
+path = "crates/hub-core/src/timecard.rs"
+type = "unit"
+
+[[file]]
 path = "crates/hub-core/src/uplink.rs"
 type = "unit"
 

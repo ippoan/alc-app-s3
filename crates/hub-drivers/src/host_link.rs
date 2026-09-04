@@ -48,12 +48,11 @@
 use std::io::Read;
 use std::sync::mpsc::Sender;
 
-use alc_hub_core::improv as improv_proto;
 use alc_hub_core::cfg::DeviceConfig;
+use alc_hub_core::improv as improv_proto;
 use alc_hub_core::protocol::{parse_line, HostCommand};
 use anyhow::Result;
 use esp_idf_svc::hal::delay::FreeRtos;
-use esp_idf_svc::sys;
 
 use alc_hub_common::control::PairFlag;
 use alc_hub_common::{
@@ -64,10 +63,7 @@ use alc_hub_common::{
 };
 use alc_hub_wifi::{improv::Improv, wifi::Wifi};
 
-use crate::auth_link;
-
-/// 行としてバッファする最大長 (超えたら読み捨て — バイナリノイズ対策)
-const MAX_LINE: usize = 512;
+use crate::console;
 
 pub fn start(
     tx: Sender<UiCommand>,
@@ -77,16 +73,10 @@ pub fn start(
     pair_flag: PairFlag,
     mut improv: Improv,
 ) -> Result<()> {
-    // USB Serial/JTAG ドライバを VFS に接続し、stdin のブロッキング読み出しを
-    // 可能にする (CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y 前提)
-    unsafe {
-        let mut cfg = sys::usb_serial_jtag_driver_config_t {
-            tx_buffer_size: 1024,
-            rx_buffer_size: 1024,
-        };
-        sys::usb_serial_jtag_driver_install(&mut cfg);
-        sys::esp_vfs_usb_serial_jtag_use_driver();
-    }
+    // stdin のブロッキング読み出しを可能にする (console.rs と同じ設置)。
+    // 本 crate は Improv (バイナリフレーム) を混ぜるため console::spawn_reader は
+    // 使わず、行の切り出しだけ console::take_line を共有する
+    crate::console::install_usb_serial_jtag();
 
     crate::task::name_next(c"host_link");
     std::thread::Builder::new()
@@ -100,7 +90,15 @@ pub fn start(
                     Ok(0) => FreeRtos::delay_ms(20),
                     Ok(n) => {
                         acc.extend_from_slice(&chunk[..n]);
-                        drain_buffer(&mut acc, &tx, &status, &settings, &wifi, &pair_flag, &mut improv);
+                        drain_buffer(
+                            &mut acc,
+                            &tx,
+                            &status,
+                            &settings,
+                            &wifi,
+                            &pair_flag,
+                            &mut improv,
+                        );
                     }
                     Err(_) => FreeRtos::delay_ms(100),
                 }
@@ -138,15 +136,11 @@ fn drain_buffer(
             improv_proto::Frame::NeedMore => return,
             improv_proto::Frame::NotImprov => {
                 // テキスト行として改行まで処理
-                let Some(pos) = acc.iter().position(|&b| b == b'\n' || b == b'\r') else {
-                    if acc.len() > MAX_LINE {
-                        acc.clear(); // 改行の来ないゴミは捨てる
-                    }
+                let Some(line) = console::take_line(acc) else {
+                    console::discard_overlong(acc);
                     return;
                 };
-                let line_bytes: Vec<u8> = acc.drain(..=pos).collect();
-                let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
-                handle_line(line.trim(), tx, status, settings, wifi, pair_flag);
+                handle_line(&line, tx, status, settings, wifi, pair_flag);
             }
         }
     }
@@ -171,8 +165,13 @@ fn handle_line(
         }
     };
 
+    // 機種に依らないコマンド (PING / HEAP / LOG / AUTH / WS) は共通実装へ。
+    // 捌かれなかったものだけがここへ落ちてくる (console.rs 参照)
+    let Some(command) = console::handle_common(command, status, settings) else {
+        return;
+    };
+
     match command {
-        HostCommand::Ping => println!("PONG"),
         HostCommand::ShowQr {
             payload,
             timeout_ms,
@@ -259,65 +258,6 @@ fn handle_line(
             pair_flag.store(true, core::sync::atomic::Ordering::SeqCst);
             println!("OK PAIR");
         }
-        // device credential の注入 (USB provisioning — ホストが auth-worker
-        // /device/pair 系で取得した credential をそのまま渡す)。secret は
-        // 応答に echo しない
-        HostCommand::AuthSet {
-            device_id,
-            device_secret,
-            tenant_id,
-        } => match settings.set_device_credential(&device_id, &device_secret, &tenant_id) {
-            Ok(()) => println!("OK AUTH SET"),
-            Err(e) => {
-                log::error!("host_link: credential 保存失敗: {e:?}");
-                println!("ERR AUTH: credential の保存に失敗しました");
-            }
-        },
-        // JWT mint (HTTP) は一時スレッドで実行し、結果は EVT AUTH_* で届く。
-        // スレッド内で Wi-Fi 接続を待つため status を渡す
-        HostCommand::AuthToken => {
-            auth_link::spawn_mint_test(settings.clone(), status.clone());
-            println!("OK AUTH TOKEN");
-        }
-        HostCommand::AuthUnpair => match settings.clear_device_credential() {
-            Ok(()) => println!("OK AUTH UNPAIR"),
-            Err(e) => {
-                log::error!("host_link: credential 破棄失敗: {e:?}");
-                println!("ERR AUTH: 破棄に失敗しました");
-            }
-        },
-        HostCommand::AuthStatus => match settings.device_credential() {
-            Some((id, _)) => println!(
-                "AUTH PAIRED {} {}",
-                settings.device_tenant().unwrap_or_default(),
-                id,
-            ),
-            None => println!("AUTH UNPAIRED"),
-        },
-        HostCommand::AuthUrl { url } => match settings.set_auth_url(&url) {
-            Ok(()) => println!("OK AUTH URL"),
-            Err(e) => {
-                log::error!("host_link: auth URL 保存失敗: {e:?}");
-                println!("ERR AUTH: URL の保存に失敗しました");
-            }
-        },
-        // 測定データの WS 送信 (cf-alc-recorder、ws_uplink.rs)
-        HostCommand::WsUrl { url } => match settings.set_ws_url(&url) {
-            Ok(()) => println!("OK WS URL"),
-            Err(e) => {
-                log::error!("host_link: WS URL 保存失敗: {e:?}");
-                println!("ERR WS: URL の保存に失敗しました");
-            }
-        },
-        HostCommand::WsStatus => {
-            let st = status.lock().map(|s| s.clone()).unwrap_or_default();
-            println!(
-                "WS CONNECTED={} QUEUE={} SEQ={}",
-                u8::from(st.ws_connected),
-                st.ws_queue_len,
-                st.ws_last_seq,
-            );
-        }
         // Windows GW (alc-gw) 連携 (gw_link.rs)
         HostCommand::GwUrl { url } => match settings.set_gw_url(&url) {
             Ok(()) => println!("OK GW URL"),
@@ -360,29 +300,18 @@ fn handle_line(
             }
         },
         HostCommand::TenkoStatus => println!("TENKO BP={}", u8::from(settings.tenko_bp())),
-        // ヒープ詳細: ブロック概況 + タスク別スタック余裕 (heap.rs 参照)
-        HostCommand::HeapDump => crate::heap::dump(),
-        // 直近ログ: .noinit リングの現在内容 (crashlog.rs 参照)。
-        // 事象の後から原因を取りに行くための口
-        HostCommand::LogDump => crate::crashlog::dump(),
         // OTA 更新 (進捗・結果は EVT OTA_* で届く。シリアル経路は WS 進捗 sink
         // 無し = None。ota.rs 参照)
         HostCommand::Ota { url } => {
             crate::ota::spawn_update(url, status.clone(), None);
             println!("OK OTA");
         }
-        // ヒープ状態の即時応答 (定期出力 EVT HEAP と同じ計測、heap.rs 参照)
-        HostCommand::Heap => {
-            let s = crate::heap::stats();
-            println!(
-                "HEAP FREE_INT={} MIN_INT={} FREE_PSRAM={} TOTAL_INT={} TOTAL_PSRAM={}",
-                s.free_int, s.min_int, s.free_psram, s.total_int, s.total_psram,
-            );
-        }
         // 印刷系は AtomS3 印刷ブリッジ (atoms3-print) 専用 (#38)。CoreS3 は
         // プリンター配線を持たないため未対応と明示する
         HostCommand::Print { .. } | HostCommand::PrinterAddr { .. } | HostCommand::PrinterStatus => {
             println!("ERR UNSUPPORTED (kiosk hub)");
         }
+        // console::handle_common が捌いたはずのもの (到達しない)
+        other => log::debug!("host_link: handled by console::handle_common: {other:?}"),
     }
 }
