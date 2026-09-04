@@ -76,15 +76,32 @@ fn main() -> Result<()> {
         probe.rtc_present,
         probe.imu_present
     );
-    // M-Bus 5V を Core 側から出すか (AW9523 BUS_EN)。**バッテリーレスの
-    // CoreS3 SE では出さない**。SE は Base LAN PoE v1.2 のように自前で M-Bus 5V を
-    // 供給するベースを履く常設機の構成 (plan/cores3-hub-consolidation.md「次期構成」)
-    // で、両側から同じ 5V レールを駆動すると PoE 単独給電では起動できない
-    // — 電池が無く突入を吸収できないため。USB を挿していると VBUS が支えるので
-    // 気づけず、「工場出荷ファームは PoE で動くのに焼いたファームだけ動かない」
-    // という症状になる。バッテリー付きの CoreS3 は従来どおり Core 側から供給する
-    // (USB 給電のベンチで RS232M/LAN 13.2 に電源が要る、Refs #76)
-    board::power::set_ext_5v_out(&mut i2c, board_kind != alc_hub_core::board::BoardKind::CoreS3Se)?;
+    // M-Bus 5V を Core 側から出すか (AW9523 BUS_EN)。判定は **AXP2101 の
+    // battery-present bit** で行う — **バッテリーが無い個体では出さない**。
+    //
+    // Base LAN PoE v1.2 のように自前で M-Bus 5V を供給するベースを履くと、Core も
+    // 出していれば同じ 5V レールを両側から駆動することになる。電池があれば突入を
+    // 吸収できるが、無い個体は PoE 単独給電で起動できずブラウンアウトを繰り返す
+    // (画面がぱちぱち点滅する)。USB を挿すと VBUS が支えるので気づけず、
+    // 「工場出荷ファームは PoE で動くのに焼いたファームだけ動かない」症状になる。
+    // M5Unified の CoreS3/CoreS3SE 初期化も BOOST_EN だけを on にし、BUS_EN は
+    // setExtOutput(true) を明示的に呼んだときだけ立てる。
+    //
+    // ★board 種別 (rtc/imu の probe) では判定しない: 実機の CoreS3 SE が
+    // `BOARD=cores3` と出る個体があり (電池は無いのに RTC/IMU のどちらかが ack
+    // する)、SE 判定に賭けると本症状を踏み抜く。電池の有無こそが「Core が
+    // 5V を出せるか」の物理的な条件なので、そちらを直接見る。
+    // 読めなかったときは従来動作 (出す) にフォールバックする (Refs #76 — USB 給電の
+    // ベンチに積んだ RS232M/LAN 13.2 は Core からの 5V が無いと無電源になる)
+    let ext_5v_out = match board::power::read_status(&mut i2c) {
+        Ok(s) => s.battery_present,
+        Err(e) => {
+            log::warn!("power: battery-present 読み出し失敗、M-Bus 5V を出す: {e:#}");
+            true
+        }
+    };
+    log::info!("power: M-Bus 5V 出力={ext_5v_out} (battery_present)");
+    board::power::set_ext_5v_out(&mut i2c, ext_5v_out)?;
     let rotation = settings.rotation();
     // 起動カウンタを 1 つ進める (点呼セッション ID の前置、Refs #112)。
     // **起動ごとに 1 回だけ** — 再起動をまたいだ session_id の再利用を防ぐ。
