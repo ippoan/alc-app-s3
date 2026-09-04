@@ -142,8 +142,10 @@ G5(=G1) / G15(=G13) の二択しかなく **内蔵スピーカー (I2S DOUT=G13 
 - **CoreS3 SE で削られるもの** (IMU/磁気/RTC/バッテリー) は hub 用途では未使用。
   バッテリーレスは充放電管理からの解放であり、時刻は起動時 NTP (SNTP) 同期で RTC レス運用
 - 停電 = 即断となるため、点呼常設機としては PoE スイッチ側 UPS 等のインフラ側考慮が必要
-- ★**M-Bus 5V の供給元は Base 側**。Core 側の BUS_EN (AW9523 P0_1、M5Unified
-  `setExtOutput(true)` 相当) を立てて Core からも 5V を出すと、同じレールを
+- ★**M-Bus 5V の供給元は Base 側** (2026-09-04 実機確認済み — CoreS3 SE +
+  Base LAN PoE v1.2 で、Core 側の 5V 出力を止めたら PoE 単独給電で起動した)。
+  Core 側の BUS_EN (AW9523 P0_1、M5Unified `setExtOutput(true)` 相当) を立てて
+  Core からも 5V を出すと、同じレールを
   両側から駆動することになり、**バッテリーレスの CoreS3 SE は PoE 単独給電で
   起動できない** (USB を挿すと VBUS が支えるので気づけない。「工場出荷ファームは
   PoE で動くのに焼いたファームだけ動かない」の正体。画面がぱちぱち点滅する)。
