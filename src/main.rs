@@ -277,13 +277,39 @@ fn main() -> Result<()> {
         let (nfc_sda, nfc_scl) = (p.pins.gpio2.into(), p.pins.gpio1.into());
         #[cfg(feature = "cores3-se")]
         let (nfc_sda, nfc_scl) = (p.pins.gpio17.into(), p.pins.gpio18.into());
-        // 免許証の読み取りは UiCommand::License で UI へ届け、点呼確認画面へ直行させる
+        // 検知の通知はコールバックで受ける (nfc.rs はボード非依存、Refs #134):
+        // どのカードでも検知ビープを鳴らし、**免許証だけは UiCommand::License を
+        // UI へ届けて**点呼確認画面へ直行させる (#121)。
+        // 再生はスレッド分離済み (speaker::start_player) — キュー投入のみで
+        // ポーリングはブロックしない (issue #102、同期再生だと音声 1.5 秒ぶん
+        // NFC の反応が止まる)。Registered は音声フィードバックの動作確認用の
+        // 仮配線 (2026-07-21): 全検知パス共通。本来の再生タイミングは登録フロー
+        // 実装時にそちらへ移す。速報性のため send 失敗 (スピーカー初期化失敗で
+        // 受信側を落とした場合) は無視する
+        let ui_for_nfc = tx.clone();
+        // I2C_NUM_1: main.rs の内部バス (I2C_NUM_0, G12/G11 電源IC/タッチ) とは別ポート。
+        // Rust 側で I2cDriver を作らず番号だけ C++ (nfc_shim → M5HAL) へ渡す
         alc_hub_drivers::nfc::start(
+            1,
             nfc_sda,
             nfc_scl,
             Arc::clone(&status),
-            speaker_tx,
-            tx.clone(),
+            move |e: &alc_hub_drivers::nfc::NfcEvent| {
+                use alc_hub_drivers::nfc::NfcEvent;
+                if matches!(e, NfcEvent::ReadFailed { .. }) {
+                    return;
+                }
+                let _ = speaker_tx.send(alc_hub_drivers::speaker::Sound::BeepOk);
+                let _ = speaker_tx.send(alc_hub_drivers::speaker::Sound::Registered);
+                if let NfcEvent::License { issue, expiry } = e {
+                    let _ = ui_for_nfc.send(alc_hub_common::ui_api::UiCommand::License(
+                        alc_hub_common::ui_api::LicenseCard {
+                            issue: issue.clone(),
+                            expiry: expiry.clone(),
+                        },
+                    ));
+                }
+            },
         )?;
     }
     // Base LAN PoE v1.2 (W5500): CS=G9 / RST=G7 / INT=G14 未使用。

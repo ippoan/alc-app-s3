@@ -1,0 +1,52 @@
+# alc-hub-atoms3-timecard — NFC タイムカード端末 (issue #134)
+#
+# ★ この設定は **検証機 (AtomS3 Lite, C124 / ESP32-S3FN8, PSRAM 非搭載)** 向け。
+#   **本番機の Atom VoiceS3R (C126-ECHO, ESP32-S3-PICO-1-N8R8 / PSRAM 8MB) では
+#   作り直すこと** — 詳細は src/main.rs の doc コメント (「S3R への移行」) 参照。
+#
+# 内訳は「atoms3-print (W5500 + OTA + TLS)」+「atoms3-nfc (I2C/RMT の legacy
+# 衝突回避)」の合併。どちらか片方だけでは動かないので、両方の理由を残す。
+
+# ---- atoms3-print 由来 (ネットワーク / OTA / コンソール) ----
+
+# ホストリンク (デバッグ/AUTH 注入) は AtomS3 ネイティブ USB-C の
+# USB Serial/JTAG コンソール経由
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
+CONFIG_FREERTOS_HZ=1000
+# HEAP DUMP (タスク別スタック余裕の列挙 = uxTaskGetSystemState) に必要
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+
+# OTA (ota.rs): 新 FW が起動完了前に死んだらブートローダが旧スロットへ戻す
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# auth-worker への HTTPS / cf-alc-recorder への WSS (公開 CA バンドル検証)
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+
+# W5500 (Atomic PoE Base) — SPI Ethernet。INT ピンは基板上未配線のため
+# esp-idf-svc 側は SpiEventSource::polling を使う (eth_w5500.rs)
+CONFIG_ETH_USE_SPI_ETHERNET=y
+CONFIG_ETH_SPI_ETHERNET_W5500=y
+
+# ---- atoms3-nfc 由来 (Unit NFC / LED の legacy ドライバ衝突回避) ----
+
+# M5UnitUnified の vendor コード (pin.cpp 等) が旧 driver/i2c.h のシンボルを
+# 参照しており、nfc_shim (新 driver/i2c_master.h) と同一バイナリにリンクされると
+# ESP-IDF 起動直後の __attribute__((constructor)) チェックで即 abort する
+# ("CONFLICT! driver_ng is not allowed to be used with this old driver"、
+#  実機で確認 2026-07-20)。実際に i2c_driver_install() (旧 API) を呼ぶ経路は
+# 使っていない (nfc_shim.cpp は i2c_new_master_bus のみ) ため公式の回避で無効化する
+CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
+
+# 同じ理由で RMT も legacy (esp-idf-hal "rmt-legacy" feature、WS2812 LED 用) と
+# 新ドライバの両方がリンクされて check_rmt_legacy_driver_conflict で abort する
+CONFIG_RMT_SKIP_LEGACY_CONFLICT_CHECK=y
+
+# ST25R3916 ドライバの detect() 内部ポーリングはタイトなビジーウェイトで、
+# NFC スレッドが載った CPU の IDLE タスクを飢餓させる。CoreS3 (ルートの
+# sdkconfig.defaults) と同じく IDLE の WDT 監視だけを外す。**タスク WDT 自体は
+# 生かす** (ウェッジ検出は残す)
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n

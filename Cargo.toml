@@ -2,6 +2,7 @@
 members = [
     "crates/atoms3-nfc",
     "crates/atoms3-print",
+    "crates/atoms3-timecard",
     "crates/hub-ble",
     "crates/hub-board",
     "crates/hub-common",
@@ -38,7 +39,7 @@ mem-hud = ["alc-hub-ui/mem-hud"]
 # タップからの点呼開始 (#121) は運用上必須なので本番へ載せる。
 # 「NFC を積むと内部RAM が ws_uplink の TLS ゲート (60KB) を割って WS が繋がらない」
 # 問題は #111 で解決済み (実機で空き 40979 → 74627 bytes)。
-nfc-verify = ["alc-hub-drivers/nfc-verify"]
+nfc-verify = ["alc-hub-drivers/nfc", "alc-hub-drivers/speaker"]
 # Base LAN PoE v1.2 (W5500)。CS=G9 / RST=G7 で内蔵スピーカー (I2S DOUT=G13) とは
 # 競合しないため、旧 LAN Module 13.2 のような排他制約は無い (Refs #111)。
 #
