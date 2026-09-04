@@ -1,0 +1,16 @@
+{
+  "name": "alc-hub Timecard",
+  "version": "0.1.0",
+  "home_assistant_domain": "",
+  "funding_url": "",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "firmware/alc-hub-atoms3-timecard-boot.bin", "offset": 0 },
+        { "path": "firmware/alc-hub-atoms3-timecard-main.bin", "offset": 65536 }
+      ]
+    }
+  ]
+}
