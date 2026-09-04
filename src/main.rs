@@ -93,14 +93,22 @@ fn main() -> Result<()> {
     // 5V を出せるか」の物理的な条件なので、そちらを直接見る。
     // 読めなかったときは従来動作 (出す) にフォールバックする (Refs #76 — USB 給電の
     // ベンチに積んだ RS232M/LAN 13.2 は Core からの 5V が無いと無電源になる)
-    let ext_5v_out = match board::power::read_status(&mut i2c) {
+    // 既定は Auto (電池の有無で決める)。`BUS5V ON|OFF` で明示上書きできる
+    // — M5 の UIFlow も同じ考え方で `power_mode` (usb_in_bus_in / usb_in_bus_out …)
+    // を NVS に持ち、設定画面から切り替えさせている (uiflow-micropython board.cpp)
+    let bus5v = settings.bus5v();
+    let battery_present = match board::power::read_status(&mut i2c) {
         Ok(s) => s.battery_present,
         Err(e) => {
-            log::warn!("power: battery-present 読み出し失敗、M-Bus 5V を出す: {e:#}");
+            log::warn!("power: battery-present 読み出し失敗、電池ありとみなす: {e:#}");
             true
         }
     };
-    log::info!("power: M-Bus 5V 出力={ext_5v_out} (battery_present)");
+    let ext_5v_out = bus5v.resolve(battery_present);
+    log::info!(
+        "power: M-Bus 5V 出力={ext_5v_out} (mode={} battery_present={battery_present})",
+        bus5v.label()
+    );
     board::power::set_ext_5v_out(&mut i2c, ext_5v_out)?;
     let rotation = settings.rotation();
     // 起動カウンタを 1 つ進める (点呼セッション ID の前置、Refs #112)。
