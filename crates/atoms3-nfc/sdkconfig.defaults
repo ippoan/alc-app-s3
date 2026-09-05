@@ -34,3 +34,15 @@ CONFIG_RMT_SKIP_LEGACY_CONFLICT_CHECK=y
 # Arduino下でも同じで無害、との公式コメント通り)
 CONFIG_ESP_MAIN_TASK_AFFINITY_CPU1=y
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+
+# ---- hub-drivers 由来 (issue #146 で読み取りループを hub-drivers へ寄せた) ----
+#
+# 本機は uplink も OTA も使わないが、alc-hub-drivers は 1 クレートなので
+# ws_uplink / auth_link / printer / ota / heap もコンパイル対象に入る。
+# 各モジュールが参照する ESP-IDF シンボルはビルド設定で生成有無が変わるため、
+# 使わなくても宣言だけは要る (atoms3-timecard と同じ 2 行)。
+
+# auth_link / printer / ws_uplink の esp_crt_bundle_attach
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+# heap.rs の uxTaskGetSystemState (タスク別スタック余裕の列挙)
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y

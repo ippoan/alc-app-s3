@@ -7,13 +7,19 @@
 pub mod auth_link;
 pub mod console;
 pub mod crashlog;
-// W5500 SPI Ethernet (AtomS3 + Atomic PoE Base)。CoreS3 の sdkconfig では
-// CONFIG_ETH_SPI_ETHERNET_W5500 を有効にしていないためコンパイルされない
+// W5500 SPI Ethernet (AtomS3 + Atomic PoE Base / CoreS3 + Base LAN PoE v1.2)。
+// CONFIG_ETH_SPI_ETHERNET_W5500 を有効にした sdkconfig でのみコンパイルされる
+// (cores3 / atoms3-print / atoms3-timecard は有効、atoms3-nfc は無効)
 #[cfg(esp_idf_eth_spi_ethernet_w5500)]
 pub mod eth_w5500;
 pub mod gw_link;
 pub mod heap;
 pub mod host_link;
+// Base LAN PoE v1.2 (CoreS3)。中身は eth_w5500 の薄いラッパなので、**同じ cfg で
+// 揃える** — 揃えないと W5500 を有効にしていない sdkconfig (crates/atoms3-nfc)
+// で `unresolved import crate::eth_w5500` になり、NFC しか使わない機まで
+// Ethernet を sdkconfig に足す羽目になる (issue #146 で実際に踏んだ)
+#[cfg(esp_idf_eth_spi_ethernet_w5500)]
 pub mod lan;
 // NFC 読み取り (Unit NFC / ST25R3916)。components/nfc_shim の extern "C" を呼ぶため
 // その component を取り込む crate だけが有効化できる
