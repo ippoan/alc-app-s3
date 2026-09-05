@@ -216,6 +216,21 @@ fn on_card(event: &NfcEvent, ws_tx: &mpsc::Sender<UplinkRecord>, led: Option<&le
         }
         // 電子車検証は人ではないので打刻にしない (検知ログだけ nfc.rs が出す)
         NfcEvent::CarInspection { .. } => return,
+        // **2 枚見えたら、どちらも打刻しない** (issue #143)。財布に 2 枚
+        // 入っていると、どちらの人の打刻か決められないまま 2 人ぶん記録して
+        // しまう — 賃金データなので曖昧なら記録しない方を採る。
+        //
+        // **サーバへは何も送らない** (UplinkRecord を作らない)。`hub_measurements`
+        // に新しい kind を足すと rust-alc-api の HUB_MEASUREMENT_KINDS と alc-app
+        // の型・一覧まで波及するので、まず端末内 (LED + serial) で完結させ、
+        // 運用で「エラーが見えない」と分かってから足す
+        NfcEvent::MultipleCards => {
+            println!("EVT NFC_MULTI_CARD");
+            if let Some(led) = led {
+                led.err();
+            }
+            return;
+        }
         NfcEvent::ReadFailed { .. } => {
             if let Some(led) = led {
                 led.err();
