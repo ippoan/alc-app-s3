@@ -23,29 +23,46 @@
 //!   SCLK=G5 / MISO=G7 / MOSI=G8 / CS=G6、INT/RST 未配線 (polling)
 //! - **M5 Unit NFC** (U216, ST25R3916): Grove Port A (SDA=G2 / SCL=G1)
 //!
-//! ピンが競合しない根拠 (M5 公式、2026-09-05 に確認):
+//! ピンの根拠 (2026-09-05 に確認)。**確定と推定を分けて書く**:
 //!
-//! - 内蔵オーディオ (ES8311/NS4150B) は G45/G0/G48/G4/G3/G17/G11/G18、
-//!   IR_TX は G47、本体ボタンは G41 — **どれも底面バスにも Grove にも出ない**
-//!   (`docs.m5stack.com/en/core/Atom_EchoS3R` のピンマップ)
-//! - 底面バスは **G5 / G6 / G7 / G8 / G38 / G39**。VoiceS3R は本体基板が
-//!   AtomS3R (`Sch_M5_AtomS3R_v0.4.1.pdf`) + 音声ドーターボード
-//!   (`Sch_M5_AtomEchoS3R_Audio_v1.0`) の 2 枚構成で、音声側の回路図には
-//!   GPIO ネットが 1 本も出てこない。底面バスの一覧は AtomS3R 公式ドキュメント
-//!   (`docs.m5stack.com/en/core/AtomS3R` の "Bottom GPIO")
-//! - 内蔵 I2C は G0/G45 なので、Grove (G1/G2) の Unit NFC と競合しない
+//! - **【確定・VoiceS3R 固有】内蔵オーディオ** (ES8311/NS4150B) は
+//!   G45/G0/G48/G4/G3/G17/G11/G18、**IR_TX は G47**、**本体ボタンは G41**
+//!   (`docs.m5stack.com/en/core/Atom_EchoS3R` の公式ピンマップ)。
+//!   どれも底面バスにも Grove にも出ない
+//! - **【確定・VoiceS3R 固有】Grove (HY2.0-4P) は SDA=G2 / SCL=G1**。
+//!   公式ピンマップ (黄=G2 / 白=G1) と、M5 公式ファーム
+//!   (`m5stack/uiflow-micropython`) の `M5STACK_Atom_EchoS3R/mpconfigboard.h`
+//!   (`MICROPY_HW_I2C0_SCL 1` / `MICROPY_HW_I2C0_SDA 2`)、および M5Unified の
+//!   `_pin_table_i2c_ex_in` の `board_M5AtomVoiceS3R` 行が一致する。
+//!   内蔵 I2C は G0/G45 なので Unit NFC と競合しない
+//! - **【推定・AtomS3R 由来】底面バスは J5 = 3V3/G5/G6/G7/G8、J6 = G39/G38/5V/GND**。
+//!   M5 は C126-ECHO の SKU ページで本体基板の回路図として
+//!   `Sch_M5_AtomS3R_v0.4.1.pdf` を挙げており、そこから読んだ値。
+//!   **ただしその PDF は AtomS3R のもので、VoiceS3R が持たない LCD
+//!   (`DISP_RST` / `LED_BL`) と IMU (`IMU_INT`) を含む。**同一基板とは限らない。
+//!   **PoE のリンクアップが実機で取れて初めて確定する** (issue #151 の受け入れ条件)
 //!
-//! # ★ 本機に RGB LED は無い
+//! # ★ 本機で `led.rs` (WS2812) は成立しない
 //!
-//! **Atom VoiceS3R は RGB LED を積んでいない。** 旧 Atom Voice (ESP32) の
-//! WS2812 は無くなっている — M5 公式 SKU ページ (C126-Echo) の比較表が
-//! "Atom VoiceS3R has no RGB LED" と明記しており、M5Unified の RGBLED ピン表
-//! (`M5Unified.cpp` の `_pin_table_other0`) にも `board_M5AtomVoiceS3R` の
-//! 行が無い (AtomS3 Lite は G35 で載っている)。
+//! **この基板に単線接続の WS2812 系 LED は無い。**回路図に出てくる LED は
+//! すべて **I2C の LP5562 (アドレス 0x30、SYS_SDA=G45 / SYS_SCL=G0) 駆動**
+//! (`LED_R` / `LED_G` / `LED_B` / `LED_BL_DRV`) で、RMT で 1 本の GPIO に
+//! ビット列を流す `led.rs` の方式では**どうやっても点かない**。
+//! LP5562 = 0x30 は M5GFX の `Light_M5StackAtomS3R` が AtomS3R の LCD
+//! バックライトを叩いているアドレスと同じ。よって #151 で `led.rs` は削除した。
 //!
-//! したがって #151 で `led.rs` ごと削除した。**検知の可否は serial ログ
-//! (`EVT TIMECARD` / `EVT NFC_MULTI_CARD`) で見る。**現場向けの可視/可聴
-//! フィードバックは ES8311 の音を入れる別 issue で戻す。
+//! **VoiceS3R に RGB LED が実装されているか自体は未確定。**
+//! M5 公式 SKU ページ (C126-Echo) の比較表は
+//! "Atom VoiceS3R has no RGB LED, while Atom Voice includes WS2812 x1" と
+//! 書いており、公式ピンマップにも LED の項が無い — が、上の回路図には
+//! LP5562 の回路がある (AtomS3R では実装されている)。
+//! **決着は実機で内蔵 I2C の 0x30 を probe するしかない。**
+//! なお M5Unified の RGBLED ピン表 `_pin_table_other0` に
+//! `board_M5AtomVoiceS3R` が無いことは**根拠にならない** — あの表は単線
+//! WS2812 用で、LP5562 で LED を持つ `board_M5AtomS3R` も同じく載っていない。
+//!
+//! 当面 **検知の可否は serial ログ (`EVT TIMECARD` / `EVT NFC_MULTI_CARD`)
+//! で見る。**現場向けの可視/可聴フィードバックは ES8311 の音を入れる別 issue で戻す。
 //!
 //! # 起動順 (変えてはいけない)
 //!

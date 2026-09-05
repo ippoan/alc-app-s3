@@ -120,8 +120,9 @@
            が出ます。財布などにカードが 2 枚入っていて両方見えたときは、どちらの打刻か決められないので
            <strong>打刻せず</strong> <code>EVT NFC_MULTI_CARD</code> だけを出します。</p>
         <div class="warning">
-            <h3>本機に LED はありません — 確認はシリアルログで</h3>
-            <p>Atom VoiceS3R には RGB LED が載っていません (旧 Atom Voice の WS2812 は無くなりました)。
+            <h3>この端末は点灯で知らせません — 確認はシリアルログで</h3>
+            <p>Atom VoiceS3R には点灯表示がありません (旧 Atom Voice の WS2812 RGB LED は
+               S3R 世代で無くなりました)。<strong>「かざしたのに光らない」は異常ではありません。</strong>
                読めたかどうかは上の <code>EVT</code> ログで確認してください。
                現場から見える形の反応 (打刻音) は別途対応します。</p>
         </div>

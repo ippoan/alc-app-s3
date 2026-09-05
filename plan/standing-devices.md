@@ -198,24 +198,37 @@ CoreS3 で踏んだ罠 (issue #102) は ES8311 でもそのまま効く見込み
 | 赤外線送信 | G47 (IR_TX) — 内部 |
 | 本体ボタン | G41 — 内部 |
 | Grove (HY2.0-4P) | G1 / G2 → Unit NFC (`atoms3-nfc` と同じ配線) |
-| 底面バス | G5/G6/G7/G8/G38/G39 → PoE Base の W5500 SPI (`atoms3-print` 実績: SCLK=G5 / MISO=G7 / MOSI=G8 / CS=G6) |
-| **RGB LED** | **無し** (下記) |
+| 底面バス (**推定**) | J5 = 3V3/G5/G6/G7/G8、J6 = G39/G38/5V/GND → PoE Base の W5500 SPI (`atoms3-print` 実績: SCLK=G5 / MISO=G7 / MOSI=G8 / CS=G6)。**根拠は AtomS3R の回路図。下記** |
+| **RGB LED** | **未確定** (下記)。ただし**単線 WS2812 は無い** |
 
-#### ★ VoiceS3R に RGB LED は無い (2026-09-05 確定、#151)
+#### ★ LED — 「WS2812 は無い」は確定、「RGB LED が有るか」は未確定 (#151)
 
-旧 Atom Voice (ESP32) の WS2812 は **S3R 世代で無くなっている**。M5 公式 3 系統で一致:
+**確定していること: この基板に単線接続の WS2812 系 LED は無い。**
+`Sch_M5_AtomS3R_v0.4.1.pdf` に出てくる LED はすべて **I2C の LP5562
+(アドレス 0x30、SYS_SDA=G45 / SYS_SCL=G0)** 駆動で、ネットは `LED_R` / `LED_G` /
+`LED_B` / `LED_BL_DRV` (最後は LCD バックライト)。0x30 = LP5562 は M5GFX の
+`Light_M5StackAtomS3R` が AtomS3R の LCD バックライトを叩いているアドレスと同じ。
+他に `GP0_LED` (緑、補助 MCU PMS150G が駆動する電源表示) と `IR_LED_DRV` (G47) があるだけ。
+⇒ **RMT で 1 本の GPIO にビット列を流す方式 (`led.rs`) はどうやっても点かない。**
+このため `crates/atoms3-timecard/src/led.rs` は #151 で**削除した**。
 
-- M5 公式 SKU ページ (`docs.m5stack.com/en/products/sku/C126-Echo`) の比較表に
-  "Atom VoiceS3R **has no RGB LED**, while Atom Voice includes WS2812 x1"
-- M5 公式ピンマップ (`docs.m5stack.com/en/core/Atom_EchoS3R`) に RGB LED の項が無い
-- M5Unified の RGBLED ピン表 `_pin_table_other0` (`src/M5Unified.cpp`) に
-  `board_M5AtomVoiceS3R` の行が無い (AtomS3 Lite / AtomS3U は `GPIO_NUM_35` で載っている)。
-  同 enum は `M5GFX/src/lgfx/boards.hpp` に `= 145` で実在するので「未対応機種」ではない
+**未確定なこと: VoiceS3R が LP5562 と RGB LED を実装しているか。**
 
-したがって `crates/atoms3-timecard` の `led.rs` は #151 で**削除した**。
-**検知の可否は serial ログ (`EVT TIMECARD` / `EVT NFC_MULTI_CARD`) で見る。**
-現場向けの反応は §2 の打刻音が引き受ける — つまり**音が入るまで、
-端末側に人から見えるフィードバックは無い**。
+- 無い側の根拠 (VoiceS3R 固有): M5 公式 SKU ページ
+  (`docs.m5stack.com/en/products/sku/C126-Echo`) の比較表に
+  "Atom VoiceS3R **has no RGB LED**, while Atom Voice includes WS2812 x1"。
+  公式ピンマップ (`docs.m5stack.com/en/core/Atom_EchoS3R`) にも LED の項が無い
+- 有る側の根拠: 上の回路図に LP5562 の回路がある (AtomS3R では実装されている)
+
+⚠ **M5Unified の RGBLED ピン表 `_pin_table_other0` に `board_M5AtomVoiceS3R` が
+無いことは根拠にならない。** あの表は**単線 WS2812 用**で、LP5562 で RGB LED を持つ
+`board_M5AtomS3R` も同じく載っていない。
+
+⇒ **決着は実機で内蔵 I2C (SDA=G45 / SCL=G0) の 0x30 を probe するしかない。**
+それまでは**「端末に点灯表示は無い」前提で運用 doc を書くこと** —
+`ippoan/alc-app#168` の「端末の反応は LED だけ (待機=暗い青 / 受付=緑 / 読取失敗=赤)」は
+**この端末には当てはまらない**。検知の可否は serial ログ
+(`EVT TIMECARD` / `EVT NFC_MULTI_CARD`) で見る。現場向けの反応は §2 の打刻音が引き受ける。
 
 #### 旧 ATOM Voice (ESP32-PICO-D4, C008-C) を選ばない理由
 
@@ -227,17 +240,26 @@ CoreS3 で踏んだ罠 (issue #102) は ES8311 でもそのまま効く見込み
 
 #### 確認結果 (2026-09-05、#151 で回路図まで当たった)
 
-1. ~~底面バスは AtomS3R のピンマップからの推定~~ → **裏が取れた**。
-   M5 公式 SKU ページ (C126-ECHO) が本体基板の回路図として
-   **`Sch_M5_AtomS3R_v0.4.1.pdf`** を挙げており、VoiceS3R は
-   「AtomS3R 本体基板 + 音声ドーターボード (`Sch_M5_AtomEchoS3R_Audio_v1.0`)」の
-   2 枚構成。音声側の回路図に出てくるネットは `MCLK / LRCK / SCLK / ASDOUT /
-   DSDIN / SPK0 / MIC0*` だけで **GPIO を追加で食っていない**。
-   底面バスの一覧は AtomS3R 公式ドキュメントの "Bottom GPIO: **G5 / G6 / G7 / G8 /
-   G38 / G39**"。内蔵 I2C は G0/G45 なので Grove (G1/G2) の Unit NFC とも競合しない
-2. スイッチサイエンスの PoE ベース対応表は依然 S3R 系が未記載だが、上記 1 で
-   底面バスのピンが一致することを確認したので**電気的には載る**。
-   **PoE の実リンクアップは実機で確認する** (#151 の受け入れ条件)
+1. **底面バスは依然「AtomS3R からの推定」。**回路図まで当たったが、
+   **VoiceS3R 固有の一次資料は見つからなかった** (VoiceS3R の公式ページに
+   底面バスの表が無い)。分かったのは次のところまで:
+   - M5 は C126-ECHO の SKU ページで本体基板の回路図として
+     **`Sch_M5_AtomS3R_v0.4.1.pdf`** を挙げている (音声側は
+     `Sch_M5_AtomEchoS3R_Audio_v1.0`)。音声側の回路図に出てくるネットは
+     `MCLK / LRCK / SCLK / ASDOUT / DSDIN / SPK0 / MIC0*` だけで
+     **GPIO を追加で食っていない**
+   - その AtomS3R 回路図の底面ヘッダは
+     **J5 (THT_Male_P_1x5) = PIN1 VDD_3V3 / PIN2 GPIO5 / PIN3 GPIO6 /
+     PIN4 GPIO7 / PIN5 GPIO8**、
+     **J6 (THT_Male_P_1x4) = PIN1 GPIO39 / PIN2 GPIO38 / PIN3 VIN_5V / PIN4 GND**。
+     モジュールは `ESP32-S3-PICO-1-N8R8` で VoiceS3R の仕様と一致する
+   - ⚠ **ただしこの PDF は AtomS3R のもので、VoiceS3R が持たない LCD
+     (`DISP_RST` / `LED_BL`) と IMU (`IMU_INT`) を含む。同一基板とは限らない**
+     (M5Unified は BMI270 の有無で AtomS3RExt と VoiceS3R を判別している =
+      VoiceS3R に BMI270 は無い)
+   ⇒ **確定は実機の PoE リンクアップをもって行う** (#151 の受け入れ条件)
+2. スイッチサイエンスの PoE ベース対応表は依然 S3R 系が未記載。上記 1 の推定が
+   正しければ電気的には載る。**実リンクアップは実機で確認する**
 3. ~~`sdkconfig.defaults` を S3R 向けに起こし直す~~ → **実施済み**
    (`crates/atoms3-timecard/sdkconfig.defaults`)。
    **ただし MODE は QUAD ではなく `CONFIG_SPIRAM_MODE_OCT=y`。**
