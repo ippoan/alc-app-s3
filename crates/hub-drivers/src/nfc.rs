@@ -33,7 +33,7 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::gpio::{AnyIOPin, Pin};
 
 use alc_hub_common::status::{now_ms, SharedStatus};
-use alc_hub_core::nfc_tap::TapGate;
+use alc_hub_core::nfc_tap::{TapGate, TapOutcome, DEFAULT_COMMIT_WINDOW_MS};
 
 extern "C" {
     fn nfc_shim_init(i2c_port: i32, sda_gpio: i32, scl_gpio: i32) -> i32;
@@ -99,6 +99,11 @@ pub enum NfcEvent {
     /// 何かかざされたが読めなかった (免許証の途中死・カード引き抜き等)。
     /// rc の意味は [`license_rc_reason`] 参照。カード無し (-2) では届かない
     ReadFailed { rc: i32 },
+    /// **確定窓のあいだに 2 枚のカードが見えた** (issue #143)。
+    /// どちらの人のタップか決められないので**どちらも登録しない** —
+    /// 受け手はエラー表示だけを行い、打刻/点呼のレコードを作らないこと。
+    /// 検出できない条件は `alc_hub_core::nfc_tap` のモジュール doc 参照
+    MultipleCards,
 }
 
 /// 検知通知の受け口。`FnMut` を trait object にせず総称で受けると
@@ -185,9 +190,14 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
     // いた (2026-09-04 実機: 1 枚で 7.5 秒に 3 打刻)。そこで**存在検知が立って
     // いる間は毎周期 touch** し、読み取り失敗を「離れた」と数えない。
     //
-    // gate は全系統で 1 つ。持ち替えれば key が変わって即発火するので分ける必要が
-    // なく、むしろ同じカードが読み取りの揺れで別経路に落ちても 1 タップ 1 回に収まる
-    let mut tap_gate = TapGate::default();
+    // gate は全系統で 1 つ。分けると「別系統で読めた 2 枚目」を 2 枚と数えられず、
+    // 同じカードが読み取りの揺れで別経路に落ちたときも 1 タップ 1 回に収まらない。
+    //
+    // **発火は遅延確定 (issue #143)。** 読めた時点では `observe` に記録するだけで、
+    // 確定窓 (DEFAULT_COMMIT_WINDOW_MS) のあいだに別キーが現れなければ `poll` が
+    // Fire を返す。現れたら MultipleCards = **どちらも登録しない** (財布に 2 枚
+    // 入っていると、どちらの人の打刻か決められないまま 2 人ぶん記録してしまう)
+    let mut tap_gate: TapGate<NfcEvent> = TapGate::default();
     // -2 (カード無し) は定常状態なのでログしない。未実行センチネルは i32::MIN。
     // **これは失敗ログの抑止専用** — 成功時の発火判定は license_gate が持つ
     let mut last_license_rc = i32::MIN;
@@ -201,6 +211,13 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
 
     loop {
         tick = tick.wrapping_add(1);
+
+        // --- 保留の確定 (issue #143) ---
+        // **存在検知ゲート (下の `if !triggered { … continue; }`) より前に置くこと。**
+        // 下に置くと、カードが離れた周期には到達しない — 1 枚を確定窓より短く
+        // かざして離したときに保留が確定せず**打刻が消える** (TapGate 単体テストは
+        // 通るのに実機だけで落ちる形)。発火はこの 1 か所に集約する
+        deliver(tap_gate.poll(now_ms()), &status, &mut sink);
 
         // --- 待機: プロトコル非依存の存在検知 (アンテナ振幅+位相) ---
         // モード切替もポーリングも行わず振幅・位相だけを見る。ベースラインは
@@ -269,14 +286,8 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
 
         match poll_felica_idm() {
             Ok(Some(idm)) => {
-                if tap_gate.should_fire(&idm, now_ms()) {
-                    // push_event はイベントログ (UI/WS) 行のみで serial には出ない。
-                    // log::info! を並置して scripts/nfc_serial_beep.py (COM 監視、
-                    // 既定 --match "NFC|免許|IDm") で検知音を鳴らせるようにする (issue #101)
-                    log::info!("NFC IDm={idm}");
-                    push_event(&status, &format!("NFC IDm={idm}"));
-                    sink.on_event(&NfcEvent::Felica { idm });
-                }
+                // ここでは発火しない — 確定窓を抜けた後に `deliver` が出す (issue #143)
+                tap_gate.observe(&idm, NfcEvent::Felica { idm: idm.clone() }, now_ms());
                 got = true;
             }
             // 読めなかったことを理由に状態をクリアしない (issue #103)。
@@ -295,17 +306,12 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
                     // のコメント参照)。tap のたびに ISO-DEP セッション1回分の
                     // コストが乗るが、非対応カードは RATS 非対応で即座に弾かれる
                     // ため実害は小さい
-                    if detect_car_inspection_a() {
-                        if tap_gate.should_fire(&uid, now_ms()) {
-                            log::info!("電子車検証 検知 (UID={uid})");
-                            push_event(&status, "電子車検証 検知");
-                            sink.on_event(&NfcEvent::CarInspection { uid });
-                        }
-                    } else if tap_gate.should_fire(&uid, now_ms()) {
-                        log::info!("NFC-A UID={uid}");
-                        push_event(&status, &format!("NFC-A UID={uid}"));
-                        sink.on_event(&NfcEvent::NfcaUid { uid });
-                    }
+                    let event = if detect_car_inspection_a() {
+                        NfcEvent::CarInspection { uid: uid.clone() }
+                    } else {
+                        NfcEvent::NfcaUid { uid: uid.clone() }
+                    };
+                    tap_gate.observe(&uid, event, now_ms());
                     got = true;
                 }
                 // issue #103: 空振りで状態をクリアしない (上の FeliCa と同じ理由)
@@ -317,15 +323,10 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
         if !got {
             let (rc, issue, expiry) = read_license_expiry();
             if rc == 0 {
-                // 免許証も同じクールダウンに載せる (issue #103)。key は交付日 +
+                // 免許証も同じ gate に載せる (issue #103)。key は交付日 +
                 // 有効期限 = alc-app タブレットが使う employees.nfc_id と同じ 16 桁
-                if tap_gate.should_fire(&format!("{issue}{expiry}"), now_ms()) {
-                    log::info!("免許証 交付 {issue} 期限 {expiry}");
-                    push_event(&status, &format!("免許証 交付 {issue} 期限 {expiry}"));
-                    // ホストにも通知 (画面遷移は UI が判断する)
-                    println!("EVT NFC_LICENSE issue={issue} expiry={expiry}");
-                    sink.on_event(&NfcEvent::License { issue, expiry });
-                }
+                let key = format!("{issue}{expiry}");
+                tap_gate.observe(&key, NfcEvent::License { issue, expiry }, now_ms());
                 got = true;
             } else if rc != -2 && rc != last_license_rc {
                 // 途中死はカード引き抜き等でも出る
@@ -339,8 +340,10 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
             triggered_since = None;
         }
 
-        // カードが載っている間は「まだ同じタップ」。**発火判定の後に置くこと** —
-        // 前に置くと、離れていた時間が touch で消えて再タップが抑止される
+        // カードが載っている間は「まだ同じタップ」。**読み取り (observe) の後に
+        // 置くこと** — 前に置くと、離れていた時間が touch で消えて再タップが
+        // 抑止される。確定窓は touch では延びない (延ばすと載せっぱなしで
+        // 窓が永久に閉じず 1 回も発火しなくなる — nfc_tap のモジュール doc)
         if present {
             tap_gate.touch(now_ms());
         }
@@ -445,6 +448,54 @@ pub fn license_rc_reason(rc: i32) -> &'static str {
         -7 => "データ長が想定より短い (EF 長が事前想定と違う、実機で要再調整)",
         _ => "不明なエラーコード",
     }
+}
+
+/// 確定した [`TapOutcome`] を外へ出す **唯一の口** (issue #143)。
+///
+/// 読み取り 4 経路それぞれが `sink.on_event` を呼んでいた形をここへ集約した。
+/// 分散していると、遅延確定 (確定窓の経過待ち) を挟んだときに「どの経路が
+/// 発火済みか」が経路の数だけ増えて追えなくなる。
+///
+/// `push_event` はイベントログ (UI/WS) 行のみで serial には出ないので、
+/// `log::info!` を並置して scripts/nfc_serial_beep.py (COM 監視、既定
+/// `--match "NFC|免許|IDm"`) で検知音を鳴らせるようにする (issue #101)。
+fn deliver(outcome: TapOutcome<NfcEvent>, status: &SharedStatus, sink: &mut impl NfcSink) {
+    let event = match outcome {
+        TapOutcome::Idle => return,
+        TapOutcome::MultipleCards => {
+            // 端末内で完結させる (サーバへは送らない)。受け手が LED/ブザーで出す
+            log::warn!(
+                "nfc: 確定窓 {DEFAULT_COMMIT_WINDOW_MS}ms に 2 枚 — どちらも登録しない (issue #143)"
+            );
+            push_event(status, "カードが 2 枚 — 1 枚だけかざしてください");
+            sink.on_event(&NfcEvent::MultipleCards);
+            return;
+        }
+        TapOutcome::Fire(event) => event,
+    };
+    match &event {
+        NfcEvent::Felica { idm } => {
+            log::info!("NFC IDm={idm}");
+            push_event(status, &format!("NFC IDm={idm}"));
+        }
+        NfcEvent::CarInspection { uid } => {
+            log::info!("電子車検証 検知 (UID={uid})");
+            push_event(status, "電子車検証 検知");
+        }
+        NfcEvent::NfcaUid { uid } => {
+            log::info!("NFC-A UID={uid}");
+            push_event(status, &format!("NFC-A UID={uid}"));
+        }
+        NfcEvent::License { issue, expiry } => {
+            log::info!("免許証 交付 {issue} 期限 {expiry}");
+            push_event(status, &format!("免許証 交付 {issue} 期限 {expiry}"));
+            // ホストにも通知 (画面遷移は UI が判断する)
+            println!("EVT NFC_LICENSE issue={issue} expiry={expiry}");
+        }
+        // gate を通らないので Fire では来ない (ReadFailed は読み取りループが直接出す)
+        NfcEvent::ReadFailed { .. } | NfcEvent::MultipleCards => {}
+    }
+    sink.on_event(&event);
 }
 
 fn push_event(status: &SharedStatus, line: &str) {

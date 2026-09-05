@@ -296,7 +296,10 @@ fn main() -> Result<()> {
             Arc::clone(&status),
             move |e: &alc_hub_drivers::nfc::NfcEvent| {
                 use alc_hub_drivers::nfc::NfcEvent;
-                if matches!(e, NfcEvent::ReadFailed { .. }) {
+                // 2 枚検出 (#143) は「登録できなかった」側なので、成功の
+                // ビープ/Registered を鳴らさない (ReadFailed と同じ扱い)。
+                // 画面での提示は点呼フローの UI 側で扱う課題として残す
+                if matches!(e, NfcEvent::ReadFailed { .. } | NfcEvent::MultipleCards) {
                     return;
                 }
                 let _ = speaker_tx.send(alc_hub_drivers::speaker::Sound::BeepOk);
