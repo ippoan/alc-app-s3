@@ -56,8 +56,32 @@ Pages インストーラ、provisioning はどちらにも同じ形で効く。�
 | **打刻音** | ブラウザ版は PC スピーカー依存で、無音 PC / ミュートで無反応に見える |
 
 **ブラウザ版は撤去しない**。タブレットしか無い拠点や、専用機の故障時のフォール
-バックとして残す。両者が同じ `POST /api/timecard/punch` に着地する形を保つこと
-(= §3.3 で「打刻の実体は rust-alc-api 側の 1 か所」に寄せる理由)。
+バックとして残す。
+
+**寄せる先は URL ではなく表**。両者が「同じ `POST /api/timecard/punch` に着地する」
+形は**もう成立していない** — ブラウザ版は `alc-app#161` (2026-09-04 merge) で
+cf-alc-recorder 経由に変わった。着地点を揃えるのではなく、
+**打刻の一次表を `hub_measurements` 1 本にする**のが現在の設計 (§3.3)。
+
+2026-09-05 に実測した現状:
+
+- ブラウザ版は同一オリジンの Nuxt server route
+  (`alc-app` の `web/server/api/timecard/punch.post.ts`) →
+  service binding → cf-alc-recorder (`cf-alc-recorder/src/index.ts:297` の
+  `.../timecard-punch`) → DO (`cf-alc-recorder/src/recorder-hub.ts:149`)。
+  同 route の doc コメント (`punch.post.ts:13`) が
+  **「rust-alc-api の `POST /api/timecard/punch` を直に叩かせない」**と明記している。
+- **rust-alc-api 側の route は廃止されていない。** `.route("/timecard/punch", post(punch))`
+  は現存する (`rust-alc-api` の `crates/alc-misc/src/timecard.rs:26`、
+  ハンドラは同 `:139`)。変わったのは**書き込み先**で、
+  `create_punch` は `INSERT INTO hub_measurements`
+  (`crates/alc-misc/src/repo/timecard.rs:221` の実装、SQL は同 `:238`)。
+  trait 側の doc も「**書き込み先は `hub_measurements` で、`time_punches` ではない**」
+  と書いている (`crates/alc-core/src/repository/timecard.rs:69-79`)。
+- **未確認**: この rust 側 route に現在も実トラフィックが到達しているか
+  (`alc-app#161` 以降の呼び出し元を全経路については数えていない)。
+  撤去の提案自体は `alc-app#161` 本文が `rust-alc-api#619` として挙げているが、
+  **2026-09-05 時点の `rust-alc-api` main (`62ffaf6`) には未反映**。
 
 ### 1.1 CoreS3 で作る案 (比較対象)
 
@@ -228,24 +252,43 @@ IDm は 8 バイトを `%02X` で 16 文字にした文字列
    ブラウザ版は `card_kind` を送らないので、**送られてきたときだけ効く**追加条件に
    すれば後方互換が壊れない
 
-#### 残課題 B: 大文字/小文字の揺れ (**実装前に必ず実測すること**)
+#### 残課題 B: 大文字/小文字の揺れ → **解決済み (小文字に正規化)**
 
-照合は case-sensitive。本端末は **大文字**の IDm を送る。一方、ブラウザ版が
-使うローカル NFC ブリッジ (Windows 常駐アプリ) が送る文字列の形式は
-この repo からは分からない (`useNfcWebSocket.ts` の `nfc_read` イベントは
-`employee_id` という名前のフィールドを持ち、`TimePunchKiosk.vue:69` が
-それをそのまま `cardId` として punch に渡している — **フィールド名が実態と
-ずれている**)。
+> **この節は 2026-09-05 に現状へ更新した。** 以前ここには「照合は case-sensitive。
+> 本番の `timecard_cards.card_id` を引いて決めること / 既存が大文字なら端末は
+> そのまま送ればよい」と書かれていたが、**正規化は `rust-alc-api` 側で
+> 実装済み**で、しかも**大文字ではなく小文字**に寄っている。
+> **`to_uppercase()` で実装しないこと。**
 
-**着手前のタスク**: 本番の `timecard_cards.card_id` を実際に引いて、
-既存登録が大文字か小文字か、区切り文字があるかを確認する。結果次第で
+正規化規約は `alc_core::repository::timecard::normalize_card_id` =
+**`trim` + 小文字 + `':'` 除去** の 1 関数
+(`rust-alc-api` の `crates/alc-core/src/repository/timecard.rs:169`)。
+照合の入口 `resolve_employee_by_card` (同 `:143`) がこれを 1 回だけ通す。
+小文字を採ったのは `alc-carins` の `normalize_nfc_uuid` (車検証 NFC タグ) と
+規約を揃えるため、と同関数の doc コメント (同 `:159-160`) にある。
 
-- 既存が大文字 → 端末はそのまま送る (追加作業なし)
-- 既存が小文字/混在 → **punch の入口で正規化する**
-  (`card_id.trim().to_uppercase()` を照合の前に 1 回、`timecard_cards` 側にも
-  同じ正規化を掛けた列 or 移行 UPDATE)。この場合は `rust-alc-api` の作業が増える
+**読み側だけでなく DB 側も固定されている**:
+migration 134 (`rust-alc-api` の
+`migrations/134_timecard_cards_normalize_card_id.sql`) が既存行を
+`lower(replace(btrim(card_id), ':', ''))` へ移行し (同 `:17-20`)、
+CHECK 制約 `timecard_cards_card_id_normalized` (同 `:27`) で
+「正規化されていない値は書けない」を固定している。
+SQL 版の同じ式は読み出し側の CTE にも入っている
+(`crates/alc-misc/src/repo/timecard.rs` の `PUNCHES_CTE`、`tc.card_id = lower(...)`)。
 
-これを決めずに端末を作ると「タップしても『登録されていません』」で止まる。
+**端末側への影響**: 本端末が **大文字**の IDm を送っても、照合の手前で
+`normalize_card_id` を通るので**そのまま送ってよい** (§3.2 冒頭の「生値のまま送る」と
+矛盾しない)。ただし**端末側で独自に大文字化・小文字化・区切り付与をしないこと** —
+`resolve_employee_by_card` の doc コメント (`crates/alc-core/src/repository/timecard.rs:141`) が
+「呼び出し側は読み取った生値をそのまま渡すこと」を明示している。
+
+**変えるときは 4 か所同時**: Rust 関数 / migration の CHECK 制約 /
+`PUNCHES_CTE` の SQL 版 / `employees.nfc_id` の JOIN 条件。片方だけ変えると
+照合が静かに外れる (この注意書きは `PUNCHES_CTE` の doc コメントにもある)。
+
+**未確認**: 本番の `timecard_cards` に実際に入っている値そのもの
+(この worktree から DB は引いていない)。ただし CHECK 制約が入って以降は
+正規化形以外を書けないため、実測しなくても形式は決まっている。
 
 ### 3.3 打刻イベントの送り方
 
@@ -253,10 +296,10 @@ IDm は 8 バイトを `%02X` で 16 文字にした文字列
 (front で処理する方針が決定済み)。
 
 上り経路は**既存の WS uplink をそのまま使う**。`crates/hub-core/src/uplink.rs` の
-`push_record` (seq 冪等 + NVS 永続の送信キュー、`MAX_QUEUE = 20`) に
-`kind = "timecard"` で積むだけでよい。オフライン打刻の取りこぼし対策はこれで済む
-(LAN 断・サーバ断の間はキューに溜まり、復帰後に同じ seq で再送、サーバ側
-`UNIQUE (tenant_id, device_id, seq)` で冪等)。
+`push_record` (seq 冪等 + NVS 永続の送信キュー) に `kind = "timecard"` で積む。
+LAN 断・サーバ断の間はキューに溜まり、復帰後に同じ seq で再送、サーバ側
+`UNIQUE (tenant_id, device_id, seq)` で冪等 — **この仕組み自体は現状のままでよい**。
+**ただし溜められる件数は足りない** (後述「オフライン打刻の保持件数」)。
 
 ```
 {"type":"measurement","seq":N,"recorded_at_ms":T,"kind":"timecard",
@@ -265,6 +308,28 @@ IDm は 8 バイトを `%02X` で 16 文字にした文字列
 
 `session_id` は**付けない** (点呼のセッションではないため。`uplink.rs` は
 `None` なら key ごと省く)。
+
+#### オフライン打刻の保持件数 — **`MAX_QUEUE = 20` では足りない (#142)**
+
+> **この節は 2026-09-05 に追記した。** §3.3 冒頭には以前
+> 「`MAX_QUEUE = 20`。オフライン打刻の取りこぼし対策はこれで済む」と
+> 書かれていたが、**issue #142 (2026-09-05 時点 OPEN) がこれを否定している。**
+
+`MAX_QUEUE = 20` は現存する (`crates/hub-drivers/src/ws_uplink.rs:52`、
+`UplinkQueue::restore` への引き渡しは同 `:164`)。#142 の主張は:
+
+- キューは**既定 `nvs` パーティションの文字列 1 キー** (`ws_queue`) に入っており、
+  読み出しバッファ 4096 に対し打刻 1 件が約 175 バイト。
+  **20 は現在の保存方式のほぼ天井**で、定数だけ上げると NVS 書き込みが失敗して
+  **キューごと消える**
+- 溢れると最も古い測定から黙って捨てられる (`pop_front` → `EVT WS_DROPPED <seq>`)。
+  **捨てられるのが打刻だと賃金計算のデータが欠ける**
+- 対処案は末尾に専用 NVS パーティション 256 KB (`punchq`) を足して **~1,500 件**に
+  上げる。**パーティションテーブルは OTA では更新されない**ため、
+  「`punchq` が無ければ従来どおり既定 `nvs` に落とす」フォールバックが必須
+
+**この doc は #142 の設計を先取りしない。** 上限の扱いは #142 側で決める。
+ここでは「20 で済む」と書かないことだけを固定する。
 
 #### HTTP 直行案を採らない理由
 
@@ -277,57 +342,79 @@ cf-alc-recorder が解決し (`cf-alc-recorder/src/index.ts` の `authenticateDe
 → `decideRecorderAuth` → `X-Recorder-Tenant-Id`)、端末は tenant を名乗らない。
 **端末の申告する tenant を信じる経路を新設しない**、が既存設計の不変条件。
 
-#### 中継の実装場所 — recorder 側か rust-alc-api 側か
+#### 中継はしない — `hub_measurements` 1 本に統合済み
 
-**推奨: rust-alc-api の `hub_measurements::ingest` の中で punch する。**
+> **⚠ この節は 2026-09-05 に現状へ全面的に書き換えた。**
+> 以前ここには **「推奨: rust-alc-api の `hub_measurements::ingest` の中で
+> punch する」** と書かれていた。**その中継は実装されたのち撤去されている**
+> (`rust-alc-api#615` で中継を撤去、`#616` で読み出し導出に置き換え)。
+> **撤去済みの relay を作り直さないこと。** これがこの節の唯一の目的。
 
 現在の流れは `端末 --WS--> cf-alc-recorder --(内部proxy)--> rust-alc-api
-POST /api/hub/measurements`。ここで:
+POST /api/hub/measurements` で、**そこで終わる**。以下は 2026-09-05 に
+`rust-alc-api` main (`62ffaf6`) を読んで確認した:
 
-- **cf-alc-recorder は `kind` を素通しする**。`cf-alc-recorder/src/measurements.ts`
-  は `kind` を「トップレベル優先、無ければ `payload.type`」で拾い、
-  **非空チェックだけ**で allowlist を持たない (allowlist は rust-alc-api 側)。
-  つまり **`kind: "timecard"` は Worker を無改造で通り抜ける**。
-- 内部 ingest は `require_internal_shared_secret` middleware が `X-Tenant-ID` から
-  `TenantId` extension を挿す (`crates/alc-core/src/auth_middleware.rs:128,145`)。
-  **punch ハンドラが要求する `Extension<TenantId>` と同じ型**なので、tenant の
-  受け渡しに新しい仕掛けが要らない。
-- 冪等が既にある。`insert_batch` は 1 件ずつ
-  `ON CONFLICT (tenant_id, device_id, seq) DO NOTHING` で入れ、
-  `res.rows_affected()` を見ている
-  (`crates/alc-devices/src/repo/hub_measurements.rs:43,55`)。
-  **「新規に入った行のときだけ punch する」**と書けば、端末の再送で
-  二重打刻にならない。これは recorder 側で中継する設計では自前で作り直す必要がある。
+- **`ingest` は `hub_measurements` に入れるだけで `time_punches` に触らない**
+  (`crates/alc-devices/src/hub_measurements.rs:154` の `ingest`)。
+  やることは validate → `freeze_employee_id` (同 `:224`) →
+  `insert_batch` (同 `:176-177`) の 3 つだけ。
+  `freeze_employee_id` は **payload に解決済み `employee_id` を凍結する**処理で、
+  別表に打刻行を作る処理ではない。
+- **打刻一覧は読み出し時に `hub_measurements` から導出する。**
+  `crates/alc-misc/src/repo/timecard.rs:78` の `PUNCHES_CTE` が
+  `FROM hub_measurements hm ... WHERE hm.tenant_id = $1 AND hm.kind IN ('timecard','license')`
+  で組み立て、一覧・件数・CSV がすべてこの 1 本の CTE を共有する (同 `:283,309,339,378`)。
+  同 CTE の doc コメント (同 `:51`) が
+  **「打刻の一次表は `hub_measurements` で、`time_punches` は読まない」**と明記。
+- **`crates/` 配下の Rust に `time_punches` への書き込みは 1 か所も残っていない**
+  (同日 grep。ヒットするのは CSV のファイル名
+  `crates/alc-misc/src/timecard.rs:299` と、「書かない」と書いた doc コメントだけ)。
+- **`kind` の allowlist はもう追加済み。** `HUB_MEASUREMENT_KINDS` に
+  `KIND_TIMECARD` (= `"timecard"`) が入っている
+  (`crates/alc-devices/src/hub_measurements.rs:46` に定数、`:82` に登録)。
+  **足す作業は残っていない。**
 
-対して **cf-alc-recorder で中継する案**は、(a) punch が tenant JWT 専用なので
-どのみち rust-alc-api に内部ルートを新設する必要があり、(b) ネットワーク往復が
-1 つ増え、(c) 「測定行は入ったが punch は失敗」という部分成功状態を新たに作る。
-利点が見つからない。
+##### 端末側の設計にとっての意味
 
-**したがって cf-alc-recorder のコード変更は不要**と見込む (§5 の一覧では
-「変更不要の確認」タスクとして残す — `kind` 素通しは読んだ限りの結論なので、
-staging で 1 回実際に通して確かめること)。
+- **端末の送るものは変わらない。** `kind: "timecard"` の測定 1 件を WS に積む、で
+  そのまま成立する。この doc の他の節 (§3.2 の `card_id` の扱い、下の JSON 例) は有効。
+- **`rust-alc-api` に punch 中継を足す作業は無い。** §3.4 の表を参照。
+- **`employee_id` を端末から送らないこと。** ingest は kind を問わず payload の
+  `employee_id` を必ず落とす (`strip_client_employee_id`、
+  `crates/alc-devices/src/hub_measurements.rs:197`)。
+  これは「端末が任意の社員に打刻を付けられる」のを防ぐための不変条件で、
+  同関数の doc コメントが本 doc の `§3.3` を根拠として引いている。
 
-#### `device_id` の型が合わない (要設計)
+`cf-alc-recorder` が `kind` を素通しする点は変わらない (allowlist は rust 側)。
+**未確認**: staging で `kind: "timecard"` を実際に 1 回通す確認は、この worktree
+からは実行していない。
 
-`time_punches.device_id` は **UUID** で `alc_api.devices(id)` への FK
-(`migrations/036_add_device_id_to_time_punches.sql`)。一方 hub 側の `device_id` は
-auth-worker が発行する **URL-safe な短い文字列** (`hub_measurements.device_id` は
-文字列カラム、上限 128)。そのままでは入らない。選択肢:
+#### `device_id` の型が合わない → **論点ごと消滅**
 
-1. **`device_id = NULL` で punch する** (最小)。`hub_measurements` 側に device_id が
-   残るので「どの端末か」は追える。`device_id` は nullable なので変更不要。**推奨**
-2. `devices` テーブルに端末を 1 行作り、hub device_id → UUID の対応表を持つ
+> **この節は 2026-09-05 に現状へ書き換えた。** 以前ここには
+> 「`time_punches.device_id` は UUID + `devices(id)` への FK
+> (`migrations/036_add_device_id_to_time_punches.sql`) だが hub の `device_id` は
+> 文字列なので入らない。`NULL` で punch するか対応表を持つか」という
+> 要設計の論点が書かれていた。**`time_punches` に書かなくなったので論点ごと無くなる。**
 
-まず 1 で出し、運用で「打刻機ごとの集計」が要るとなってから 2 を検討する。
+打刻は `hub_measurements` にしか入らず、そこの `device_id` は
+**文字列カラム** (`hub_measurements.device_id`、上限 128 =
+`crates/alc-devices/src/hub_measurements.rs` の `MAX_DEVICE_ID_LEN`) なので、
+auth-worker が発行する URL-safe な短い文字列がそのまま入る。**変換も対応表も要らない。**
+
+読み出し側も文字列のまま扱う: `PUNCHES_CTE` は
+`hm.device_id AS hub_device_id` で素通しする
+(`crates/alc-misc/src/repo/timecard.rs` の `PUNCHES_CTE` 内)。
+ブラウザ版が同じ表に入れるときも文字列で、キオスクの UUID をどう入れるかは
+`create_punch` の実装側のコメント (同 `:229`) に書かれている。
 
 ### 3.4 他 repo の作業 (この方針での実際の差分)
 
 | repo | ファイル | 作業 |
 |---|---|---|
-| `rust-alc-api` | `crates/alc-devices/src/hub_measurements.rs:52` | `HUB_MEASUREMENT_KINDS` に `"timecard"` を足す。**「将来の拡張 (timecard イベント等) はここに足す」と doc コメントに先に書かれている**箇所 |
-| `rust-alc-api` | 同 `ingest` | 新規行のときだけ punch を呼ぶ。punch 本体 (`crates/alc-misc/src/timecard.rs` の `punch`) からカード照合部分を関数に括り出して再利用する (二重実装しない) |
-| `rust-alc-api` | `coverage_100.toml:225` | `crates/alc-misc/src/timecard.rs` は**登録済み** = 分岐ごとのテストが必須。カード有り / nfc_id フォールバック / 未登録 / 重複 seq の 4 分岐を足す |
+| `rust-alc-api` | `crates/alc-devices/src/hub_measurements.rs:46,82` | **作業なし (実施済み)**。`HUB_MEASUREMENT_KINDS` に `KIND_TIMECARD` (= `"timecard"`) が既に入っている |
+| `rust-alc-api` | 同 `ingest` (`crates/alc-devices/src/hub_measurements.rs:154`) | **作業なし。punch 中継を足さないこと** — `#615` で撤去済み (§3.3)。`ingest` は `hub_measurements` に入れるだけで `time_punches` に触らない。打刻一覧は読み出し時に `PUNCHES_CTE` (`crates/alc-misc/src/repo/timecard.rs:78`) で導出する |
+| `rust-alc-api` | `coverage_100.toml:225` | `crates/alc-misc/src/timecard.rs` は**登録済み** = 分岐ごとのテストが必須。ただし**この doc の端末を足すこと自体では同ファイルは変わらない** (端末の打刻は `alc-devices` の `ingest` に着地する)。触ったときだけ分岐を埋める |
 | `alc-app` | `web/app/types/index.ts:1159` | `HUB_MEASUREMENT_KINDS` (現在 5 種) に `'timecard'` を追加。backend の同名 allowlist と一致させる |
 | `alc-app` | `cf-alc-recorder` | **変更不要の見込み**。staging で `kind: "timecard"` が素通ることを 1 回確認する |
 | `auth-worker` | `src/lib/device.ts:139` | `DEVICE_ROLE_TIMECARD = "device-timecard"` を定義し `DEVICE_ROLES` に追加 |
