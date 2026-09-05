@@ -62,6 +62,9 @@
         <h2>書き込み手順</h2>
         <ol>
             <li>本体を USB-C ケーブルで PC に接続 (PoE Base は外れていてもよい)</li>
+            <li><strong>箱出しの新品は本体ボタンを押しながら挿し直す</strong> —
+                工場出荷ファームは USB オーディオデバイスとして動いており、
+                そのままではシリアルポートが出てきません</li>
             <li>下の「Install」ボタンをクリックし、シリアルポートを選択</li>
             <li>書き込み完了後、PoE Base に載せて LAN ケーブル (PoE) を接続し、Unit NFC を Grove に挿す</li>
             <li>シリアルに <code>EVT NFC_READY</code> と <code>EVT ETH_CONNECTED &lt;IP&gt;</code> が出れば疎通完了</li>
@@ -81,8 +84,10 @@
         <h3>動作要件</h3>
         <ul>
             <li>Chrome / Edge / Opera (Web Serial API 対応ブラウザ)</li>
-            <li>AtomS3 系は USB Serial/JTAG 内蔵のため追加ドライバ不要</li>
-            <li>認識されない場合は本体側面のリセットボタンを約 2 秒長押しして書き込みモードへ</li>
+            <li>ESP32-S3 は USB Serial/JTAG 内蔵のため追加ドライバ不要</li>
+            <li>シリアルポートが出てこない場合は、<strong>本体ボタンを押したまま USB を挿し直す</strong>
+                (ROM ダウンロードモード)。工場出荷ファームや、書き込んだファームが
+                起動直後に落ちる状態では、これが唯一の入り口です</li>
         </ul>
     </div>
 
