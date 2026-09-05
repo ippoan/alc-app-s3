@@ -15,6 +15,8 @@ dependencies = [
 name = "alc-hub-atoms3-nfc"
 version = "0.1.0"
 dependencies = [
+ "alc-hub-common",
+ "alc-hub-drivers",
  "anyhow",
  "chrono",
  "embuild",

@@ -549,10 +549,17 @@ GPIO を Web 検索の要約だけで書いて実機で無点灯になり、M5Un
   (**`crashlog::init` は `heap::start` より前**。配線漏れで `.noinit` のゴミ帳簿に
   書いて boot loop になった実害が 2026-07-14 にある)
 
-機 (1) の NFC 読み取りループは `crates/atoms3-nfc/src/main.rs` (328 行) の
-**存在検知ゲート (`PRESENCE_DELTA`) + F→A→B 逐次ポーリング**をそのまま持ってくる。
-免許証 EF2F01 も同じループで読めているので、§3.2 の `card_kind` 出し分けは
-「どの分岐で読めたか」で決まる。**新しい NFC コードは書かない**。
+機 (1) の NFC 読み取りループは **`crates/hub-drivers/src/nfc.rs` を呼ぶ**
+(`nfc::start(i2c_port, sda, scl, status, sink)`)。**新しい NFC コードは書かない**。
+
+⚠ **持ってくる元は `crates/atoms3-nfc` ではない** (issue #146)。ベンチの
+存在検知ゲート (`PRESENCE_DELTA`) + F→A→B 逐次ポーリングは既に
+`hub-drivers/src/nfc.rs` へ移植済みで、そちらが**正本**。重複抑止も
+`alc_hub_core::nfc_tap::TapGate` (issue #103 / #143) に一本化されており、
+ベンチの旧エッジ判定を写すと**「1 タップで 2 回」の壊れ方が復活する**。
+`crates/atoms3-nfc` 自身も #146 で `hub-drivers` を呼ぶ側へ寄せた。
+免許証 EF2F01 も同じループで読めるので、§3.2 の `card_kind` 出し分けは
+「どの分岐で読めたか」(`NfcEvent` のどの variant か) で決まる。
 
 ### 5.2 CI (`.github/workflows/build.yml`)
 
@@ -617,9 +624,14 @@ NVS キー (`dev_id` / `dev_secret` / `dev_tenant` / `auth_url` / `ws_url`) と
 
 ## 7. 参考 (実在を 2026-09-04 に確認)
 
-- `crates/atoms3-nfc/src/main.rs` — AtomS3 Lite + Unit NFC の実績コード。
-  存在検知 (アンテナ振幅 `PRESENCE_DELTA`) → 逐次ポーリングで**交通系 IDm と
-  免許証 EF2F01 の両方**を読む。`components/nfc_shim` 経由の C++ FFI
+- `crates/hub-drivers/src/nfc.rs` — **NFC 読み取りの正本**。存在検知
+  (アンテナ振幅 `PRESENCE_DELTA`) → F→A→B 逐次ポーリングで**交通系 IDm と
+  免許証 EF2F01 の両方**を読む。`components/nfc_shim` 経由の C++ FFI。
+  重複抑止は `alc_hub_core::nfc_tap::TapGate` (#103 / #143)。ボード非依存で、
+  検知は `NfcEvent` のコールバックで外へ出す
+- `crates/atoms3-nfc/src/main.rs` — AtomS3 Lite + Unit NFC のベンチ検証機。
+  **読み取りループは持たず** 上の `nfc::start` を呼んで LED を出すだけ (#146)。
+  ここに NFC のコードを写して 3 実装目を作らないこと
 - `crates/atoms3-print/src/main.rs` — AtomS3 + Atomic PoE Base の実績骨格。
   `eth_w5500` / `ota` / `ws_uplink` / `crashlog` / `heap` を結線済み。**新バイナリの雛形**
 - `crates/hub-core/src/uplink.rs` — WS フレーム組立 + NVS 永続の送信キュー
