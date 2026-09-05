@@ -5,6 +5,13 @@ CoreS3 統合ハブ (ルートの `alc-hub-cores3`) と `hub-*` クレート群�
 `crates/atoms3-nfc` (NFC ベンチ) と同じ位置づけで、ワークスペースに crate を
 足し、CI に build leg を足し、Pages にインストーラを足す。
 
+> **実装状況 (2026-09-05, #151 時点)**
+> 機 (1) タイムカード端末は **crate・CI leg・Pages インストーラまで実装済み**で、
+> `crates/atoms3-timecard` が**本番機 Atom VoiceS3R 向け**になっている (#134 → #151)。
+> 残りは**音 (ES8311)** だけ。機 (2) 警告デバイスは未着手。
+> 以下 §5 / §6 は「これから作るもの」として書かれた当初の計画で、
+> 機 (1) について済んだ項目にはその旨を追記してある。
+
 2 台を 1 本の doc にまとめたのは、**共有部分が設計の大半を占める**ため:
 `speaker.rs` のボード非依存化、device role / kind の追加、build.yml の leg、
 Pages インストーラ、provisioning はどちらにも同じ形で効く。装置固有の話は
@@ -21,7 +28,7 @@ Pages インストーラ、provisioning はどちらにも同じ形で効く。�
 | 用途 | 営業所常設。NFC タップ → 打刻音 → 打刻イベント送信 | キオスク異常 (WebSerial/ブリッジ切断) と点呼呼び出しを音で知らせる |
 | ハード | Atom VoiceS3R (C126-ECHO) + Atomic PoE Base (A091) + Unit NFC (U216) | ATOM 系 + USB でキオスク PC に接続 (給電も USB) |
 | 通信 | PoE 1 本 (W5500) + 既存 WS 常時接続 | Wi-Fi + 既存 WS 常時接続 (下り command) / USB は給電と heartbeat |
-| 新 crate | `crates/atoms3-timecard` (仮) | `crates/atoms3-alarm` (仮) |
+| 新 crate | `crates/atoms3-timecard` (実装済み) | `crates/atoms3-alarm` (仮) |
 | 雛形 | `crates/atoms3-print/src/main.rs` | 同上 (LAN を Wi-Fi に差し替え) |
 | 新 device role | `device-timecard` | `device-alarm` |
 | 送信 | `kind: "timecard"` を既存 WS uplink に載せる | 送信なし (下り受けのみ)。crash_log は載る |
@@ -154,10 +161,10 @@ ffmpeg / sox のコマンド列として残すこと)。CoreS3 用の既存 raw 
    (`Sound::Stop` を受けたら再生中のループを抜ける) が要る — 現状の
    `while let Ok(sound) = rx.recv()` は再生中に次を受け取れないので、
    `recv_timeout` ベースへ書き換える。
-3. **`speaker` モジュールの feature ゲートを直す**。今は
-   `#[cfg(feature = "nfc-verify")] pub mod speaker;` (`hub-drivers/src/lib.rs`)
-   になっており、**NFC と無関係に音だけ欲しい機 (2) がビルドできない**。
-   `speaker` feature を新設し、`nfc-verify` からは切り離すこと。
+3. ~~**`speaker` モジュールの feature ゲートを直す**~~ — **対応済み**。
+   `hub-drivers/Cargo.toml` に独立した `speaker = []` feature があり、
+   `hub-drivers/src/lib.rs:42` は `#[cfg(feature = "speaker")] pub mod speaker;`。
+   `nfc-verify` とは切り離されているので、音だけ欲しい機 (2) もビルドできる。
 
 **ES8311 + NFC の初期化は新規に書く必要がある**。2026-09-04 の意味検索で
 ippoan の公開 repo 全体に **ES8311 の実装は存在しない**ことを確認済み
@@ -180,16 +187,35 @@ CoreS3 で踏んだ罠 (issue #102) は ES8311 でもそのまま効く見込み
 ### 3.1 ハード構成とピン
 
 **Atom VoiceS3R** (別名 Atom EchoS3R, M5 SKU C126-ECHO、ESP32-S3-PICO-1-N8R8 /
-8MB Flash / 8MB PSRAM) + **Atomic PoE Base** (A091, W5500) + **M5 Unit NFC**
-(U216, ST25R3916)。
+8MB Flash / **8MB Octal PSRAM**) + **Atomic PoE Base** (A091, W5500) +
+**M5 Unit NFC** (U216, ST25R3916)。
 
 ピンが競合しない根拠 (M5 公式 docs):
 
 | 用途 | GPIO |
 |---|---|
 | 内蔵オーディオ (ES8311 codec / NS4150B アンプ / MEMS マイク) | G45(SDA) / G0(SCL) / G48(DOUT) / G4(DIN) / G3(WS) / G17(BCLK) / G11(MCLK) / G18(NS4150_CTR) — **すべて内部ピン** |
+| 赤外線送信 | G47 (IR_TX) — 内部 |
+| 本体ボタン | G41 — 内部 |
 | Grove (HY2.0-4P) | G1 / G2 → Unit NFC (`atoms3-nfc` と同じ配線) |
 | 底面バス | G5/G6/G7/G8/G38/G39 → PoE Base の W5500 SPI (`atoms3-print` 実績: SCLK=G5 / MISO=G7 / MOSI=G8 / CS=G6) |
+| **RGB LED** | **無し** (下記) |
+
+#### ★ VoiceS3R に RGB LED は無い (2026-09-05 確定、#151)
+
+旧 Atom Voice (ESP32) の WS2812 は **S3R 世代で無くなっている**。M5 公式 3 系統で一致:
+
+- M5 公式 SKU ページ (`docs.m5stack.com/en/products/sku/C126-Echo`) の比較表に
+  "Atom VoiceS3R **has no RGB LED**, while Atom Voice includes WS2812 x1"
+- M5 公式ピンマップ (`docs.m5stack.com/en/core/Atom_EchoS3R`) に RGB LED の項が無い
+- M5Unified の RGBLED ピン表 `_pin_table_other0` (`src/M5Unified.cpp`) に
+  `board_M5AtomVoiceS3R` の行が無い (AtomS3 Lite / AtomS3U は `GPIO_NUM_35` で載っている)。
+  同 enum は `M5GFX/src/lgfx/boards.hpp` に `= 145` で実在するので「未対応機種」ではない
+
+したがって `crates/atoms3-timecard` の `led.rs` は #151 で**削除した**。
+**検知の可否は serial ログ (`EVT TIMECARD` / `EVT NFC_MULTI_CARD`) で見る。**
+現場向けの反応は §2 の打刻音が引き受ける — つまり**音が入るまで、
+端末側に人から見えるフィードバックは無い**。
 
 #### 旧 ATOM Voice (ESP32-PICO-D4, C008-C) を選ばない理由
 
@@ -199,17 +225,30 @@ CoreS3 で踏んだ罠 (issue #102) は ES8311 でもそのまま効く見込み
 増える。S3R はオーディオが内部ピンに移り、ターゲットも `xtensa-esp32s3-espidf`
 のままなので両方解消する。
 
-#### 未確認 — **発注前に回路図 PDF で底面バスを確認すること**
+#### 確認結果 (2026-09-05、#151 で回路図まで当たった)
 
-1. VoiceS3R 固有ページに底面バスのピン一覧が無く、**AtomS3R のピンマップからの推定**
-2. スイッチサイエンスの PoE ベース対応表は AtomS3 / AtomS3 Lite までで S3R 系が
-   未記載 (M5 docs 側には AtomS3R とのバス接続表あり)
-3. **PSRAM 8MB 搭載**のため、PSRAM 非搭載の AtomS3 (`atoms3-print`) 向け
-   `sdkconfig.defaults` は流用不可。ルートの CoreS3 用 SPIRAM 設定
-   (`CONFIG_SPIRAM_MODE_QUAD` 等) を参照して S3R 向けに起こし直す。
-   **CoreS3 の QUAD/OCT で 1 度踏んでいる** (OCT 指定で "PSRAM chip is not
-   connected" → `IGNORE_NOTFOUND` により黙って PSRAM なし起動、`EVT HEAP` の
-   `free_psram=0` で発覚) ので、起動ログの `free_psram` を必ず確認すること
+1. ~~底面バスは AtomS3R のピンマップからの推定~~ → **裏が取れた**。
+   M5 公式 SKU ページ (C126-ECHO) が本体基板の回路図として
+   **`Sch_M5_AtomS3R_v0.4.1.pdf`** を挙げており、VoiceS3R は
+   「AtomS3R 本体基板 + 音声ドーターボード (`Sch_M5_AtomEchoS3R_Audio_v1.0`)」の
+   2 枚構成。音声側の回路図に出てくるネットは `MCLK / LRCK / SCLK / ASDOUT /
+   DSDIN / SPK0 / MIC0*` だけで **GPIO を追加で食っていない**。
+   底面バスの一覧は AtomS3R 公式ドキュメントの "Bottom GPIO: **G5 / G6 / G7 / G8 /
+   G38 / G39**"。内蔵 I2C は G0/G45 なので Grove (G1/G2) の Unit NFC とも競合しない
+2. スイッチサイエンスの PoE ベース対応表は依然 S3R 系が未記載だが、上記 1 で
+   底面バスのピンが一致することを確認したので**電気的には載る**。
+   **PoE の実リンクアップは実機で確認する** (#151 の受け入れ条件)
+3. ~~`sdkconfig.defaults` を S3R 向けに起こし直す~~ → **実施済み**
+   (`crates/atoms3-timecard/sdkconfig.defaults`)。
+   **ただし MODE は QUAD ではなく `CONFIG_SPIRAM_MODE_OCT=y`。**
+   VoiceS3R は ESP32-S3-PICO-1-**N8R8** で PSRAM が Octal。M5 公式ファーム
+   (`m5stack/uiflow-micropython`) のボード定義でも
+   `M5STACK_Atom_EchoS3R` / `M5STACK_AtomS3R` は `boards/sdkconfig.spiram_oct` を読み、
+   `M5STACK_CoreS3` は読まない — **CoreS3 (Quad) と S3R 系 (Octal) は M5 自身の設定で
+   分かれている**。CoreS3 で 2026-07-13 に踏んだ QUAD/OCT の件は
+   「CoreS3 が Quad だった」という話で、S3R には**逆向きに**効く。
+   どちらに間違えても `IGNORE_NOTFOUND` で**黙って PSRAM なし起動**になるので、
+   起動ログの `EVT HEAP` の `free_psram` を必ず確認すること
 
 ### 3.2 `card_id` の扱い — 接頭辞を付けてはいけない
 
@@ -520,7 +559,11 @@ USB-UART ブリッジ (CH9102 等) の DTR/RTS 配線とは事情が違う。**�
 ATOM 系の本体ボタン (**GPIO 番号は機種ごとに違う。この repo には ATOM 系ボタンの
 実績コードが無いので、M5 公式ピンマップで確認してから配線すること** — LED の
 GPIO を Web 検索の要約だけで書いて実機で無点灯になり、M5Unified のボード定義を
-読み直して G38→G35 と判明した実害が `atoms3-nfc` にある) を押したら鳴動を止め、
+読み直して G38→G35 と判明した実害が `atoms3-nfc` にある。#151 では
+**そもそも VoiceS3R に LED が無い**ことが同じ読み方で分かった。
+ちなみに AtomS3 / AtomS3 Lite / AtomS3U / AtomS3R / **VoiceS3R の本体ボタンは
+どれも G41**、と M5Unified の `_update_button_state` が明示している)
+を押したら鳴動を止め、
 §2.1 の「停止の合図」(1200Hz 150ms) を鳴らす。
 止めた事実は `EVT` としてホスト (キオスク) へも出し、ブラウザ側で「ブザーを人が
 止めた」ことが分かるようにする。**異常が解消していない限り、次の周期でまた鳴らす
@@ -530,7 +573,9 @@ GPIO を Web 検索の要約だけで書いて実機で無点灯になり、M5Un
 
 ### 5.1 新 crate
 
-`crates/atoms3-print` の構成をそのまま踏襲する:
+> **機 (1) は実装済み** — `crates/atoms3-timecard` が下記の形で存在する
+> (`Cargo.toml` / `sdkconfig.defaults` / `partitions.csv` / `src/main.rs` /
+> `src/console.rs`)。以下は残る機 (2) 向けの手順として読むこと。
 
 - `Cargo.toml` に `[[bin]]` + `[package.metadata.esp-idf-sys]`
   (`esp_idf_sdkconfig_defaults` は crate 相対ではなく**ワークスペースルート基準**の
@@ -539,8 +584,8 @@ GPIO を Web 検索の要約だけで書いて実機で無点灯になり、M5Un
 - **`ESP_IDF_SYS_ROOT_CRATE=<crate 名>` を必ず指定してビルドする**
   (指定しないとワークスペース root package = CoreS3 の sdkconfig が使われる)
 - ルート `Cargo.toml` の `[workspace] members` に追加
-- `sdkconfig.defaults` は機ごとに新規。機 (1) は **PSRAM あり**なので
-  `atoms3-print` のものを流用しない (§3.1 未確認 ③)
+- `sdkconfig.defaults` は機ごとに新規。機 (1) は **PSRAM あり (Octal)** なので
+  `atoms3-print` のものを流用しない (§3.1 確認結果 ③)
 - `partitions.csv` は 8MB Flash なので `crates/atoms3-print/partitions.csv` を流用可
   (nvs=0x9000 / otadata=0x10000 は build.yml の Split step と結合しているので動かさない)
 - 雛形は `crates/atoms3-print/src/main.rs` (144 行)。`crashlog::init` →
@@ -563,12 +608,19 @@ GPIO を Web 検索の要約だけで書いて実機で無点灯になり、M5Un
 
 ### 5.2 CI (`.github/workflows/build.yml`)
 
-- `check` job の matrix に 2 leg 追加
+> **機 (1) 分は実施済み** — `check` / `build` の両 job に `atoms3-timecard` leg があり、
+> `assemble-pages` も `manifest-timecard.json` を出している。残るのは機 (2) の leg。
+
+- `check` job の matrix に leg 追加
   (`ESP_IDF_SYS_ROOT_CRATE=... cargo check --release --locked -p ...`)。
-  `cache_key` は **sdkconfig が違うので新規** (`build-timecard` / `build-alarm`)。
+  `cache_key` は **sdkconfig が違うので新規** (`build-timecard-s3r` / `build-alarm`)。
   「全 leg 一律 `build` だと別フレーバーの esp-idf-sys 成果物が永遠に cold」
-  という #63 の実測があるので、ここを揃えてはいけない
-- `build` job の matrix に 2 leg 追加 (`bin` / `build_env` / `flash_size: 8mb` /
+  という #63 の実測があるので、ここを揃えてはいけない。
+  **同じ理由で、既存 leg の sdkconfig を変えたときもキーを取り替える** —
+  #151 で timecard に PSRAM を足したとき `build-timecard` →
+  `build-timecard-s3r` に切り替えたのがそれ。**`check` と `build` の両方**を直すこと
+  (この 2 つは互いに同じキーでなければ同じ成果物を 2 回作ることになる)
+- `build` job の matrix に leg 追加 (`bin` / `build_env` / `flash_size: 8mb` /
   `partition_table` / `cache_key`)
 - `assemble-pages` の cp 行と manifest 生成を追加 (build.yml:528-538 付近)
 
@@ -576,8 +628,11 @@ GPIO を Web 検索の要約だけで書いて実機で無点灯になり、M5Un
 dev バリアントの実体は `mem-hud` feature (hub-ui のメモリ HUD) — 画面を持たない
 Atom 系には意味がない。`assemble-pages` の出力は **3 本 → 5 本** になる
 (manifest / manifest-dev / manifest-atoms3-print / manifest-timecard / manifest-alarm)。
+**うち manifest-timecard までは出ている** (現状 4 本)。
 
 ### 5.3 Pages インストーラ
+
+> **機 (1) 分は実施済み** — `docs/timecard.html` + `docs/manifest-timecard.json`。
 
 `docs/atoms3-print.html` (112 行) + `docs/manifest-atoms3-print.json` を雛形に
 機種ごとに 1 組ずつ足す。manifest の `parts` は **boot.bin(offset 0) +
@@ -602,15 +657,16 @@ NVS キー (`dev_id` / `dev_secret` / `dev_tenant` / `auth_url` / `ws_url`) と
 
 ### (1) NFC タイムカード端末
 
-0. **発注前**: VoiceS3R の回路図 PDF で底面バスを確認 (§3.1)。
-   本番 `timecard_cards.card_id` の大文字/小文字を実測 (§3.2 残課題 B)
-1. `speaker` の feature 分離 + `Sound` 拡張 + ES8311 初期化 (§2.3)。
-   **実機で 3000Hz が鳴るまでが 1 マイルストーン**
-2. crate 雛形 + PoE リンクアップ (`atoms3-print` の Milestone 0 と同形)
-3. NFC ループ移植 + 打刻音 (ここまでネットワーク送信なし、シリアルログのみ)
-4. `kind: "timecard"` の WS 送信 (端末側)
-5. `rust-alc-api` 側の受け口 + テスト (§3.4)
-6. CI leg + インストーラ + `/device/setup` の機種追加
+0. [x] VoiceS3R の回路図で底面バスを確認 (§3.1、#151 で完了)。
+   `timecard_cards.card_id` の大文字/小文字の実測は**残っている** (§3.2 残課題 B)
+1. [ ] `Sound` 拡張 + ES8311 初期化 (§2.3)。**実機で 3000Hz が鳴るまでが 1 マイルストーン**。
+   `speaker` の feature 分離は**済み** (§2.3-3)
+2. [x] crate + PoE リンクアップ (#134)
+3. [x] NFC ループ結線 (`hub-drivers::nfc` を呼ぶ)。打刻音は上の 1 と一緒に
+4. [x] `kind: "timecard"` の WS 送信 (端末側)
+5. [x] `rust-alc-api` 側の受け口 (§3.4 — 書き込み先は `hub_measurements`)
+6. [x] CI leg + インストーラ + `/device/setup` の機種追加
+7. [x] **本番機 Atom VoiceS3R への移行** (#151): PSRAM (Octal) / cache_key / LED 廃止
 
 ### (2) 警告デバイス
 
@@ -632,6 +688,11 @@ NVS キー (`dev_id` / `dev_secret` / `dev_tenant` / `auth_url` / `ws_url`) と
 - `crates/atoms3-nfc/src/main.rs` — AtomS3 Lite + Unit NFC のベンチ検証機。
   **読み取りループは持たず** 上の `nfc::start` を呼んで LED を出すだけ (#146)。
   ここに NFC のコードを写して 3 実装目を作らないこと
+- `crates/atoms3-timecard/src/main.rs` — **本番機 (Atom VoiceS3R) のタイムカード端末**。
+  §3 の設計の実体。`hub-drivers` の `nfc` / `eth_w5500` / `ws_uplink` / `ota` /
+  `crashlog` / `heap` を結線するだけで、**NFC も打刻判定も持たない**。
+  ボード固有の事情 (PSRAM Octal / LED 無し / ピン) は同 crate の
+  `sdkconfig.defaults` と main.rs の doc コメントに書いてある
 - `crates/atoms3-print/src/main.rs` — AtomS3 + Atomic PoE Base の実績骨格。
   `eth_w5500` / `ota` / `ws_uplink` / `crashlog` / `heap` を結線済み。**新バイナリの雛形**
 - `crates/hub-core/src/uplink.rs` — WS フレーム組立 + NVS 永続の送信キュー

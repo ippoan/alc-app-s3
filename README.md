@@ -182,7 +182,7 @@ partitions.csv を持ち、`ESP_IDF_SYS_ROOT_CRATE=<crate 名>` を付けてビ�
 | クレート | 機 | 内容 |
 |---|---|---|
 | [crates/atoms3-print](crates/atoms3-print) | AtomS3 + Atomic PoE Base | 印刷ブリッジ (PDF → プリンター 9100)、Refs #38 |
-| [crates/atoms3-timecard](crates/atoms3-timecard) | AtomS3 系 + PoE Base + Unit NFC | NFC タイムカード端末 (`kind=timecard` を WS uplink へ)、Refs #134 |
+| [crates/atoms3-timecard](crates/atoms3-timecard) | Atom VoiceS3R + Atomic PoE Base + Unit NFC | NFC タイムカード端末 (`kind=timecard` を WS uplink へ)、Refs #134 / #151 |
 | [crates/atoms3-nfc](crates/atoms3-nfc) | AtomS3 Lite + Unit NFC | NFC ベンチ検証機 (独立実装。読み取りループは `hub-drivers/src/nfc.rs` と重複) |
 
 **NFC の読み取りループ・ホストコンソールを新しい機へ写さないこと。**

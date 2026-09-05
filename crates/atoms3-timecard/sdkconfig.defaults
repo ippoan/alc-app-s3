@@ -1,15 +1,16 @@
-# alc-hub-atoms3-timecard — NFC タイムカード端末 (issue #134)
+# alc-hub-atoms3-timecard — NFC タイムカード端末 (issue #134 / 本番機移行 #151)
 #
-# ★ この設定は **検証機 (AtomS3 Lite, C124 / ESP32-S3FN8, PSRAM 非搭載)** 向け。
-#   **本番機の Atom VoiceS3R (C126-ECHO, ESP32-S3-PICO-1-N8R8 / PSRAM 8MB) では
-#   作り直すこと** — 詳細は src/main.rs の doc コメント (「S3R への移行」) 参照。
+# 対象は **本番機 Atom VoiceS3R** (M5Stack Atom EchoS3R, SKU C126-ECHO /
+# ESP32-S3-PICO-1-N8R8 = 8MB Flash + **8MB Octal PSRAM**)。
+# 2026-09-05 の #151 で検証機 (AtomS3 Lite, PSRAM 非搭載) 向けから差し替えた。
+# 検証機 (AtomS3 Lite + Unit NFC) の役割は crates/atoms3-nfc が持っている。
 #
-# 内訳は「atoms3-print (W5500 + OTA + TLS)」+「atoms3-nfc (I2C/RMT の legacy
-# 衝突回避)」の合併。どちらか片方だけでは動かないので、両方の理由を残す。
+# 内訳は「atoms3-print (W5500 + OTA + TLS)」+「atoms3-nfc (I2C の legacy
+# 衝突回避)」+ PSRAM。どれか 1 つ欠けても動かないので、全部の理由を残す。
 
 # ---- atoms3-print 由来 (ネットワーク / OTA / コンソール) ----
 
-# ホストリンク (デバッグ/AUTH 注入) は AtomS3 ネイティブ USB-C の
+# ホストリンク (デバッグ/AUTH 注入) は Atom ネイティブ USB-C の
 # USB Serial/JTAG コンソール経由
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
@@ -30,7 +31,7 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_ETH_USE_SPI_ETHERNET=y
 CONFIG_ETH_SPI_ETHERNET_W5500=y
 
-# ---- atoms3-nfc 由来 (Unit NFC / LED の legacy ドライバ衝突回避) ----
+# ---- atoms3-nfc 由来 (Unit NFC の legacy ドライバ衝突回避) ----
 
 # M5UnitUnified の vendor コード (pin.cpp 等) が旧 driver/i2c.h のシンボルを
 # 参照しており、nfc_shim (新 driver/i2c_master.h) と同一バイナリにリンクされると
@@ -40,13 +41,42 @@ CONFIG_ETH_SPI_ETHERNET_W5500=y
 # 使っていない (nfc_shim.cpp は i2c_new_master_bus のみ) ため公式の回避で無効化する
 CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
 
-# 同じ理由で RMT も legacy (esp-idf-hal "rmt-legacy" feature、WS2812 LED 用) と
-# 新ドライバの両方がリンクされて check_rmt_legacy_driver_conflict で abort する
-CONFIG_RMT_SKIP_LEGACY_CONFLICT_CHECK=y
-
 # ST25R3916 ドライバの detect() 内部ポーリングはタイトなビジーウェイトで、
 # NFC スレッドが載った CPU の IDLE タスクを飢餓させる。CoreS3 (ルートの
 # sdkconfig.defaults) と同じく IDLE の WDT 監視だけを外す。**タスク WDT 自体は
 # 生かす** (ウェッジ検出は残す)
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+
+# ---- PSRAM (#151) ----
+#
+# ★★ **MODE は OCT。QUAD ではない。** ルート (CoreS3) の SPIRAM 設定を
+#    そのまま持ってくると QUAD になり、この機では PSRAM が初期化できず
+#    IGNORE_NOTFOUND により**黙って PSRAM なしで起動**する
+#    (CoreS3 では 2026-07-13 に逆向きで踏んでいる — あちらは OCT 指定で
+#     "octal_psram: PSRAM chip is not connected, or wrong PSRAM line mode")。
+#
+#    根拠は M5Stack 公式ファーム (m5stack/uiflow-micropython) のボード定義:
+#    `m5stack/boards/M5STACK_Atom_EchoS3R/mpconfigboard.cmake` の
+#    SDKCONFIG_DEFAULTS が `boards/sdkconfig.spiram_oct`
+#    (= `CONFIG_SPIRAM_MODE_OCT=y` / `CONFIG_SPIRAM_MODE_QUAD=`) を読む。
+#    同じ M5 の CoreS3 (`M5STACK_CoreS3`) は `sdkconfig.spiram_sx` で
+#    OCT を読まない — **両機の差は M5 自身の設定でも OCT/QUAD で分かれている**。
+#
+#    **起動ログの `EVT HEAP` で `free_psram` が 0 でないことを必ず確認すること。**
+#    ここを間違えても boot は通ってしまうので、コンパイルでは絶対に分からない。
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+# 4KB 未満の割当 (頻繁アクセスの小物・ドライバ周り) は内蔵 SRAM に残す。
+# **1024 を使う理由**: ルートの実測で 4096 にすると 4KB 以下の malloc が全部
+# 内部 RAM に載り、NFC を有効にした構成で ws_uplink の TLS ゲート
+# (内部RAM 60KB) を満たせなくなる。本機は NFC + TLS の同時稼働なので同条件
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
+# DMA / 内蔵必須の割当 (W5500 の SPI DMA を含む) が枯渇しないよう内蔵側に 64KB 予約
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+# PSRAM 初期化失敗時も abort せず PSRAM なしで boot 継続 (fail-safe)。
+# **壁付けの打刻端末は boot loop より「PSRAM 無しでも打刻できる」方が上**という
+# 判断。代わりに検出は上記 `free_psram` の目視に委ねる
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y

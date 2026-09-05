@@ -1,4 +1,5 @@
-# NFC タイムカード端末 (issue #134、設計 plan/standing-devices.md §3)。
+# NFC タイムカード端末 (issue #134、本番機 Atom VoiceS3R への移行は #151、
+# 設計 plan/standing-devices.md §3)。
 #
 # ルートの alc-hub-cores3 と同一ワークスペースの別バイナリ。esp-idf-sys は
 # 既定で「ワークスペースの root package (= ルートの alc-hub-cores3)」の
@@ -19,7 +20,9 @@ harness = false
 [dependencies]
 alc-hub-common = { path = "../hub-common" }
 alc-hub-core = { path = "../hub-core" }
-# nfc feature のみ (speaker は要らない — 音は issue #134 第2段階、ES8311 は未実装)
+# nfc feature のみ。音 (ES8311) は本番機移行 (#151) と分けて別 issue で足す。
+# **RMT は使わない** — Atom VoiceS3R に RGB LED が無く led.rs を #151 で削除した
+# ため、WS2812 用の esp-idf-hal 直接依存 (rmt-legacy) も一緒に落としている
 alc-hub-drivers = { path = "../hub-drivers", features = ["nfc"] }
 anyhow = "1"
 log = "0.4"
@@ -29,10 +32,6 @@ esp-idf-svc = { version = "0.52", default-features = false, features = [
     "alloc",
     "binstart",
 ] }
-# 本体 RGB LED (WS2812)。ws2812-esp32-rmt-driver crate は esp-idf-sys ^0.36 に
-# 固定されており esp-idf-svc 0.52 (esp-idf-hal 0.46) と links が衝突してビルド
-# 不能 (atoms3-nfc で確認済み 2026-07-20)。esp-idf-hal の legacy RMT を直接使う
-esp-idf-hal = { version = "0.46", features = ["rmt-legacy"] }
 
 [build-dependencies]
 embuild = "0.33"

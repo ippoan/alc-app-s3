@@ -44,16 +44,17 @@
     <div class="card">
         <h2>対応機器</h2>
         <div class="device-info">
-            <div><strong>マイコン</strong>M5Stack AtomS3 系 (検証機は AtomS3 Lite / SKU C124)</div>
+            <div><strong>マイコン</strong>M5Stack Atom VoiceS3R (Atom EchoS3R / SKU C126-ECHO、8MB PSRAM)</div>
             <div><strong>ネットワーク</strong>Atomic PoE Base (SKU A091, W5500 + PoE 給電)</div>
             <div><strong>カードリーダー</strong>M5 Unit NFC (SKU U216, ST25R3916) — Grove Port A</div>
         </div>
         <div class="warning">
-            <h3>本番機 (Atom VoiceS3R) はまだ対象外です</h3>
-            <p>ここで配布しているのは <strong>PSRAM 非搭載の AtomS3 系</strong>向けビルドです。
-               本番機 Atom VoiceS3R (SKU C126-ECHO、PSRAM 8MB) は sdkconfig / パーティション
-               構成が変わるため、<strong>このイメージをそのまま焼かないでください</strong>。
-               打刻音 (ES8311) も VoiceS3R 到着後の対応です。</p>
+            <h3>PSRAM 非搭載の AtomS3 系には焼かないでください</h3>
+            <p>ここで配布しているのは <strong>Atom VoiceS3R 専用</strong>のビルドです。
+               PSRAM (Octal 8MB) を前提に sdkconfig を組んでいるため、
+               AtomS3 / AtomS3 Lite などの PSRAM 非搭載機に焼いても
+               <strong>PSRAM 無しのまま静かに起動します</strong> (エラーは出ません)。
+               打刻音 (ES8311) はまだ入っていません — 別途対応します。</p>
         </div>
     </div>
 
@@ -111,7 +112,14 @@
             <li><code>OTA &lt;url&gt;</code> — 手動ファームウェア更新</li>
         </ul>
         <p>カードをかざすと <code>EVT TIMECARD card_id=… card_kind=felica_idm|license|nfca_uid</code>
-           が出ます。本体 LED は 待機=暗い青 / 読み取り成功=緑 / 失敗=赤 です。</p>
+           が出ます。財布などにカードが 2 枚入っていて両方見えたときは、どちらの打刻か決められないので
+           <strong>打刻せず</strong> <code>EVT NFC_MULTI_CARD</code> だけを出します。</p>
+        <div class="warning">
+            <h3>本機に LED はありません — 確認はシリアルログで</h3>
+            <p>Atom VoiceS3R には RGB LED が載っていません (旧 Atom Voice の WS2812 は無くなりました)。
+               読めたかどうかは上の <code>EVT</code> ログで確認してください。
+               現場から見える形の反応 (打刻音) は別途対応します。</p>
+        </div>
         <div class="warning">
             <h3>打刻が「登録されていません」になるとき</h3>
             <p>端末は読み取った <strong>生の値</strong>を送ります (交通系 IC は大文字の IDm 16 文字、
