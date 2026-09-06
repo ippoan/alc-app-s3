@@ -217,6 +217,8 @@ fn run(
         // 取りこぼされる (起動直後と es8311 dump_regs 直後の約 200ms)
         println!("EVT NFC_POLL_ORDER LicenseFirst");
         log::info!("nfc: B 先行 + B 粘着でポーリングする (PollOrder::LicenseFirst)");
+        // step 4b: 「まだ載っている」(present) は RF の応答で決める (下の touch の直前)
+        println!("EVT NFC_PRESENT_SRC rf");
     }
 
     // 重複抑止は **debounce**「離れて N ms 経つまで、まだ同じタップ」
@@ -263,6 +265,9 @@ fn run(
     // LicenseFirst の B 粘着 (遷移は alc_hub_core::nfc_sticky)。cycle は計器用の周回番号
     let mut sticky = Sticky::default();
     let mut cycle: u32 = 0;
+    // 計器行 (`nfc cycle=`) は rc / 粘着 / F-A の有無のどれかが前周と変わった周だけ出す。
+    // 載せっぱなしや常時トリガで毎周出すと crashlog のリングを押し流すため
+    let mut last_inst: Option<(i32, bool, bool)> = None;
 
     loop {
         tick = tick.wrapping_add(1);
@@ -283,7 +288,10 @@ fn run(
         let mut triggered = false;
         // 存在検知が**測定できたうえで**「載っている」と言えたか。
         // 測定失敗のフォールバック (下の else) は触らない — 測定が壊れている間
-        // ずっと touch し続けると、二度と発火しなくなる
+        // ずっと touch し続けると、二度と発火しなくなる。
+        // **FelicaFirst ではこの present がトリガ中のベースライン凍結に由来する**ので、
+        // 位相が動くとカードが離れても張り付く (実機: 読めた 9 タップ中 7 が発火せず)。
+        // LicenseFirst は下 (touch の直前) で RF の応答に上書きする。FelicaFirst 側の追随は #162
         let mut present = false;
         if amp >= 0 {
             if baseline < 0 {
@@ -385,6 +393,13 @@ fn run(
         // `TapGate::poll` は「毎周期呼ぶこと」が規約なので、回数を増やすのは安全側
         let mut got = false;
         cycle = cycle.wrapping_add(1);
+        // step 4b (LicenseFirst のみ): この周に実際に打った poll のどれかが応答したか。
+        // `present` (tap_gate.touch = 「まだ同じタップ」) をこれで上書きする — 理由は touch の直前
+        let mut rf_present = false;
+        // 計器行の材料 (周末に 1 行にまとめて出す)
+        let mut b_rc = i32::MIN;
+        let mut fa = "-";
+        let mut sticky_word = "-";
 
         // --- B 先行 (LicenseFirst、#155 step 4) ---
         // 待機中は B モードのまま電界 ON なので、ここは切替 (電界断) ゼロで入れる
@@ -395,14 +410,10 @@ fn run(
             }
             let (next, release) = nfc_sticky::next(sticky, rc);
             sticky = next;
-            let fa = if got || sticky.on { "skip" } else { "run" };
-            log::info!(
-                "nfc cycle={cycle} order=B rc={rc} sticky={} cycles={} misses={} mf={} fa={fa}",
-                release.label(sticky.on),
-                sticky.cycles,
-                sticky.misses,
-                sticky.mf_fails
-            );
+            b_rc = rc;
+            rf_present = rc != nfc_sticky::RC_NO_CARD && rc != nfc_sticky::RC_NOT_READY;
+            fa = if got || sticky.on { "skip" } else { "run" };
+            sticky_word = release.label(sticky.on);
             deliver(tap_gate.poll(now_ms()), &status, &mut sink);
         }
 
@@ -467,6 +478,33 @@ fn run(
             triggered_since = None;
             // 読めた = 固着ではない。巻き戻しの回数を数え直す
             stuck_rollbacks = 0;
+            // F/A で読めた周も RF が応答している (B は rc で判定済み)
+            rf_present = true;
+        }
+
+        if license_first {
+            // step 4b: 「まだ載っている」は RF の応答で決める (振幅/位相は**ゲートを開く**
+            // 役だけに使う)。位相のベースラインはトリガ中に追従しないので、位相が動いた後は
+            // 振幅/位相由来の `present` が張り付き、カードが離れている間も touch が続いて
+            // 次のタップが「同じタップ」扱いで debounce に飲まれる (step 4 実機: 読めた
+            // 9 タップのうち 7 が発火せず)。LicenseFirst では粘着中の B が毎周 (84ms)
+            // 応答するので RF が「載っている」の確実な根拠になる。**FelicaFirst では
+            // 免許証が数周に 1 回しか応答しない** (FeliCa / Type-A は毎周応答する) ので
+            // 同じ手は使えない → LicenseFirst 限定。
+            // 二重打刻の担保: 載ったままの -2 は実測 0/131 周、途中死は最大 1 周 (85ms) で
+            // debounce の cooldown (1000ms) に吸収される
+            present = rf_present;
+            let inst = (b_rc, sticky.on, fa == "run");
+            if last_inst != Some(inst) {
+                last_inst = Some(inst);
+                log::info!(
+                    "nfc cycle={cycle} order=B rc={b_rc} sticky={sticky_word} cycles={} misses={} mf={} fa={fa} present=rf:{}",
+                    sticky.cycles,
+                    sticky.misses,
+                    sticky.mf_fails,
+                    u8::from(rf_present)
+                );
+            }
         }
 
         // カードが載っている間は「まだ同じタップ」。**読み取り (observe) の後に
