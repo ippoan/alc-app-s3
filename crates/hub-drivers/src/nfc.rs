@@ -498,10 +498,9 @@ fn run(
             if last_inst != Some(inst) {
                 last_inst = Some(inst);
                 log::info!(
-                    "nfc cycle={cycle} order=B rc={b_rc} sticky={sticky_word} cycles={} misses={} mf={} fa={fa} present=rf:{}",
+                    "nfc cycle={cycle} order=B rc={b_rc} sticky={sticky_word} cycles={} misses={} fa={fa} present=rf:{}",
                     sticky.cycles,
                     sticky.misses,
-                    sticky.mf_fails,
                     u8::from(rf_present)
                 );
             }
