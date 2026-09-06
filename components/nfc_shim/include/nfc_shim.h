@@ -40,6 +40,7 @@ int nfc_shim_poll_nfca_uid(char* out_hex, int out_cap);
  * 交付日・有効期限を "YYYYMMDD" 形式の文字列で返す (plan/nfc-card-identity.md の
  * BCD デコード規則、ippoan/AlcoholChecker の NfcReader.kt と同じ APDU シーケンス)。
  * 戻り値: 0=成功、非0=失敗 (カード無し/免許証以外/読み取り失敗)。
+ *   -8 = ATQB の FWI が免許証プロファイル未満 (スマホの HCE 等)。ATTRIB せず即戻る (#155)
  */
 int nfc_shim_read_license_expiry(char* out_issue, int issue_cap, char* out_expiry, int expiry_cap);
 

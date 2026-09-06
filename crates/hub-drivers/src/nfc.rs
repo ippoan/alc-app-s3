@@ -437,6 +437,15 @@ fn run(
 
             if !got {
                 match poll_nfca_uid() {
+                    // スマホ (HCE) のランダム UID (ISO/IEC 14443-3 §6.4.4: 4B で UID0=0x08) は
+                    // **gate に載せない**。載せると同じ周で読めた FeliCa (モバイル Suica) の
+                    // IDm と「別のカード 2 枚」(#143) になり、両方捨ててエラー音が鳴る
+                    // (実機 2026-09-06: ATQB ゲートで HCE を活性化しなくなった直後から
+                    // 確定窓 250ms に IDm と UID が揃うようになった)。打刻 ID としても
+                    // 毎回変わって無意味 (#166 は on_card で弾くが、それは gate の後で遅い)
+                    Ok(Some(uid)) if alc_hub_core::nfca_uid::is_random_nfca_uid(&uid) => {
+                        log::info!("nfc: nfca random UID — gate に載せない");
+                    }
                     Ok(Some(uid)) => {
                         // 電子車検証は Type-A + ISO14443-4 (ISO-DEP、RATS 応答あり) で
                         // 応答することを実機確認済み (issue #105)。UID が取れた時点で
@@ -638,6 +647,7 @@ pub fn license_rc_reason(rc: i32) -> &'static str {
         -5 => "SELECT EF 2F01 失敗",
         -6 => "READ BINARY 失敗",
         -7 => "データ長が想定より短い (EF 長が事前想定と違う、実機で要再調整)",
+        -8 => "免許証以外の Type-B (ATQB の FWI)",
         _ => "不明なエラーコード",
     }
 }

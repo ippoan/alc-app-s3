@@ -255,16 +255,9 @@ fn on_card(
 ) {
     let (card_id, kind) = match event {
         NfcEvent::Felica { idm } => (idm.clone(), CardKind::FelicaIdm),
-        NfcEvent::NfcaUid { uid } => {
-            // スマホ (HCE) のランダム UID は打刻に使わない (#155)。近づけたとき FeliCa、
-            // 離すとき Type-A で別 key として 2 回鳴るのを止める。実タグ (7B) はそのまま。
-            // 理由と規格根拠は alc_hub_core::nfca_uid のモジュール doc
-            if alc_hub_core::nfca_uid::is_random_nfca_uid(uid) {
-                log::info!("timecard: card_kind=nfca_uid ignored=random");
-                return;
-            }
-            (uid.clone(), CardKind::NfcaUid)
-        }
+        // スマホ (HCE) のランダム UID はここに来ない — hub-drivers の nfc.rs が gate に載せる前に
+        // 弾く (#155、alc_hub_core::nfca_uid)。実タグ (7B の NTAG / MIFARE) はそのまま打刻
+        NfcEvent::NfcaUid { uid } => (uid.clone(), CardKind::NfcaUid),
         // 免許証は「交付日 8 桁 + 有効期限 8 桁」= alc-app タブレットが使う
         // employees.nfc_id と同じキー。punch はカード未登録なら
         // employees.nfc_id へフォールバックするので、この 16 桁で当たる
