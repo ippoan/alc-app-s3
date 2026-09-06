@@ -247,10 +247,32 @@ namespace {
 //  - ATTRIB 後の APDU は ISO-DEP (I-block) フレーミング必須。NFCBFileSystem の
 //    構築副作用で activatedPICC の FWI/FSC から isoDEP config を設定し、
 //    AlcoholChecker (NfcReader.kt) 実績のバイト列を transceiveAPDU で送る
+// 免許証プロファイルの FWI 下限 (ATQB の Protocol Info、実機で免許証 = 12 / スマホの HCE = 7)
+constexpr uint8_t kLicenseFwiMin = 12;
+
 int try_read_license_once(char* out_issue, char* out_expiry)
 {
     m5::nfc::b::PICC picc{};
     const auto t0 = m5::utility::millis();
+    // ATQB ゲート (#155): ATTRIB の前に WUPB で ATQB だけ取り、FWI が免許証プロファイル未満なら
+    // 免許証でない Type-B (スマホの HCE 等) として -8 を即返す。理由は 2 つ:
+    //  1. HCE を ISO-DEP で活性化 (ATTRIB → SELECT MF → DESELECT) すると、スマホはその後
+    //     数秒 FeliCa (モバイル Suica) に応答しなくなる (実機 2026-09-06: 約 10 タップ中 5 が無音)
+    //  2. ATTRIB 50ms + SELECT MF + deactivate + reset_rf_field + 60ms の約 230ms を省ける
+    // 免許証は ATQB proto=B3 81 C1 (FWI=12)、スマホは 80 81 71 (FWI=7)。判定は FWI だけ
+    // (ISO14443-4 bit は両方 1、protocol[0] は bit rate capability で IC ごとに変わりうる)。
+    // FWI の抽出式は NFCLayerB::select() のログと同じ。直後の select() がもう一度 WUPB を
+    // 打つ (二重 WUPB、数 ms) のは許容する
+    {
+        m5::nfc::b::PICC probe{};
+        uint16_t len = m5::nfc::b::ATQB_LENGTH;
+        if (!g_nfc_b->wakeup(probe.atqb, len)) {
+            return -2;  // WUPB 無応答 = カード無し (select() の WUPB 失敗と同じ扱い)
+        }
+        if (((probe.protocol[2] >> 4) & 0x0F) < kLicenseFwiMin) {
+            return -8;  // 免許証以外の Type-B (ATQB の FWI)
+        }
+    }
     // ATTRIB 待ちは 100ms (2026-07-21 短縮): 応答するカードは数十 ms で返す一方、
     // 応答しないケースは FWT (FWI=12 → 1.24s) まで待っても来ないことを実測済み。
     // 早く見切って即リセット→再試行した方がトータルの検出が速い
@@ -406,6 +428,8 @@ extern "C" int nfc_shim_read_license_expiry(char* out_issue, int issue_cap, char
     //  - セッション途中死 (-4/-5/-6) の直後だけリセットする (カードが
     //    READY/ACTIVE で固まり、チップ状態も汚れるため。リセット無しの
     //    再試行は無意味なことを実機確認)
+    //  - 免許証以外の Type-B (-8、ATQB の FWI で判定) は途中死ではないのでリセットしない。
+    //    ISO-DEP を活性化していないのでカード側にも汚れは無い
     //  - 全滅のまま予算を使い切ったら最後に1回だけリセット (ATTRIB 失敗で
     //    READY スタックしたカードの保険。次の呼び出しまで ≥200ms 空くので
     //    再設定直後 WUPB 全滅問題は踏まない)
@@ -425,6 +449,9 @@ extern "C" int nfc_shim_read_license_expiry(char* out_issue, int issue_cap, char
             // 連続タップにも即応する
             reset_rf_field();
             return 0;
+        }
+        if (rc == -8) {
+            return rc;  // 免許証以外の Type-B。予算を使い切らず即戻り、呼び出し側が F/A へ回す
         }
         if (rc != -2) {
             last_rc = rc;  // 途中死の理由は最後のものを返す

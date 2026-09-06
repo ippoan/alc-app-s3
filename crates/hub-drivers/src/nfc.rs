@@ -638,6 +638,7 @@ pub fn license_rc_reason(rc: i32) -> &'static str {
         -5 => "SELECT EF 2F01 失敗",
         -6 => "READ BINARY 失敗",
         -7 => "データ長が想定より短い (EF 長が事前想定と違う、実機で要再調整)",
+        -8 => "免許証以外の Type-B (ATQB の FWI)",
         _ => "不明なエラーコード",
     }
 }
