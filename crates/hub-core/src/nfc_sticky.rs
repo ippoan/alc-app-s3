@@ -14,7 +14,9 @@
 //! - **無応答 (-2) が [`RELEASE_MISSES`] 周連続** = カードが離れた
 //! - **上限 [`MAX_CYCLES`] 周** = 途中死 (-3 / -5 / -6) が続く限り粘ると F/A が周回から
 //!   閉め出されるので打ち切る (免許証の読了 5〜6 周の 2 倍)
-//! - **SELECT MF 失敗 (-4)** = 免許証でない Type-B が載っている。その周で解く。
+//! - **免許証以外の Type-B (-8)** = ATQB の FWI が免許証プロファイル未満 (スマホの HCE 等)。
+//!   ATTRIB する前に shim が即返す。その周で解いて F → A へ回す (粘着しない)
+//! - **SELECT MF 失敗 (-4)** = ATQB は免許証プロファイルだったが SELECT MF が落ちた。その周で解く。
 //!   **スマホ (モバイル Suica) は HCE で Type-B にも応答する**ので、ここで粘ると
 //!   F (FeliCa) が閉め出されて Suica が読めない/遅くなる (実機: 3 周粘ると
 //!   スマホの応答が 1.0 秒、旧 F 先行は 0.35 秒)。弱結合の免許証でも -4 は出るが稀
@@ -23,7 +25,8 @@
 //!
 //! 純関数にしてホストでテストする (`nfc_tap` と同じ流儀)。**rc の意味は nfc_shim の
 //! `nfc_shim_read_license_expiry()` の戻り値**: 0 読了 / -1 未初期化 / -2 無応答 /
-//! -3 ATTRIB 失敗 / -4 SELECT MF 失敗 / -5 SELECT EF 失敗 / -6 READ BINARY 失敗。
+//! -3 ATTRIB 失敗 / -4 SELECT MF 失敗 / -5 SELECT EF 失敗 / -6 READ BINARY 失敗 /
+//! -8 免許証以外の Type-B (ATQB の FWI)。
 
 /// 粘着を解く、無応答 (-2) の連続周回数
 pub const RELEASE_MISSES: u32 = 2;
@@ -36,6 +39,8 @@ pub const RC_NO_CARD: i32 = -2;
 pub const RC_NOT_READY: i32 = -1;
 /// nfc_shim の rc: SELECT MF 失敗 (免許証以外の Type-B の可能性)
 pub const RC_SELECT_MF_FAILED: i32 = -4;
+/// nfc_shim の rc: 免許証以外の Type-B (ATQB の FWI が免許証プロファイル未満)
+pub const RC_NOT_LICENSE: i32 = -8;
 
 /// 粘着の状態。`Default` = 粘着していない
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -60,6 +65,8 @@ pub enum Release {
     MaxCycles,
     /// SELECT MF 失敗 (免許証でない Type-B)
     MfFail,
+    /// 免許証以外の Type-B (ATQB の FWI)
+    NotLicense,
 }
 
 impl Release {
@@ -72,6 +79,7 @@ impl Release {
             Release::Misses => "released(miss)",
             Release::MaxCycles => "released(max)",
             Release::MfFail => "released(mf)",
+            Release::NotLicense => "released(atqb)",
         }
     }
 }
@@ -91,6 +99,7 @@ pub fn next(prev: Sticky, rc: i32) -> (Sticky, Release) {
             }
         }
         RC_SELECT_MF_FAILED => return (Sticky::default(), Release::MfFail),
+        RC_NOT_LICENSE => return (Sticky::default(), Release::NotLicense),
         _ => {
             // 免許証として応答した後の途中死 (-3 ATTRIB / -5 SELECT EF / -6 READ BINARY)。
             // 次周も B だけを電界断なしで再試行する
@@ -189,6 +198,17 @@ mod tests {
     }
 
     #[test]
+    fn not_license_type_b_never_sticks() {
+        // スマホ (HCE) の Type-B 応答: ATQB の FWI で弾かれた周は粘着せず F/A へ
+        let (s, r) = run(&[-8]);
+        assert_eq!(s, Sticky::default());
+        assert_eq!(r, Release::NotLicense);
+        let (s, r) = run(&[-3, -8]);
+        assert_eq!(s, Sticky::default());
+        assert_eq!(r, Release::NotLicense);
+    }
+
+    #[test]
     fn labels() {
         assert_eq!(Release::None.label(true), "true");
         assert_eq!(Release::None.label(false), "false");
@@ -196,5 +216,6 @@ mod tests {
         assert_eq!(Release::Misses.label(false), "released(miss)");
         assert_eq!(Release::MaxCycles.label(false), "released(max)");
         assert_eq!(Release::MfFail.label(false), "released(mf)");
+        assert_eq!(Release::NotLicense.label(false), "released(atqb)");
     }
 }
