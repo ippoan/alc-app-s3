@@ -6,41 +6,65 @@
 //! 判定は front 側で行う (plan/standing-devices.md §3.3)。
 //! CoreS3 統合ハブ (ルートの alc-hub-cores3) と hub-* クレート群を共有する。
 //!
-//! # 第 1 段階 (本コミット) のスコープ
+//! # スコープ — 音はまだ入れない
 //!
-//! NFC → WS 送信までの経路。**音 (ES8311) は入れない** — Atom VoiceS3R の
-//! 到着後に第 2 段階として足す (plan §2)。したがって本 crate は
+//! NFC → WS 送信までの経路。**音 (ES8311) は入れない** — 本番機 (Atom
+//! VoiceS3R) への移行 (#151) と分けて別 issue で足す。したがって本 crate は
 //! `alc-hub-drivers` の `nfc` feature のみを有効にし、`speaker` は使わない。
 //!
-//! # ハード構成 (検証機)
+//! # ハード構成 (本番機)
 //!
-//! - **AtomS3 Lite** (SKU C124, ESP32-S3FN8): PSRAM 非搭載、8MB flash
+//! - **Atom VoiceS3R** (M5Stack Atom EchoS3R, SKU C126-ECHO /
+//!   ESP32-S3-PICO-1-N8R8): 8MB Flash + **8MB Octal PSRAM**。
+//!   PSRAM の線モードは **OCT** — CoreS3 の QUAD をそのまま持ってくると
+//!   `CONFIG_SPIRAM_IGNORE_NOTFOUND` により黙って PSRAM なしで起動する
+//!   (根拠と検出方法は `sdkconfig.defaults` の PSRAM 節)
 //! - **Atomic PoE Base** (SKU A091): W5500 SPI Ethernet + PoE 給電。
 //!   SCLK=G5 / MISO=G7 / MOSI=G8 / CS=G6、INT/RST 未配線 (polling)
-//! - **M5 Unit NFC** (U216, ST25R3916): Grove Port A (SDA=G2 / SCL=G1)。
-//!   底面バス (G5-G8) と競合しないことを 2026-09-04 に実機で確認済み
+//! - **M5 Unit NFC** (U216, ST25R3916): Grove Port A (SDA=G2 / SCL=G1)
 //!
-//! # ★ 本番機 (Atom VoiceS3R) への移行で作り直すもの
+//! ピンの根拠 (2026-09-05 に確認)。**確定と推定を分けて書く**:
 //!
-//! 本番機は **Atom VoiceS3R** (C126-ECHO, ESP32-S3-PICO-1-N8R8 /
-//! **PSRAM 8MB** / 8MB Flash)。検証機は PSRAM 非搭載なので、次の 3 つは
-//! **流用せず作り直すこと** (plan/standing-devices.md §3.1 未確認 ③):
+//! - **【確定・VoiceS3R 固有】内蔵オーディオ** (ES8311/NS4150B) は
+//!   G45/G0/G48/G4/G3/G17/G11/G18、**IR_TX は G47**、**本体ボタンは G41**
+//!   (`docs.m5stack.com/en/core/Atom_EchoS3R` の公式ピンマップ)。
+//!   どれも底面バスにも Grove にも出ない
+//! - **【確定・VoiceS3R 固有】Grove (HY2.0-4P) は SDA=G2 / SCL=G1**。
+//!   公式ピンマップ (黄=G2 / 白=G1) と、M5 公式ファーム
+//!   (`m5stack/uiflow-micropython`) の `M5STACK_Atom_EchoS3R/mpconfigboard.h`
+//!   (`MICROPY_HW_I2C0_SCL 1` / `MICROPY_HW_I2C0_SDA 2`)、および M5Unified の
+//!   `_pin_table_i2c_ex_in` の `board_M5AtomVoiceS3R` 行が一致する。
+//!   内蔵 I2C は G0/G45 なので Unit NFC と競合しない
+//! - **【確定・実機 2026-09-06】底面バスは J5 = 3V3/G5/G6/G7/G8、J6 = G39/G38/5V/GND**。
+//!   もとは AtomS3R の回路図 (`Sch_M5_AtomS3R_v0.4.1.pdf`、M5 が C126-ECHO の
+//!   SKU ページで本体基板の回路図として挙げているもの) **からの推定**だった —
+//!   その PDF は VoiceS3R が持たない LCD と IMU を含むため同一基板とは限らない。
+//!   **#151 の初回書き込みで Atomic PoE Base を載せた実機が W5500 に応答し
+//!   DHCP まで通ったので確定**した (`EVT ETH_CONNECTED`)。
+//!   外していれば `W5500 version mismatched` で必ず落ちる種類の推定だったので、
+//!   実機まで持ち込んで決着させてよかった (経緯は plan §3.1)
 //!
-//! 1. **`sdkconfig.defaults`** — PSRAM 8MB のため SPIRAM 系を足す必要がある。
-//!    ルート (CoreS3) の `CONFIG_SPIRAM_MODE_QUAD` 等を参照して S3R 向けに
-//!    起こし直す。**CoreS3 の QUAD/OCT で 1 度踏んでいる** (OCT 指定で
-//!    "PSRAM chip is not connected" → `IGNORE_NOTFOUND` により黙って PSRAM
-//!    なしで起動、`EVT HEAP` の `free_psram=0` で発覚) ので、**起動ログの
-//!    `free_psram` を必ず確認する**こと
-//! 2. **`partitions.csv`** — Flash 容量は同じ 8MB だが、PSRAM 付きでバイナリが
-//!    伸びるため app スロット (各 3MB) の余裕を再確認する
-//! 3. **CI (`.github/workflows/build.yml`) の `cache_key`** — sdkconfig が違うと
-//!    esp-idf-sys の成果物が別フレーバーになる。使い回すと**永遠に cold**
-//!    (#63 の実測)。S3R 用の leg には新しい `cache_key` を付ける
+//! # ★ 本機で `led.rs` (WS2812) は成立しない
 //!
-//! 加えて **本体 LED の GPIO は機種ごとに違う** (AtomS3 Lite は G35。
-//! Web 検索の要約だけで G38 と書いて実機で無点灯になった実害が atoms3-nfc に
-//! ある)。S3R では M5 公式ボード定義で確認してから配線すること。
+//! **この基板に単線接続の WS2812 系 LED は無い。**回路図に出てくる LED は
+//! すべて **I2C の LP5562 (アドレス 0x30、SYS_SDA=G45 / SYS_SCL=G0) 駆動**
+//! (`LED_R` / `LED_G` / `LED_B` / `LED_BL_DRV`) で、RMT で 1 本の GPIO に
+//! ビット列を流す `led.rs` の方式では**どうやっても点かない**。
+//! LP5562 = 0x30 は M5GFX の `Light_M5StackAtomS3R` が AtomS3R の LCD
+//! バックライトを叩いているアドレスと同じ。よって #151 で `led.rs` は削除した。
+//!
+//! **VoiceS3R に RGB LED が実装されているか自体は未確定。**
+//! M5 公式 SKU ページ (C126-Echo) の比較表は
+//! "Atom VoiceS3R has no RGB LED, while Atom Voice includes WS2812 x1" と
+//! 書いており、公式ピンマップにも LED の項が無い — が、上の回路図には
+//! LP5562 の回路がある (AtomS3R では実装されている)。
+//! **決着は実機で内蔵 I2C の 0x30 を probe するしかない。**
+//! なお M5Unified の RGBLED ピン表 `_pin_table_other0` に
+//! `board_M5AtomVoiceS3R` が無いことは**根拠にならない** — あの表は単線
+//! WS2812 用で、LP5562 で LED を持つ `board_M5AtomS3R` も同じく載っていない。
+//!
+//! 当面 **検知の可否は serial ログ (`EVT TIMECARD` / `EVT NFC_MULTI_CARD`)
+//! で見る。**現場向けの可視/可聴フィードバックは ES8311 の音を入れる別 issue で戻す。
 //!
 //! # 起動順 (変えてはいけない)
 //!
@@ -50,7 +74,6 @@
 //! なった実害が 2026-07-14 にある。
 
 mod console;
-mod led;
 
 use alc_hub_common::{
     config,
@@ -138,18 +161,6 @@ fn main() -> Result<()> {
     let spi: &'static SpiDriver<'static> = Box::leak(Box::new(spi));
     eth_w5500::start(spi, p.pins.gpio6.into(), None, sysloop, Arc::clone(&status))?;
 
-    // 本体 RGB LED (WS2812, AtomS3 Lite は G35)。初期化失敗は致命にしない —
-    // LED が無くても打刻そのものは成立する
-    #[allow(deprecated)] // legacy RMT (理由は led.rs のモジュール属性)
-    let mut led = match led::Led::new(p.rmt.channel0, p.pins.gpio35) {
-        Ok(l) => Some(l),
-        Err(e) => {
-            log::warn!("led: 初期化失敗 (表示なしで継続): {e:#}");
-            None
-        }
-    };
-    let led_signal = led.as_ref().map(|l| l.signal());
-
     // Unit NFC (ST25R3916): Grove Port A (SDA=G2 / SCL=G1)。読み取りループは
     // hub-drivers/src/nfc.rs (CoreS3 と共有)。**ここに NFC のコードを書かない**
     nfc::start(
@@ -157,7 +168,7 @@ fn main() -> Result<()> {
         p.pins.gpio2.into(),
         p.pins.gpio1.into(),
         Arc::clone(&status),
-        move |e: &NfcEvent| on_card(e, &ws_meas_tx, led_signal.as_ref()),
+        move |e: &NfcEvent| on_card(e, &ws_meas_tx),
     )?;
 
     // 起動完了 = OTA rollback 解除 (CoreS3 と同じ安全装置、ota.rs 参照)
@@ -171,7 +182,7 @@ fn main() -> Result<()> {
     // **ここで即起動してはいけない** — 理由は ntp::start_when_online の doc
     let mut sntp = None;
 
-    // メインループ: LED の反映と SNTP の遅延起動だけ (ホスト向けイベントは
+    // メインループ: SNTP の遅延起動だけ (ホスト向けイベントは
     // eth_w5500 / heap / ws_uplink の各スレッドが出す)
     loop {
         FreeRtos::delay_ms(100);
@@ -179,9 +190,6 @@ fn main() -> Result<()> {
             &mut sntp,
             status.lock().map(|s| !s.lan_ip.is_empty()).unwrap_or(false),
         );
-        if let Some(led) = led.as_mut() {
-            led.tick();
-        }
     }
 }
 
@@ -190,7 +198,7 @@ fn main() -> Result<()> {
 /// **`card_id` は生値のまま**送る (接頭辞を付けると punch のカード照合が
 /// 必ず外れる — alc_hub_core::timecard の doc 参照)。`session_id` は
 /// 点呼ではないので付けない。
-fn on_card(event: &NfcEvent, ws_tx: &mpsc::Sender<UplinkRecord>, led: Option<&led::LedSignal>) {
+fn on_card(event: &NfcEvent, ws_tx: &mpsc::Sender<UplinkRecord>) {
     let (card_id, kind) = match event {
         NfcEvent::Felica { idm } => (idm.clone(), CardKind::FelicaIdm),
         NfcEvent::NfcaUid { uid } => (uid.clone(), CardKind::NfcaUid),
@@ -207,9 +215,6 @@ fn on_card(event: &NfcEvent, ws_tx: &mpsc::Sender<UplinkRecord>, led: Option<&le
                 None => {
                     // 日付が 8 桁数字でなければキーにできない (壊れた読み取り)
                     log::warn!("timecard: 免許証の日付が想定外 issue={issue} expiry={expiry}");
-                    if let Some(led) = led {
-                        led.err();
-                    }
                     return;
                 }
             }
@@ -222,21 +227,14 @@ fn on_card(event: &NfcEvent, ws_tx: &mpsc::Sender<UplinkRecord>, led: Option<&le
         //
         // **サーバへは何も送らない** (UplinkRecord を作らない)。`hub_measurements`
         // に新しい kind を足すと rust-alc-api の HUB_MEASUREMENT_KINDS と alc-app
-        // の型・一覧まで波及するので、まず端末内 (LED + serial) で完結させ、
-        // 運用で「エラーが見えない」と分かってから足す
+        // の型・一覧まで波及するので、まず端末内 (serial ログ) で完結させ、
+        // 運用で「エラーが見えない」と分かってから足す。**本機に LED は無い**
+        // ので、現場から見える形にするのは音 (ES8311) を入れる別 issue
         NfcEvent::MultipleCards => {
             println!("EVT NFC_MULTI_CARD");
-            if let Some(led) = led {
-                led.err();
-            }
             return;
         }
-        NfcEvent::ReadFailed { .. } => {
-            if let Some(led) = led {
-                led.err();
-            }
-            return;
-        }
+        NfcEvent::ReadFailed { .. } => return,
     };
 
     let record = UplinkRecord {
@@ -249,14 +247,7 @@ fn on_card(event: &NfcEvent, ws_tx: &mpsc::Sender<UplinkRecord>, led: Option<&le
     };
     println!("EVT TIMECARD card_id={card_id} card_kind={}", kind.label());
     if ws_tx.send(record).is_err() {
-        // ws_uplink スレッドが死んでいる = 送信不能。LED を赤にして気付かせる
+        // ws_uplink スレッドが死んでいる = 送信不能
         log::error!("timecard: 送信キューへ積めなかった (ws_uplink が停止)");
-        if let Some(led) = led {
-            led.err();
-        }
-        return;
-    }
-    if let Some(led) = led {
-        led.ok();
     }
 }

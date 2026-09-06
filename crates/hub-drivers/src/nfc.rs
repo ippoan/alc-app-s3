@@ -19,7 +19,7 @@
 //! **本モジュールは CoreS3 専用ではない。** I2C ポート番号はピンと同じく
 //! 引数で受け、検知の通知は [`NfcEvent`] のコールバックで外へ出す。
 //! CoreS3 は「ビープ + 免許証なら `UiCommand::License`」を、NFC タイムカード端末
-//! (crates/atoms3-timecard) は「打刻イベントを WS uplink へ積む + LED」を
+//! (crates/atoms3-timecard) は「打刻イベントを WS uplink へ積む」を
 //! それぞれコールバック側で行う。**読み取りループを写して 3 実装目を作らないこと。**
 //!
 //! ログ通知 (`SharedStatus::push_event` — 「ログ確認」画面に既存の rs232.rs 等と

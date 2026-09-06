@@ -1,6 +1,15 @@
-# NFC タイムカード端末 (8MB flash) 用パーティションテーブル。
+# NFC タイムカード端末 (Atom VoiceS3R / 8MB flash) 用パーティションテーブル。
 # crates/atoms3-print/partitions.csv と同一レイアウト (8MB Flash 機で共通)。
 # nvs/phy_init のオフセットは ESP-IDF 既定互換 + OTA 2 スロット構成。
+#
+# **本番機移行 (#151) でレイアウトは変えていない。実測で足りている:**
+# PSRAM (OCT) を有効にしたビルドの app イメージは **1,225,568 バイト**
+# (`espflash save-image --chip esp32s3` で実測、2026-09-06)。app スロットは各 3M
+# (3,145,728) なので **使用率 39.0% / 空き 1.83MB**。
+# flash 全体でも 8MB のうち末尾 0x1E0000 (約 1.9MB) が空いている
+# (ota_1 の末尾は 0x620000)。**足りなくなったら ota_1 の開始位置を後ろへずらす形で
+# 両スロットを広げられる** — ただし nvs=0x9000 / otadata=0x10000 を動かすと
+# build.yml の Split step も直す必要がある (下記)。
 #
 # ★ 手焼きでも必ず `--partition-table crates/atoms3-timecard/partitions.csv` を
 #   渡すこと。省略すると espflash 既定の factory 1 スロットになり、OTA が

@@ -44,16 +44,17 @@
     <div class="card">
         <h2>対応機器</h2>
         <div class="device-info">
-            <div><strong>マイコン</strong>M5Stack AtomS3 系 (検証機は AtomS3 Lite / SKU C124)</div>
+            <div><strong>マイコン</strong>M5Stack Atom VoiceS3R (Atom EchoS3R / SKU C126-ECHO、8MB PSRAM)</div>
             <div><strong>ネットワーク</strong>Atomic PoE Base (SKU A091, W5500 + PoE 給電)</div>
             <div><strong>カードリーダー</strong>M5 Unit NFC (SKU U216, ST25R3916) — Grove Port A</div>
         </div>
         <div class="warning">
-            <h3>本番機 (Atom VoiceS3R) はまだ対象外です</h3>
-            <p>ここで配布しているのは <strong>PSRAM 非搭載の AtomS3 系</strong>向けビルドです。
-               本番機 Atom VoiceS3R (SKU C126-ECHO、PSRAM 8MB) は sdkconfig / パーティション
-               構成が変わるため、<strong>このイメージをそのまま焼かないでください</strong>。
-               打刻音 (ES8311) も VoiceS3R 到着後の対応です。</p>
+            <h3>PSRAM 非搭載の AtomS3 系には焼かないでください</h3>
+            <p>ここで配布しているのは <strong>Atom VoiceS3R 専用</strong>のビルドです。
+               PSRAM (Octal 8MB) を前提に sdkconfig を組んでいるため、
+               AtomS3 / AtomS3 Lite などの PSRAM 非搭載機に焼いても
+               <strong>PSRAM 無しのまま静かに起動します</strong> (エラーは出ません)。
+               打刻音 (ES8311) はまだ入っていません — 別途対応します。</p>
         </div>
     </div>
 
@@ -61,10 +62,30 @@
         <h2>書き込み手順</h2>
         <ol>
             <li>本体を USB-C ケーブルで PC に接続 (PoE Base は外れていてもよい)</li>
+            <li><strong>箱出しの新品は本体ボタンを押しながら挿し直す</strong> —
+                工場出荷ファームは USB オーディオデバイスとして動いており、
+                そのままではシリアルポートが出てきません</li>
             <li>下の「Install」ボタンをクリックし、シリアルポートを選択</li>
-            <li>書き込み完了後、PoE Base に載せて LAN ケーブル (PoE) を接続し、Unit NFC を Grove に挿す</li>
+            <li><strong>書き込みが終わったら、ボタンから指を離して USB を挿し直す</strong> —
+                押したままだと起動のたびにダウンロードモードに入り、
+                <strong>焼けているのにアプリが動きません</strong></li>
+            <li>PoE Base に載せて LAN ケーブル (PoE) を接続し、Unit NFC を Grove に挿す</li>
             <li>シリアルに <code>EVT NFC_READY</code> と <code>EVT ETH_CONNECTED &lt;IP&gt;</code> が出れば疎通完了</li>
         </ol>
+        <div class="warning">
+            <h3>「焼けたのに動かない」ときに見るところ</h3>
+            <p>シリアルに <code>waiting for download</code> や
+               <code>boot:0x30 (DOWNLOAD(USB/UART0))</code> が出ていたら、
+               <strong>ダウンロードモードに入ったままです</strong>。ボタンから指を離して挿し直してください
+               (書き込みは成功しています)。</p>
+            <p><strong>Unit NFC は電源を入れる前に挿しておいてください。</strong>
+               起動時に挿さっていないと <code>EVT NFC_INIT_NG</code> が出て、
+               <strong>後から挿しても再起動するまで復帰しません</strong> (Refs #152)。</p>
+            <p>コマンドラインで確認する場合、<code>espflash monitor</code> に
+               <strong><code>--no-reset</code> を付けないでください</strong> —
+               付けると端末がフラッシュスタブに留まってアプリが起動せず、
+               「反応が無い」ように見えます。</p>
+        </div>
         <div class="warning">
             <h3>初回インストール後はデバイス登録が必要です</h3>
             <p>書き込み直後は未登録で、<code>AUTH STATUS</code> が <code>AUTH UNPAIRED</code> を返します。
@@ -80,8 +101,10 @@
         <h3>動作要件</h3>
         <ul>
             <li>Chrome / Edge / Opera (Web Serial API 対応ブラウザ)</li>
-            <li>AtomS3 系は USB Serial/JTAG 内蔵のため追加ドライバ不要</li>
-            <li>認識されない場合は本体側面のリセットボタンを約 2 秒長押しして書き込みモードへ</li>
+            <li>ESP32-S3 は USB Serial/JTAG 内蔵のため追加ドライバ不要</li>
+            <li>シリアルポートが出てこない場合は、<strong>本体ボタンを押したまま USB を挿し直す</strong>
+                (ROM ダウンロードモード)。工場出荷ファームや、書き込んだファームが
+                起動直後に落ちる状態では、これが唯一の入り口です</li>
         </ul>
     </div>
 
@@ -111,7 +134,15 @@
             <li><code>OTA &lt;url&gt;</code> — 手動ファームウェア更新</li>
         </ul>
         <p>カードをかざすと <code>EVT TIMECARD card_id=… card_kind=felica_idm|license|nfca_uid</code>
-           が出ます。本体 LED は 待機=暗い青 / 読み取り成功=緑 / 失敗=赤 です。</p>
+           が出ます。財布などにカードが 2 枚入っていて両方見えたときは、どちらの打刻か決められないので
+           <strong>打刻せず</strong> <code>EVT NFC_MULTI_CARD</code> だけを出します。</p>
+        <div class="warning">
+            <h3>この端末は点灯で知らせません — 確認はシリアルログで</h3>
+            <p>Atom VoiceS3R には点灯表示がありません (旧 Atom Voice の WS2812 RGB LED は
+               S3R 世代で無くなりました)。<strong>「かざしたのに光らない」は異常ではありません。</strong>
+               読めたかどうかは上の <code>EVT</code> ログで確認してください。
+               現場から見える形の反応 (打刻音) は別途対応します。</p>
+        </div>
         <div class="warning">
             <h3>打刻が「登録されていません」になるとき</h3>
             <p>端末は読み取った <strong>生の値</strong>を送ります (交通系 IC は大文字の IDm 16 文字、

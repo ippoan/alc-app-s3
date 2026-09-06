@@ -32,8 +32,7 @@
 
 // esp-idf-hal 0.46 の legacy RMT は deprecated 扱いだが、新 RMT API は ws2812 の
 // ビット列を組む口が無く、また新旧が同一バイナリに載ると
-// check_rmt_legacy_driver_conflict で abort する (sdkconfig.defaults 参照)。
-// crates/atoms3-timecard/src/led.rs と同じ理由・同じ抑止
+// check_rmt_legacy_driver_conflict で abort する (sdkconfig.defaults 参照)
 #![allow(deprecated)]
 
 use std::sync::{Arc, Mutex};
@@ -126,8 +125,9 @@ fn paint_event(led: &Mutex<Led>, event: &NfcEvent) {
 
 /// 本体 LED (WS2812) とラッチ状態。**塗るのは NFC スレッド (sink クロージャ)、
 /// 待機色へ戻すのは main ループ**なので Mutex 越しに共有する。
-/// crates/atoms3-timecard の `led.rs` とは共有しない — ボードは同じでも
-/// あちらは打刻端末の運用表示、こちらはベンチの目視デバッグで寿命が違う
+/// **本番機 (crates/atoms3-timecard = Atom VoiceS3R) には LED が無い**ので
+/// 共有相手はもう居ない (#151 で向こうの led.rs は消えた)。ここは AtomS3 Lite
+/// (G35) 専用のベンチ用目視デバッグ
 struct Led {
     tx: TxRmtDriver<'static>,
     /// 現在出している色 (同色の再送出を避ける)

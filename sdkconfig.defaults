@@ -47,6 +47,16 @@ CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 # MODE は QUAD (実機 2026-07-13: OCT だと "octal_psram: PSRAM chip is not
 # connected, or wrong PSRAM line mode" で初期化失敗 → IGNORE_NOTFOUND により
 # 黙って PSRAM なし起動になっていた。EVT HEAP の free_psram=0 で発覚)
+#
+# ★★ **この「QUAD が正しい」は CoreS3 (Quad の石) 固有。他機へ横展開しないこと。**
+#    石が Octal の機に QUAD を指定すると、**まったく同じ症状が向きを逆にして出る**
+#    (IGNORE_NOTFOUND により黙って PSRAM なし起動 → free_psram=0)。
+#    実例: Atom VoiceS3R (ESP32-S3-PICO-1-**N8R8**、末尾 R8 = Octal) は
+#    `CONFIG_SPIRAM_MODE_OCT=y` が正しい (crates/atoms3-timecard/sdkconfig.defaults)。
+#    2026-09-06 に、この罠の記述を限定なしで読んで**逆向きに踏みかけた** (#151)。
+#    **判定は M5 公式ファーム (m5stack/uiflow-micropython) の
+#    m5stack/boards/<BOARD>/mpconfigboard.cmake が boards/sdkconfig.spiram_oct を
+#    読むかどうか**で付く。CoreS3 は読まない / AtomS3R・Atom EchoS3R は読む
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_SPEED_80M=y

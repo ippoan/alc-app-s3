@@ -121,11 +121,15 @@ jobs:
               cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-print cargo check --release --locked -p alc-hub-atoms3-print",
               cache_key: build-atoms3 }
           # NFC タイムカード端末 (#134)。sdkconfig が atoms3-print とも違う
-          # (Unit NFC / WS2812 のための legacy ドライバ衝突回避を足している) ため
-          # cache_key は**新規**。使い回すと esp-idf-sys が永遠に cold (Refs #63)
+          # (Unit NFC の legacy ドライバ衝突回避 + PSRAM) ため cache_key は**新規**。
+          # 使い回すと esp-idf-sys が永遠に cold (Refs #63)。
+          # **本番機 Atom VoiceS3R への移行 (#151) で PSRAM (OCT) を足したので、
+          #   検証機時代の `build-timecard` からキーを切り替えている** — sdkconfig が
+          #   変わると esp-idf-sys の成果物が別フレーバーになり、同じキーのままだと
+          #   毎回 miss して復元にも保存にも時間だけ払う
           - { name: atoms3-timecard,
               cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard cargo check --release --locked -p alc-hub-atoms3-timecard",
-              cache_key: build-timecard }
+              cache_key: build-timecard-s3r }
 
     steps:
       - name: Checkout
@@ -279,14 +283,16 @@ jobs:
           # **配布の前提**: /device/setup の機種エントリ (auth-worker) と
           # cf-alc-recorder の device-timecard role が揃っていること — role と
           # kind の 1:1 が崩れると firmware の取り違えを構造的に防げなくなる。
-          # 本番機 Atom VoiceS3R (PSRAM 8MB) へ移すときは sdkconfig /
-          # partitions / cache_key を作り直すこと (crates/atoms3-timecard/src/main.rs)
+          # 対象は**本番機 Atom VoiceS3R** (C126-ECHO / 8MB Flash + 8MB Octal PSRAM)。
+          # #151 で検証機 (AtomS3 Lite) 向けから差し替えた。PSRAM を足して sdkconfig が
+          # 変わったので **cache_key も `build-timecard` から切り替えている** (Refs #63)。
+          # check の leg (上) と**同じキーにすること** — 別々だと同じ成果物を 2 回作る
           - name: atoms3-timecard
             bin: alc-hub-atoms3-timecard
             build_env: 'ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard'
             flash_size: 8mb
             partition_table: crates/atoms3-timecard/partitions.csv
-            cache_key: build-timecard
+            cache_key: build-timecard-s3r
 
     steps:
       - name: Checkout
