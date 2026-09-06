@@ -219,6 +219,9 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
     // **現在値を新しい基準にしてはいけない** — カードが載ったままの値を基準化すると、
     // 以後そのカードは差分を作れず**永久に見えなくなる** (#155 で実機確認)
     let mut baseline_before_trigger: Option<(i32, i32)> = None;
+    /// 固着 → 巻き戻し → また固着、が続いた回数。**2 回目で現在値を採る** (#155)
+    const STUCK_ROLLBACK_LIMIT: u32 = 2;
+    let mut stuck_rollbacks: u32 = 0;
     let mut tick: u32 = 0;
 
     loop {
@@ -285,17 +288,40 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
                 baseline_before_trigger = Some((baseline, baseline_ph));
             }
             Some(t0) if t0.elapsed() > TRIGGER_STUCK => {
-                // **現在値を基準にしない** (#155)。カードが載っている可能性がある間に
-                // その値を基準化すると、以後そのカードが見えなくなる。
-                // トリガ前の値へ戻すだけにする — 本当に環境が変わっていれば
-                // すぐ再びトリガするが、**トリガ中もポーリングは回る**ので
-                // カードは読める (存在検知は RF ポーリングを省く最適化にすぎない)
-                if let Some((b, bp)) = baseline_before_trigger {
-                    baseline = b;
-                    baseline_ph = bp;
-                }
+                // 固着の抜け方は 2 段構え (#155)。**どちらか一方だけでは破綻する:**
+                //
+                // 1 回目は**トリガ前の値へ巻き戻す。現在値を基準にしない** —
+                // カードが載ったままの値を基準化すると、**以後そのカードが
+                // 見えなくなる** (実機で確認)。
+                //
+                // **2 回続けて固着したら現在値を採る。** 巻き戻しだけにしていたら、
+                // 環境が本当にドリフトしたとき (実機: 位相の地合いが 176→181 へ移動)
+                // **巻き戻した基準に永久に戻れず、8 秒ごとに固着し続けた**。
+                // そのあいだ常時ポーリング状態になり、**読み取りが軒並み失敗する**
+                // (`ATTRIB 失敗` / `select 失敗` が続いた)。
+                // 「固着してもポーリングは回るから読める」という当初の読みは
+                // **実機で否定された** (2026-09-06)。
+                let rolled_back = if stuck_rollbacks < STUCK_ROLLBACK_LIMIT - 1 {
+                    if let Some((b, bp)) = baseline_before_trigger {
+                        baseline = b;
+                        baseline_ph = bp;
+                    }
+                    stuck_rollbacks += 1;
+                    true
+                } else {
+                    // 巻き戻しても直らなかった = 地合いが動いている。現在値を採る
+                    baseline = amp;
+                    baseline_ph = ph;
+                    stuck_rollbacks = 0;
+                    false
+                };
                 log::info!(
-                    "nfc presence: トリガ固着 {TRIGGER_STUCK:?} — ベースラインを戻す (amp={amp}/{baseline} ph={ph}/{baseline_ph})"
+                    "nfc presence: トリガ固着 {TRIGGER_STUCK:?} — {} (amp={amp}/{baseline} ph={ph}/{baseline_ph})",
+                    if rolled_back {
+                        "ベースラインを戻す"
+                    } else {
+                        "戻しても直らないので現在値を基準にする"
+                    }
                 );
                 triggered_since = None;
                 baseline_before_trigger = None;
@@ -379,6 +405,8 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
 
         if got {
             triggered_since = None;
+            // 読めた = 固着ではない。巻き戻しの回数を数え直す
+            stuck_rollbacks = 0;
         }
 
         // カードが載っている間は「まだ同じタップ」。**読み取り (observe) の後に
