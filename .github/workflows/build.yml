@@ -228,14 +228,15 @@ jobs:
       # read-only restore する。restore-keys の fallback は .cargo/config.toml +
       # rust-toolchain.toml の hash 内に閉じる: ESP_IDF_VERSION / toolchain 変更を
       # 跨いで古い esp-idf-sys CMake build dir (絶対パスを記憶する) が刺さる事故を
-      # 防ぐ (ble-medical-gateway で実測)
+      # 防ぐ (ble-medical-gateway で実測)。components/ の hash も同様
+      # (理由は build job の Cache target dir のコメント)
       - name: Restore target dir (restore only)
         uses: actions/cache/restore@v4
         with:
           path: target
-          key: target-${{ matrix.cache_key }}-${{ hashFiles('.cargo/config.toml', 'rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          key: target-${{ matrix.cache_key }}-${{ hashFiles('.cargo/config.toml', 'rust-toolchain.toml') }}-${{ hashFiles('components/**') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            target-${{ matrix.cache_key }}-${{ hashFiles('.cargo/config.toml', 'rust-toolchain.toml') }}-
+            target-${{ matrix.cache_key }}-${{ hashFiles('.cargo/config.toml', 'rust-toolchain.toml') }}-${{ hashFiles('components/**') }}-
 
       # 変更があったクレートの再コンパイルを内容ベースの rustc キャッシュで
       # ヒットに変える (未変更クレートは restore-mtime + target restore で
@@ -390,14 +391,20 @@ jobs:
       # esp-idf-sys の CMake ビルドディレクトリは ninja 等の絶対パスを記憶する
       # ため、ESP_IDF_VERSION 変更を跨いで古いキャッシュを復元すると CMake
       # configure が壊れる (ble-medical-gateway で実測)。バージョン変更時は
-      # fallback 無しの cold start になり、素の状態から作り直す
+      # fallback 無しの cold start になり、素の状態から作り直す。
+      # components/ (nfc_shim / M5 の C++ コンポーネント) のハッシュも key と
+      # fallback prefix に入れる: esp-idf-sys の成果物 (libnfc_shim.a 等) はその
+      # source に依存するのに cargo は components/ を追跡しない。#163 で shim に
+      # extern "C" 関数を足したとき、cache に残った古い成果物で link が
+      # `undefined reference to nfc_shim_prepare_mode_b` になり main の build が
+      # 4 連続で落ちた (2026-09-06)。ローカルで cargo clean -p esp-idf-sys が要ったのと同じ
       - name: Cache target dir
         uses: actions/cache@v4
         with:
           path: target
-          key: target-${{ matrix.cache_key }}-${{ hashFiles('.cargo/config.toml', 'rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          key: target-${{ matrix.cache_key }}-${{ hashFiles('.cargo/config.toml', 'rust-toolchain.toml') }}-${{ hashFiles('components/**') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            target-${{ matrix.cache_key }}-${{ hashFiles('.cargo/config.toml', 'rust-toolchain.toml') }}-
+            target-${{ matrix.cache_key }}-${{ hashFiles('.cargo/config.toml', 'rust-toolchain.toml') }}-${{ hashFiles('components/**') }}-
 
       - name: Cache espflash binary
         id: cache-espflash
