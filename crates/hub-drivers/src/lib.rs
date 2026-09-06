@@ -38,7 +38,11 @@ pub mod recorder;
 pub mod rs232;
 pub mod task;
 // 音 (I2S + codec)。**NFC とは独立**の feature — 音だけ欲しい機 (点呼端末の
-// 警告デバイス) がビルドできるようにするため分けてある (plan/standing-devices.md §2.3)
+// 警告デバイス) がビルドできるようにするため分けてある (plan/standing-devices.md §2.3)。
+// speaker.rs = 共通の再生ロジック + CoreS3 (AW88298) の初期化、
+// es8311.rs = Atom VoiceS3R の初期化。**ボード依存はコーデックの起こし方だけ**
+#[cfg(feature = "speaker")]
+pub mod es8311;
 #[cfg(feature = "speaker")]
 pub mod speaker;
 pub mod ws_uplink;

@@ -83,13 +83,16 @@ use alc_hub_common::{
 };
 use alc_hub_core::timecard::{payload_json, CardKind};
 use alc_hub_drivers::nfc::NfcEvent;
-use alc_hub_drivers::{crashlog, eth_w5500, heap, nfc, ntp, ota, ws_uplink};
+use alc_hub_drivers::speaker::Sound;
+use alc_hub_drivers::{crashlog, es8311, eth_w5500, heap, nfc, ntp, ota, speaker, ws_uplink};
 use anyhow::Result;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::{
     delay::FreeRtos,
+    i2c::{config::Config as I2cConfig, I2cDriver},
     peripherals::Peripherals,
     spi::{config::DriverConfig as SpiDriverConfig, Dma, SpiDriver},
+    units::Hertz,
 };
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use std::sync::{mpsc, Arc, Mutex};
@@ -161,6 +164,51 @@ fn main() -> Result<()> {
     let spi: &'static SpiDriver<'static> = Box::leak(Box::new(spi));
     eth_w5500::start(spi, p.pins.gpio6.into(), None, sysloop, Arc::clone(&status))?;
 
+    // 内蔵オーディオ (ES8311 + NS4150B、issue #154)。**打刻音はこの端末で
+    // かざした人に伝わる唯一の反応** — 本機に LED は無い (#151)。
+    //
+    // I2C は内蔵バス (SDA=G45 / SCL=G0)。**Grove の Unit NFC とは別ポート**で、
+    // あちらは nfc_shim (C++) が I2C_NUM_0 を新ドライバで握っているため
+    // ここは i2c1 を使う (CoreS3 とは逆の割り当て)
+    let mut audio_i2c = I2cDriver::new(
+        p.i2c1,
+        p.pins.gpio45,
+        p.pins.gpio0,
+        &I2cConfig::new().baudrate(Hertz(400_000)),
+    )?;
+    // 内蔵バスに誰が居るか。ES8311 (0x18) が見えなければ配線かポートが違う。
+    // ついでに LP5562 (0x30) の有無も見る — #151 で未確定のまま残した点で、
+    // 居なければ「この端末に RGB LED は無い」が確定する
+    es8311::probe_bus(&mut audio_i2c);
+
+    // 音は**失敗しても致命にしない** — 鳴らなくても打刻そのものは成立する。
+    // `_amp_en` は NS4150B の有効化ピン (G18) で、**drop すると出力が落ちる**ので
+    // main が持ち続ける
+    let (speaker_tx, _amp_en) = match (|| -> Result<_> {
+        // **順番が命** (Refs #102): I2S を立てて BCK/WS を実際に流してから
+        // コーデックを起こす。新 I2S ドライバは FIFO 空で BCK を止めるので、
+        // `tx_enable()` だけではクロックが出ず PLL がロックしない。
+        // MCLK (G11) は配線しない — ES8311 側を MCLK=BCLK で使う (es8311.rs)
+        let mut spk = speaker::Speaker::new(
+            p.i2s1,
+            p.pins.gpio17.into(), // BCLK
+            p.pins.gpio3.into(),  // WS (LRCK)
+            p.pins.gpio48.into(), // DOUT
+        )?;
+        spk.feed_silence(300)?;
+        let en = es8311::init_amp(&mut audio_i2c, p.pins.gpio18.into())?;
+        // 無音だったときの切り分け用に初期化直後の全レジスタを残す (Refs #102)
+        es8311::dump_regs(&mut audio_i2c);
+        Ok((speaker::start_player(spk)?, en))
+    })() {
+        Ok((tx, en)) => (Some(tx), Some(en)),
+        Err(e) => {
+            log::warn!("speaker: 初期化失敗 — 打刻音なしで継続する: {e:#}");
+            println!("EVT SPEAKER_NG");
+            (None, None)
+        }
+    };
+
     // Unit NFC (ST25R3916): Grove Port A (SDA=G2 / SCL=G1)。読み取りループは
     // hub-drivers/src/nfc.rs (CoreS3 と共有)。**ここに NFC のコードを書かない**
     nfc::start(
@@ -168,7 +216,7 @@ fn main() -> Result<()> {
         p.pins.gpio2.into(),
         p.pins.gpio1.into(),
         Arc::clone(&status),
-        move |e: &NfcEvent| on_card(e, &ws_meas_tx),
+        move |e: &NfcEvent| on_card(e, &ws_meas_tx, speaker_tx.as_ref()),
     )?;
 
     // 起動完了 = OTA rollback 解除 (CoreS3 と同じ安全装置、ota.rs 参照)
@@ -198,7 +246,11 @@ fn main() -> Result<()> {
 /// **`card_id` は生値のまま**送る (接頭辞を付けると punch のカード照合が
 /// 必ず外れる — alc_hub_core::timecard の doc 参照)。`session_id` は
 /// 点呼ではないので付けない。
-fn on_card(event: &NfcEvent, ws_tx: &mpsc::Sender<UplinkRecord>) {
+fn on_card(
+    event: &NfcEvent,
+    ws_tx: &mpsc::Sender<UplinkRecord>,
+    speaker: Option<&mpsc::Sender<Sound>>,
+) {
     let (card_id, kind) = match event {
         NfcEvent::Felica { idm } => (idm.clone(), CardKind::FelicaIdm),
         NfcEvent::NfcaUid { uid } => (uid.clone(), CardKind::NfcaUid),
@@ -247,7 +299,15 @@ fn on_card(event: &NfcEvent, ws_tx: &mpsc::Sender<UplinkRecord>) {
     };
     println!("EVT TIMECARD card_id={card_id} card_kind={}", kind.label());
     if ws_tx.send(record).is_err() {
-        // ws_uplink スレッドが死んでいる = 送信不能
+        // ws_uplink スレッドが死んでいる = 送信不能。**鳴らさない** —
+        // 「鳴った = 打刻を預かった」を崩さないため
         log::error!("timecard: 送信キューへ積めなかった (ws_uplink が停止)");
+        return;
+    }
+    // 打刻音。**送信キューへ積めたときだけ鳴らす。**再生はスレッド分離済み
+    // (speaker::start_player) なので、ここはキュー投入だけで即座に戻る —
+    // NFC のポーリングを 160ms 止めない
+    if let Some(tx) = speaker {
+        let _ = tx.send(Sound::PunchOk);
     }
 }

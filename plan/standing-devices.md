@@ -138,7 +138,25 @@ ffmpeg / sox のコマンド列として残すこと)。CoreS3 用の既存 raw 
 — CoreS3 の AW88298 + 内蔵スピーカーでは無加工が最良と 2026-07-21 に実測済みで、
 共有すると CoreS3 側が劣化する。
 
-### 2.3 `speaker.rs` の分割 (両機で共有する部分)
+### 2.3 コーデックの分け方 (両機で共有する部分)
+
+> **実装状況 (2026-09-06、#154)**: **`speaker.rs` は割らなかった。**
+> ES8311 は **`crates/hub-drivers/src/es8311.rs` を隣に足す**形で実装し、
+> `speaker.rs` は「共通の再生ロジック + CoreS3 (AW88298) の初期化」のまま残してある。
+>
+> **割らなかった理由**: ボード依存はコーデックの起こし方だけで、`es8311.rs` を
+> 並べれば済む。**割ると CoreS3 本番ファームの共有コードを動かすことになり、
+> 機能上の利得が無いのに実機で確かめ直す範囲が広がる。**
+> (下の 1. は ES8311 の実装が無い時点で立てた設計で、**もう不要**)
+>
+> **実際に共有しているもの**: `Sound` enum / `start_player` / `Speaker::new` /
+> `beep` / `beep_twice` / `feed_silence` / `play_pcm_24k_mono`。
+> **ボード依存はコーデック初期化とアンプ有効化だけ** —
+> CoreS3 = `speaker::init_amp` (AW88298 + AW9523)、
+> VoiceS3R = `es8311::init_amp` (ES8311 0x18 + NS4150B の G18)。
+>
+> ⚠ **`speaker.rs` という名前だが、その `init_amp` / `dump_regs` / `read_sysst` は
+> CoreS3 専用。**VoiceS3R のつもりで呼ばないこと (モジュール doc にも書いてある)。
 
 現状の `crates/hub-drivers/src/speaker.rs` は CoreS3 専用の初期化と汎用の再生
 ロジックが 1 ファイルに同居している。ボード依存は次の 2 点だけ:
@@ -152,11 +170,17 @@ ffmpeg / sox のコマンド列として残すこと)。CoreS3 用の既存 raw 
 
 したがって:
 
-1. `speaker.rs` を **codec 初期化 trait (もしくは `#[cfg]` 分岐) + 共通再生**に割る。
-   `Speaker::new` は既にピンを引数で受けているのでそのまま使える。
-2. **`Sound` enum を拡張する** — 現状 `BeepOk` / `Registered` の 2 つで、
+1. ~~`speaker.rs` を **codec 初期化 trait (もしくは `#[cfg]` 分岐) + 共通再生**に割る~~
+   → **割らなかった** (上のとおり `es8311.rs` を並べた、#154)。
+   `Speaker::new` が既にピンを引数で受けているので、そのまま両機で使えている。
+2. **`Sound` enum を拡張する** — もとは `BeepOk` / `Registered` の 2 つで、
    `start_player` の `match` にハードコードされている。§2.1 の 4 パターン
-   (`PunchOk` / `AlertLoop` / `AlertStop`) を足す。ループ音は
+   (`PunchOk` / `AlertLoop` / `AlertStop`) を足す。
+   **`PunchOk` (3000Hz 60ms ×2、間隔 40ms) は #154 で実装済み** —
+   `Speaker::beep_twice` として、1 本のバッファに畳んで書く形にしてある
+   (`beep` を 2 回呼ぶと 1 回ごとに先頭 20ms のリードイン無音が入り、
+   間隔が 40ms ではなく 60ms に伸びて「速く 2 回」に聞こえない)。
+   残る `AlertLoop` / `AlertStop` は機 (2) の話。ループ音は
    「止めるまで繰り返す」ので、`start_player` に**中断可能なループ**の口
    (`Sound::Stop` を受けたら再生中のループを抜ける) が要る — 現状の
    `while let Ok(sound) = rx.recv()` は再生中に次を受け取れないので、
@@ -194,20 +218,29 @@ CoreS3 で踏んだ罠 (issue #102) は ES8311 でもそのまま効く見込み
 
 | 用途 | GPIO |
 |---|---|
-| 内蔵オーディオ (ES8311 codec / NS4150B アンプ / MEMS マイク) | G45(SDA) / G0(SCL) / G48(DOUT) / G4(DIN) / G3(WS) / G17(BCLK) / G11(MCLK) / G18(NS4150_CTR) — **すべて内部ピン** |
+| 内蔵オーディオ (ES8311 codec / NS4150B アンプ / MEMS マイク) | G45(SDA) / G0(SCL) / G48(DOUT) / G4(DIN) / G3(WS) / G17(BCLK) / **G11(MCLK — 配線は在るが再生では使わない**、下記) / G18(NS4150_CTR) — **すべて内部ピン** |
+
+**G11 (MCLK) について**: **配線は基板に在るが、打刻音の再生では使っていない** (#154)。
+ES8311 のレジスタ `0x01 = 0xB5` が **「MCLK は BCLK から取る」**指定で、
+MCLK ピンを配線しなくても鳴るため。M5Unified の VoiceS3R 定義でも
+**スピーカー側は `spk_cfg.pin_mck` がコメントアウト**されており、
+`pin_mck = GPIO_NUM_11` を設定しているのは**マイク側だけ**。
+⇒ **「無い」のではなく「在るが使っていない」。**マイクを使うときや、
+MCLK 必須の設定に変えるときはこのピンを配線する。
 | 赤外線送信 | G47 (IR_TX) — 内部 |
 | 本体ボタン | G41 — 内部 |
 | Grove (HY2.0-4P) | G1 / G2 → Unit NFC (`atoms3-nfc` と同じ配線) |
 | 底面バス (**実機で確定**) | J5 = 3V3/G5/G6/G7/G8、J6 = G39/G38/5V/GND → PoE Base の W5500 SPI (SCLK=G5 / MISO=G7 / MOSI=G8 / CS=G6)。**2026-09-06 に実機で DHCP まで通過。下記** |
-| **RGB LED** | **未確定** (下記)。ただし**単線 WS2812 は無い** |
+| **RGB LED** | **無し** (2026-09-06 に実機で確定、下記) |
 
-#### ★ この端末は LED で知らせない (#151、オーナー判断 2026-09-05)
+#### ★ この端末は LED で知らせない (#151、オーナー判断 2026-09-05。#154 で確定)
 
 **結論を先に: `crates/atoms3-timecard` に LED 表示は無い。**
 **AtomS3 Lite の WS2812 (G35) を前提に設計しないこと。**
 現場向けの反応は §2 の**打刻音 (ES8311)** が全部引き受ける。
 オーナー判断は「**このまま進める。音だけで良い**」で、LED を外付けする案も、
 LED と音の両方を持つボードへ見直す案も**採らない**。
+**打刻音は #154 で入り、実機で鳴ることを確認済み** (2026-09-06)。
 
 以下は根拠。**「確定」と「未確定」を混ぜないこと** (#151 で 1 度混ぜかけた)。
 
@@ -220,21 +253,31 @@ LED と音の両方を持つボードへ見直す案も**採らない**。
 ⇒ **RMT で 1 本の GPIO にビット列を流す方式 (`led.rs`) はどうやっても点かない。**
 このため `crates/atoms3-timecard/src/led.rs` は #151 で**削除した**。
 
-**未確定なこと: VoiceS3R が LP5562 と RGB LED を実装しているか。**
+**LP5562 の実装有無も 2026-09-06 に決着した (#154): 居ない。**
 
-- 無い側の根拠 (VoiceS3R 固有): M5 公式 SKU ページ
-  (`docs.m5stack.com/en/products/sku/C126-Echo`) の比較表に
-  "Atom VoiceS3R **has no RGB LED**, while Atom Voice includes WS2812 x1"。
-  公式ピンマップ (`docs.m5stack.com/en/core/Atom_EchoS3R`) にも LED の項が無い
-- 有る側の根拠: 上の回路図に LP5562 の回路がある (AtomS3R では実装されている)
+`#154` で ES8311 の I2C バスを立てたついでに内蔵バス (SDA=G45 / SCL=G0) を
+スキャンした実機出力:
+
+```
+EVT I2C_SCAN devices=1 es8311=1 lp5562=0
+```
+
+**居たのは ES8311 (0x18) だけ。LP5562 (0x30) は不在。**
+⇒ **Atom VoiceS3R に RGB LED は無い** (確定)。
+
+**未確定だった経緯 (消さないこと)**: `#151` の時点では
+「単線 WS2812 は無い」までしか確定できなかった。M5 公式 SKU 比較表
+(`docs.m5stack.com/en/products/sku/C126-Echo`) の
+"Atom VoiceS3R **has no RGB LED**, while Atom Voice includes WS2812 x1" と、
+公式ピンマップ (`docs.m5stack.com/en/core/Atom_EchoS3R`) に LED の項が無いことから
+「無い」と読めたが、**M5 が同 SKU ページに挙げている AtomS3R の回路図には
+LP5562 の回路がある**ため、VoiceS3R が実装しているかが決められなかった。
+**実機の I2C スキャンで確定させた。**
 
 ⚠ **M5Unified の RGBLED ピン表 `_pin_table_other0` に `board_M5AtomVoiceS3R` が
-無いことは根拠にならない。** あの表は**単線 WS2812 用**で、LP5562 で RGB LED を持つ
-`board_M5AtomS3R` も同じく載っていない。
-
-⇒ **決着は実機で内蔵 I2C (SDA=G45 / SCL=G0) の 0x30 を probe するしかない。**
-ただし**仮に載っていても方式が違う** (I2C ドライバの新規実装) ので、
-上の結論 (LED で知らせない) は変わらない。
+無いことは根拠にならない** (#151 で 1 度これを根拠にしかけた)。
+あの表は**単線 WS2812 用**で、LP5562 で RGB LED を持つ `board_M5AtomS3R` も
+同じく載っていない。**「表に無い = 非搭載」ではない。**
 
 **運用 doc への影響**: `ippoan/alc-app` の `docs/operator/` 系が
 「打刻音は鳴らない。端末の反応は LED だけ (待機=暗い青 / 受付=緑 / 読取失敗=赤、1 秒ラッチ)」と

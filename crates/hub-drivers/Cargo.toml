@@ -9,7 +9,8 @@ description = "ホストリンク (USB CDC 行プロトコル + Improv 振り分
 nfc = []
 # 音 (I2S + codec)。**nfc とは独立** — 音だけ欲しい機 (点呼端末の警告デバイス) が
 # ビルドできるように分けてある (plan/standing-devices.md §2.3)。
-# 現状の実装は CoreS3 (AW88298) 専用。ES8311 は issue #134 第2段階
+# コーデックは CoreS3 = AW88298 (speaker.rs)、Atom VoiceS3R = ES8311 (es8311.rs)。
+# 再生ロジックは両者で共有する
 speaker = []
 
 [dependencies]
