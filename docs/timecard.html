@@ -66,9 +66,26 @@
                 工場出荷ファームは USB オーディオデバイスとして動いており、
                 そのままではシリアルポートが出てきません</li>
             <li>下の「Install」ボタンをクリックし、シリアルポートを選択</li>
-            <li>書き込み完了後、PoE Base に載せて LAN ケーブル (PoE) を接続し、Unit NFC を Grove に挿す</li>
+            <li><strong>書き込みが終わったら、ボタンから指を離して USB を挿し直す</strong> —
+                押したままだと起動のたびにダウンロードモードに入り、
+                <strong>焼けているのにアプリが動きません</strong></li>
+            <li>PoE Base に載せて LAN ケーブル (PoE) を接続し、Unit NFC を Grove に挿す</li>
             <li>シリアルに <code>EVT NFC_READY</code> と <code>EVT ETH_CONNECTED &lt;IP&gt;</code> が出れば疎通完了</li>
         </ol>
+        <div class="warning">
+            <h3>「焼けたのに動かない」ときに見るところ</h3>
+            <p>シリアルに <code>waiting for download</code> や
+               <code>boot:0x30 (DOWNLOAD(USB/UART0))</code> が出ていたら、
+               <strong>ダウンロードモードに入ったままです</strong>。ボタンから指を離して挿し直してください
+               (書き込みは成功しています)。</p>
+            <p><strong>Unit NFC は電源を入れる前に挿しておいてください。</strong>
+               起動時に挿さっていないと <code>EVT NFC_INIT_NG</code> が出て、
+               <strong>後から挿しても再起動するまで復帰しません</strong> (Refs #152)。</p>
+            <p>コマンドラインで確認する場合、<code>espflash monitor</code> に
+               <strong><code>--no-reset</code> を付けないでください</strong> —
+               付けると端末がフラッシュスタブに留まってアプリが起動せず、
+               「反応が無い」ように見えます。</p>
+        </div>
         <div class="warning">
             <h3>初回インストール後はデバイス登録が必要です</h3>
             <p>書き込み直後は未登録で、<code>AUTH STATUS</code> が <code>AUTH UNPAIRED</code> を返します。

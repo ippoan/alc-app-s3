@@ -35,12 +35,14 @@
 //!   (`MICROPY_HW_I2C0_SCL 1` / `MICROPY_HW_I2C0_SDA 2`)、および M5Unified の
 //!   `_pin_table_i2c_ex_in` の `board_M5AtomVoiceS3R` 行が一致する。
 //!   内蔵 I2C は G0/G45 なので Unit NFC と競合しない
-//! - **【推定・AtomS3R 由来】底面バスは J5 = 3V3/G5/G6/G7/G8、J6 = G39/G38/5V/GND**。
-//!   M5 は C126-ECHO の SKU ページで本体基板の回路図として
-//!   `Sch_M5_AtomS3R_v0.4.1.pdf` を挙げており、そこから読んだ値。
-//!   **ただしその PDF は AtomS3R のもので、VoiceS3R が持たない LCD
-//!   (`DISP_RST` / `LED_BL`) と IMU (`IMU_INT`) を含む。**同一基板とは限らない。
-//!   **PoE のリンクアップが実機で取れて初めて確定する** (issue #151 の受け入れ条件)
+//! - **【確定・実機 2026-09-06】底面バスは J5 = 3V3/G5/G6/G7/G8、J6 = G39/G38/5V/GND**。
+//!   もとは AtomS3R の回路図 (`Sch_M5_AtomS3R_v0.4.1.pdf`、M5 が C126-ECHO の
+//!   SKU ページで本体基板の回路図として挙げているもの) **からの推定**だった —
+//!   その PDF は VoiceS3R が持たない LCD と IMU を含むため同一基板とは限らない。
+//!   **#151 の初回書き込みで Atomic PoE Base を載せた実機が W5500 に応答し
+//!   DHCP まで通ったので確定**した (`EVT ETH_CONNECTED`)。
+//!   外していれば `W5500 version mismatched` で必ず落ちる種類の推定だったので、
+//!   実機まで持ち込んで決着させてよかった (経緯は plan §3.1)
 //!
 //! # ★ 本機で `led.rs` (WS2812) は成立しない
 //!

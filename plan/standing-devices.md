@@ -198,7 +198,7 @@ CoreS3 で踏んだ罠 (issue #102) は ES8311 でもそのまま効く見込み
 | 赤外線送信 | G47 (IR_TX) — 内部 |
 | 本体ボタン | G41 — 内部 |
 | Grove (HY2.0-4P) | G1 / G2 → Unit NFC (`atoms3-nfc` と同じ配線) |
-| 底面バス (**推定**) | J5 = 3V3/G5/G6/G7/G8、J6 = G39/G38/5V/GND → PoE Base の W5500 SPI (`atoms3-print` 実績: SCLK=G5 / MISO=G7 / MOSI=G8 / CS=G6)。**根拠は AtomS3R の回路図。下記** |
+| 底面バス (**実機で確定**) | J5 = 3V3/G5/G6/G7/G8、J6 = G39/G38/5V/GND → PoE Base の W5500 SPI (SCLK=G5 / MISO=G7 / MOSI=G8 / CS=G6)。**2026-09-06 に実機で DHCP まで通過。下記** |
 | **RGB LED** | **未確定** (下記)。ただし**単線 WS2812 は無い** |
 
 #### ★ この端末は LED で知らせない (#151、オーナー判断 2026-09-05)
@@ -255,11 +255,29 @@ Pages に載せてはいるが、**現場で動いている AtomS3 Lite の群�
 増える。S3R はオーディオが内部ピンに移り、ターゲットも `xtensa-esp32s3-espidf`
 のままなので両方解消する。
 
-#### 確認結果 (2026-09-05、#151 で回路図まで当たった)
+#### 確認結果 (2026-09-05 に回路図、2026-09-06 に実機。#151)
 
-1. **底面バスは依然「AtomS3R からの推定」。**回路図まで当たったが、
-   **VoiceS3R 固有の一次資料は見つからなかった** (VoiceS3R の公式ページに
-   底面バスの表が無い)。分かったのは次のところまで:
+1. **底面バスは「AtomS3R の回路図からの推定」→ 2026-09-06 に実機で確定。**
+   **VoiceS3R 固有の一次資料は最後まで見つからなかった** (VoiceS3R の公式ページに
+   底面バスの表が無い)。**推定のまま焼いて、実機で決着させた。**
+
+   **決着** (2026-09-06、#151 の初回書き込み): Atomic PoE Base に載せた状態で
+   **W5500 が応答し、DHCP で IP を取得**した。
+   ```
+   I esp_idf_svc::eth: Initialization complete
+   I esp_eth.netif.netif_glue: ethernet attached to netif
+   EVT ETH_CONNECTED <IP> subnet=Subnet { gateway: <GW>, mask: Mask(24) }
+   ```
+   ⇒ **SCLK=G5 / MISO=G7 / MOSI=G8 / CS=G6 は VoiceS3R でそのまま使える。**
+
+   **推定のまま進めてよかった理由を残す** (次の機種で効く):
+   **外れていたら W5500 の初期化で必ず落ちる** ので、間違ったまま気付かず進む形にならなかった。
+   実際、Unit NFC / PoE Base を挿さずに焼いた 1 回目は
+   `W5500 version mismatched, expected 0x04, got 0x00` で明示的に落ちている。
+   **「外れたら黙って進む」種類の推定なら、実機まで持ち込んではいけない**
+   (PSRAM の線モードがまさにそれで、`IGNORE_NOTFOUND` のせいで黙って通ってしまう)。
+
+   以下は推定の根拠として当時集めたもの (**消さないこと**):
    - M5 は C126-ECHO の SKU ページで本体基板の回路図として
      **`Sch_M5_AtomS3R_v0.4.1.pdf`** を挙げている (音声側は
      `Sch_M5_AtomEchoS3R_Audio_v1.0`)。音声側の回路図に出てくるネットは
@@ -274,9 +292,8 @@ Pages に載せてはいるが、**現場で動いている AtomS3 Lite の群�
      (`DISP_RST` / `LED_BL`) と IMU (`IMU_INT`) を含む。同一基板とは限らない**
      (M5Unified は BMI270 の有無で AtomS3RExt と VoiceS3R を判別している =
       VoiceS3R に BMI270 は無い)
-   ⇒ **確定は実機の PoE リンクアップをもって行う** (#151 の受け入れ条件)
-2. スイッチサイエンスの PoE ベース対応表は依然 S3R 系が未記載。上記 1 の推定が
-   正しければ電気的には載る。**実リンクアップは実機で確認する**
+2. スイッチサイエンスの PoE ベース対応表は依然 S3R 系が未記載だが、
+   **上記 1 のとおり実機で載ることを確認済み** (2026-09-06)
 3. ~~`sdkconfig.defaults` を S3R 向けに起こし直す~~ → **実施済み**
    (`crates/atoms3-timecard/sdkconfig.defaults`)。
    **ただし MODE は QUAD ではなく `CONFIG_SPIRAM_MODE_OCT=y`。**
