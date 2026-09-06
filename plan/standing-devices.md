@@ -138,7 +138,25 @@ ffmpeg / sox のコマンド列として残すこと)。CoreS3 用の既存 raw 
 — CoreS3 の AW88298 + 内蔵スピーカーでは無加工が最良と 2026-07-21 に実測済みで、
 共有すると CoreS3 側が劣化する。
 
-### 2.3 `speaker.rs` の分割 (両機で共有する部分)
+### 2.3 コーデックの分け方 (両機で共有する部分)
+
+> **実装状況 (2026-09-06、#154)**: **`speaker.rs` は割らなかった。**
+> ES8311 は **`crates/hub-drivers/src/es8311.rs` を隣に足す**形で実装し、
+> `speaker.rs` は「共通の再生ロジック + CoreS3 (AW88298) の初期化」のまま残してある。
+>
+> **割らなかった理由**: ボード依存はコーデックの起こし方だけで、`es8311.rs` を
+> 並べれば済む。**割ると CoreS3 本番ファームの共有コードを動かすことになり、
+> 機能上の利得が無いのに実機で確かめ直す範囲が広がる。**
+> (下の 1. は ES8311 の実装が無い時点で立てた設計で、**もう不要**)
+>
+> **実際に共有しているもの**: `Sound` enum / `start_player` / `Speaker::new` /
+> `beep` / `beep_twice` / `feed_silence` / `play_pcm_24k_mono`。
+> **ボード依存はコーデック初期化とアンプ有効化だけ** —
+> CoreS3 = `speaker::init_amp` (AW88298 + AW9523)、
+> VoiceS3R = `es8311::init_amp` (ES8311 0x18 + NS4150B の G18)。
+>
+> ⚠ **`speaker.rs` という名前だが、その `init_amp` / `dump_regs` / `read_sysst` は
+> CoreS3 専用。**VoiceS3R のつもりで呼ばないこと (モジュール doc にも書いてある)。
 
 現状の `crates/hub-drivers/src/speaker.rs` は CoreS3 専用の初期化と汎用の再生
 ロジックが 1 ファイルに同居している。ボード依存は次の 2 点だけ:
@@ -152,11 +170,17 @@ ffmpeg / sox のコマンド列として残すこと)。CoreS3 用の既存 raw 
 
 したがって:
 
-1. `speaker.rs` を **codec 初期化 trait (もしくは `#[cfg]` 分岐) + 共通再生**に割る。
-   `Speaker::new` は既にピンを引数で受けているのでそのまま使える。
-2. **`Sound` enum を拡張する** — 現状 `BeepOk` / `Registered` の 2 つで、
+1. ~~`speaker.rs` を **codec 初期化 trait (もしくは `#[cfg]` 分岐) + 共通再生**に割る~~
+   → **割らなかった** (上のとおり `es8311.rs` を並べた、#154)。
+   `Speaker::new` が既にピンを引数で受けているので、そのまま両機で使えている。
+2. **`Sound` enum を拡張する** — もとは `BeepOk` / `Registered` の 2 つで、
    `start_player` の `match` にハードコードされている。§2.1 の 4 パターン
-   (`PunchOk` / `AlertLoop` / `AlertStop`) を足す。ループ音は
+   (`PunchOk` / `AlertLoop` / `AlertStop`) を足す。
+   **`PunchOk` (3000Hz 60ms ×2、間隔 40ms) は #154 で実装済み** —
+   `Speaker::beep_twice` として、1 本のバッファに畳んで書く形にしてある
+   (`beep` を 2 回呼ぶと 1 回ごとに先頭 20ms のリードイン無音が入り、
+   間隔が 40ms ではなく 60ms に伸びて「速く 2 回」に聞こえない)。
+   残る `AlertLoop` / `AlertStop` は機 (2) の話。ループ音は
    「止めるまで繰り返す」ので、`start_player` に**中断可能なループ**の口
    (`Sound::Stop` を受けたら再生中のループを抜ける) が要る — 現状の
    `while let Ok(sound) = rx.recv()` は再生中に次を受け取れないので、
@@ -194,7 +218,15 @@ CoreS3 で踏んだ罠 (issue #102) は ES8311 でもそのまま効く見込み
 
 | 用途 | GPIO |
 |---|---|
-| 内蔵オーディオ (ES8311 codec / NS4150B アンプ / MEMS マイク) | G45(SDA) / G0(SCL) / G48(DOUT) / G4(DIN) / G3(WS) / G17(BCLK) / G11(MCLK) / G18(NS4150_CTR) — **すべて内部ピン** |
+| 内蔵オーディオ (ES8311 codec / NS4150B アンプ / MEMS マイク) | G45(SDA) / G0(SCL) / G48(DOUT) / G4(DIN) / G3(WS) / G17(BCLK) / **G11(MCLK — 配線は在るが再生では使わない**、下記) / G18(NS4150_CTR) — **すべて内部ピン** |
+
+**G11 (MCLK) について**: **配線は基板に在るが、打刻音の再生では使っていない** (#154)。
+ES8311 のレジスタ `0x01 = 0xB5` が **「MCLK は BCLK から取る」**指定で、
+MCLK ピンを配線しなくても鳴るため。M5Unified の VoiceS3R 定義でも
+**スピーカー側は `spk_cfg.pin_mck` がコメントアウト**されており、
+`pin_mck = GPIO_NUM_11` を設定しているのは**マイク側だけ**。
+⇒ **「無い」のではなく「在るが使っていない」。**マイクを使うときや、
+MCLK 必須の設定に変えるときはこのピンを配線する。
 | 赤外線送信 | G47 (IR_TX) — 内部 |
 | 本体ボタン | G41 — 内部 |
 | Grove (HY2.0-4P) | G1 / G2 → Unit NFC (`atoms3-nfc` と同じ配線) |

@@ -1,4 +1,10 @@
-//! 内蔵スピーカー (AW88298 I2S アンプ) 読み取りビープ (issue #101 PR2)。
+//! 内蔵スピーカー — **共通の再生ロジック** + **CoreS3 (AW88298) の初期化** (issue #101 PR2)。
+//!
+//! [`Sound`] / [`start_player`] / [`Speaker`] (`beep` / `feed_silence` /
+//! `play_pcm_24k_mono`) は**ボード非依存**で、Atom VoiceS3R (ES8311) からも
+//! そのまま使う。ボード依存なのはコーデックの初期化とアンプ有効化だけで、
+//! VoiceS3R 側は [`crate::es8311`] にある (plan/standing-devices.md §2.3)。
+//! 本ファイルに残る `init_amp` / `dump_regs` / `read_sysst` は **CoreS3 専用**。
 //!
 //! CoreS3 の内蔵スピーカーは AW88298 (I2C0, addr 0x36) が I2S 信号 (I2S_NUM_1,
 //! BCK=G34 / WS=G33 / DOUT=G13) を増幅する構成。アンプの電源 (AXP2101 ALDO1)
@@ -134,6 +140,12 @@ pub enum Sound {
     BeepOk,
     /// 「登録完了しました」音声 (~1.5 秒)
     Registered,
+    /// 打刻成功 (3000Hz 60ms ×2、間隔 40ms)。タイムカード端末 (issue #154)。
+    /// **3000Hz なのは実測** — 旧 ATOM Voice で 1000〜5000Hz を鳴らし比べ、
+    /// 小型スピーカーの共振帯域である 3000Hz が最大音量だった
+    /// (plan/standing-devices.md §2.1)。**この端末は LED を持たないので、
+    /// これがかざした人に伝わる唯一の反応**になる (issue #151)
+    PunchOk,
 }
 
 /// 再生専用スレッドを立て、送信ハンドルを返す (issue #102)。
@@ -152,6 +164,7 @@ pub fn start_player(mut speaker: Speaker) -> Result<std::sync::mpsc::Sender<Soun
                 let r = match sound {
                     Sound::BeepOk => speaker.beep(2000.0, 40),
                     Sound::Registered => speaker.play_registered(),
+                    Sound::PunchOk => speaker.beep_twice(3000.0, 60, 40),
                 };
                 if let Err(e) = r {
                     log::warn!("speaker: 再生失敗: {e:#}");
@@ -257,39 +270,76 @@ impl Speaker {
     /// (NFC ポーリングスレッドからの呼び出し想定 — カード検知直後の1回のみなので許容)
     pub fn beep(&mut self, freq_hz: f32, duration_ms: u32) -> Result<()> {
         let n_samples = (SAMPLE_RATE_HZ * duration_ms / 1000) as usize;
-        let half_period = (SAMPLE_RATE_HZ as f32 / freq_hz / 2.0) as usize;
-        let half_period = half_period.max(1);
-        // 先頭 20ms は無音: FIFO 空で BCK が止まっていた場合の AW88298 PLL
-        // 再ロック時間を確保する (issue #102。ロック自体は数 ms)。
-        // black_box: 定数 960 (×4=3840) が畳み込まれると xtensa LLVM の
-        // "Cannot select: Constant<3840>" ISel エラーでコンパイルが落ちる
-        let lead_in = core::hint::black_box((SAMPLE_RATE_HZ / 50) as usize);
-        // ステレオ (L/R 同値) 16bit PCM の矩形波。half_period サンプルごとに極性反転。
-        // 振幅 6000 ≒ -12dB (フル音量矩形波は実機でうるさい、2026-07-21。
-        // レジスタ 0x0C は 0dB のまま)。
-        // 注: リードインを Vec::resize(定数長, 0) で書くと xtensa LLVM の
-        // "Cannot select: Constant" ISel エラーになるため 1 ループに畳んでいる
-        // 終端 50ms はフェードアウト (n_samples 以下にクランプ): 矩形波を
-        // ぶつ切りにするとクリックが乗る。40ms ビープでは実質全体が減衰
-        // エンベロープになり、やわらかい「ポン」という鳴りになる (実機調整)
-        let fade_out = core::hint::black_box((SAMPLE_RATE_HZ / 20) as usize).min(n_samples.max(1));
+        let lead_in = lead_in_samples();
         let mut buf = Vec::with_capacity((lead_in + n_samples) * 4);
-        for n in 0..lead_in + n_samples {
-            let sample: i16 = if n < lead_in {
-                0
-            } else {
-                let t = n - lead_in;
-                let mut v: i32 = if (t / half_period) % 2 == 0 { 6000 } else { -6000 };
-                let remain = n_samples - t;
-                if remain <= fade_out {
-                    v = v * remain as i32 / fade_out as i32;
-                }
-                v as i16
-            };
-            buf.extend_from_slice(&sample.to_le_bytes());
-            buf.extend_from_slice(&sample.to_le_bytes());
-        }
+        push_silence(&mut buf, lead_in);
+        push_square(&mut buf, freq_hz, n_samples);
         self.i2s.write_all(&buf, BLOCK)?;
         Ok(())
+    }
+
+    /// 同じ高さのビープを間隔を空けて 2 回鳴らす (打刻成功音、issue #154)。
+    /// `Sound::PunchOk` は 3000Hz / 60ms / 間隔 40ms (plan §2.1 で実測確定)。
+    ///
+    /// **[`Self::beep`] を 2 回呼ぶのでは駄目** — 1 回ごとに先頭 20ms のリードイン
+    /// 無音が入るので、間隔が `gap_ms + 20ms` に伸びて「速く 2 回」に聞こえない。
+    /// 1 本のバッファに畳んで 1 回で書き込む
+    pub fn beep_twice(&mut self, freq_hz: f32, duration_ms: u32, gap_ms: u32) -> Result<()> {
+        // black_box: `beep` のリードインと同じ理由 — 呼び出し元の定数が畳み込まれると
+        // 特定長で xtensa LLVM の "Cannot select: Constant" ISel エラーを踏む
+        let n_samples = core::hint::black_box((SAMPLE_RATE_HZ * duration_ms / 1000) as usize);
+        let gap = core::hint::black_box((SAMPLE_RATE_HZ * gap_ms / 1000) as usize);
+        let lead_in = lead_in_samples();
+        let mut buf = Vec::with_capacity((lead_in + n_samples * 2 + gap) * 4);
+        push_silence(&mut buf, lead_in);
+        push_square(&mut buf, freq_hz, n_samples);
+        push_silence(&mut buf, gap);
+        push_square(&mut buf, freq_hz, n_samples);
+        self.i2s.write_all(&buf, BLOCK)?;
+        Ok(())
+    }
+}
+
+/// 鳴らし始めのリードイン無音の長さ (20ms)。FIFO 空で BCK が止まっていた場合の
+/// コーデック PLL 再ロック時間を確保する (issue #102。ロック自体は数 ms)。
+/// black_box: 定数 960 (×4=3840) が畳み込まれると xtensa LLVM の
+/// "Cannot select: Constant<3840>" ISel エラーでコンパイルが落ちる
+fn lead_in_samples() -> usize {
+    core::hint::black_box((SAMPLE_RATE_HZ / 50) as usize)
+}
+
+/// ステレオ (L/R 同値) 16bit PCM を 1 サンプル積む
+fn push_sample(buf: &mut Vec<u8>, v: i16) {
+    buf.extend_from_slice(&v.to_le_bytes());
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+/// 無音を `n_samples` 分積む。
+/// 注: `Vec::resize(定数長, 0)` で書くと xtensa LLVM の "Cannot select: Constant"
+/// ISel エラーになるため、ループで積む
+fn push_silence(buf: &mut Vec<u8>, n_samples: usize) {
+    for _ in 0..n_samples {
+        push_sample(buf, 0);
+    }
+}
+
+/// 矩形波を `n_samples` 分積む。終端 50ms はフェードアウト (`n_samples` 以下に
+/// クランプ): 矩形波をぶつ切りにするとクリックが乗る。40ms ビープでは実質全体が
+/// 減衰エンベロープになり、やわらかい「ポン」という鳴りになる (実機調整)。
+/// 振幅 6000 ≒ -12dB (フル音量矩形波は実機でうるさい、2026-07-21)
+fn push_square(buf: &mut Vec<u8>, freq_hz: f32, n_samples: usize) {
+    let half_period = ((SAMPLE_RATE_HZ as f32 / freq_hz / 2.0) as usize).max(1);
+    let fade_out = core::hint::black_box((SAMPLE_RATE_HZ / 20) as usize).min(n_samples.max(1));
+    for t in 0..n_samples {
+        let mut v: i32 = if (t / half_period) % 2 == 0 {
+            6000
+        } else {
+            -6000
+        };
+        let remain = n_samples - t;
+        if remain <= fade_out {
+            v = v * remain as i32 / fade_out as i32;
+        }
+        push_sample(buf, v as i16);
     }
 }

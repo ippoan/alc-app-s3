@@ -20,10 +20,10 @@ harness = false
 [dependencies]
 alc-hub-common = { path = "../hub-common" }
 alc-hub-core = { path = "../hub-core" }
-# nfc feature のみ。音 (ES8311) は本番機移行 (#151) と分けて別 issue で足す。
+# nfc = Unit NFC の読み取り / speaker = 打刻音 (ES8311、#154)。
 # **RMT は使わない** — Atom VoiceS3R に RGB LED が無く led.rs を #151 で削除した
 # ため、WS2812 用の esp-idf-hal 直接依存 (rmt-legacy) も一緒に落としている
-alc-hub-drivers = { path = "../hub-drivers", features = ["nfc"] }
+alc-hub-drivers = { path = "../hub-drivers", features = ["nfc", "speaker"] }
 anyhow = "1"
 log = "0.4"
 esp-idf-svc = { version = "0.52", default-features = false, features = [
