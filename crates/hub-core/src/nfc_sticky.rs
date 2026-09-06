@@ -14,11 +14,12 @@
 //! - **無応答 (-2) が [`RELEASE_MISSES`] 周連続** = カードが離れた
 //! - **上限 [`MAX_CYCLES`] 周** = 途中死 (-3 / -5 / -6) が続く限り粘ると F/A が周回から
 //!   閉め出されるので打ち切る (免許証の読了 5〜6 周の 2 倍)
-//! - **SELECT MF 失敗 (-4) が [`MAX_MF_FAIL_CYCLES`] 周連続** = 免許証でない Type-B
-//!   (社員証等) が載っている可能性が高い。ただし**弱結合の免許証でも -4 は出る**
-//!   (実機で確認) ので、即解除ではなく数周だけ粘る: 完全に外すと弱結合の免許証の
-//!   再試行が 85ms → 500ms (F/A 1 周ぶん) に遅くなり、12 周粘ると別の Type-B が
-//!   載っているとき F/A を 1 秒閉め出す
+//! - **SELECT MF 失敗 (-4)** = 免許証でない Type-B が載っている。その周で解く。
+//!   **スマホ (モバイル Suica) は HCE で Type-B にも応答する**ので、ここで粘ると
+//!   F (FeliCa) が閉め出されて Suica が読めない/遅くなる (実機: 3 周粘ると
+//!   スマホの応答が 1.0 秒、旧 F 先行は 0.35 秒)。弱結合の免許証でも -4 は出るが稀
+//!   (実機 27 タップ中 2) で、-4 は ATTRIB が通った後なので結合は既にあり、F/A を
+//!   1 周挟んだ次の B で読める
 //!
 //! 純関数にしてホストでテストする (`nfc_tap` と同じ流儀)。**rc の意味は nfc_shim の
 //! `nfc_shim_read_license_expiry()` の戻り値**: 0 読了 / -1 未初期化 / -2 無応答 /
@@ -28,8 +29,6 @@
 pub const RELEASE_MISSES: u32 = 2;
 /// 粘着の連続周回数の上限
 pub const MAX_CYCLES: u32 = 12;
-/// SELECT MF 失敗 (-4) の連続周回数の上限 (モジュール doc 参照)
-pub const MAX_MF_FAIL_CYCLES: u32 = 3;
 
 /// nfc_shim の rc: カード無し (WUPB 無応答)
 pub const RC_NO_CARD: i32 = -2;
@@ -47,8 +46,6 @@ pub struct Sticky {
     pub misses: u32,
     /// 粘着の連続周回数
     pub cycles: u32,
-    /// SELECT MF 失敗 (-4) の連続周回数
-    pub mf_fails: u32,
 }
 
 /// この周で粘着が解けた理由 (計器用)。解けていなければ [`Release::None`]
@@ -61,7 +58,7 @@ pub enum Release {
     Misses,
     /// [`MAX_CYCLES`] 周を超えた
     MaxCycles,
-    /// SELECT MF 失敗が [`MAX_MF_FAIL_CYCLES`] 周連続
+    /// SELECT MF 失敗 (免許証でない Type-B)
     MfFail,
 }
 
@@ -93,20 +90,12 @@ pub fn next(prev: Sticky, rc: i32) -> (Sticky, Release) {
                 return (Sticky::default(), Release::Misses);
             }
         }
-        RC_SELECT_MF_FAILED => {
-            s.on = true;
-            s.misses = 0;
-            s.mf_fails += 1;
-            if s.mf_fails >= MAX_MF_FAIL_CYCLES {
-                return (Sticky::default(), Release::MfFail);
-            }
-        }
+        RC_SELECT_MF_FAILED => return (Sticky::default(), Release::MfFail),
         _ => {
             // 免許証として応答した後の途中死 (-3 ATTRIB / -5 SELECT EF / -6 READ BINARY)。
             // 次周も B だけを電界断なしで再試行する
             s.on = true;
             s.misses = 0;
-            s.mf_fails = 0;
         }
     }
     s.cycles += 1;
@@ -140,7 +129,7 @@ mod tests {
     fn partial_response_starts_sticky() {
         let (s, r) = run(&[-3]);
         assert!(s.on);
-        assert_eq!((s.misses, s.cycles, s.mf_fails), (0, 1, 0));
+        assert_eq!((s.misses, s.cycles), (0, 1));
         assert_eq!(r, Release::None);
     }
 
@@ -166,7 +155,7 @@ mod tests {
     fn response_after_a_miss_resets_misses() {
         let (s, r) = run(&[-3, -2, -5]);
         assert!(s.on);
-        assert_eq!((s.misses, s.cycles, s.mf_fails), (0, 3, 0));
+        assert_eq!((s.misses, s.cycles), (0, 3));
         assert_eq!(r, Release::None);
     }
 
@@ -184,23 +173,19 @@ mod tests {
     }
 
     #[test]
-    fn select_mf_failure_sticks_only_a_few_cycles() {
-        let (s, r) = run(&[-4, -4]);
-        assert!(s.on);
-        assert_eq!((s.mf_fails, s.cycles), (2, 2));
-        assert_eq!(r, Release::None);
-        let (s, r) = run(&[-4, -4, -4]);
+    fn select_mf_failure_releases_next_cycle() {
+        // スマホ (HCE) の Type-B 応答: 初回の -4 で解いて同周内に F/A へ
+        let (s, r) = run(&[-4]);
         assert_eq!(s, Sticky::default());
         assert_eq!(r, Release::MfFail);
     }
 
     #[test]
-    fn license_response_resets_select_mf_failures() {
-        // 弱結合の免許証: -4 が混じっても -3/-5/-6 が来れば数え直す
-        let (s, r) = run(&[-4, -4, -3, -4, -4]);
-        assert!(s.on);
-        assert_eq!((s.mf_fails, s.cycles), (2, 5));
-        assert_eq!(r, Release::None);
+    fn select_mf_failure_releases_even_while_sticky() {
+        // 弱結合の免許証が -4 を返した周も解く (F/A を 1 周挟んで次の B で読める)
+        let (s, r) = run(&[-3, -5, -4]);
+        assert_eq!(s, Sticky::default());
+        assert_eq!(r, Release::MfFail);
     }
 
     #[test]
