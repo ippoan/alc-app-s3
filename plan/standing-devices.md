@@ -231,15 +231,16 @@ MCLK 必須の設定に変えるときはこのピンを配線する。
 | 本体ボタン | G41 — 内部 |
 | Grove (HY2.0-4P) | G1 / G2 → Unit NFC (`atoms3-nfc` と同じ配線) |
 | 底面バス (**実機で確定**) | J5 = 3V3/G5/G6/G7/G8、J6 = G39/G38/5V/GND → PoE Base の W5500 SPI (SCLK=G5 / MISO=G7 / MOSI=G8 / CS=G6)。**2026-09-06 に実機で DHCP まで通過。下記** |
-| **RGB LED** | **未確定** (下記)。ただし**単線 WS2812 は無い** |
+| **RGB LED** | **無し** (2026-09-06 に実機で確定、下記) |
 
-#### ★ この端末は LED で知らせない (#151、オーナー判断 2026-09-05)
+#### ★ この端末は LED で知らせない (#151、オーナー判断 2026-09-05。#154 で確定)
 
 **結論を先に: `crates/atoms3-timecard` に LED 表示は無い。**
 **AtomS3 Lite の WS2812 (G35) を前提に設計しないこと。**
 現場向けの反応は §2 の**打刻音 (ES8311)** が全部引き受ける。
 オーナー判断は「**このまま進める。音だけで良い**」で、LED を外付けする案も、
 LED と音の両方を持つボードへ見直す案も**採らない**。
+**打刻音は #154 で入り、実機で鳴ることを確認済み** (2026-09-06)。
 
 以下は根拠。**「確定」と「未確定」を混ぜないこと** (#151 で 1 度混ぜかけた)。
 
@@ -252,21 +253,31 @@ LED と音の両方を持つボードへ見直す案も**採らない**。
 ⇒ **RMT で 1 本の GPIO にビット列を流す方式 (`led.rs`) はどうやっても点かない。**
 このため `crates/atoms3-timecard/src/led.rs` は #151 で**削除した**。
 
-**未確定なこと: VoiceS3R が LP5562 と RGB LED を実装しているか。**
+**LP5562 の実装有無も 2026-09-06 に決着した (#154): 居ない。**
 
-- 無い側の根拠 (VoiceS3R 固有): M5 公式 SKU ページ
-  (`docs.m5stack.com/en/products/sku/C126-Echo`) の比較表に
-  "Atom VoiceS3R **has no RGB LED**, while Atom Voice includes WS2812 x1"。
-  公式ピンマップ (`docs.m5stack.com/en/core/Atom_EchoS3R`) にも LED の項が無い
-- 有る側の根拠: 上の回路図に LP5562 の回路がある (AtomS3R では実装されている)
+`#154` で ES8311 の I2C バスを立てたついでに内蔵バス (SDA=G45 / SCL=G0) を
+スキャンした実機出力:
+
+```
+EVT I2C_SCAN devices=1 es8311=1 lp5562=0
+```
+
+**居たのは ES8311 (0x18) だけ。LP5562 (0x30) は不在。**
+⇒ **Atom VoiceS3R に RGB LED は無い** (確定)。
+
+**未確定だった経緯 (消さないこと)**: `#151` の時点では
+「単線 WS2812 は無い」までしか確定できなかった。M5 公式 SKU 比較表
+(`docs.m5stack.com/en/products/sku/C126-Echo`) の
+"Atom VoiceS3R **has no RGB LED**, while Atom Voice includes WS2812 x1" と、
+公式ピンマップ (`docs.m5stack.com/en/core/Atom_EchoS3R`) に LED の項が無いことから
+「無い」と読めたが、**M5 が同 SKU ページに挙げている AtomS3R の回路図には
+LP5562 の回路がある**ため、VoiceS3R が実装しているかが決められなかった。
+**実機の I2C スキャンで確定させた。**
 
 ⚠ **M5Unified の RGBLED ピン表 `_pin_table_other0` に `board_M5AtomVoiceS3R` が
-無いことは根拠にならない。** あの表は**単線 WS2812 用**で、LP5562 で RGB LED を持つ
-`board_M5AtomS3R` も同じく載っていない。
-
-⇒ **決着は実機で内蔵 I2C (SDA=G45 / SCL=G0) の 0x30 を probe するしかない。**
-ただし**仮に載っていても方式が違う** (I2C ドライバの新規実装) ので、
-上の結論 (LED で知らせない) は変わらない。
+無いことは根拠にならない** (#151 で 1 度これを根拠にしかけた)。
+あの表は**単線 WS2812 用**で、LP5562 で RGB LED を持つ `board_M5AtomS3R` も
+同じく載っていない。**「表に無い = 非搭載」ではない。**
 
 **運用 doc への影響**: `ippoan/alc-app` の `docs/operator/` 系が
 「打刻音は鳴らない。端末の反応は LED だけ (待機=暗い青 / 受付=緑 / 読取失敗=赤、1 秒ラッチ)」と
