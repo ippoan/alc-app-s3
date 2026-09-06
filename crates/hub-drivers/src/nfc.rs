@@ -295,7 +295,7 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
                     baseline_ph = bp;
                 }
                 log::info!(
-                    "nfc presence: トリガ固着 {TRIGGER_STUCK:?} — ベースラインを立ち上がり前へ戻す                      (amp={amp}/{baseline} ph={ph}/{baseline_ph})"
+                    "nfc presence: トリガ固着 {TRIGGER_STUCK:?} — ベースラインを戻す (amp={amp}/{baseline} ph={ph}/{baseline_ph})"
                 );
                 triggered_since = None;
                 baseline_before_trigger = None;
