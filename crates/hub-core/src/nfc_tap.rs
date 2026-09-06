@@ -180,11 +180,33 @@ impl<T> TapGate<T> {
             None => false,
         };
         if quiet {
-            self.last = None;
-            if matches!(self.phase, Phase::Rejected) {
-                self.phase = Phase::Idle;
-            }
+            self.clear_last();
         }
+    }
+
+    /// タップの区切り: 直前のカードを忘れ、エラー確定済みなら解除する。
+    /// **保留 (`Pending`) は落とさない** ([`TapGate::expire`] と同じ理由)
+    fn clear_last(&mut self) {
+        self.last = None;
+        if matches!(self.phase, Phase::Rejected) {
+            self.phase = Phase::Idle;
+        }
+    }
+
+    /// カードが離れたことが**外から確定した**ときに、cooldown を待たずタップを区切る
+    /// (issue #155)。
+    ///
+    /// 呼び出し側が RF の無応答 (B → F → A の 1 周すべて無応答) で「離れた」と
+    /// 判定できるとき用。cooldown (既定 1000ms) は「載ったまま読み取りが空振りした
+    /// 時間」を吸収するためのもので、離れたことが分かっているなら待つ必要が無い —
+    /// 離した直後 (0.5 秒程度) の再タップを別の打刻として受けたい運用要望に応える。
+    /// cooldown を短くする案は、B の読み取りが S(WTX) で 0.87 秒かかった周や
+    /// -4 → F/A の寄り道で観測の間隔が 500ms を超え、**載ったまま二重打刻**になった
+    /// (実機 2026-09-06) ので採らない。
+    ///
+    /// **確定窓 (`Pending`) は落とさない** — 窓より短くかざして離した打刻を消さない。
+    pub fn release(&mut self) {
+        self.clear_last();
     }
 
     /// カードが載っていることだけを伝える (読めたかは問わない)。
@@ -681,6 +703,50 @@ mod tests {
             poll_until(&mut g, 5_980, 6_500),
             vec![TapOutcome::Fire("A")]
         );
+    }
+
+    /// release (RF で離れたと確定) の後は、cooldown 内の同じカードでも新しいタップ (#155)
+    #[test]
+    fn release_lets_same_card_fire_again_within_cooldown() {
+        let mut g = TapGate::new(1_000);
+        observe(&mut g, "A", 0);
+        g.touch(0);
+        assert_eq!(poll_until(&mut g, 0, 300), vec![TapOutcome::Fire("A")]);
+        // 離れたと確定 (300ms) → 700ms で再タップ = cooldown 1000ms の内側でも別の打刻
+        g.release();
+        observe(&mut g, "A", 700);
+        assert_eq!(poll_until(&mut g, 700, 1_000), vec![TapOutcome::Fire("A")]);
+    }
+
+    /// release 無しなら同じ再タップは cooldown 内で抑止される (上の対照)
+    #[test]
+    fn without_release_same_card_within_cooldown_is_suppressed() {
+        let mut g = TapGate::new(1_000);
+        observe(&mut g, "A", 0);
+        assert_eq!(poll_until(&mut g, 0, 300), vec![TapOutcome::Fire("A")]);
+        observe(&mut g, "A", 700);
+        assert_eq!(poll_until(&mut g, 700, 1_000), vec![]);
+    }
+
+    /// 確定窓の途中で release されても保留は落ちない (窓より短くかざした打刻を消さない)
+    #[test]
+    fn release_while_pending_keeps_the_pending_tap() {
+        let mut g = TapGate::new(1_000);
+        observe(&mut g, "A", 0);
+        g.release();
+        assert_eq!(poll_until(&mut g, 100, 400), vec![TapOutcome::Fire("A")]);
+    }
+
+    /// エラー確定済み (2 枚) は release で解除され、次のカードをすぐ受ける
+    #[test]
+    fn release_clears_rejected_error() {
+        let mut g = TapGate::new(1_000);
+        observe(&mut g, "A", 0);
+        observe(&mut g, "B", 100);
+        assert_eq!(poll_until(&mut g, 100, 400), vec![TapOutcome::MultipleCards]);
+        g.release();
+        observe(&mut g, "A", 500);
+        assert_eq!(poll_until(&mut g, 500, 800), vec![TapOutcome::Fire("A")]);
     }
 
     /// 時刻が巻き戻っても発火し続けない (抑止側に倒す)
