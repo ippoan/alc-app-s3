@@ -18,6 +18,7 @@ pub mod improv;
 pub mod layout;
 pub mod nfc_sticky;
 pub mod nfc_tap;
+pub mod nfca_uid;
 pub mod pairing;
 pub mod printer;
 pub mod protocol;
