@@ -185,9 +185,17 @@ jobs:
             echo "ldproxy=missing" >> "$GITHUB_OUTPUT"
           fi
 
+      # espup は最新版の問い合わせ (api.github.com の rust-build releases) を
+      # 未認証で叩くため、runner の共有 IP で rate limit に当たると
+      # `GitHub API returned status code: 403 Forbidden` で落ちる
+      # (2026-09-06 PR #166/#167 で実測、rerun で通る = flake)。espup は
+      # 環境変数 GITHUB_TOKEN があれば Bearer 付きで叩くので、step の env で渡す
+      # (composite action の run step は呼び出し側 step の env を継承する)
       - name: Install Xtensa Rust toolchain
         if: steps.cache-xtensa.outputs.cache-hit != 'true' || steps.verify-xtensa.outputs.ldproxy != 'ok'
         uses: esp-rs/xtensa-toolchain@v1.7.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           default: true
           buildtargets: esp32s3
@@ -351,9 +359,17 @@ jobs:
             echo "ldproxy=missing" >> "$GITHUB_OUTPUT"
           fi
 
+      # espup は最新版の問い合わせ (api.github.com の rust-build releases) を
+      # 未認証で叩くため、runner の共有 IP で rate limit に当たると
+      # `GitHub API returned status code: 403 Forbidden` で落ちる
+      # (2026-09-06 PR #166/#167 で実測、rerun で通る = flake)。espup は
+      # 環境変数 GITHUB_TOKEN があれば Bearer 付きで叩くので、step の env で渡す
+      # (composite action の run step は呼び出し側 step の env を継承する)
       - name: Install Xtensa Rust toolchain
         if: steps.cache-xtensa.outputs.cache-hit != 'true' || steps.verify-xtensa.outputs.ldproxy != 'ok'
         uses: esp-rs/xtensa-toolchain@v1.7.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           default: true
           buildtargets: esp32s3
