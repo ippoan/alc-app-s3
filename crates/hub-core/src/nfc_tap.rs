@@ -52,6 +52,42 @@
 //! 毎周期「まだ見えている」ことにする**。読めたかどうかではなく
 //! **カードが物理的に載っているか**で「同じタップか」を決める。
 //!
+//! # 読み取りに cooldown より長くかかっても「離れた」と数えない (issue #171)
+//!
+//! touch も observe も**周の区切りにしか入らない**ので、1 回の読み取りが
+//! cooldown (1 秒) を超えると、その間 gate は何も観測しない。免許証 (Type-B) の
+//! APDU は S(WTX) で**最大 2 秒まで**延びるため、載せたままでも読了時刻で
+//! 連続性を判定すると「1 秒以上見ていない = 新しいタップ」になり**二重打刻**する
+//! (実機 2026-09-06: cooldown 500ms の実験で、B 読み 0.87 秒 + -4 → F/A の
+//! 寄り道で観測間隔 0.89 秒 → 二重打刻)。cooldown を伸ばしても WTX の上限に
+//! 追いつくだけで、かざし直しの待ちが伸びる。
+//!
+//! **読み取りが成功したなら、カードはその読み取りを始めた時点で載っていた**
+//! (WUPB / ポーリングに応答したのがその時刻)。そこで [`TapGate::observe`] は
+//! **読み始めた時刻 (`since_ms`) と読了時刻 (`now_ms`) の両方**を受け、
+//! 「同じタップか」は `since_ms` で、「最後に見た時刻」と確定窓の起点は
+//! `now_ms` で決める。読み取りが何秒かかっても、始めたときに前回の観測から
+//! cooldown 以内なら同じタップ。**確定窓 (#143) の意味は変えない** — 起点は
+//! 読了時刻のままなので、2 枚検知の窓が読み取り時間ぶん縮むことはない。
+//!
+//! 「読み取りの前に `touch` を置く」では塞げない — 差は縮まるが、存在検知由来の
+//! touch を observe の前に置くと**離れていた時間が消えて再タップが抑止される**
+//! (hub-drivers nfc.rs の touch 位置のコメント)。読めた事実だけを根拠にする。
+//!
+//! ## 副作用 (承知のうえ)
+//!
+//! 「離れてからの再タップ」を新タップと数える境界が、**その読みの所要時間ぶん**
+//! 手前に動く (B は 0.2 s、WTX で 0.87〜2.0 s)。前回の観測から cooldown 以内に
+//! **読み始めた**タップは、読了が cooldown を超えていても同じタップになる。
+//!
+//! - LicenseFirst (タイムカード端末) は #169 の [`TapGate::release`] (RF が
+//!   1 周無応答の周で last を消す) が補償するので、離した直後の再タップは変わらない
+//! - **FelicaFirst (CoreS3 / atoms3-nfc) には補償が無い**。点呼に再タップの要件は
+//!   無いが、退行の境界はテストで固定する (読み 0.2 s のタップを 1.5 s 間隔で
+//!   2 回 → 2 回とも発火)
+//! - 2 枚エラー ([`Phase::Rejected`]) の解除も同じ判定なので、エラー後の再タップの
+//!   受付が読み時間ぶん遅れる
+//!
 //! # 方式 2: 2 枚見えたらどちらも登録しない (issue #143)
 //!
 //! 1 つの財布に FeliCa が 2 枚入っていると、A と B が交互に読まれる。
@@ -227,13 +263,25 @@ impl<T> TapGate<T> {
     ///
     /// - `key`: カードを一意に表す文字列 (IDm / UID / 免許証の 16 桁)
     /// - `payload`: 発火が確定したときに [`TapOutcome::Fire`] で返す値
-    /// - `now_ms`: **単調増加**の時刻 (稼働時間)。壁時計を渡さないこと —
-    ///   NTP 同期で時刻が飛ぶとクールダウンが飛ぶ
-    pub fn observe(&mut self, key: &str, payload: T, now_ms: u64) {
-        self.expire(now_ms);
-        // 同じカードを cooldown 内にまた見た = まだ同じタップ (issue #103)
+    /// - `since_ms`: **この読み取りを始めた時刻**。読めたということはカードは
+    ///   この時点で載っていたので、「同じタップか」(cooldown 内か) はこちらで
+    ///   判定する (issue #171、モジュール doc)。読み取りが同期で数秒かかっても
+    ///   「離れた」と数えない。呼び出し側はポーリングを打つ**直前**に取ること
+    /// - `now_ms`: 読了時刻 = 「最後に見た時刻」と確定窓の起点。**単調増加**の
+    ///   時刻 (稼働時間) を渡し、壁時計を渡さないこと — NTP 同期で時刻が飛ぶと
+    ///   クールダウンが飛ぶ
+    ///
+    /// **契約: `since_ms <= now_ms`** (同じ時計で、読み始め ≤ 読了)。呼び出し側は
+    /// `since_ms` を**各 poll の直前**で取ること — 周の先頭で 1 つ取り回すと
+    /// 抑止の窓が 1 周期ぶん (~0.5 s) 余計に膨らむ
+    pub fn observe(&mut self, key: &str, payload: T, since_ms: u64, now_ms: u64) {
+        debug_assert!(since_ms <= now_ms, "observe: since_ms > now_ms");
+        self.expire(since_ms);
+        // 同じカードを cooldown 内にまた見た = まだ同じタップ (issue #103)。
+        // 経過は読み始めから数える — 読了時刻から数えると、WTX で 1 秒を超えた
+        // 読みが載せたまま新タップになる (issue #171)
         let same_tap = matches!(&self.last, Some((k, seen))
-            if k == key && now_ms.saturating_sub(*seen) < self.cooldown_ms);
+            if k == key && since_ms.saturating_sub(*seen) < self.cooldown_ms);
         self.last = Some((key.to_string(), now_ms));
 
         match &self.phase {
@@ -306,9 +354,9 @@ mod tests {
 
     const W: u64 = DEFAULT_COMMIT_WINDOW_MS;
 
-    /// テスト用: `key` をペイロードにして観測する
+    /// テスト用: `key` をペイロードにして観測する。読み取りは一瞬 (開始 = 読了)
     fn observe(g: &mut TapGate<&'static str>, key: &'static str, now: u64) {
-        g.observe(key, key, now);
+        g.observe(key, key, now, now);
     }
 
     /// `now` まで 20ms 刻みで poll し、確定したものを順に集める
@@ -391,20 +439,23 @@ mod tests {
         // ループ先頭の poll (元からある)
         push(g.poll(t), &mut out);
 
+        // 各 poll は「打つ直前の時刻」を since に渡す (#171。実機の呼び出しと同じ形)
         // --- F ---
+        let since = t;
         t += T_F;
         let mut got = false;
         if let Some(k) = read_f {
-            observe(g, k, t);
+            g.observe(k, k, since, t);
             got = true;
         }
         push(g.poll(t), &mut out); // #155 で追加
 
         // --- A ---
         if !got {
+            let since = t;
             t += T_A;
             if let Some(k) = read_a {
-                observe(g, k, t);
+                g.observe(k, k, since, t);
                 got = true;
             }
         }
@@ -412,9 +463,10 @@ mod tests {
 
         // --- B ---
         if !got {
+            let since = t;
             t += T_B;
             if let Some(k) = read_b {
-                observe(g, k, t);
+                g.observe(k, k, since, t);
             }
         }
         push(g.poll(t), &mut out); // #155 で追加
@@ -810,6 +862,207 @@ mod tests {
         assert_eq!(
             poll_until(&mut g, 3_000, 3_500),
             vec![TapOutcome::Fire("A")]
+        );
+    }
+
+    // ---- 読み取りが cooldown より長い (S(WTX)) でも載せたままは 1 タップ (issue #171) ----
+    //
+    // LicenseFirst (タイムカード端末) の周を模す: B を先頭で読み、読了で observe、
+    // RF が応答した周の末尾で touch、各所で poll。読み取りは**同期**なので、
+    // その間 touch も poll も入らない (実機と同じ)。
+
+    /// 免許証を載せたまま 1 周の B 読みが S(WTX) で 2 秒かかっても、二重打刻しない。
+    /// **読了時刻で連続性を見ると 2 秒 > cooldown 1 秒で新タップになる**穴 (#171)
+    #[test]
+    fn issue171_held_license_read_spanning_wtx_fires_only_once() {
+        let mut g = TapGate::new(1_000);
+        let mut fired = Vec::new();
+        let mut push = |o: TapOutcome<&'static str>, out: &mut Vec<_>| {
+            if !matches!(o, TapOutcome::Idle) {
+                out.push(o);
+            }
+        };
+        // 1 周目: 通常の読み (200ms)
+        let mut t = T_B;
+        g.observe("LICENSE", "LICENSE", 0, t);
+        // 以降 6 周、毎周の B 読みが WTX 上限の 2 秒かかる
+        for _ in 0..6 {
+            push(g.poll(t), &mut fired);
+            g.touch(t);
+            t += T_SLEEP;
+            let since = t;
+            t += 2_000; // read_license_expiry が S(WTX) で 2 秒ブロック
+            g.observe("LICENSE", "LICENSE", since, t);
+            push(g.poll(t), &mut fired);
+        }
+        assert_eq!(
+            fired,
+            vec![TapOutcome::Fire("LICENSE")],
+            "載せたまま WTX 2 秒の周で再発火した"
+        );
+    }
+
+    /// 実測型 (2026-09-06、cooldown 500ms の実験で顕在化): B が -4 で応答して粘着を解き
+    /// F → A の寄り道で周が伸び、次周の B 読みが S(WTX) で 0.87 秒。周末の touch から
+    /// 読了まで 0.89 秒でも同じタップ。**cooldown 500ms でも塞がる**ことを、穴が
+    /// cooldown の長さの問題ではないことの証拠として固定する。
+    /// B が応答したが読了しなかった周は、`poll_license` が読み取り直後 (次の poll の前) に
+    /// touch する (nfc.rs) — 呼び出し順もここで模す
+    #[test]
+    fn issue171_measured_detour_then_wtx_read_stays_one_tap_even_with_short_cooldown() {
+        let mut g = TapGate::new(500);
+        let mut fired = Vec::new();
+        let mut push = |o: TapOutcome<&'static str>, out: &mut Vec<_>| {
+            if !matches!(o, TapOutcome::Idle) {
+                out.push(o);
+            }
+        };
+        // 周 1: B 読了 (200ms)。RF 応答ありなので周末に touch
+        g.observe("LICENSE", "LICENSE", 0, 200);
+        push(g.poll(200), &mut fired);
+        g.touch(200);
+        // 周 2 (220〜): B が -4 (SELECT MF 失敗、応答あり) を 100ms で返す →
+        // 読み取り直後の touch → poll → F (91ms) → poll → A (140ms) → poll → 周末 touch
+        g.touch(320);
+        push(g.poll(320), &mut fired);
+        push(g.poll(411), &mut fired);
+        push(g.poll(551), &mut fired);
+        g.touch(551);
+        // 周 3 (571〜): B 読みが S(WTX) で 0.87 秒。読了 1_441 = 周末 touch から 0.89 秒
+        g.observe("LICENSE", "LICENSE", 571, 1_441);
+        push(g.poll(1_441), &mut fired);
+        g.touch(1_441);
+        // 次の確定窓が閉じるところまで回す (二重打刻ならここで 2 つ目の Fire が出る)
+        push(g.poll(1_461), &mut fired);
+        push(g.poll(1_700), &mut fired);
+        assert_eq!(
+            fired,
+            vec![TapOutcome::Fire("LICENSE")],
+            "寄り道 + WTX 読みで観測間隔が cooldown を超えても、載せたままなら 1 タップ"
+        );
+    }
+
+    /// **読了しなかった長い読みでも同じタップ**: B が S(WTX) で 2 秒待った末に途中死 (-6) した周。
+    /// 読み取り直後の touch が次の `poll` の expire より**前**にあれば last は消えず、
+    /// 次周の読了は同じタップ。逆順 (poll → touch) だと expire が last を消し、touch は
+    /// 空振り (last=None は何もしない) → 次周が新タップ = 二重打刻になる。
+    /// nfc.rs の `poll_license` がこの順で呼ぶことを、ここで呼び出しパターンとして固定する
+    #[test]
+    fn issue171_failed_long_read_touch_before_poll_keeps_the_tap() {
+        let mut g = TapGate::new(1_000);
+        let mut fired = Vec::new();
+        let mut push = |o: TapOutcome<&'static str>, out: &mut Vec<_>| {
+            if !matches!(o, TapOutcome::Idle) {
+                out.push(o);
+            }
+        };
+        g.observe("LICENSE", "LICENSE", 0, 200);
+        push(g.poll(200), &mut fired);
+        g.touch(200);
+        // 周 2 (220〜): B が 2 秒ブロックして -6。poll_license が touch してから poll
+        g.touch(2_220);
+        push(g.poll(2_220), &mut fired);
+        g.touch(2_220);
+        // 周 3 (2_240〜): B 読了 (200ms)
+        g.observe("LICENSE", "LICENSE", 2_240, 2_440);
+        push(g.poll(2_440), &mut fired);
+        g.touch(2_440);
+        push(g.poll(2_700), &mut fired);
+        assert_eq!(fired, vec![TapOutcome::Fire("LICENSE")]);
+    }
+
+    /// **退行の境界 (FelicaFirst 相当 = `release` が無い)**: 読み 0.2 s のタップを
+    /// 1.5 s 間隔で 2 回 → 2 回とも発火する。since で判定するぶん再タップの境界は
+    /// 読み時間 (0.2 s) だけ手前に動くが、1.5 s 間隔なら影響しない (モジュール doc の副作用)
+    #[test]
+    fn issue171_felicafirst_retaps_1500ms_apart_both_fire_without_release() {
+        let mut g = TapGate::new(1_000);
+        let mut fired = Vec::new();
+        for tap in 0..2u64 {
+            // F/A 空振り後の B 読み: 開始 t、読了 t + 200。周末に touch (存在検知)
+            let t = tap * 1_500;
+            g.observe("LICENSE", "LICENSE", t, t + T_B);
+            g.touch(t + T_B);
+            // 離れた。release は呼ばれない (FelicaFirst)。次のタップまで poll だけ回る
+            fired.extend(poll_until(&mut g, t + T_B, t + 1_480));
+        }
+        assert_eq!(
+            fired,
+            vec![TapOutcome::Fire("LICENSE"), TapOutcome::Fire("LICENSE")],
+            "release 無しでも 1.5 s 間隔の再タップは 2 回とも別打刻"
+        );
+    }
+
+    /// **無応答 (-2 / -1) の周では touch しない**ので、載っていない時間は cooldown どおり
+    /// 数えられる。nfc.rs の `poll_license` は「応答あり・未読了」(rc ∉ {0, -2, -1}) でだけ
+    /// touch する — 無応答でも touch すると離れたカードの last が生き続け、再タップが
+    /// 抑止される。ここでは「touch が無ければ cooldown で区切れる」側を固定する
+    #[test]
+    fn issue171_no_response_cycle_does_not_touch_so_cooldown_still_splits() {
+        let mut g = TapGate::new(1_000);
+        g.observe("LICENSE", "LICENSE", 0, 200);
+        g.touch(200);
+        assert_eq!(
+            poll_until(&mut g, 200, 600),
+            vec![TapOutcome::Fire("LICENSE")]
+        );
+        // 以降の周は B が -2 (無応答、~180ms): touch は無く poll だけ
+        assert_eq!(poll_until(&mut g, 780, 1_320), vec![]);
+        // 前回の観測 (200) から 1 秒以上 → 読み始め 1_340 の再タップは新タップ
+        g.observe("LICENSE", "LICENSE", 1_340, 1_540);
+        assert_eq!(
+            poll_until(&mut g, 1_540, 1_900),
+            vec![TapOutcome::Fire("LICENSE")]
+        );
+    }
+
+    /// release (#169) の後に始めた読みは、読み始めが cooldown 内でも新タップ
+    /// (release と since の判定は矛盾しない: release が last を消すので since は比較されない)
+    #[test]
+    fn issue171_read_started_after_release_is_a_new_tap() {
+        let mut g = TapGate::new(1_000);
+        g.observe("LICENSE", "LICENSE", 0, 200);
+        assert_eq!(
+            poll_until(&mut g, 200, 600),
+            vec![TapOutcome::Fire("LICENSE")]
+        );
+        g.release();
+        // 離れてから 300ms で再タップ。読みは 2 秒かかっても 1 回だけ発火
+        g.observe("LICENSE", "LICENSE", 900, 2_900);
+        assert_eq!(
+            poll_until(&mut g, 2_900, 3_300),
+            vec![TapOutcome::Fire("LICENSE")]
+        );
+    }
+
+    /// **確定窓の起点は読了時刻のまま** (2 枚検知 #143 の窓が since で縮まない)。
+    /// 2 秒かかった B の読了直後 (窓の中) に別キーが読めたら、従来どおり 2 枚
+    #[test]
+    fn issue171_commit_window_still_starts_at_read_end() {
+        let mut g = TapGate::default();
+        // 読み始め 0、読了 2_000。since で窓を測ると 2_000 の時点で閉じているはず
+        g.observe("LICENSE", "LICENSE", 0, 2_000);
+        assert_eq!(g.poll(2_000), TapOutcome::Idle, "読了直後はまだ確定窓の中");
+        // 次周 F (111ms 後) で 2 枚目
+        g.observe("FELICA_2", "FELICA_2", 2_020, 2_111);
+        assert_eq!(
+            poll_until(&mut g, 2_111, 2_111 + W + 500),
+            vec![TapOutcome::MultipleCards]
+        );
+    }
+
+    /// 確定窓の途中で始めた 2 枚目の読みが窓の外で読了しても 2 枚。
+    /// キー違いは時刻を見ず、窓は `poll()` が呼ばれて初めて閉じる (#155 と同じ。従来どおり)
+    #[test]
+    fn issue171_second_key_read_finishing_after_window_is_still_two_cards() {
+        let mut g = TapGate::default();
+        g.observe("FELICA_1", "FELICA_1", 0, 91);
+        // A の読みは 111 に始まり (窓 91 + 250 = 341 の中)、車検証の ISO-DEP が
+        // 延びて 400 に読了 (窓の外)。あいだに poll は入らない
+        g.observe("NFCA_2", "NFCA_2", 111, 400);
+        assert_eq!(
+            poll_until(&mut g, 400, 800),
+            vec![TapOutcome::MultipleCards]
         );
     }
 
