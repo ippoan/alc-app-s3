@@ -47,6 +47,10 @@ path = "crates/hub-core/src/layout.rs"
 type = "unit"
 
 [[file]]
+path = "crates/hub-core/src/nfc_sticky.rs"
+type = "unit"
+
+[[file]]
 path = "crates/hub-core/src/nfc_tap.rs"
 type = "unit"
 

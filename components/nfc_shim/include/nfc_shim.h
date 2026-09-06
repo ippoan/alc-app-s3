@@ -62,6 +62,12 @@ int nfc_shim_read_license_expiry(char* out_issue, int issue_cap, char* out_expir
 int nfc_shim_transceive_apdu_a(const uint8_t* cmd, int cmd_len, uint8_t* out, int out_cap);
 
 /**
+ * B モードへ戻す (電界 ON のまま。既に B なら何もしない)。Rust 側の
+ * PollOrder::LicenseFirst が F/A の後に呼び、待機中のモードを B に揃える (#155 step 4)
+ */
+void nfc_shim_prepare_mode_b(void);
+
+/**
  * アンテナ振幅を1回測定して返す (0-255、失敗時 -1)。カード接近の存在検知
  * 実験用 (issue #96 続き、2026-07-21)
  */

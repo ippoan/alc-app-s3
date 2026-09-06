@@ -293,6 +293,8 @@ fn main() -> Result<()> {
             1,
             nfc_sda,
             nfc_scl,
+            // CoreS3 は従来どおり F → A → B (#155 step 4 の B 先行は atoms3-timecard だけ)
+            alc_hub_drivers::nfc::PollOrder::FelicaFirst,
             Arc::clone(&status),
             move |e: &alc_hub_drivers::nfc::NfcEvent| {
                 use alc_hub_drivers::nfc::NfcEvent;

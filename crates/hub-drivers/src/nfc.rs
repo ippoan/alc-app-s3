@@ -33,6 +33,7 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::gpio::{AnyIOPin, Pin};
 
 use alc_hub_common::status::{now_ms, SharedStatus};
+use alc_hub_core::nfc_sticky::{self, Sticky};
 use alc_hub_core::nfc_tap::{TapGate, TapOutcome, DEFAULT_COMMIT_WINDOW_MS};
 
 extern "C" {
@@ -47,6 +48,7 @@ extern "C" {
     ) -> i32;
     fn nfc_shim_measure_amplitude() -> i32;
     fn nfc_shim_measure_phase() -> i32;
+    fn nfc_shim_prepare_mode_b();
     fn nfc_shim_transceive_apdu_a(
         cmd: *const u8,
         cmd_len: i32,
@@ -140,6 +142,26 @@ const POLL_INTERVAL_MS: u32 = 20;
 /// 逆に短すぎると読める前に打ち切ってしまう — **長い側に倒すのが安全側**
 const TRIGGER_STUCK: Duration = Duration::from_secs(8);
 
+/// トリガ後に F/A/B をどの順で回すか (#155 step 4)。**呼び出し側が選ぶ。**
+///
+/// 1 周 (F → A → B、実測 448ms) の各先頭でモード切替 = **電界断 (10ms) が 3 回**入る。
+/// FeliCa は低消費電力で F の窓 1 回で読めるが、免許証 (Type-B、暗号コプロ付き) は
+/// F/A の電源断 2 回の直後の B 窓 150ms で WUPB→ATTRIB→APDU×3 を完走する必要があり、
+/// 結合が弱いと B 窓の先頭で電源が立ち上がりきらず **痕跡ゼロで落ちる** (実機 4 build:
+/// 無反応 4/10, 2/5, 7/10, 8/10。音・常時ポーリング・PSRAM・同時負荷は全て否定済み)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PollOrder {
+    /// F → A → B (従来。CoreS3 と検証機 atoms3-nfc はこちら、挙動不変)
+    FelicaFirst,
+    /// **B 先行 + B 粘着** (NFC タイムカード端末)。待機中は B モードのまま電界 ON なので、
+    /// トリガ後の 1 周目は切替ゼロで B から読む。B が応答した (成功以外の途中死も含む) なら
+    /// 次周は F/A を飛ばして **B だけを電界断なしで再試行**する (粘着。解く条件と理由は
+    /// `alc_hub_core::nfc_sticky` のモジュール doc)。B が -2 なら F → A を回し、**周末に
+    /// B モードへ戻して**待機と次周先頭を B に揃える (戻さないと待機中のモードが A に変わり、
+    /// 次周の B で電界断が復活し、存在検知のベースラインも B 前提から外れる)
+    LicenseFirst,
+}
+
 /// NFC 読み取りスレッドを起動する。
 ///
 /// - `i2c_port`: nfc_shim (C++ 側) に立てさせる I2C ポート番号。**Rust 側で
@@ -150,6 +172,7 @@ pub fn start(
     i2c_port: i32,
     sda: AnyIOPin,
     scl: AnyIOPin,
+    order: PollOrder,
     status: SharedStatus,
     sink: impl NfcSink,
 ) -> Result<()> {
@@ -165,11 +188,18 @@ pub fn start(
         .name("nfc".into())
         // APDU 組立 (String) + FFI 経由の hex 文字列バッファがあるため rs232.rs と同等
         .stack_size(8 * 1024)
-        .spawn(move || run(i2c_port, sda_num, scl_num, status, sink))?;
+        .spawn(move || run(i2c_port, sda_num, scl_num, order, status, sink))?;
     Ok(())
 }
 
-fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink: impl NfcSink) {
+fn run(
+    i2c_port: i32,
+    sda_num: i32,
+    scl_num: i32,
+    order: PollOrder,
+    status: SharedStatus,
+    mut sink: impl NfcSink,
+) {
     if !init_with_retry(i2c_port, sda_num, scl_num, &status) {
         return;
     }
@@ -181,6 +211,15 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
     println!("EVT NFC_READY port={i2c_port} sda={sda_num} scl={scl_num}");
     crate::crashlog::note("EVT NFC_READY");
     push_event(&status, "NFC 待受開始 (存在検知ゲート + F→A→B 逐次ポーリング)");
+    let license_first = order == PollOrder::LicenseFirst;
+    if license_first {
+        // 起動マーカー。**NFC_READY より前に置かない** — それより前のコンソール出力は
+        // 取りこぼされる (起動直後と es8311 dump_regs 直後の約 200ms)
+        println!("EVT NFC_POLL_ORDER LicenseFirst");
+        log::info!("nfc: B 先行 + B 粘着でポーリングする (PollOrder::LicenseFirst)");
+        // step 4b: 「まだ載っている」(present) は RF の応答で決める (下の touch の直前)
+        println!("EVT NFC_PRESENT_SRC rf");
+    }
 
     // 重複抑止は **debounce**「離れて N ms 経つまで、まだ同じタップ」
     // (alc_hub_core::nfc_tap、issue #103)。
@@ -223,6 +262,12 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
     const STUCK_ROLLBACK_LIMIT: u32 = 2;
     let mut stuck_rollbacks: u32 = 0;
     let mut tick: u32 = 0;
+    // LicenseFirst の B 粘着 (遷移は alc_hub_core::nfc_sticky)。cycle は計器用の周回番号
+    let mut sticky = Sticky::default();
+    let mut cycle: u32 = 0;
+    // 計器行 (`nfc cycle=`) は rc / 粘着 / F-A の有無のどれかが前周と変わった周だけ出す。
+    // 載せっぱなしや常時トリガで毎周出すと crashlog のリングを押し流すため
+    let mut last_inst: Option<(i32, bool, bool)> = None;
 
     loop {
         tick = tick.wrapping_add(1);
@@ -243,7 +288,10 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
         let mut triggered = false;
         // 存在検知が**測定できたうえで**「載っている」と言えたか。
         // 測定失敗のフォールバック (下の else) は触らない — 測定が壊れている間
-        // ずっと touch し続けると、二度と発火しなくなる
+        // ずっと touch し続けると、二度と発火しなくなる。
+        // **FelicaFirst ではこの present がトリガ中のベースライン凍結に由来する**ので、
+        // 位相が動くとカードが離れても張り付く (実機: 読めた 9 タップ中 7 が発火せず)。
+        // LicenseFirst は下 (touch の直前) で RF の応答に上書きする。FelicaFirst 側の追随は #162
         let mut present = false;
         if amp >= 0 {
             if baseline < 0 {
@@ -344,69 +392,119 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
         // (実機で読了 373ms → 発火 911ms、うち ~290ms がこの待ち)。
         // `TapGate::poll` は「毎周期呼ぶこと」が規約なので、回数を増やすのは安全側
         let mut got = false;
+        cycle = cycle.wrapping_add(1);
+        // step 4b (LicenseFirst のみ): この周に実際に打った poll のどれかが応答したか。
+        // `present` (tap_gate.touch = 「まだ同じタップ」) をこれで上書きする — 理由は touch の直前
+        let mut rf_present = false;
+        // 計器行の材料 (周末に 1 行にまとめて出す)
+        let mut b_rc = i32::MIN;
+        let mut fa = "-";
+        let mut sticky_word = "-";
 
-        match poll_felica_idm() {
-            Ok(Some(idm)) => {
-                // ここでは発火しない — 確定窓を抜けた後に `deliver` が出す (issue #143)
-                tap_gate.observe(&idm, NfcEvent::Felica { idm: idm.clone() }, now_ms());
+        // --- B 先行 (LicenseFirst、#155 step 4) ---
+        // 待機中は B モードのまま電界 ON なので、ここは切替 (電界断) ゼロで入れる
+        if license_first {
+            let rc = poll_license(&mut tap_gate, &mut sink, &mut last_license_rc);
+            if rc == 0 {
                 got = true;
             }
-            // 読めなかったことを理由に状態をクリアしない (issue #103)。
-            // 空振りで状態が消えることが 2 重発火の原因だった
-            Ok(None) => {}
-            Err(e) => log::warn!("nfc: FeliCa poll error: {e:#}"),
+            let (next, release) = nfc_sticky::next(sticky, rc);
+            sticky = next;
+            b_rc = rc;
+            rf_present = rc != nfc_sticky::RC_NO_CARD && rc != nfc_sticky::RC_NOT_READY;
+            fa = if got || sticky.on { "skip" } else { "run" };
+            sticky_word = release.label(sticky.on);
+            deliver(tap_gate.poll(now_ms()), &status, &mut sink);
         }
 
-        // 確定窓の経過チェック (F の後)。重い A/B に入る前に発火できる
-        deliver(tap_gate.poll(now_ms()), &status, &mut sink);
-
-        if !got {
-            match poll_nfca_uid() {
-                Ok(Some(uid)) => {
-                    // 電子車検証は Type-A + ISO14443-4 (ISO-DEP、RATS 応答あり) で
-                    // 応答することを実機確認済み (issue #105)。UID が取れた時点で
-                    // このカードがただの UID タグ (NTAG 等) かスマートカードかを
-                    // SELECT MF で追加確認する (詳細は detect_car_inspection_a
-                    // のコメント参照)。tap のたびに ISO-DEP セッション1回分の
-                    // コストが乗るが、非対応カードは RATS 非対応で即座に弾かれる
-                    // ため実害は小さい
-                    let event = if detect_car_inspection_a() {
-                        NfcEvent::CarInspection { uid: uid.clone() }
-                    } else {
-                        NfcEvent::NfcaUid { uid: uid.clone() }
-                    };
-                    tap_gate.observe(&uid, event, now_ms());
+        // --- F → A (→ B) ---
+        // LicenseFirst で読了済み or 粘着中はここを丸ごと飛ばす (電界断ゼロを守る)
+        if !(license_first && (got || sticky.on)) {
+            match poll_felica_idm() {
+                Ok(Some(idm)) => {
+                    // ここでは発火しない — 確定窓を抜けた後に `deliver` が出す (issue #143)
+                    tap_gate.observe(&idm, NfcEvent::Felica { idm: idm.clone() }, now_ms());
                     got = true;
                 }
-                // issue #103: 空振りで状態をクリアしない (上の FeliCa と同じ理由)
+                // 読めなかったことを理由に状態をクリアしない (issue #103)。
+                // 空振りで状態が消えることが 2 重発火の原因だった
                 Ok(None) => {}
-                Err(e) => log::warn!("nfc: NFC-A poll error: {e:#}"),
+                Err(e) => log::warn!("nfc: FeliCa poll error: {e:#}"),
             }
-        }
 
-        // 確定窓の経過チェック (A の後)。いちばん重い B に入る前に発火できる
-        deliver(tap_gate.poll(now_ms()), &status, &mut sink);
+            // 確定窓の経過チェック (F の後)。重い A/B に入る前に発火できる
+            deliver(tap_gate.poll(now_ms()), &status, &mut sink);
 
-        if !got {
-            let (rc, issue, expiry) = read_license_expiry();
-            if rc == 0 {
-                // 免許証も同じ gate に載せる (issue #103)。key は交付日 +
-                // 有効期限 = alc-app タブレットが使う employees.nfc_id と同じ 16 桁
-                let key = format!("{issue}{expiry}");
-                tap_gate.observe(&key, NfcEvent::License { issue, expiry }, now_ms());
-                got = true;
-            } else if rc != -2 && rc != last_license_rc {
-                // 途中死はカード引き抜き等でも出る
-                log::warn!("nfc: 免許証 読み取り失敗 rc={rc} ({})", license_rc_reason(rc));
-                sink.on_event(&NfcEvent::ReadFailed { rc });
+            if !got {
+                match poll_nfca_uid() {
+                    Ok(Some(uid)) => {
+                        // 電子車検証は Type-A + ISO14443-4 (ISO-DEP、RATS 応答あり) で
+                        // 応答することを実機確認済み (issue #105)。UID が取れた時点で
+                        // このカードがただの UID タグ (NTAG 等) かスマートカードかを
+                        // SELECT MF で追加確認する (詳細は detect_car_inspection_a
+                        // のコメント参照)。tap のたびに ISO-DEP セッション1回分の
+                        // コストが乗るが、非対応カードは RATS 非対応で即座に弾かれる
+                        // ため実害は小さい
+                        let event = if detect_car_inspection_a() {
+                            NfcEvent::CarInspection { uid: uid.clone() }
+                        } else {
+                            NfcEvent::NfcaUid { uid: uid.clone() }
+                        };
+                        tap_gate.observe(&uid, event, now_ms());
+                        got = true;
+                    }
+                    // issue #103: 空振りで状態をクリアしない (上の FeliCa と同じ理由)
+                    Ok(None) => {}
+                    Err(e) => log::warn!("nfc: NFC-A poll error: {e:#}"),
+                }
             }
-            last_license_rc = rc;
+
+            // 確定窓の経過チェック (A の後)。いちばん重い B に入る前に発火できる
+            deliver(tap_gate.poll(now_ms()), &status, &mut sink);
+
+            if !got && !license_first {
+                if poll_license(&mut tap_gate, &mut sink, &mut last_license_rc) == 0 {
+                    got = true;
+                }
+            }
+            if license_first {
+                // 周末に B モードへ戻す (PollOrder の doc 参照)。F/A のどちらで
+                // 終わっていても、待機と次周先頭の B を切替ゼロにする
+                unsafe { nfc_shim_prepare_mode_b() };
+            }
         }
 
         if got {
             triggered_since = None;
             // 読めた = 固着ではない。巻き戻しの回数を数え直す
             stuck_rollbacks = 0;
+            // F/A で読めた周も RF が応答している (B は rc で判定済み)
+            rf_present = true;
+        }
+
+        if license_first {
+            // step 4b: 「まだ載っている」は RF の応答で決める (振幅/位相は**ゲートを開く**
+            // 役だけに使う)。位相のベースラインはトリガ中に追従しないので、位相が動いた後は
+            // 振幅/位相由来の `present` が張り付き、カードが離れている間も touch が続いて
+            // 次のタップが「同じタップ」扱いで debounce に飲まれる (step 4 実機: 読めた
+            // 9 タップのうち 7 が発火せず)。LicenseFirst では粘着中の B が毎周 (84ms)
+            // 応答するので RF が「載っている」の確実な根拠になる。**FelicaFirst では
+            // 免許証が数周に 1 回しか応答しない** (FeliCa / Type-A は毎周応答する) ので
+            // 同じ手は使えない → LicenseFirst 限定。
+            // 二重打刻の担保: 載ったままの -2 は実測 0/131 周、途中死は最大 1 周 (85ms) で
+            // debounce の cooldown (1000ms) に吸収される
+            present = rf_present;
+            let inst = (b_rc, sticky.on, fa == "run");
+            if last_inst != Some(inst) {
+                last_inst = Some(inst);
+                log::info!(
+                    "nfc cycle={cycle} order=B rc={b_rc} sticky={sticky_word} cycles={} misses={} mf={} fa={fa} present=rf:{}",
+                    sticky.cycles,
+                    sticky.misses,
+                    sticky.mf_fails,
+                    u8::from(rf_present)
+                );
+            }
         }
 
         // カードが載っている間は「まだ同じタップ」。**読み取り (observe) の後に
@@ -454,6 +552,28 @@ fn detect_car_inspection_a() -> bool {
     }
     let n = n as usize;
     out[n - 2] == 0x90 && out[n - 1] == 0x00
+}
+
+/// B (免許証) を 1 回読み、読めたら gate に載せる。戻り値は shim の rc (0 = 読了)。
+/// F/A/B の順序に依らず B の後始末は同じなので、[`PollOrder`] の両方から呼ぶ
+fn poll_license(
+    tap_gate: &mut TapGate<NfcEvent>,
+    sink: &mut impl NfcSink,
+    last_license_rc: &mut i32,
+) -> i32 {
+    let (rc, issue, expiry) = read_license_expiry();
+    if rc == 0 {
+        // 免許証も同じ gate に載せる (issue #103)。key は交付日 +
+        // 有効期限 = alc-app タブレットが使う employees.nfc_id と同じ 16 桁
+        let key = format!("{issue}{expiry}");
+        tap_gate.observe(&key, NfcEvent::License { issue, expiry }, now_ms());
+    } else if rc != -2 && rc != *last_license_rc {
+        // 途中死はカード引き抜き等でも出る
+        log::warn!("nfc: 免許証 読み取り失敗 rc={rc} ({})", license_rc_reason(rc));
+        sink.on_event(&NfcEvent::ReadFailed { rc });
+    }
+    *last_license_rc = rc;
+    rc
 }
 
 fn poll_felica_idm() -> Result<Option<String>> {

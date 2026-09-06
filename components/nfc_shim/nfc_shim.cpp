@@ -364,6 +364,17 @@ int measure_ad(uint8_t cmd)
 }
 }  // namespace
 
+// B モードへ戻す (電界 ON のまま)。既に B なら何もしない (ensure_mode の early return)。
+// Rust 側の PollOrder::LicenseFirst が周末に呼び、待機と次周先頭の B を切替ゼロにする
+// (#155 step 4)。それ以外の用途には使わない
+extern "C" void nfc_shim_prepare_mode_b(void)
+{
+    if (!g_ready) {
+        return;
+    }
+    ensure_mode(m5::nfc::NFC::B);
+}
+
 extern "C" int nfc_shim_measure_amplitude(void)
 {
     return measure_ad(m5::unit::st25r3916::command::CMD_MEASURE_AMPLITUDE);
