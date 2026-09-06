@@ -128,9 +128,17 @@ const PRESENCE_DELTA: i32 = 2;
 // タップ運用 (かざしてすぐ離す) のため空白時間を最小化 (AtomS3 ベンチと同値)
 const POLL_INTERVAL_MS: u32 = 20;
 
-/// トリガ固着の保険: 何も読めないまま3秒続いたら誤トリガとみなし再較正
-/// (温度ドリフト等でベースラインが実態とずれたケースの自己回復)
-const TRIGGER_STUCK: Duration = Duration::from_secs(3);
+/// トリガ固着の保険: 何も読めないままこの時間が続いたら誤トリガとみなし、
+/// ベースラインを**トリガが立つ前の値へ戻す** (温度ドリフト等の自己回復)。
+///
+/// **★ 既知の読み取り所要より確実に長くすること。**
+/// `alc_hub_core::nfc_tap` の実測どおり **免許証は 3.4〜4.1 秒に 1 回しか読めない**。
+/// ここが 3 秒だったため、**読める前に再較正が走っていた** (#155 で実機実測):
+/// 1 周 448ms → 3 秒では 6 回しか試せないのに、免許証が読めたのは 9 周目 (3922ms)。
+/// **「3 回に 1 回しか反応しない」の直接の原因**だったので、実測の上限 4.1 秒に
+/// 倍近い余裕を取る。固着したままでも**ポーリングは続く**ので実害は少なく、
+/// 逆に短すぎると読める前に打ち切ってしまう — **長い側に倒すのが安全側**
+const TRIGGER_STUCK: Duration = Duration::from_secs(8);
 
 /// NFC 読み取りスレッドを起動する。
 ///
@@ -207,6 +215,10 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
     let mut baseline: i32 = -1;
     let mut baseline_ph: i32 = -1;
     let mut triggered_since: Option<Instant> = None;
+    // トリガが立つ**直前**のベースライン。固着したときはここへ戻す。
+    // **現在値を新しい基準にしてはいけない** — カードが載ったままの値を基準化すると、
+    // 以後そのカードは差分を作れず**永久に見えなくなる** (#155 で実機確認)
+    let mut baseline_before_trigger: Option<(i32, i32)> = None;
     let mut tick: u32 = 0;
 
     loop {
@@ -267,12 +279,26 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
             continue;
         }
         match triggered_since {
-            None => triggered_since = Some(Instant::now()),
+            None => {
+                triggered_since = Some(Instant::now());
+                // 立ち上がりの値を控える。固着したらここへ戻す
+                baseline_before_trigger = Some((baseline, baseline_ph));
+            }
             Some(t0) if t0.elapsed() > TRIGGER_STUCK => {
-                log::info!("nfc presence: 再較正 amp={amp} ph={ph} (トリガ固着 {TRIGGER_STUCK:?})");
-                baseline = amp;
-                baseline_ph = ph;
+                // **現在値を基準にしない** (#155)。カードが載っている可能性がある間に
+                // その値を基準化すると、以後そのカードが見えなくなる。
+                // トリガ前の値へ戻すだけにする — 本当に環境が変わっていれば
+                // すぐ再びトリガするが、**トリガ中もポーリングは回る**ので
+                // カードは読める (存在検知は RF ポーリングを省く最適化にすぎない)
+                if let Some((b, bp)) = baseline_before_trigger {
+                    baseline = b;
+                    baseline_ph = bp;
+                }
+                log::info!(
+                    "nfc presence: トリガ固着 {TRIGGER_STUCK:?} — ベースラインを立ち上がり前へ戻す                      (amp={amp}/{baseline} ph={ph}/{baseline_ph})"
+                );
                 triggered_since = None;
+                baseline_before_trigger = None;
                 FreeRtos::delay_ms(POLL_INTERVAL_MS);
                 continue;
             }
@@ -280,8 +306,17 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
         }
 
         // --- 何かかざされた: F (交通系IDm、日常の主役) → A (HCE/UID) → B (免許証) ---
-        // 軽い単発交換 (F/A の検出は数ms) を先に、重い APDU セッション (B) を
-        // 最後に試す。主要経路の交通系タップが最速になる並び
+        // 軽い方から先に、重い方を後に試す。主要経路の交通系タップが最速になる並び。
+        //
+        // **★ 実測 (#155、Atom VoiceS3R): F=91ms / A=140ms / B=200ms で 1 周 448ms。**
+        // ここは元々「F/A の検出は数ms」と書いてあったが、**実測と 10〜30 倍ずれていた。**
+        // この 448ms が「反応まで 1 秒以上」の土台になっている
+        // (F/A が何に消えているかは別 issue)。**定数を決めるときはこの実測を見ること。**
+        //
+        // 各 poll の**あいだにも確定窓の経過を見る** — 1 周 448ms もあるので、
+        // ループ先頭でしか見ないと窓 (250ms) が閉じても最大 448ms 発火が遅れる
+        // (実機で読了 373ms → 発火 911ms、うち ~290ms がこの待ち)。
+        // `TapGate::poll` は「毎周期呼ぶこと」が規約なので、回数を増やすのは安全側
         let mut got = false;
 
         match poll_felica_idm() {
@@ -295,6 +330,9 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
             Ok(None) => {}
             Err(e) => log::warn!("nfc: FeliCa poll error: {e:#}"),
         }
+
+        // 確定窓の経過チェック (F の後)。重い A/B に入る前に発火できる
+        deliver(tap_gate.poll(now_ms()), &status, &mut sink);
 
         if !got {
             match poll_nfca_uid() {
@@ -319,6 +357,9 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
                 Err(e) => log::warn!("nfc: NFC-A poll error: {e:#}"),
             }
         }
+
+        // 確定窓の経過チェック (A の後)。いちばん重い B に入る前に発火できる
+        deliver(tap_gate.poll(now_ms()), &status, &mut sink);
 
         if !got {
             let (rc, issue, expiry) = read_license_expiry();
@@ -347,6 +388,10 @@ fn run(i2c_port: i32, sda_num: i32, scl_num: i32, status: SharedStatus, mut sink
         if present {
             tap_gate.touch(now_ms());
         }
+
+        // 確定窓の経過チェック (B の後)。読めた周のうちに窓が閉じていれば
+        // ここで発火し、次の周 (448ms 先) まで待たされない
+        deliver(tap_gate.poll(now_ms()), &status, &mut sink);
 
         FreeRtos::delay_ms(POLL_INTERVAL_MS);
     }
