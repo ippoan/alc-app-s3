@@ -215,6 +215,8 @@ fn main() -> Result<()> {
         I2C_PORT_NFC,
         p.pins.gpio2.into(),
         p.pins.gpio1.into(),
+        // B 先行 + B 粘着 (#155 step 4)。理由は nfc::PollOrder の doc
+        nfc::PollOrder::LicenseFirst,
         Arc::clone(&status),
         move |e: &NfcEvent| on_card(e, &ws_meas_tx, speaker_tx.as_ref()),
     )?;

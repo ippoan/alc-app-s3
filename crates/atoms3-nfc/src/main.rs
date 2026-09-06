@@ -95,6 +95,8 @@ fn main() -> Result<()> {
         I2C_PORT_NFC,
         p.pins.gpio2.into(),
         p.pins.gpio1.into(),
+        // 検証機は従来どおり F → A → B (#155 step 4 の B 先行は本番機 atoms3-timecard だけ)
+        nfc::PollOrder::FelicaFirst,
         Arc::clone(&status),
         move |e: &NfcEvent| paint_event(&led_for_nfc, e),
     )?;
