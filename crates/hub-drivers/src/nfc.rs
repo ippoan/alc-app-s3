@@ -244,6 +244,11 @@ fn run(
     // 確定窓 (DEFAULT_COMMIT_WINDOW_MS) のあいだに別キーが現れなければ `poll` が
     // Fire を返す。現れたら MultipleCards = **どちらも登録しない** (財布に 2 枚
     // 入っていると、どちらの人の打刻か決められないまま 2 人ぶん記録してしまう)
+    //
+    // **`observe` には各 poll を打つ直前の時刻も渡す (issue #171)。** 読み取りは同期で、
+    // 免許証の APDU は S(WTX) で最大 2 秒、車検証の ISO-DEP も同じ上限。その間 touch も
+    // poll も入らないので、読了時刻だけで連続性を見ると載せたままでも cooldown (1 秒) を
+    // 超えて新タップ = 二重打刻になる。読めたならその読みを始めた時点で載っていた
     let mut tap_gate: TapGate<NfcEvent> = TapGate::default();
     // -2 (カード無し) は定常状態なのでログしない。未実行センチネルは i32::MIN。
     // **これは失敗ログの抑止専用** — 成功時の発火判定は license_gate が持つ
@@ -420,10 +425,11 @@ fn run(
         // --- F → A (→ B) ---
         // LicenseFirst で読了済み or 粘着中はここを丸ごと飛ばす (電界断ゼロを守る)
         if !(license_first && (got || sticky.on)) {
+            let started = now_ms();
             match poll_felica_idm() {
                 Ok(Some(idm)) => {
                     // ここでは発火しない — 確定窓を抜けた後に `deliver` が出す (issue #143)
-                    tap_gate.observe(&idm, NfcEvent::Felica { idm: idm.clone() }, now_ms());
+                    tap_gate.observe(&idm, NfcEvent::Felica { idm: idm.clone() }, started, now_ms());
                     got = true;
                 }
                 // 読めなかったことを理由に状態をクリアしない (issue #103)。
@@ -436,6 +442,7 @@ fn run(
             deliver(tap_gate.poll(now_ms()), &status, &mut sink);
 
             if !got {
+                let started = now_ms();
                 match poll_nfca_uid() {
                     // スマホ (HCE) のランダム UID (ISO/IEC 14443-3 §6.4.4: 4B で UID0=0x08) は
                     // **gate に載せない**。載せると同じ周で読めた FeliCa (モバイル Suica) の
@@ -459,7 +466,7 @@ fn run(
                         } else {
                             NfcEvent::NfcaUid { uid: uid.clone() }
                         };
-                        tap_gate.observe(&uid, event, now_ms());
+                        tap_gate.observe(&uid, event, started, now_ms());
                         got = true;
                     }
                     // issue #103: 空振りで状態をクリアしない (上の FeliCa と同じ理由)
@@ -578,16 +585,27 @@ fn poll_license(
     sink: &mut impl NfcSink,
     last_license_rc: &mut i32,
 ) -> i32 {
+    // 読み始めの時刻。S(WTX) で読了が 2 秒先になっても、載っていた証拠はここ (issue #171)
+    let started = now_ms();
     let (rc, issue, expiry) = read_license_expiry();
     if rc == 0 {
         // 免許証も同じ gate に載せる (issue #103)。key は交付日 +
         // 有効期限 = alc-app タブレットが使う employees.nfc_id と同じ 16 桁
         let key = format!("{issue}{expiry}");
-        tap_gate.observe(&key, NfcEvent::License { issue, expiry }, now_ms());
-    } else if rc != -2 && rc != *last_license_rc {
-        // 途中死はカード引き抜き等でも出る
-        log::warn!("nfc: 免許証 読み取り失敗 rc={rc} ({})", license_rc_reason(rc));
-        sink.on_event(&NfcEvent::ReadFailed { rc });
+        tap_gate.observe(&key, NfcEvent::License { issue, expiry }, started, now_ms());
+    } else if rc != nfc_sticky::RC_NO_CARD {
+        if rc != nfc_sticky::RC_NOT_READY {
+            // カードは応答したが読了しなかった (途中死 / 免許証以外の Type-B)。読み取りの
+            // あいだ (S(WTX) で最大 2 秒) は poll も touch も入らないので、この直後の
+            // `poll` の expire が「cooldown のあいだ何も見ていない」と last を消す前に
+            // 「まだ載っている」を記録する (issue #171)。読了なら observe が since で同じことをする
+            tap_gate.touch(now_ms());
+        }
+        if rc != *last_license_rc {
+            // 途中死はカード引き抜き等でも出る
+            log::warn!("nfc: 免許証 読み取り失敗 rc={rc} ({})", license_rc_reason(rc));
+            sink.on_event(&NfcEvent::ReadFailed { rc });
+        }
     }
     *last_license_rc = rc;
     rc
