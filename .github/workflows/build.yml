@@ -158,7 +158,10 @@ jobs:
             esp-idf-tools-${{ runner.os }}-
 
       # esp ツールチェーン (数百MB) のダウンロードを毎回やらない。
-      # 新しい Rust ESP リリースに上げたい時は key の -v2 を上げて invalidate
+      # 新しい Rust ESP リリースに上げたい時は key の -v3 を上げて invalidate。
+      # -v3: -v2 の cache は ldproxy 抜きで保存されていた (下の rust-cache
+      # cache-bin コメント参照)。exact hit の cache は再保存されないので
+      # key を上げて作り直す (Refs #172)
       - name: Cache Xtensa Rust toolchain
         id: cache-xtensa
         uses: actions/cache@v4
@@ -166,7 +169,7 @@ jobs:
           path: |
             ~/.rustup/toolchains/esp
             ~/.cargo/bin/ldproxy
-          key: xtensa-rust-${{ runner.os }}-v2
+          key: xtensa-rust-${{ runner.os }}-v3
 
       # cache hit でも中身が揃っているとは限らない。実際 2026-08-19 に
       # `~/.rustup/toolchains/esp` はあるが `~/.cargo/bin/ldproxy` が無い
@@ -201,6 +204,12 @@ jobs:
           buildtargets: esp32s3
           ldproxy: true
 
+      # Install 直後に cache path の実体を出す。ここで無ければ action 側の
+      # 挙動が変わった (unzip 先が ~/.cargo/bin でなくなった等) ので落とす
+      - name: Show installed ldproxy
+        if: steps.cache-xtensa.outputs.cache-hit != 'true' || steps.verify-xtensa.outputs.ldproxy != 'ok'
+        run: ls -la "$HOME/.cargo/bin/ldproxy"
+
       # cache hit で Install step をスキップすると、action が設定するはずの
       # LIBCLANG_PATH が無く、esp-idf-sys の bindgen がシステム libclang
       # (xtensa 非対応) を使って "unknown target triple 'xtensa'" で落ちる
@@ -211,7 +220,7 @@ jobs:
         run: |
           LIBCLANG_FILE=$(find "$HOME/.rustup/toolchains/esp" -name 'libclang.so*' -type f 2>/dev/null | head -1)
           if [ -z "$LIBCLANG_FILE" ]; then
-            echo "::error::キャッシュ済み esp ツールチェーンに libclang が見つかりません。cache key (-v1) を上げて再インストールしてください"
+            echo "::error::キャッシュ済み esp ツールチェーンに libclang が見つかりません。cache key (-v3) を上げて再インストールしてください"
             exit 1
           fi
           echo "LIBCLANG_PATH=$(dirname "$LIBCLANG_FILE")" >> "$GITHUB_ENV"
@@ -231,6 +240,9 @@ jobs:
           key: ${{ hashFiles('.cargo/config.toml') }}
           save-if: 'false'
           cache-targets: 'false'
+          # build job と同じ path 集合で restore する (~/.cargo/bin は持たない。
+          # 理由は build job の同名 step のコメント、Refs #172)
+          cache-bin: 'false'
 
       # main の build job が warm した target/ (build-std fingerprint 込み) を
       # read-only restore する。restore-keys の fallback は .cargo/config.toml +
@@ -332,7 +344,10 @@ jobs:
             esp-idf-tools-${{ runner.os }}-
 
       # esp ツールチェーン (数百MB) のダウンロードを毎回やらない。
-      # 新しい Rust ESP リリースに上げたい時は key の -v2 を上げて invalidate
+      # 新しい Rust ESP リリースに上げたい時は key の -v3 を上げて invalidate。
+      # -v3: -v2 の cache は ldproxy 抜きで保存されていた (下の rust-cache
+      # cache-bin コメント参照)。exact hit の cache は再保存されないので
+      # key を上げて作り直す (Refs #172)
       - name: Cache Xtensa Rust toolchain
         id: cache-xtensa
         uses: actions/cache@v4
@@ -340,7 +355,7 @@ jobs:
           path: |
             ~/.rustup/toolchains/esp
             ~/.cargo/bin/ldproxy
-          key: xtensa-rust-${{ runner.os }}-v2
+          key: xtensa-rust-${{ runner.os }}-v3
 
       # cache hit でも中身が揃っているとは限らない。実際 2026-08-19 に
       # `~/.rustup/toolchains/esp` はあるが `~/.cargo/bin/ldproxy` が無い
@@ -375,6 +390,12 @@ jobs:
           buildtargets: esp32s3
           ldproxy: true
 
+      # Install 直後に cache path の実体を出す。ここで無ければ action 側の
+      # 挙動が変わった (unzip 先が ~/.cargo/bin でなくなった等) ので落とす
+      - name: Show installed ldproxy
+        if: steps.cache-xtensa.outputs.cache-hit != 'true' || steps.verify-xtensa.outputs.ldproxy != 'ok'
+        run: ls -la "$HOME/.cargo/bin/ldproxy"
+
       # cache hit で Install step をスキップすると、action が設定するはずの
       # LIBCLANG_PATH が無く、esp-idf-sys の bindgen がシステム libclang
       # (xtensa 非対応) を使って "unknown target triple 'xtensa'" で落ちる
@@ -385,13 +406,25 @@ jobs:
         run: |
           LIBCLANG_FILE=$(find "$HOME/.rustup/toolchains/esp" -name 'libclang.so*' -type f 2>/dev/null | head -1)
           if [ -z "$LIBCLANG_FILE" ]; then
-            echo "::error::キャッシュ済み esp ツールチェーンに libclang が見つかりません。cache key (-v1) を上げて再インストールしてください"
+            echo "::error::キャッシュ済み esp ツールチェーンに libclang が見つかりません。cache key (-v3) を上げて再インストールしてください"
             exit 1
           fi
           echo "LIBCLANG_PATH=$(dirname "$LIBCLANG_FILE")" >> "$GITHUB_ENV"
 
       # rust-cache は ~/.cargo (registry) 専用に縮退 (cache-targets: false)。
       # 理由は check job の同名コメント参照 (build-std fingerprint の purge、Refs #69)
+      #
+      # cache-bin: false — rust-cache は save 時の cleanup で「自分の restore
+      # 時点で既に ~/.cargo/bin にあった binary」を削除する (cleanBin、rustup
+      # の proxy 等を自分の cache に入れないため)。Install Xtensa Rust toolchain
+      # が置いた ~/.cargo/bin/ldproxy はこれに該当し、post step は逆順に走るので
+      # 「rust-cache の cleanup (ldproxy 削除) → Cache Xtensa の save」の順に
+      # なり、xtensa cache が ldproxy 抜きで保存されていた (2026-09-02 の main
+      # run 33603280133 atoms3-print leg で実測: `Cleaning cargo/bin` の 10 秒後
+      # に `Cache saved with key: xtensa-rust-Linux-v2`)。その cache を引く全
+      # job が Verify で ldproxy=missing になり、毎回 espup が走って API 403 を
+      # 踏んでいた (Refs #172 / #170 / #115 の再発)。bin の cache は要らない
+      # (espflash は専用 cache、ldproxy は xtensa cache) ので cleanup ごと止める
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
@@ -399,6 +432,7 @@ jobs:
           key: ${{ hashFiles('.cargo/config.toml') }}
           cache-on-failure: true
           cache-targets: 'false'
+          cache-bin: 'false'
 
       # target/ は素の actions/cache で cleanup 無しに保存する (build-std
       # fingerprint 込み)。main で warm し PR check leg が restore する。
