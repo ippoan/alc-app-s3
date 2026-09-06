@@ -331,6 +331,208 @@ mod tests {
         );
     }
 
+    // ---- 実機の呼び出しパターンを固定する (issue #155) ----
+    //
+    // `hub-drivers/src/nfc.rs` は **1 周 448ms** かけて F → A → B を順に試し、
+    // **各 poll のあいだにも `poll()` を挟む** (#155 で追加。挟まないと窓が閉じても
+    // 次の周まで最大 448ms 発火が遅れる)。**`TapGate` 自体は無改造**なので、
+    // ここで固定するのは「その呼び出し順で仕様が保たれるか」だけ。
+    //
+    // 実測 (Atom VoiceS3R、#155): F=91ms / A=140ms / B=200ms、周の末尾に 20ms の sleep。
+
+    /// F / A / B の poll 所要 [ms] (実機実測)
+    const T_F: u64 = 91;
+    const T_A: u64 = 140;
+    const T_B: u64 = 200;
+    /// 周末の `FreeRtos::delay_ms(POLL_INTERVAL_MS)`
+    const T_SLEEP: u64 = 20;
+
+    /// 1 周ぶんを実機と同じ順序で回す。
+    ///
+    /// `read_f` / `read_a` / `read_b` は「その poll でカードが読めたか」。
+    /// 実機と同じく **読めた時点で以降の poll は飛ばす** (`got` による短絡)。
+    /// 戻り値は、その周で確定したもの。
+    fn one_loop(
+        g: &mut TapGate<&'static str>,
+        t0: u64,
+        read_f: Option<&'static str>,
+        read_a: Option<&'static str>,
+        read_b: Option<&'static str>,
+    ) -> (u64, Vec<TapOutcome<&'static str>>) {
+        let mut out = Vec::new();
+        let mut push = |o: TapOutcome<&'static str>, out: &mut Vec<_>| {
+            if !matches!(o, TapOutcome::Idle) {
+                out.push(o);
+            }
+        };
+        let mut t = t0;
+        // ループ先頭の poll (元からある)
+        push(g.poll(t), &mut out);
+
+        // --- F ---
+        t += T_F;
+        let mut got = false;
+        if let Some(k) = read_f {
+            observe(g, k, t);
+            got = true;
+        }
+        push(g.poll(t), &mut out); // #155 で追加
+
+        // --- A ---
+        if !got {
+            t += T_A;
+            if let Some(k) = read_a {
+                observe(g, k, t);
+                got = true;
+            }
+        }
+        push(g.poll(t), &mut out); // #155 で追加
+
+        // --- B ---
+        if !got {
+            t += T_B;
+            if let Some(k) = read_b {
+                observe(g, k, t);
+            }
+        }
+        push(g.poll(t), &mut out); // #155 で追加
+
+        t += T_SLEEP;
+        (t, out)
+    }
+
+    /// **#143 の本命が保たれる**: 財布の中の FeliCa 2 枚は**どちらも F で読める**ので、
+    /// #155 で挟んだ `poll()` がすべて F の**後ろ**にある限り、2 枚目の `observe` が
+    /// 先に走る。つまり 2 枚検出は壊れない。
+    #[test]
+    fn issue155_call_pattern_still_detects_two_felica_cards() {
+        let mut g = TapGate::default();
+        let mut fired = Vec::new();
+        let mut t = 0;
+        // 1 周目: 1 枚目が F で読める
+        let (next, o) = one_loop(&mut g, t, Some("FELICA_1"), None, None);
+        fired.extend(o);
+        t = next;
+        // 2 周目: 2 枚目が F で読める (交互読み)。1 周 111ms < 確定窓 250ms
+        let (next, o) = one_loop(&mut g, t, Some("FELICA_2"), None, None);
+        fired.extend(o);
+        t = next;
+        // 以降は窓が閉じるまで回す
+        for _ in 0..6 {
+            let (next, o) = one_loop(&mut g, t, Some("FELICA_1"), None, None);
+            fired.extend(o);
+            t = next;
+        }
+        assert_eq!(
+            fired,
+            vec![TapOutcome::MultipleCards],
+            "2 枚とも F で読めるなら、#155 の呼び出し順でも 2 枚と判定できること"
+        );
+    }
+
+    /// **A (NFC-A) で読めるカードも、#155 の呼び出し順で 1 回だけ発火する。**
+    /// F が空振りしてから A が読む経路 (HCE / UID タグ) の回帰。
+    #[test]
+    fn issue155_single_nfca_card_fires_through_the_new_call_pattern() {
+        let mut g = TapGate::default();
+        let mut fired = Vec::new();
+        let mut t = 0;
+        // 1 周目: F は空振り、A で読める
+        let (next, o) = one_loop(&mut g, t, None, Some("NFCA_1"), None);
+        fired.extend(o);
+        t = next;
+        // 載せっぱなしで数周。確定窓が閉じたところで 1 回だけ発火する
+        for _ in 0..4 {
+            let (next, o) = one_loop(&mut g, t, None, Some("NFCA_1"), None);
+            fired.extend(o);
+            t = next;
+        }
+        assert_eq!(fired, vec![TapOutcome::Fire("NFCA_1")]);
+    }
+
+    /// **1 枚目が F、2 枚目が A でも 2 枚検出は保たれる** (#155 で親から名指しされたケース)。
+    ///
+    /// 経過時間だけ見ると 2 枚目の観測は 1 枚目から 251ms 後で**確定窓 250ms を超えて**
+    /// いるが、**窓は `poll()` が呼ばれて初めて閉じる**。F と A のあいだの `poll()` は
+    /// まだ 111ms の時点なので閉じておらず、A が読んだ瞬間はまだ保留中 —
+    /// つまり **2 枚目として拾える**。
+    ///
+    /// **#155 で `poll()` を増やしても、増やした位置がすべて F の後ろなので、
+    /// 「F で 1 枚目 → 同じ周の A で 2 枚目」の並びは壊れない。**
+    #[test]
+    fn issue155_felica_then_nfca_still_detects_two_cards() {
+        let mut g = TapGate::default();
+        let mut fired = Vec::new();
+        let mut t = 0;
+        // 1 周目: F で 1 枚目 (got により A/B は短絡)
+        let (next, o) = one_loop(&mut g, t, Some("FELICA_1"), None, None);
+        fired.extend(o);
+        t = next;
+        // 2 周目: F は空振り、A で 2 枚目
+        let (_next, o) = one_loop(&mut g, t, None, Some("NFCA_2"), None);
+        fired.extend(o);
+        assert_eq!(fired, vec![TapOutcome::MultipleCards]);
+    }
+
+    /// 2 枚とも A で読める場合も同様に 2 枚と判定できる (上と同じ理由)。
+    #[test]
+    fn issue155_two_nfca_cards_still_detected() {
+        let mut g = TapGate::default();
+        let mut fired = Vec::new();
+        let mut t = 0;
+        let (next, o) = one_loop(&mut g, t, None, Some("NFCA_1"), None);
+        fired.extend(o);
+        t = next;
+        let (_next, o) = one_loop(&mut g, t, None, Some("NFCA_2"), None);
+        fired.extend(o);
+        assert_eq!(fired, vec![TapOutcome::MultipleCards]);
+    }
+
+    /// **既知の限界を仕様として固定する**: 「1 枚目が F、2 枚目が B でしか読めない」
+    /// 組み合わせは **2 枚と判定できない**。
+    ///
+    /// **これは #155 が壊したのではない。**1 周 448ms が確定窓 250ms より長いので、
+    /// **窓が F/A/B の一巡をまたげない**ため元から取りこぼしていた
+    /// (モジュール doc の「交互読みの周期が確定窓より長い組み合わせは 2 枚と
+    /// 判定できない」がこれ)。**doc と一致していることをテストで示す。**
+    #[test]
+    fn issue155_two_cards_across_slow_poll_cycle_are_not_detected_by_design() {
+        let mut g = TapGate::default();
+        let mut fired = Vec::new();
+        let mut t = 0;
+        // 1 周目: F で 1 枚目。この周の残り (A/B) は短絡で走らない
+        let (next, o) = one_loop(&mut g, t, Some("FELICA_1"), None, None);
+        fired.extend(o);
+        t = next;
+        // 2 周目: F も A も空振りし、B (免許証) でようやく 2 枚目。
+        // ここに着くのは 1 周目の観測から 111 + 91 + 140 + 200 = 542ms 後で、
+        // **確定窓 250ms はとうに閉じている**
+        let (_next, o) = one_loop(&mut g, t, None, None, Some("LICENSE_2"));
+        fired.extend(o);
+        assert_eq!(
+            fired,
+            vec![TapOutcome::Fire("FELICA_1")],
+            "窓より遅い交互読みは 2 枚と判定できない (既知の限界。doc と一致)"
+        );
+    }
+
+    /// **#155 で挟んだ `poll()` は発火を早める**: 読めた周のうちに窓が閉じていれば、
+    /// **次の周 (448ms 先) を待たずに**発火する。
+    #[test]
+    fn issue155_fires_within_the_same_loop_when_window_already_closed() {
+        let mut g = TapGate::default();
+        // 0ms に観測 (前の周で読めた想定)
+        observe(&mut g, "A", 0);
+        // 窓が閉じた後の周: 先頭の poll は t0=W-50 でまだ閉じていない。
+        // F の poll (+91ms) を過ぎた時点で窓が閉じ、**その周のうちに**発火する
+        let (_t, out) = one_loop(&mut g, W - 50, None, None, None);
+        assert_eq!(
+            out,
+            vec![TapOutcome::Fire("A")],
+            "窓が閉じたら、その周のうちに発火すること (次の周まで待たない)"
+        );
+    }
+
     /// 2 枚が載りっぱなしで交互に読まれ続けても、エラーは 1 タップ 1 回。
     /// (毎周期エラーを出すとブザーが鳴りっぱなしになる)
     #[test]
