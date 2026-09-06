@@ -503,14 +503,23 @@ fn run(
             // 二重打刻の担保: 載ったままの -2 は実測 0/131 周、途中死は最大 1 周 (85ms) で
             // debounce の cooldown (1000ms) に吸収される
             present = rf_present;
+            // 離れたことが RF で確定した周 = B (粘着なら -2 ×2 で解けた後) → F → A の
+            // 1 周すべて無応答。cooldown を待たずタップを区切り、離した直後の再タップを
+            // 別の打刻として受ける (#155、`TapGate::release` の doc)。B だけの周 (~180ms)
+            // の 1 回の -2 では解かない — 電界の縁で -2 → 0 と揺れる免許証が新タップになる
+            let released_gate = !rf_present && fa == "run";
+            if released_gate {
+                tap_gate.release();
+            }
             let inst = (b_rc, sticky.on, fa == "run");
             if last_inst != Some(inst) {
                 last_inst = Some(inst);
                 log::info!(
-                    "nfc cycle={cycle} order=B rc={b_rc} sticky={sticky_word} cycles={} misses={} fa={fa} present=rf:{}",
+                    "nfc cycle={cycle} order=B rc={b_rc} sticky={sticky_word} cycles={} misses={} fa={fa} present=rf:{}{}",
                     sticky.cycles,
                     sticky.misses,
-                    u8::from(rf_present)
+                    u8::from(rf_present),
+                    if released_gate { " released=gate" } else { "" }
                 );
             }
         }
