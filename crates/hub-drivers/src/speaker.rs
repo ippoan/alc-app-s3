@@ -140,6 +140,18 @@ pub enum Sound {
     BeepOk,
     /// 「登録完了しました」音声 (~1.5 秒)
     Registered,
+    /// **打刻できなかった** (3000Hz 400ms ×1)。タイムカード端末 (issue #155)。
+    ///
+    /// **`PunchOk` と周波数は同じ 3000Hz。区別はリズムでつける** —
+    /// 「ピピッ (速く 2 回)」対「ピーッ (長く 1 回)」。
+    /// **低い音にして区別してはいけない**: plan/standing-devices.md §2 の実機測定で
+    /// **3000Hz が最大音量 (小型スピーカーの共振帯域)** と確定しており、
+    /// 1000〜2000Hz は**同じ振幅でも聞こえが落ちる**。
+    ///
+    /// **なぜ要るか**: 本機は LED を持たないので、打刻しなかったときに端末が
+    /// **完全に無反応**になる。実機で「2 枚見えて弾いた」のを利用者が
+    /// **「壊れている」と受け取った** (2026-09-06)。**断ったことを伝える手段が要る。**
+    PunchNg,
     /// 打刻成功 (3000Hz 60ms ×2、間隔 40ms)。タイムカード端末 (issue #154)。
     /// **3000Hz なのは実測** — 旧 ATOM Voice で 1000〜5000Hz を鳴らし比べ、
     /// 小型スピーカーの共振帯域である 3000Hz が最大音量だった
@@ -165,6 +177,9 @@ pub fn start_player(mut speaker: Speaker) -> Result<std::sync::mpsc::Sender<Soun
                     Sound::BeepOk => speaker.beep(2000.0, 40),
                     Sound::Registered => speaker.play_registered(),
                     Sound::PunchOk => speaker.beep_twice(3000.0, 60, 40),
+                    // 長く 1 回。`beep` は終端 50ms がフェードアウトなので
+                    // 「ピーッ」と減衰して終わる (成功の「ピピッ」と紛れない)
+                    Sound::PunchNg => speaker.beep(3000.0, 400),
                 };
                 if let Err(e) = r {
                     log::warn!("speaker: 再生失敗: {e:#}");
