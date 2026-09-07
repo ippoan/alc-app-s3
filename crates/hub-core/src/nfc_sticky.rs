@@ -124,7 +124,8 @@ pub const FA_EVERY_CYCLES: u32 = 2;
 /// この周に F → A を回すか (`PollOrder::LicenseFirst` の B の直後に決める)。
 ///
 /// - `got` (B で読了) / `sticky_on` (粘着中) は飛ばす — 電界断ゼロを守る (#155 step 4)
-/// - B が応答した周 (`rf_present`。-4 / -8 の HCE スマホも含む) は常に回す — Suica の F 窓を遅らせない
+/// - B が応答したが粘着しなかった周 (`rf_present` かつ `!sticky_on` = -4 / -8 の HCE スマホ) は
+///   間引き周でも回す — Suica の F 窓を遅らせない。-3 / -5 / -6 は粘着するので上の条件で飛ぶ
 /// - `always_poll` で B が無応答の周は `cycle` が [`FA_EVERY_CYCLES`] の倍数のときだけ (間引き、#175)。
 ///   新しいカウンタは持たず、計器用の周回番号の偶奇で決める
 /// - Adaptive (`always_poll == false`) は従来どおり B が無応答なら毎周回す
@@ -152,7 +153,7 @@ mod tests {
 
     #[test]
     fn run_fa_always_runs_when_b_responded() {
-        // -4 / -8 (HCE スマホ) や途中死で粘着が解けた周は間引き周でも F/A へ回す
+        // -4 / -8 (HCE スマホ、粘着しない) の周は間引き周でも F/A へ回す
         assert!(run_fa(false, false, true, true, 1));
         assert!(run_fa(false, false, true, true, 2));
     }

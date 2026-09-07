@@ -787,21 +787,31 @@ mod tests {
     }
 
     /// 確定窓の途中で release されても保留は落ちない (窓より短くかざした打刻を消さない)
-    /// release の戻り値: 区切るものがあった周だけ true。待機中 (何も読んでいない) の
-    /// 連続呼び出しは false (#175 の計器行はこれで待機中に流れない)
+    /// release の戻り値: 直前のタップ (last) or 2 枚エラーが残っていた周は true (区切った)
     #[test]
-    fn release_reports_whether_a_tap_was_cut() {
+    fn release_reports_true_when_a_tap_was_cut() {
         let mut g = TapGate::new(1_000);
-        assert!(!g.release());
         observe(&mut g, "A", 0);
         assert_eq!(poll_until(&mut g, 0, 300), vec![TapOutcome::Fire("A")]);
         assert!(g.release());
-        assert!(!g.release());
         // 2 枚エラーの解除も「区切った」
         observe(&mut g, "A", 1_000);
         observe(&mut g, "B", 1_100);
         assert_eq!(poll_until(&mut g, 1_100, 1_400), vec![TapOutcome::MultipleCards]);
         assert!(g.release());
+    }
+
+    /// 何も読んでいない待機中の連続呼び出しは false (#175 の AlwaysPoll では待機中も
+    /// 毎周呼ばれる。計器行はこれで待機中に流れない)
+    #[test]
+    fn release_reports_false_when_nothing_to_cut() {
+        let mut g = TapGate::new(1_000);
+        assert!(!g.release());
+        assert!(!g.release());
+        observe(&mut g, "A", 0);
+        assert_eq!(poll_until(&mut g, 0, 300), vec![TapOutcome::Fire("A")]);
+        assert!(g.release());
+        assert!(!g.release());
     }
 
     #[test]
