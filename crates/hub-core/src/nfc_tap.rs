@@ -241,8 +241,14 @@ impl<T> TapGate<T> {
     /// (実機 2026-09-06) ので採らない。
     ///
     /// **確定窓 (`Pending`) は落とさない** — 窓より短くかざして離した打刻を消さない。
-    pub fn release(&mut self) {
+    ///
+    /// 戻り値は「区切るものがあったか」(直前のタップ or 2 枚エラーが残っていた)。
+    /// 常時ポーリング (#175) では待機中も RF 無応答の周が続き毎周呼ばれるので、
+    /// 計器行はこれが true の周 (= タップが実際に終わった周) だけを出す
+    pub fn release(&mut self) -> bool {
+        let had = self.last.is_some() || matches!(self.phase, Phase::Rejected);
         self.clear_last();
+        had
     }
 
     /// カードが載っていることだけを伝える (読めたかは問わない)。
@@ -781,6 +787,23 @@ mod tests {
     }
 
     /// 確定窓の途中で release されても保留は落ちない (窓より短くかざした打刻を消さない)
+    /// release の戻り値: 区切るものがあった周だけ true。待機中 (何も読んでいない) の
+    /// 連続呼び出しは false (#175 の計器行はこれで待機中に流れない)
+    #[test]
+    fn release_reports_whether_a_tap_was_cut() {
+        let mut g = TapGate::new(1_000);
+        assert!(!g.release());
+        observe(&mut g, "A", 0);
+        assert_eq!(poll_until(&mut g, 0, 300), vec![TapOutcome::Fire("A")]);
+        assert!(g.release());
+        assert!(!g.release());
+        // 2 枚エラーの解除も「区切った」
+        observe(&mut g, "A", 1_000);
+        observe(&mut g, "B", 1_100);
+        assert_eq!(poll_until(&mut g, 1_100, 1_400), vec![TapOutcome::MultipleCards]);
+        assert!(g.release());
+    }
+
     #[test]
     fn release_while_pending_keeps_the_pending_tap() {
         let mut g = TapGate::new(1_000);

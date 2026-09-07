@@ -572,13 +572,12 @@ fn run(
             // 1 周すべて無応答。cooldown を待たずタップを区切り、離した直後の再タップを
             // 別の打刻として受ける (#155、`TapGate::release` の doc)。B だけの周 (~180ms)
             // の 1 回の -2 では解かない — 電界の縁で -2 → 0 と揺れる免許証が新タップになる
-            let released_gate = !rf_present && run_fa;
-            if released_gate {
-                tap_gate.release();
-            }
+            // AlwaysPoll では待機中もこの周が毎回来るが、`release` は区切るものが無ければ
+            // no-op で false を返す。計器行の `released=gate` は true の周だけ
+            let released_gate = !rf_present && run_fa && tap_gate.release();
             // 待機中 (AlwaysPoll) に流さないための正規化: -1 (未初期化 / バッファ不足) は
             // -2 と同じ「無応答」に寄せ、fa の run/idle の交互 (待機周で毎周入れ替わる) は
-            // 「B が周を取ったか」に置き換える。#169 の `released=gate` の周は必ず出す
+            // 「B が周を取ったか」に置き換える。#169 でタップが区切られた周は必ず出す
             let rc_norm = if b_rc == nfc_sticky::RC_NOT_READY {
                 nfc_sticky::RC_NO_CARD
             } else {
