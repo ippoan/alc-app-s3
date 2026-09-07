@@ -151,7 +151,7 @@ const TRIGGER_STUCK: Duration = Duration::from_secs(8);
 /// 無反応 4/10, 2/5, 7/10, 8/10。音・常時ポーリング・PSRAM・同時負荷は全て否定済み)。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PollOrder {
-    /// F → A → B (従来。CoreS3 と検証機 atoms3-nfc はこちら、挙動不変)
+    /// F → A → B (従来。検証機 atoms3-nfc 用。CoreS3 も #162 で [`LicenseFirst`](Self::LicenseFirst) に寄せた)
     FelicaFirst,
     /// **B 先行 + B 粘着** (NFC タイムカード端末)。待機中は B モードのまま電界 ON なので、
     /// トリガ後の 1 周目は切替ゼロで B から読む。B が応答した (成功以外の途中死も含む) なら
@@ -169,11 +169,10 @@ pub enum PollOrder {
 /// 触らない) なので、増えるのは WUPB の変調と I2C の転送
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PresenceGate {
-    /// 振幅・位相がベースラインから動いたときだけ F/A/B を回す (従来。CoreS3 と検証機
-    /// atoms3-nfc はこちら、挙動不変)。
+    /// 振幅・位相がベースラインから動いたときだけ F/A/B を回す (従来。検証機 atoms3-nfc 用)。
     ///
-    /// CoreS3 も免許証で点呼を始める (#125) ので同じ穴があり、LicenseFirst + AlwaysPoll に
-    /// 寄せるのが筋だが、CoreS3 実機では未計測 (#162 の候補 C)。今回は据え置き
+    /// CoreS3 も免許証で点呼を始める (#125) ので同じ穴があり、#162 で LicenseFirst +
+    /// AlwaysPoll に寄せた (候補 C)
     Adaptive,
     /// 存在検知でゲートせず**待機中も毎周 poll を回す** (NFC タイムカード端末)。
     ///
