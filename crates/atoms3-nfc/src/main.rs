@@ -97,6 +97,8 @@ fn main() -> Result<()> {
         p.pins.gpio1.into(),
         // 検証機は従来どおり F → A → B (#155 step 4 の B 先行は本番機 atoms3-timecard だけ)
         nfc::PollOrder::FelicaFirst,
+        // 存在検知ゲートも従来どおり (#175 の AlwaysPoll は本番機 atoms3-timecard だけ)
+        nfc::PresenceGate::Adaptive,
         Arc::clone(&status),
         move |e: &NfcEvent| paint_event(&led_for_nfc, e),
     )?;

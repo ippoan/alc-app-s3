@@ -217,6 +217,9 @@ fn main() -> Result<()> {
         p.pins.gpio1.into(),
         // B 先行 + B 粘着 (#155 step 4)。理由は nfc::PollOrder の doc
         nfc::PollOrder::LicenseFirst,
+        // 存在検知をゲートに使わず待機中も B を回す (#175)。本番機では免許証を上から置いても
+        // 振幅・位相が動かない置き方があり、ゲートが 1/5 しか開かなかった。理由は nfc::PresenceGate の doc
+        nfc::PresenceGate::AlwaysPoll,
         Arc::clone(&status),
         move |e: &NfcEvent| on_card(e, &ws_meas_tx, speaker_tx.as_ref()),
     )?;

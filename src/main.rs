@@ -295,6 +295,8 @@ fn main() -> Result<()> {
             nfc_scl,
             // CoreS3 は従来どおり F → A → B (#155 step 4 の B 先行は atoms3-timecard だけ)
             alc_hub_drivers::nfc::PollOrder::FelicaFirst,
+            // 存在検知ゲートも従来どおり (#175 の AlwaysPoll は atoms3-timecard だけ。CoreS3 は未計測)
+            alc_hub_drivers::nfc::PresenceGate::Adaptive,
             Arc::clone(&status),
             move |e: &alc_hub_drivers::nfc::NfcEvent| {
                 use alc_hub_drivers::nfc::NfcEvent;

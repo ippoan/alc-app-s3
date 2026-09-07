@@ -162,6 +162,35 @@ pub enum PollOrder {
     LicenseFirst,
 }
 
+/// 存在検知 (アンテナ振幅・位相、`PRESENCE_DELTA`) を**カード読み取りのゲートに使うかどうか** (#175)。
+///
+/// 存在検知は RF ポーリングを省くための最適化にすぎない。ゲートを外しても読めるものは同じで、
+/// 変わるのは「待機中も WUPB を打つか」だけ。待機中も電界は ON (`measure_ad` は tx_en を
+/// 触らない) なので、増えるのは WUPB の変調と I2C の転送
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PresenceGate {
+    /// 振幅・位相がベースラインから動いたときだけ F/A/B を回す (従来。CoreS3 と検証機
+    /// atoms3-nfc はこちら、挙動不変)。
+    ///
+    /// CoreS3 も免許証で点呼を始める (#125) ので同じ穴があり、LicenseFirst + AlwaysPoll に
+    /// 寄せるのが筋だが、CoreS3 実機では未計測 (#162 の候補 C)。今回は据え置き
+    Adaptive,
+    /// 存在検知でゲートせず**待機中も毎周 poll を回す** (NFC タイムカード端末)。
+    ///
+    /// 本番機 (VoiceS3R + Unit NFC、振幅 34) の実測 (#175、2026-09-07): 免許証を上から真っ直ぐ
+    /// 置いて 4.5 秒保持 ×5 でゲートが開いたのは **1/5** (横から滑らせても 1/5、速い再タップは 5/5)。
+    /// 開かない間は heartbeat が `amp=34/34 ph=181/181` のまま = **置き位置・向きによって振幅も
+    /// 位相も動かない置き方がある**。ゲートに頼る限り「載せても数秒鳴らない」が残るので、
+    /// 読み取り側 (#163 B 先行・粘着 / #167 ATQB / #169 #174 TapGate) が直った今、待機中も B を回す。
+    ///
+    /// **[`PollOrder::LicenseFirst`] と組んで使う。** B が無応答の待機周は F → A → B 戻しを
+    /// [`nfc_sticky::FA_EVERY_CYCLES`] 周に 1 回に間引き、残りは B のまま切替 (電界断) ゼロ。
+    /// FelicaFirst と組むと毎周 F → A → B で電界断 3 回/周 (#155 step 3 と同じ条件) になるので
+    /// 使わない (構造では禁止しない)。固着復帰 (`TRIGGER_STUCK`) は常時トリガでは意味を失うので
+    /// 丸ごと飛ばす。振幅・位相の測定と baseline の追従は続ける (heartbeat の設置診断に使う)
+    AlwaysPoll,
+}
+
 /// NFC 読み取りスレッドを起動する。
 ///
 /// - `i2c_port`: nfc_shim (C++ 側) に立てさせる I2C ポート番号。**Rust 側で
@@ -173,6 +202,7 @@ pub fn start(
     sda: AnyIOPin,
     scl: AnyIOPin,
     order: PollOrder,
+    gate: PresenceGate,
     status: SharedStatus,
     sink: impl NfcSink,
 ) -> Result<()> {
@@ -188,7 +218,7 @@ pub fn start(
         .name("nfc".into())
         // APDU 組立 (String) + FFI 経由の hex 文字列バッファがあるため rs232.rs と同等
         .stack_size(8 * 1024)
-        .spawn(move || run(i2c_port, sda_num, scl_num, order, status, sink))?;
+        .spawn(move || run(i2c_port, sda_num, scl_num, order, gate, status, sink))?;
     Ok(())
 }
 
@@ -197,6 +227,7 @@ fn run(
     sda_num: i32,
     scl_num: i32,
     order: PollOrder,
+    gate: PresenceGate,
     status: SharedStatus,
     mut sink: impl NfcSink,
 ) {
@@ -219,6 +250,12 @@ fn run(
         log::info!("nfc: B 先行 + B 粘着でポーリングする (PollOrder::LicenseFirst)");
         // step 4b: 「まだ載っている」(present) は RF の応答で決める (下の touch の直前)
         println!("EVT NFC_PRESENT_SRC rf");
+    }
+    let always_poll = gate == PresenceGate::AlwaysPoll;
+    if always_poll {
+        // 起動マーカー (同じく NFC_READY より後)
+        println!("EVT NFC_PRESENCE_GATE AlwaysPoll");
+        log::info!("nfc: 存在検知をゲートに使わず常時ポーリングする (PresenceGate::AlwaysPoll)");
     }
 
     // 重複抑止は **debounce**「離れて N ms 経つまで、まだ同じタップ」
@@ -270,9 +307,10 @@ fn run(
     // LicenseFirst の B 粘着 (遷移は alc_hub_core::nfc_sticky)。cycle は計器用の周回番号
     let mut sticky = Sticky::default();
     let mut cycle: u32 = 0;
-    // 計器行 (`nfc cycle=`) は rc / 粘着 / F-A の有無のどれかが前周と変わった周だけ出す。
-    // 載せっぱなしや常時トリガで毎周出すと crashlog のリングを押し流すため
-    let mut last_inst: Option<(i32, bool, bool)> = None;
+    // 計器行 (`nfc cycle=`) は rc / 粘着 / 「B が周を取ったか」/ release のどれかが前周と
+    // 変わった周だけ出す。載せっぱなしや常時ポーリングの待機で毎周出すと crashlog のリングを
+    // 押し流すため (tuple の中身は周末の `inst` を参照)
+    let mut last_inst: Option<(i32, bool, bool, bool)> = None;
 
     loop {
         tick = tick.wrapping_add(1);
@@ -329,12 +367,20 @@ fn run(
             );
         }
 
+        // 常時ポーリング (#175): 存在検知の当たり外れを読み取りの可否に持ち込まない。
+        // 上の amp/ph 判定と baseline の追従はそのまま走らせる (heartbeat の設置診断に使う)。
+        // `present` は触らない — LicenseFirst は下 (touch の直前) で RF の応答に上書きする
+        let triggered = always_poll || triggered;
         if !triggered {
             triggered_since = None;
             FreeRtos::delay_ms(POLL_INTERVAL_MS);
             continue;
         }
         match triggered_since {
+            // 固着の保険は存在検知をゲートに使っているときだけ意味がある。常時ポーリングでは
+            // 常にトリガなので、放っておくと 8 秒ごとに「固着」と判定して baseline を弄り
+            // ログを出し続けるだけになる。`triggered_since` 等は None のまま凍結 (害なし)
+            _ if always_poll => {}
             None => {
                 triggered_since = Some(Instant::now());
                 // 立ち上がりの値を控える。固着したらここへ戻す
@@ -405,6 +451,9 @@ fn run(
         let mut b_rc = i32::MIN;
         let mut fa = "-";
         let mut sticky_word = "-";
+        // F → A を回すか。FelicaFirst は常に回す。LicenseFirst は B の結果と
+        // (AlwaysPoll の待機周では) 周回番号の偶奇で決める — `nfc_sticky::run_fa`
+        let mut run_fa = true;
 
         // --- B 先行 (LicenseFirst、#155 step 4) ---
         // 待機中は B モードのまま電界 ON なので、ここは切替 (電界断) ゼロで入れる
@@ -417,14 +466,23 @@ fn run(
             sticky = next;
             b_rc = rc;
             rf_present = rc != nfc_sticky::RC_NO_CARD && rc != nfc_sticky::RC_NOT_READY;
-            fa = if got || sticky.on { "skip" } else { "run" };
+            run_fa = nfc_sticky::run_fa(got, sticky.on, rf_present, always_poll, cycle);
+            // skip = B が周を取った (読了 / 粘着)、idle = AlwaysPoll の待機周の間引き
+            fa = if run_fa {
+                "run"
+            } else if got || sticky.on {
+                "skip"
+            } else {
+                "idle"
+            };
             sticky_word = release.label(sticky.on);
             deliver(tap_gate.poll(now_ms()), &status, &mut sink);
         }
 
         // --- F → A (→ B) ---
-        // LicenseFirst で読了済み or 粘着中はここを丸ごと飛ばす (電界断ゼロを守る)
-        if !(license_first && (got || sticky.on)) {
+        // LicenseFirst で読了済み / 粘着中 / AlwaysPoll の間引き周はここを丸ごと飛ばす
+        // (電界断ゼロを守る)
+        if run_fa {
             let started = now_ms();
             match poll_felica_idm() {
                 Ok(Some(idm)) => {
@@ -500,7 +558,7 @@ fn run(
 
         if license_first {
             // step 4b: 「まだ載っている」は RF の応答で決める (振幅/位相は**ゲートを開く**
-            // 役だけに使う)。位相のベースラインはトリガ中に追従しないので、位相が動いた後は
+            // 役だけに使う。AlwaysPoll ではその役も無く、heartbeat の計器に残るだけ)。位相のベースラインはトリガ中に追従しないので、位相が動いた後は
             // 振幅/位相由来の `present` が張り付き、カードが離れている間も touch が続いて
             // 次のタップが「同じタップ」扱いで debounce に飲まれる (step 4 実機: 読めた
             // 9 タップのうち 7 が発火せず)。LicenseFirst では粘着中の B が毎周 (84ms)
@@ -514,11 +572,18 @@ fn run(
             // 1 周すべて無応答。cooldown を待たずタップを区切り、離した直後の再タップを
             // 別の打刻として受ける (#155、`TapGate::release` の doc)。B だけの周 (~180ms)
             // の 1 回の -2 では解かない — 電界の縁で -2 → 0 と揺れる免許証が新タップになる
-            let released_gate = !rf_present && fa == "run";
-            if released_gate {
-                tap_gate.release();
-            }
-            let inst = (b_rc, sticky.on, fa == "run");
+            // AlwaysPoll では待機中もこの周が毎回来るが、`release` は区切るものが無ければ
+            // no-op で false を返す。計器行の `released=gate` は true の周だけ
+            let released_gate = !rf_present && run_fa && tap_gate.release();
+            // 待機中 (AlwaysPoll) に流さないための正規化: -1 (未初期化 / バッファ不足) は
+            // -2 と同じ「無応答」に寄せ、fa の run/idle の交互 (待機周で毎周入れ替わる) は
+            // 「B が周を取ったか」に置き換える。#169 でタップが区切られた周は必ず出す
+            let rc_norm = if b_rc == nfc_sticky::RC_NOT_READY {
+                nfc_sticky::RC_NO_CARD
+            } else {
+                b_rc
+            };
+            let inst = (rc_norm, sticky.on, got || sticky.on, released_gate);
             if last_inst != Some(inst) {
                 last_inst = Some(inst);
                 log::info!(

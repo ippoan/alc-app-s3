@@ -114,9 +114,64 @@ pub fn next(prev: Sticky, rc: i32) -> (Sticky, Release) {
     (s, Release::None)
 }
 
+/// `PresenceGate::AlwaysPoll` (hub-drivers の nfc.rs、#175) で **B が無応答の待機周**に
+/// F → A (→ B モード戻し) を回す頻度 (N 周に 1 回)。常時ポーリングでは待機周も本体に入るので、
+/// 毎周 F/A を回すと 1 周が ~350ms になり、しかも切替で電界断が毎周 3 回入る (= #155 step 3 と
+/// 同じ条件)。N 周に 1 回に間引くと待機は B (WUPB ~85ms、切替ゼロ) が主役になり、FeliCa の
+/// F 窓は最悪 N 周 ≈ 0.46 秒に 1 回 (N=2、2026-09-06 の決定: Suica の F 窓を優先)
+pub const FA_EVERY_CYCLES: u32 = 2;
+
+/// この周に F → A を回すか (`PollOrder::LicenseFirst` の B の直後に決める)。
+///
+/// - `got` (B で読了) / `sticky_on` (粘着中) は飛ばす — 電界断ゼロを守る (#155 step 4)
+/// - B が応答したが粘着しなかった周 (`rf_present` かつ `!sticky_on` = -4 / -8 の HCE スマホ) は
+///   間引き周でも回す — Suica の F 窓を遅らせない。-3 / -5 / -6 は粘着するので上の条件で飛ぶ
+/// - `always_poll` で B が無応答の周は `cycle` が [`FA_EVERY_CYCLES`] の倍数のときだけ (間引き、#175)。
+///   新しいカウンタは持たず、計器用の周回番号の偶奇で決める
+/// - Adaptive (`always_poll == false`) は従来どおり B が無応答なら毎周回す
+pub fn run_fa(got: bool, sticky_on: bool, rf_present: bool, always_poll: bool, cycle: u32) -> bool {
+    if got || sticky_on {
+        return false;
+    }
+    rf_present || !always_poll || cycle % FA_EVERY_CYCLES == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_fa_skips_when_b_took_the_cycle() {
+        // 読了 / 粘着中はゲートの種類も周回番号も見ずに飛ばす
+        for always_poll in [false, true] {
+            for cycle in [1, 2] {
+                assert!(!run_fa(true, false, true, always_poll, cycle));
+                assert!(!run_fa(false, true, true, always_poll, cycle));
+            }
+        }
+    }
+
+    #[test]
+    fn run_fa_always_runs_when_b_responded() {
+        // -4 / -8 (HCE スマホ、粘着しない) の周は間引き周でも F/A へ回す
+        assert!(run_fa(false, false, true, true, 1));
+        assert!(run_fa(false, false, true, true, 2));
+    }
+
+    #[test]
+    fn run_fa_always_poll_idle_every_other_cycle() {
+        // 待機周 (B 無応答) は FA_EVERY_CYCLES 周に 1 回
+        let runs: Vec<bool> = (1..=4).map(|c| run_fa(false, false, false, true, c)).collect();
+        assert_eq!(runs, vec![false, true, false, true]);
+    }
+
+    #[test]
+    fn run_fa_adaptive_runs_every_idle_cycle() {
+        // Adaptive は従来どおり B が -2 なら毎周 F → A
+        for cycle in 1..=4 {
+            assert!(run_fa(false, false, false, false, cycle));
+        }
+    }
 
     fn run(rcs: &[i32]) -> (Sticky, Release) {
         let mut s = Sticky::default();
