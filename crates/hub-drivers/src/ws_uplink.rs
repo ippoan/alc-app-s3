@@ -31,9 +31,9 @@ use std::net::TcpStream;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
 use alc_hub_core::uplink::{
-    command_action, command_gw_url, command_ota_url, command_print_chunk, command_print_url,
-    command_result_frame, measurement_frame, parse_downlink, should_wait_for_clock, Downlink,
-    DroppedEntry, UplinkQueue, PING_FRAME,
+    command_action, command_gw_url, command_log_max_bytes, command_ota_url,
+    command_print_chunk, command_print_url, command_result_frame, measurement_frame,
+    parse_downlink, should_wait_for_clock, Downlink, DroppedEntry, UplinkQueue, PING_FRAME,
 };
 use anyhow::Result;
 use esp_idf_svc::ws::client::{
@@ -751,6 +751,20 @@ fn handle_downlink(
                             )
                         })
                         .unwrap_or_else(|_| r#"{"read":false}"#.to_string());
+                    send_command_result(conn, &id, &payload);
+                }
+                // 直近ログの取得 (#195): crash_log / `LOG DUMP` と同じ `.noinit`
+                // リングの末尾 (行境界) を command_result で返す。auth-worker の
+                // MCP get_device_log が読む。上限は payload の max_bytes
+                // (省略時 3000、1〜3800 にクランプ)。command_result は NVS
+                // キューを通らず socket 直書きなので MAX_LINE_BYTES には掛からない
+                Some("get_log") => {
+                    let text = crate::crashlog::snapshot_text();
+                    let payload = alc_hub_core::crashlog::log_payload(
+                        &text,
+                        command_log_max_bytes(&payload),
+                        now_ms(),
+                    );
                     send_command_result(conn, &id, &payload);
                 }
                 // 未知の action も従来どおり空 result で ack する

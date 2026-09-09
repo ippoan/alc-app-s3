@@ -135,6 +135,38 @@ pub fn tail_str(s: &str, max_bytes: usize) -> &str {
     &s[start..]
 }
 
+/// 末尾 `max_bytes` バイト以内に収まる**行の並び**と、切り詰めたかどうか。
+///
+/// [`tail_str`] の結果を行境界にスナップする — 切った位置が行の途中なら、
+/// その欠けた先頭行を捨てる。全体が収まれば `(text, false)`。
+/// `get_log` command (#195) がリングの末尾を返すのに使う。
+pub fn tail_lines(text: &str, max_bytes: usize) -> (&str, bool) {
+    let tail = tail_str(text, max_bytes);
+    let start = text.len() - tail.len();
+    let snapped = if start > 0 && text.as_bytes()[start - 1] != b'\n' {
+        tail.find('\n').map_or("", |i| &tail[i + 1..])
+    } else {
+        tail
+    };
+    (snapped, snapped.len() < text.len())
+}
+
+/// `get_log` command (#195) の command_result payload (JSON オブジェクト文字列)。
+/// `text` (リングの sanitize 済み全文) の末尾 `max_bytes` を行境界で切って返す。
+/// リングは 4 KB なので `max_bytes` を最大にしても全体は取れないことがある —
+/// `truncated` と `total_bytes` で伝える。文字列のエスケープは serde_json に任せる。
+pub fn log_payload(text: &str, max_bytes: usize, uptime_ms: u64) -> String {
+    let (tail, truncated) = tail_lines(text, max_bytes);
+    serde_json::json!({
+        "text": tail,
+        "bytes": tail.len(),
+        "total_bytes": text.len(),
+        "truncated": truncated,
+        "uptime_ms": uptime_ms,
+    })
+    .to_string()
+}
+
 /// kind="crash_log" の WS payload (JSON オブジェクト文字列) を組み立てる。
 /// ログは末尾 `max_log_bytes` に切り詰める (NVS 送信キュー 4KB 制限との同居。
 /// 切った場合は truncated:true)。RAM が保持されなかった場合は空文字で呼ぶ —
@@ -284,6 +316,49 @@ mod tests {
         assert_eq!(tail_str("abcdef", 3), "def");
         // "あ" は 3 バイト — 境界をまたぐ切り出しは次の文字境界へ寄せる
         assert_eq!(tail_str("あい", 4), "い");
+    }
+
+    #[test]
+    fn tail_lines_returns_all_when_it_fits() {
+        assert_eq!(tail_lines("a\nbb\n", 10), ("a\nbb\n", false));
+        assert_eq!(tail_lines("a\nbb\n", 5), ("a\nbb\n", false));
+    }
+
+    #[test]
+    fn tail_lines_drops_partial_first_line() {
+        // 6 バイト以内 = "b\nccc\n" だが先頭行 "b" は "bb" の欠け → 捨てる
+        assert_eq!(tail_lines("a\nbb\nccc\n", 6), ("ccc\n", true));
+        // 切った位置がちょうど行頭なら捨てない
+        assert_eq!(tail_lines("a\nbb\nccc\n", 7), ("bb\nccc\n", true));
+        // 収まる範囲に改行が無い (1 行が長すぎる) → 空 + truncated
+        assert_eq!(tail_lines("abcdefgh", 3), ("", true));
+        // UTF-8 境界は tail_str が守る ("あ" は 3 バイト)
+        assert_eq!(tail_lines("x\nあい\n", 6), ("", true));
+        assert_eq!(tail_lines("x\nあい\n", 7), ("あい\n", true));
+    }
+
+    #[test]
+    fn tail_lines_empty_text() {
+        assert_eq!(tail_lines("", 100), ("", false));
+        assert_eq!(tail_lines("", 0), ("", false));
+    }
+
+    #[test]
+    fn log_payload_reports_sizes_and_truncation() {
+        let p = log_payload("l1\nl2 \"q\"\n", 100, 4242);
+        let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+        assert_eq!(v["text"], "l1\nl2 \"q\"\n");
+        assert_eq!(v["bytes"], 10);
+        assert_eq!(v["total_bytes"], 10);
+        assert_eq!(v["truncated"], false);
+        assert_eq!(v["uptime_ms"], 4242);
+
+        let p = log_payload("l1\nl2\nl3\n", 4, 0);
+        let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+        assert_eq!(v["text"], "l3\n");
+        assert_eq!(v["bytes"], 3);
+        assert_eq!(v["total_bytes"], 9);
+        assert_eq!(v["truncated"], true);
     }
 
     #[test]

@@ -68,7 +68,7 @@ Idle ─タップ→ Menu                                         自動/タッ�
 | `RESET` | 待機画面へ |
 | `ROTATE <0\|90\|180\|270>` | 画面向き変更 (NVS 保存、再起動後も維持) |
 | `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0 BOARD=cores3` 応答 (`BOARD` は起動時の I2C probe で `cores3` / `cores3se`) |
-| `LOG DUMP` | 直近ログ (`.noinit` リング) を `LOGDUMP ...` で吸い出す。事象の後から原因を追う用 |
+| `LOG DUMP` | 直近ログ (`.noinit` リング) を `LOGDUMP ...` で吸い出す。事象の後から原因を追う用。WS 下り command `{action:"get_log",max_bytes?}` (省略時 3000、上限 3800) でも同じリングの末尾を `command_result` `{text,bytes,total_bytes,truncated,uptime_ms}` で遠隔から取れる (auth-worker MCP `get_device_log`) |
 | `CFG GET` | 現在の設定を 1 行 JSON でエクスポート |
 | `CFG SET <json>` | 設定 (画面向き + Wi-Fi) を検証して NVS へインポート |
 | `WIFI TEST` | 保存済み Wi-Fi 設定で接続テスト (失敗時は原因を切り分け) |
