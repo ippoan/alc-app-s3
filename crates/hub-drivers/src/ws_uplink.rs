@@ -23,7 +23,8 @@
 //! |---|---|
 //! | `EVT WS_CONNECTED` / `EVT WS_DISCONNECTED` | WS 接続状態の変化 |
 //! | `EVT WS_COMMAND <id> <payload>` | 下り command を受信 |
-//! | `EVT WS_DROPPED <seq>` | キュー上限で最古の未送信測定を破棄 |
+//! | `EVT WS_DROPPED <seq> <kind>` | 保存先が一杯で最古の未送信測定を破棄 |
+//! | `EVT PUNCHQ <mode> count=<n>` | 送信キューの保存先と未送信件数 (punchq.rs) |
 
 use std::io::Write;
 use std::net::TcpStream;
@@ -32,7 +33,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use alc_hub_core::uplink::{
     command_action, command_gw_url, command_ota_url, command_print_chunk, command_print_url,
     command_result_frame, measurement_frame, parse_downlink, should_wait_for_clock, Downlink,
-    UplinkQueue, PING_FRAME,
+    DroppedEntry, UplinkQueue, PING_FRAME,
 };
 use anyhow::Result;
 use esp_idf_svc::ws::client::{
@@ -46,10 +47,13 @@ use alc_hub_common::{
     ui_api::UiCommand,
 };
 
-use crate::auth_link;
+use crate::{auth_link, punchq};
 
-/// NVS キューの最大保持件数 (NVS 文字列 4KB 制限に収める)
-const MAX_QUEUE: usize = 20;
+/// 送信窓 = RAM に載せる未 ack エントリの件数 (Refs #142)。
+/// **保持できる総件数はここではなく保存先 (punchq パーティション) の容量で決まる**
+/// — flash がキューの本体で、窓が空いたら次を読み込む。RAM 使用量は総件数に
+/// 依存しないので、PSRAM の有無を見る必要も無い
+const WINDOW: usize = 20;
 /// 接続タイムアウト
 const CONNECT_TIMEOUT_S: u64 = 10;
 /// keep-alive ping の間隔
@@ -160,11 +164,17 @@ fn run(
     settings: Settings,
     boot_id: u32,
 ) {
-    let (restored, skipped) =
-        UplinkQueue::restore(settings.ws_last_seq(), &settings.ws_queue(), MAX_QUEUE);
+    // 保存先は専用 NVS パーティション punchq。無い機 (OTA だけで更新した機) は
+    // 既定 nvs の文字列へフォールバックする (punchq::open_store)
+    let (store, mode) = punchq::open_store(&settings);
+    let (restored, skipped) = UplinkQueue::open(settings.ws_last_seq(), store, WINDOW);
     let mut queue = restored;
+    log::info!(
+        "ws_uplink: 送信キュー = {mode} (未送信 {} 件、窓 {WINDOW} 件)",
+        queue.len()
+    );
     if skipped > 0 {
-        log::warn!("ws_uplink: NVS キューの壊れた行を {skipped} 件読み飛ばし");
+        log::warn!("ws_uplink: 保存先の壊れた行を {skipped} 件読み飛ばし");
     }
     publish_status(&status, &queue, false);
 
@@ -180,6 +190,8 @@ fn run(
     let mut backoff_until: u64 = 0;
     let mut last_ping: u64 = 0;
     let mut last_flush: u64 = 0;
+    // ack で窓に次のぶんが載った → 次の周回で未送信ぶんだけ即座に送る
+    let mut send_unsent = false;
     // 接続不能の連続ログを抑制する (1 回目だけ warn)
     let mut connect_warned = false;
     // ヒープ不足ログの最終出力時刻
@@ -216,6 +228,9 @@ fn run(
                     connect_warned = false;
                     println!("EVT WS_CONNECTED");
                     crate::crashlog::note("EVT WS_CONNECTED");
+                    // 前の接続で送った分がサーバに届いたかは分からないので、
+                    // 送信済みの印を落として窓の全件を送り直す
+                    queue.reset_sent();
                     last_flush = 0; // 接続直後にキューを流す
                     dirty = true;
                 }
@@ -231,7 +246,10 @@ fn run(
                     dirty = true;
                 }
                 WsEvent::Text(text) => {
-                    handle_downlink(
+                    // ack で窓に次のぶんが載ったら再送周期 (15 秒) を待たずに送る。
+                    // 待つと保存先に溜まった分の排出が「窓 20 件 / 15 秒」に
+                    // 律速される (2,000 件で 25 分かかる、Refs #142)
+                    if handle_downlink(
                         &text,
                         &mut queue,
                         &settings,
@@ -240,7 +258,9 @@ fn run(
                         &ui_tx,
                         &status,
                         &ev_tx,
-                    );
+                    ) {
+                        send_unsent = true;
+                    }
                     dirty = true;
                 }
                 WsEvent::Outbound(frame) => {
@@ -332,7 +352,11 @@ fn run(
         if !wait_clock {
             clock_wait_logged = false;
         }
-        if !wait_clock && !ble_busy && !queue.is_empty() && now.saturating_sub(last_flush) >= RESEND_INTERVAL_MS {
+        // 定期の再送周期か、ack で窓に次のぶんが載った直後 (即時送信) に送る。
+        // **即時送信は未送信ぶんだけ** — 窓の全件を送ると ack 1 件ごとに
+        // まだ ack 待ちの最大 WINDOW-1 件も送り直すことになる (Refs #142)
+        let periodic = now.saturating_sub(last_flush) >= RESEND_INTERVAL_MS;
+        if !wait_clock && !ble_busy && !queue.is_empty() && (periodic || send_unsent) {
             // NTP 未同期 (ネットワーク無し) で記録した測定は recorded_at_ms が 1970 起点
             // になっている。今は同期済み (接続できている = ネットワークがある) なので、
             // 記録時と今の稼働時間の差で実時刻へ直してから送る (同じ起動の分だけ)
@@ -342,31 +366,17 @@ fn run(
                 println!("EVT WS_TIME_FIXED {fixed}");
                 persist(&settings, &queue);
             }
+            send_unsent = false;
             // 再送も同じ seq (サーバ冪等)。send 失敗は接続破棄 → 再接続
-            let mut failed = false;
-            {
-                let c = conn.as_mut().expect("connected implies conn");
-                for entry in queue.entries() {
-                    match measurement_frame(entry) {
-                        Ok(frame) => {
-                            if let Err(e) = c.client.send(FrameType::Text(false), frame.as_bytes())
-                            {
-                                log::warn!("ws_uplink: 送信失敗 seq={}: {e:?}", entry.seq);
-                                failed = true;
-                                break;
-                            }
-                        }
-                        Err(e) => log::error!("ws_uplink: フレーム組立失敗 seq={}: {e}", entry.seq),
-                    }
-                }
-            }
-            if failed {
+            if flush_queue(&mut conn, &mut queue, !periodic) {
                 mark_disconnected(&mut conn, "測定の送信失敗", &queue);
                 backoff_until = now + RECONNECT_BACKOFF_MS;
                 publish_status(&status, &queue, false);
                 continue;
             }
-            last_flush = now;
+            if periodic {
+                last_flush = now;
+            }
         }
 
         // --- 5. keep-alive ping (キューが空の間も下り command を受けるため) ---
@@ -407,6 +417,41 @@ fn heap_headroom_ok(now: u64, last_log: &mut u64) -> bool {
     true
 }
 
+/// 窓の測定を送り、送れたものに送信済みの印を付ける。
+///
+/// `unsent_only` が true なら**まだこの接続で送っていないぶんだけ**送る
+/// (ack 駆動の即時送信)。false なら窓の全件を送る (再送周期・接続直後)。
+/// 戻り値 true = 送信に失敗したので接続を捨てて再接続すべき
+fn flush_queue(conn: &mut Option<Conn>, queue: &mut UplinkQueue, unsent_only: bool) -> bool {
+    // 先に seq だけ集め、フレームは 1 件ずつ組む (窓 20 件ぶんの文字列を
+    // 同時にヒープへ置かない)
+    let targets: Vec<u64> = if unsent_only {
+        queue.entries_unsent().map(|e| e.seq).collect()
+    } else {
+        queue.entries().map(|e| e.seq).collect()
+    };
+    let Some(c) = conn.as_mut() else {
+        return false;
+    };
+    for seq in targets {
+        let frame = match queue.entries().find(|e| e.seq == seq).map(measurement_frame) {
+            Some(Ok(frame)) => frame,
+            Some(Err(e)) => {
+                log::error!("ws_uplink: フレーム組立失敗 seq={seq}: {e}");
+                continue;
+            }
+            // 送る前に窓から外れた (ここへは来ない)
+            None => continue,
+        };
+        if let Err(e) = c.client.send(FrameType::Text(false), frame.as_bytes()) {
+            log::warn!("ws_uplink: 送信失敗 seq={seq}: {e:?}");
+            return true;
+        }
+        queue.mark_sent(seq);
+    }
+    false
+}
+
 /// WS の接続を「切れた」状態にする。**client は drop しない。**
 ///
 /// esp-idf-svc の `Drop for EspWebSocketClient` は
@@ -445,28 +490,33 @@ fn mark_disconnected(conn: &mut Option<Conn>, reason: &str, queue: &UplinkQueue)
 /// 測定をキューへ積み NVS へ永続化する。記録時の稼働時間と boot_id も持たせ、
 /// NTP 未同期で記録した時刻を送信時に補正できるようにする (fix_unsynced_times)
 fn enqueue(queue: &mut UplinkQueue, settings: &Settings, rec: &UplinkRecord, boot_id: u32) {
-    match queue.push_record(
+    let result = queue.push_record(
         rec.kind,
         rec.recorded_at_ms,
         &rec.payload,
         rec.session_id.as_deref(),
         Some(rec.at_ms),
         Some(boot_id),
-    ) {
-        Ok((_, dropped)) => {
-            if let Some(seq) = dropped {
-                log::warn!("ws_uplink: キュー上限で seq={seq} を破棄");
-                println!("EVT WS_DROPPED {seq}");
-            }
-            persist(settings, queue);
-        }
-        Err(e) => log::error!("ws_uplink: 不正 payload を破棄: {e}"),
+    );
+    let dropped = match &result {
+        Ok(pushed) => pushed.dropped.as_ref(),
+        Err(failed) => failed.dropped.as_ref(),
+    };
+    if let Some(DroppedEntry { seq, kind }) = dropped {
+        // 捨てられたのが打刻だと賃金計算のデータが欠けるので kind まで出す
+        log::warn!("ws_uplink: 保存先が一杯で seq={seq} ({kind}) を破棄");
+        println!("EVT WS_DROPPED {seq} {kind}");
+    }
+    match result {
+        Ok(_) => persist(settings, queue),
+        Err(failed) => log::error!("ws_uplink: 測定を保存できません: {}", failed.reason),
     }
 }
 
+/// 採番カウンタだけを永続化する。**未 ack エントリ本体は push/ack のたびに
+/// 保存先 (punchq) が 1 件単位で書いている**ので、ここでの書き戻しは無い
 fn persist(settings: &Settings, queue: &UplinkQueue) {
     settings.set_ws_last_seq(queue.last_seq());
-    settings.set_ws_queue(&queue.serialize());
 }
 
 fn publish_status(status: &SharedStatus, queue: &UplinkQueue, connected: bool) {
@@ -477,7 +527,8 @@ fn publish_status(status: &SharedStatus, queue: &UplinkQueue, connected: bool) {
     }
 }
 
-/// 下りフレームの処理 (ack 消し込み / command 中継)
+/// 下りフレームの処理 (ack 消し込み / command 中継)。
+/// **戻り値 true = 窓に次の送信対象が載ったので即座に送ってよい** (Refs #142)
 #[allow(clippy::too_many_arguments)]
 fn handle_downlink(
     text: &str,
@@ -488,12 +539,15 @@ fn handle_downlink(
     ui_tx: &Sender<UiCommand>,
     status: &SharedStatus,
     ev_tx: &mpsc::Sender<WsEvent>,
-) {
+) -> bool {
     match parse_downlink(text) {
         Ok(Downlink::Ack { seq }) => {
-            if queue.ack(seq) {
+            let acked = queue.ack(seq);
+            if acked.removed {
                 persist(settings, queue);
             }
+            // 窓が保存先から埋まったぶんだけ、続けて送る対象がある
+            return acked.refilled > 0;
         }
         Ok(Downlink::ServerError { seq, message }) => {
             // キューに残して次の再送周期で送り直す
@@ -706,6 +760,8 @@ fn handle_downlink(
         Ok(Downlink::Connected) | Ok(Downlink::Pong) => {}
         Err(e) => log::warn!("ws_uplink: 下りフレーム解析失敗: {e} ({text})"),
     }
+    // ack 以外は窓を動かさないので、送信を早める理由が無い
+    false
 }
 
 /// command への即時 command_result を送る (接続が生きていれば best-effort)。

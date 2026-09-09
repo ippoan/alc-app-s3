@@ -28,9 +28,15 @@
 # [0x10000,末尾) に分割して書くため nvs/phy_init (device credential) は消えない。
 # merged.bin の offset 0 一括書き込み (CLI) は従来どおり消える。
 # nvs=0x9000 / otadata=0x10000 を動かすときは build.yml の Split step も要修正。
+#
+# punchq = オフライン送信キュー (#142)。**CLI で merged.bin を offset 0 から
+# 一括で焼くと消える** (Web インストーラーは Split で避ける)。OTA では
+# パーティションテーブルは更新されないので、この行が無い機は既定 nvs の
+# ws_queue 文字列 (上限 20 件) にフォールバックする (hub-drivers/punchq.rs)。
 # Name,   Type, SubType, Offset,   Size,   Flags
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,
 otadata,  data, ota,     0x10000,  0x2000,
 ota_0,    app,  ota_0,   0x20000,  3M,
 ota_1,    app,  ota_1,   0x320000, 3M,
+punchq,   data, nvs,     0x620000, 0x80000,

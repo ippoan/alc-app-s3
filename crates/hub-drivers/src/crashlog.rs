@@ -39,8 +39,9 @@ use esp_idf_svc::sys;
 /// リング容量。`.noinit` は静的 DRAM を常時消費するため控えめにする
 /// (ログ 1 行 ~100 バイトとして直近 ~40 行相当)。
 const RING_CAP: usize = 4096;
-/// WS payload に載せるログの上限。NVS 送信キュー全体が 4KB 制限
-/// (settings::ws_queue) のため、他の測定エントリと同居できる大きさに抑える。
+/// WS payload に載せるログの上限。送信キューは 1 件 1 キー (punchq、#142) に
+/// なったが、**1 行 (= 1 件) は NVS 文字列の上限 4000 バイト未満**である必要が
+/// あるため、payload はそれに収まる大きさに抑える。
 const MAX_WS_LOG_BYTES: usize = 1024;
 /// "CRLG" — リングが前回稼働から保持されているかの判定 magic。
 const MAGIC: u32 = 0x43524c47;

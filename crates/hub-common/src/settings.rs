@@ -26,7 +26,9 @@ const KEY_DEV_TENANT: &str = "dev_tenant";
 /// auth-worker ベース URL の上書き (staging テスト用、`AUTH URL` コマンド)
 const KEY_AUTH_URL: &str = "auth_url";
 // WS 送信 (cf-alc-recorder、ippoan/alc-app-s3#21)
-/// 未 ack の送信キュー (uplink::UplinkQueue::serialize の改行区切り)
+/// 未 ack の送信キュー (1 行 1 件の改行区切り)。**専用パーティション punchq を
+/// 持たない機のフォールバック先** (#142、hub-drivers/punchq.rs の
+/// LegacyStringStore)。punchq がある機では移行後に空文字になる
 const KEY_WS_QUEUE: &str = "ws_queue";
 /// seq 採番カウンタ。ack 後も再利用しない (サーバ側 UNIQUE 冪等化のため)
 const KEY_WS_SEQ: &str = "ws_seq";
@@ -198,7 +200,8 @@ impl Settings {
         Ok(())
     }
 
-    /// 未 ack の WS 送信キュー (uplink::UplinkQueue::restore へ渡す)
+    /// 未 ack の WS 送信キュー (punchq を持たない機のフォールバック先。
+    /// punchq がある機では起動時の移行で空になる)
     pub fn ws_queue(&self) -> String {
         let Ok(nvs) = self.nvs.lock() else {
             return String::new();
