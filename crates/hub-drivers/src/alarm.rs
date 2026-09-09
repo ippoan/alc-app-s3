@@ -19,7 +19,66 @@
 //! ポートを reject する。CoreS3 は代わりに既存 `STATUS LAN=… BOARD=cores3` 行の
 //! 末尾へ [`AlarmMonitor::status_field`] を足して伝える (issue #187)。
 
+//!
+//! # 武装状態は USB/JTAG reset を跨いで残す (`ARMED`, issue #194)
+//!
+//! 運行者 PC の PWA タブを閉じると Windows の driver がハンドル解放で DTR → RTS を
+//! 落とし、途中の「DTR=0 かつ RTS=1」で USB-Serial-JTAG がチップを reset する。
+//! ブラウザ側 (ippoan/alc-app#190 / #200) では防げなかった。再起動で
+//! [`AlarmMonitor`] の「初回 heartbeat で武装」が消えると**閉じても鳴らない**ので、
+//! heartbeat を受けるたびに `.noinit` の [`ArmedFlag`] へ「武装済み」を書き、
+//! 起動側 (各 bin の main) が **USB/JTAG 起因の reset かつ magic 一致** のときだけ
+//! [`restore_armed_flag`] で拾って武装済み (`with_boot_grace(Some(SILENCE_MS))`)
+//! で生成する。電源断でゴミになるのは magic 不一致で弾く (crashlog の `RING` と
+//! 同じ自己修復の形)。解除経路は元々無いので、クリアもしない。
+
+use core::mem::MaybeUninit;
+
 use alc_hub_core::alarm::{AlarmMonitor, SharedMonitor};
+
+/// "ARMD" — `.noinit` の [`ArmedFlag`] が前回稼働から保持されているかの判定 magic。
+const ARMED_MAGIC: u32 = 0x41524d44;
+
+/// `.noinit` に置く武装フラグ。crashlog の `Ring` とは責務が違うので別の静的領域
+/// (RING の構造体に足さない)。8 バイトの DRAM を常時消費する
+#[repr(C)]
+struct ArmedFlag {
+    magic: u32,
+    /// 1 = 武装済み (heartbeat を一度でも受けた)
+    armed: u8,
+}
+
+#[link_section = ".noinit"]
+static mut ARMED: MaybeUninit<ArmedFlag> = MaybeUninit::uninit();
+
+fn armed_ptr() -> *mut ArmedFlag {
+    // MaybeUninit<ArmedFlag> は ArmedFlag と同一レイアウト。u8/u32 は全ビット
+    // パターンが有効なため電源断後のゴミも「読める」— 信頼性は magic で判定する
+    core::ptr::addr_of_mut!(ARMED) as *mut ArmedFlag
+}
+
+/// 武装済みを `.noinit` に記録する。heartbeat のたびに呼ぶ (RAM への代入なので
+/// 毎回でよい)。書き手は heartbeat の受け手 1 スレッドだけで、値も単調
+/// (未武装 → 武装) なので排他は要らない
+fn store_armed_flag() {
+    unsafe {
+        let f = armed_ptr();
+        (*f).armed = 1;
+        (*f).magic = ARMED_MAGIC;
+    }
+}
+
+/// 前回稼働の武装状態を `.noinit` から読む。`true` = magic が一致し武装済み。
+///
+/// **呼び出し側が reset 理由を見てから使うこと** — sw (esp_restart) や電源投入では
+/// 復元しない (`alc_hub_core::crashlog::is_usb_serial_reset`)。電源投入直後の
+/// ゴミは magic 不一致で `false`
+pub fn restore_armed_flag() -> bool {
+    unsafe {
+        let f = armed_ptr();
+        (*f).magic == ARMED_MAGIC && (*f).armed == 1
+    }
+}
 
 /// 判定器を lock して現在時刻とともに渡す。
 ///
@@ -47,6 +106,8 @@ pub fn apply_heartbeat(
     call: bool,
     grace: Option<u16>,
 ) {
+    // 受けた = 武装した。USB/JTAG reset を跨いで残す (モジュール doc、#194)
+    store_armed_flag();
     with_monitor(monitor, |m, now| {
         m.on_heartbeat_with_grace(now, ok, reason, call, grace)
     });

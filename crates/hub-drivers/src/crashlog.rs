@@ -160,10 +160,15 @@ extern "C" {
 
 /// 起動直後 (他モジュールの初期化より前) に呼ぶ。
 ///
-/// 前回リセットの解析 → リング初期化 → hook 設置の順。クラッシュ由来の
-/// リセットだった場合は snapshot を返すので、WS キュー起動後に `report()` へ
-/// 渡すこと。
-pub fn init() -> Option<CrashSnapshot> {
+/// 前回リセットの解析 → リング初期化 → hook 設置の順。戻り値は
+/// `(reset_code, snapshot)`:
+///
+/// - `reset_code` — `esp_reset_reason()` の値 (`pure::reset_reason_name` /
+///   `pure::is_usb_serial_reset` で分類する)。起動後いつ呼んでも同じ値なので、
+///   ここで取ったものをそのまま持ち回る (警告デバイスの武装復元 #194 が使う)
+/// - `snapshot` — クラッシュ由来のリセットだった場合の panic 前ログ。
+///   WS キュー起動後に `report()` へ渡すこと
+pub fn init() -> (i32, Option<CrashSnapshot>) {
     let reset_code = unsafe { sys::esp_reset_reason() } as i32;
     // 起動時の reset 理由を EVT で出す (setup ページの KNOWN フィルタに乗せる #59)。
     // usb/jtag/sw = シリアルポート open 等の無害なリセット (メール通知なし)、
@@ -213,7 +218,7 @@ pub fn init() -> Option<CrashSnapshot> {
         "crashlog: reset_reason={} ({reset_code})",
         pure::reset_reason_name(reset_code)
     );
-    snapshot
+    (reset_code, snapshot)
 }
 
 /// 現在の epoch ms (NTP 未同期の起動直後は 1970 起点になる — サーバ側が

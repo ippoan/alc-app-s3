@@ -54,7 +54,7 @@ fn main() -> Result<()> {
     // 前回リセットの解析 (クラッシュ由来なら panic 前ログの snapshot を得る) と
     // ログ捕捉 hook (vprintf tee + Rust panic hook) の設置。他モジュールの
     // 初期化より先に呼び、起動中のログ・クラッシュも捕まえる (Refs #43)
-    let crash = crashlog::init();
+    let (reset_code, crash) = crashlog::init();
     log::info!("alc-hub-cores3 v{} 起動", config::FIRMWARE_VERSION);
 
     let p = Peripherals::take()?;
@@ -219,8 +219,22 @@ fn main() -> Result<()> {
     // ★ **武装方式** (`with_boot_grace(None)`): **初回 heartbeat を受けるまで
     //   鳴らない**。CoreS3 は据置ハブとして PWA 無しでも動くので、VoiceS3R の
     //   起動猶予方式 (30 秒で鳴り出す) だと PWA を繋がない設置で鳴り続ける
+    // ★ ただし **USB/JTAG 起因の reset で、前回稼働が武装済み** (`.noinit` の
+    //   フラグ) なら武装済みで生成する (issue #194)。PWA のタブを閉じると
+    //   Windows の driver が DTR/RTS を落とす途中でチップが reset するため、
+    //   従来は「閉じたのに鳴らない」になっていた。復元後は通常の沈黙判定
+    //   (SILENCE_MS) に入り、PWA が閉じられたままなら起動から約 10 秒で鳴る
     let alarm_monitor: alc_hub_core::alarm::SharedMonitor = Arc::new(Mutex::new(
-        alc_hub_core::alarm::AlarmMonitor::with_boot_grace(None),
+        if alc_hub_core::crashlog::is_usb_serial_reset(reset_code)
+            && alc_hub_drivers::alarm::restore_armed_flag()
+        {
+            println!("EVT ALARM_RESTORED reset={reset_code}");
+            alc_hub_core::alarm::AlarmMonitor::with_boot_grace(Some(
+                alc_hub_core::alarm::SILENCE_MS,
+            ))
+        } else {
+            alc_hub_core::alarm::AlarmMonitor::with_boot_grace(None)
+        },
     ));
 
     // auth-worker device JWT 交換 (AUTH TOKEN 自己診断) は host_link が
