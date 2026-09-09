@@ -15,9 +15,14 @@
 //!   ┌──────────────────────────┐        ┌──────────────────────────────┐
 //!   │                          ▼        │                              ▼
 //!  Idle ──abnormal──▶ Alarming ──ボタン──▶ Muted ──!abnormal──▶ Idle (PlayResolved)
-//!         PlayAlert   1.8 秒ごとに        音を止めるだけ
-//!                     PlayAlert           (異常が続く限り維持)
+//!         PlayAlert   1.8 秒ごとに   ▲          │  5 秒ごとに PlayMutedTick
+//!                     PlayAlert      └──ボタン──┘  (短い単発)
 //! ```
+//!
+//! **ボタンはトグル** — 鳴動中に押すと黙り、黙っているあいだにもう一度押すと
+//! 鳴動へ戻る。黙らせているあいだも [`MUTED_TICK_MS`] ごとに
+//! [`Action::PlayMutedTick`] を出す。**完全な無音にはしない** — 異常が続いて
+//! いることを忘れられるため (2026-09-09 の実機確認でのユーザー要望)。
 
 /// 最後の heartbeat からこれだけ間が空いたら沈黙 = 異常とみなす。
 /// キオスク側の送信間隔は 3 秒 (背面タブの `setInterval` スロットルは 1 秒までなので
@@ -36,6 +41,12 @@ pub const ALERT_PERIOD_MS: u64 = 1_800;
 /// ブラウザは遷移イベントを取りこぼしても、次のこれで現在値に追いつける
 pub const BANNER_MS: u64 = 5_000;
 
+/// ボタンで黙らせているあいだ、短い合図 ([`Action::PlayMutedTick`]) を出す周期。
+/// **完全な無音にすると異常が続いていることを忘れられる** — 実機で鳴らした
+/// ユーザーの要望 (2026-09-09)。鳴動の周期 (`ALERT_PERIOD_MS`) より長く取り、
+/// 「鳴っている」ではなく「まだ直っていない」と伝わる間隔にしてある
+pub const MUTED_TICK_MS: u64 = 5_000;
+
 /// `HB NG` に理由ラベルが付いていなかったときに使う既定の理由。
 /// `cause=ng:` のように空で出すと行の文法 (`ng:<reason>`) が崩れるため
 pub const DEFAULT_NG_REASON: &str = "unspecified";
@@ -50,6 +61,11 @@ pub enum Action {
     /// 人が見に行く必要があり、状態解消なら放置でよい。この区別を現場で音だけで
     /// つけるための合図 (plan/standing-devices.md §2.1)
     PlayResolved,
+    /// 黙らせているあいだの短い合図 (`Sound::MutedTick` = 3000Hz 60ms ×1)。
+    /// [`MUTED_TICK_MS`] ごとに出る。**3 連の警告音と紛れないよう 1 発だけ** —
+    /// 鳴動へ戻すのはボタンだけで、これは「まだ直っていない」ことを思い出させる
+    /// ための最小限の合図 (plan/standing-devices.md §4.4)
+    PlayMutedTick,
     /// この行をホスト (キオスク) へ書き出す (`EVT ALARM state=... cause=...`)
     Emit(String),
 }
@@ -84,7 +100,9 @@ impl Cause {
 enum State {
     Idle,
     Alarming { next_beep_at: u64 },
-    Muted,
+    /// `next_muted_tick_at` = 次に短い合図を出す時刻。バナー (`BANNER_MS`) とは
+    /// 独立に刻む — バナーは emit のたびに引き直されるので合図の間隔に使えない
+    Muted { next_muted_tick_at: u64 },
 }
 
 impl State {
@@ -92,7 +110,7 @@ impl State {
         match self {
             Self::Idle => "idle",
             Self::Alarming { .. } => "alarming",
-            Self::Muted => "muted",
+            Self::Muted { .. } => "muted",
         }
     }
 }
@@ -141,14 +159,32 @@ impl AlarmMonitor {
         self.hb_call = call;
     }
 
-    /// 本体ボタン (VoiceS3R は G41) が押された。鳴動中なら黙らせる。
-    /// **音は鳴らさない** — 「直った」合図と紛れさせないため
+    /// 本体ボタン (VoiceS3R は G41) が押された。**トグル** — 鳴動中なら黙らせ、
+    /// 黙らせているあいだに押されたら鳴動へ戻す。
+    ///
+    /// 黙らせるときは**音を鳴らさない** (「直った」合図と紛れさせないため)。
+    /// 鳴動へ戻すときは押した手応えを兼ねて即 [`Action::PlayAlert`] を出し、
+    /// 次の周期を `now + ALERT_PERIOD_MS` に置く (Idle → Alarming と同じ入り方)。
+    /// Idle での押下は何も起こさない
     pub fn on_button(&mut self, now_ms: u64) -> Vec<Action> {
         let mut out = Vec::new();
-        if matches!(self.state, State::Alarming { .. }) {
-            self.state = State::Muted;
-            let cause = self.cause_at(now_ms);
-            self.emit(now_ms, &cause, &mut out);
+        match self.state {
+            State::Alarming { .. } => {
+                self.state = State::Muted {
+                    next_muted_tick_at: now_ms + MUTED_TICK_MS,
+                };
+                let cause = self.cause_at(now_ms);
+                self.emit(now_ms, &cause, &mut out);
+            }
+            State::Muted { .. } => {
+                self.state = State::Alarming {
+                    next_beep_at: now_ms + ALERT_PERIOD_MS,
+                };
+                out.push(Action::PlayAlert);
+                let cause = self.cause_at(now_ms);
+                self.emit(now_ms, &cause, &mut out);
+            }
+            State::Idle => {}
         }
         out
     }
@@ -184,10 +220,20 @@ impl AlarmMonitor {
                     self.resolve(now_ms, &cause, &mut out);
                 }
             }
-            // ボタンで黙らせた後は、異常が完全に解消するまで維持する。
-            // 人が認識済みなので cause が変わっても鳴らし直さない (plan §4.4)
-            State::Muted => {
-                if !abnormal {
+            // ボタンで黙らせた後。3 連の鳴動には戻さない (人が認識済みなので
+            // cause が変わっても鳴らし直さない) が、**完全な無音にもしない** —
+            // MUTED_TICK_MS ごとに短い合図を出し、異常が続いていることを
+            // 思い出させる (2026-09-09 の実機確認での要望。plan §4.4)。
+            // 鳴動へ戻すのはボタンだけ (on_button のトグル)
+            State::Muted { next_muted_tick_at } => {
+                if abnormal {
+                    if now_ms >= next_muted_tick_at {
+                        out.push(Action::PlayMutedTick);
+                        self.state = State::Muted {
+                            next_muted_tick_at: next_muted_tick_at + MUTED_TICK_MS,
+                        };
+                    }
+                } else {
                     self.resolve(now_ms, &cause, &mut out);
                 }
             }
@@ -366,19 +412,64 @@ mod tests {
             m.status_line(200),
             "STATUS alarm state=muted cause=call hb_age_ms=200"
         );
-        // 鳴動周期が来ても鳴らない
+        // 鳴動周期が来ても 3 連は鳴らない
         assert_eq!(m.tick(ALERT_PERIOD_MS + 200), vec![]);
         // 人が認識済みなので、理由が変わっても鳴らし直さない
         m.on_heartbeat(2_500, false, Some("serial"), false);
         assert_eq!(m.tick(2_500), vec![]);
-        // 二度押しは何も起こさない
-        assert_eq!(m.on_button(2_600), vec![]);
         // 解消したときだけ「直った」合図が鳴る
         m.on_heartbeat(3_000, true, None, false);
         assert_eq!(
             m.tick(3_000),
             vec![Action::PlayResolved, emit("idle", "none")]
         );
+        // 解消したら短い合図も止まる (Muted のカウンタは持ち越さない)
+        m.on_heartbeat(3_000 + MUTED_TICK_MS, true, None, false);
+        assert_eq!(m.tick(3_000 + MUTED_TICK_MS), vec![emit("idle", "none")]);
+    }
+
+    #[test]
+    fn muted_beeps_a_short_reminder_every_five_seconds() {
+        let mut m = AlarmMonitor::new();
+        m.on_heartbeat(0, true, None, true);
+        assert_eq!(m.tick(0), vec![Action::PlayAlert, emit("alarming", "call")]);
+        assert_eq!(m.on_button(0), vec![emit("muted", "call")]);
+        // 1ms 足りないうちは出ない
+        m.on_heartbeat(MUTED_TICK_MS - 1, true, None, true);
+        assert_eq!(m.tick(MUTED_TICK_MS - 1), vec![]);
+        // 5 秒でバナーと重なる。Action の順は PlayMutedTick → Emit
+        m.on_heartbeat(MUTED_TICK_MS, true, None, true);
+        assert_eq!(
+            m.tick(MUTED_TICK_MS),
+            vec![Action::PlayMutedTick, emit("muted", "call")]
+        );
+        // 2 回目もその 5 秒後
+        m.on_heartbeat(2 * MUTED_TICK_MS - 1, true, None, true);
+        assert_eq!(m.tick(2 * MUTED_TICK_MS - 1), vec![]);
+        m.on_heartbeat(2 * MUTED_TICK_MS, true, None, true);
+        assert_eq!(
+            m.tick(2 * MUTED_TICK_MS),
+            vec![Action::PlayMutedTick, emit("muted", "call")]
+        );
+    }
+
+    #[test]
+    fn pressing_the_button_again_restores_the_alarm() {
+        let mut m = AlarmMonitor::new();
+        m.on_heartbeat(0, true, None, true);
+        assert_eq!(m.tick(0), vec![Action::PlayAlert, emit("alarming", "call")]);
+        assert_eq!(m.on_button(0), vec![emit("muted", "call")]);
+        // もう一度押すと鳴動へ戻る (即 PlayAlert)
+        assert_eq!(
+            m.on_button(1_000),
+            vec![Action::PlayAlert, emit("alarming", "call")]
+        );
+        assert_eq!(
+            m.status_line(1_000),
+            "STATUS alarm state=alarming cause=call hb_age_ms=1000"
+        );
+        // 戻った後は、黙らせていたときのカウンタが来ても短い合図は出ない
+        assert_eq!(m.tick(MUTED_TICK_MS), vec![Action::PlayAlert]);
     }
 
     #[test]
@@ -408,6 +499,7 @@ mod tests {
         for a in [
             Action::PlayAlert,
             Action::PlayResolved,
+            Action::PlayMutedTick,
             Action::Emit("x".into()),
         ] {
             assert!(!format!("{:?}", a.clone()).is_empty());

@@ -206,6 +206,9 @@ fn main() -> Result<()> {
                 // 止めたのに鳴り続ける (speaker.rs の Sound::Alert の doc)
                 Action::PlayAlert => send(&speaker_tx, Sound::Alert),
                 Action::PlayResolved => send(&speaker_tx, Sound::AlertResolved),
+                // 黙らせているあいだの短い合図 (alarm::MUTED_TICK_MS ごと)。
+                // 完全な無音だと異常が続いていることを忘れられる
+                Action::PlayMutedTick => send(&speaker_tx, Sound::MutedTick),
                 // キオスクのバナー用。遷移のたび + BANNER_MS ごとに出る
                 Action::Emit(line) => println!("{line}"),
             }
