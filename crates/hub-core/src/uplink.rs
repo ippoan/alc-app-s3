@@ -16,8 +16,13 @@
 //! 冪等化される。**seq は ack 後も再利用しない** (再利用すると ON CONFLICT
 //! DO NOTHING で新データが黙って落ちる) ため、採番カウンタ (last_seq) は
 //! キューが空になっても永続化する。
+//!
+//! キューの実体は flash 側の [`UplinkStore`] (firmware では専用 NVS
+//! パーティション `punchq` の 1 件 1 キー) にあり、RAM ([`UplinkQueue`]) が
+//! 持つのは**送信窓**と seq の索引だけ (Refs #142)。保持件数を増やしても
+//! RAM 使用量はほぼ変わらない。
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use serde_json::{json, Map, Value};
 
@@ -277,105 +282,252 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 送信キューの帳簿。実際の送受信・永続化は呼び出し側が行う。
+/// store のキーに使う seq の 16 進表記 (小文字)。NVS のキーは NUL 込み 16 バイト
+/// = **15 文字**までなので、この長さの上限を [`MAX_KEY_LEN`] で固定する
+pub fn seq_key(seq: u64) -> String {
+    format!("{seq:x}")
+}
+
+/// NVS のキー長上限 (文字数、NUL を除く)
+pub const MAX_KEY_LEN: usize = 15;
+
+/// 1 件の行の上限バイト数。NVS の文字列は NUL 込み 4000 バイトまでなので、
+/// これ以上の行は保存できない (push を Err で弾く)
+pub const MAX_LINE_BYTES: usize = 4000;
+
+/// 未 ack エントリの保存先。**キューの本体は flash 側のこれ**で、
+/// [`UplinkQueue`] が RAM に持つのは送信窓 (先頭数件) と seq の索引だけ。
+/// 保持件数は store の容量で決まり、RAM 使用量は件数に依存しない。
+///
+/// firmware では専用 NVS パーティション `punchq` の 1 件 1 キー実装、
+/// パーティションを持たない機 (OTA だけで更新した機) では既定 nvs の文字列
+/// 1 キー実装が入る (hub-drivers::punchq)。テストは [`MemStore`]。
+pub trait UplinkStore {
+    /// seq で 1 件保存する (同じ seq への上書きも put)。
+    /// 容量不足なら `Err(StoreFull)` — 呼び側が最古を消して 1 回だけ再試行する
+    fn put(&mut self, seq: u64, line: &str) -> Result<(), StoreFull>;
+    /// 1 件消す。存在しない seq は無視してよい
+    fn remove(&mut self, seq: u64);
+    /// 1 件読む。無い / 読めないなら None
+    fn get(&self, seq: u64) -> Option<String>;
+    /// 保存済み seq の一覧 (順不同でよい。呼び側で昇順に並べる)。
+    /// open 時に 1 回だけ呼ぶ
+    fn seqs(&self) -> Vec<u64>;
+}
+
+/// 保存先の容量不足 (NVS の `ESP_ERR_NVS_NOT_ENOUGH_SPACE` など)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreFull;
+
+/// テスト用の RAM 実装。`capacity` = 保持できる件数
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemStore {
+    items: BTreeMap<u64, String>,
+    capacity: usize,
+}
+
+impl MemStore {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            items: BTreeMap::new(),
+            capacity,
+        }
+    }
+
+    /// 保存されている行 (seq 昇順)。テストの確認用
+    pub fn lines(&self) -> Vec<String> {
+        self.items.values().cloned().collect()
+    }
+}
+
+impl UplinkStore for MemStore {
+    fn put(&mut self, seq: u64, line: &str) -> Result<(), StoreFull> {
+        if !self.items.contains_key(&seq) && self.items.len() >= self.capacity {
+            return Err(StoreFull);
+        }
+        self.items.insert(seq, line.to_string());
+        Ok(())
+    }
+
+    fn remove(&mut self, seq: u64) {
+        self.items.remove(&seq);
+    }
+
+    fn get(&self, seq: u64) -> Option<String> {
+        self.items.get(&seq).cloned()
+    }
+
+    fn seqs(&self) -> Vec<u64> {
+        self.items.keys().copied().collect()
+    }
+}
+
+/// 容量確保のために捨てた最古のエントリ (`EVT WS_DROPPED <seq> <kind>` 用)
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedEntry {
+    pub seq: u64,
+    /// 捨てた測定の種別。行が読めなかった場合は `"?"`
+    pub kind: String,
+}
+
+/// push 成功。`dropped` は容量確保のために捨てた最古のエントリ
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pushed {
+    pub seq: u64,
+    pub dropped: Option<DroppedEntry>,
+}
+
+/// push 失敗。`dropped` が Some なら**捨てただけで新しい方も保存できていない**
+/// (呼び側は両方をログに出す)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushFailed {
+    pub reason: String,
+    pub dropped: Option<DroppedEntry>,
+}
+
+/// 保存用の 1 行 JSON (parse_line と対)
+pub fn line(entry: &QueueEntry) -> String {
+    // payload は open/push で検証済みのため必ずオブジェクト
+    let payload: Value = serde_json::from_str(&entry.payload).expect("validated payload");
+    let mut line = json!({
+        "seq": entry.seq,
+        "recorded_at_ms": entry.recorded_at_ms,
+        "kind": entry.kind,
+        "payload": payload,
+    });
+    if let Some(session_id) = &entry.session_id {
+        line["session_id"] = json!(session_id);
+    }
+    if let Some(uptime_ms) = entry.uptime_ms {
+        line["uptime_ms"] = json!(uptime_ms);
+    }
+    if let Some(boot_id) = entry.boot_id {
+        line["boot_id"] = json!(boot_id);
+    }
+    line.to_string()
+}
+
+/// 保存用の 1 行 JSON を QueueEntry へ戻す (line と対)。壊れた行は None
+pub fn parse_line(line: &str) -> Option<QueueEntry> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    let obj = v.as_object()?;
+    Some(QueueEntry {
+        seq: obj.get("seq")?.as_u64()?,
+        recorded_at_ms: obj.get("recorded_at_ms")?.as_u64()?,
+        kind: obj.get("kind")?.as_str()?.to_string(),
+        payload: obj.get("payload").filter(|p| p.is_object())?.to_string(),
+        // 旧フォーマット (session_id を持たない NVS データ) は None で復元する
+        session_id: obj
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        // 同じく旧データは None (補正対象外になるだけ)
+        uptime_ms: obj.get("uptime_ms").and_then(|v| v.as_u64()),
+        boot_id: obj
+            .get("boot_id")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok()),
+    })
+}
+
+/// 送信キューの帳簿。実際の送受信は呼び出し側が行い、永続化は `store` が担う。
+///
+/// **flash がキューの本体、RAM は送信窓** (Refs #142): 未 ack エントリの実体は
+/// すべて `store` にあり、RAM には「いま送ってよい先頭 `window` 件」と全 seq の
+/// 索引 (u64 の Vec) だけを持つ。ack で窓が空けば store から次を読み込む
+/// (`refill`)。保持件数を増やしても RAM 使用量はほぼ変わらないため、
+/// PSRAM の有無に依存しない。
 pub struct UplinkQueue {
+    store: Box<dyn UplinkStore>,
+    /// store 上の全 seq (昇順)
+    index: Vec<u64>,
+    /// 送信窓。**必ず `index` の先頭からの連続した prefix** を保つ
     entries: VecDeque<QueueEntry>,
+    window: usize,
     /// 最後に採番した seq。**キューが空でも減らない・再利用しない**
     last_seq: u64,
-    max: usize,
+    /// NTP 未同期で記録した (seq, boot_id)。fix_unsynced_times の対象を
+    /// 索引全走査せずに引くために持つ
+    unsynced: Vec<(u64, u32)>,
 }
 
 impl UplinkQueue {
-    /// 永続化済みの last_seq とキュー行 (serialize の出力) から復元する。
-    /// 壊れた行は読み飛ばす (戻り値 .1 = 読み飛ばした行数)。
-    pub fn restore(last_seq: u64, lines: &str, max: usize) -> (Self, usize) {
-        let mut entries = VecDeque::new();
-        let mut skipped = 0usize;
-        let mut max_seq = last_seq;
-        for line in lines.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match Self::parse_line(line) {
-                Some(e) => {
-                    max_seq = max_seq.max(e.seq);
-                    entries.push_back(e);
-                }
-                None => skipped += 1,
-            }
-        }
-        while entries.len() > max {
-            entries.pop_front();
-        }
-        (
-            Self {
-                entries,
-                last_seq: max_seq,
-                max,
-            },
-            skipped,
-        )
+    /// 保存先を開いて復元する。`last_seq` は永続化済みの採番カウンタ。
+    /// **seq の単調性のため `max(last_seq, store 上の最大 seq)` を採る** —
+    /// store の切り替え (移行・フォールバック) をまたいで seq を再利用すると
+    /// ack が別のエントリを消し込む。壊れた行は捨てる (戻り値 .1 = その件数)
+    pub fn open(last_seq: u64, store: Box<dyn UplinkStore>, window: usize) -> (Self, usize) {
+        let mut index = store.seqs();
+        index.sort_unstable();
+        let last_seq = last_seq.max(index.last().copied().unwrap_or(0));
+        let mut queue = Self {
+            store,
+            index,
+            entries: VecDeque::new(),
+            window,
+            last_seq,
+            unsynced: Vec::new(),
+        };
+        let skipped = queue.refill();
+        (queue, skipped)
     }
 
-    fn parse_line(line: &str) -> Option<QueueEntry> {
-        let v: Value = serde_json::from_str(line).ok()?;
-        let obj = v.as_object()?;
-        Some(QueueEntry {
-            seq: obj.get("seq")?.as_u64()?,
-            recorded_at_ms: obj.get("recorded_at_ms")?.as_u64()?,
-            kind: obj.get("kind")?.as_str()?.to_string(),
-            payload: obj.get("payload").filter(|p| p.is_object())?.to_string(),
-            // 旧フォーマット (session_id を持たない NVS データ) は None で復元する
-            session_id: obj
-                .get("session_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            // 同じく旧データは None (補正対象外になるだけ)
-            uptime_ms: obj.get("uptime_ms").and_then(|v| v.as_u64()),
-            boot_id: obj
-                .get("boot_id")
-                .and_then(|v| v.as_u64())
-                .and_then(|v| u32::try_from(v).ok()),
-        })
+    /// 窓を `window` 件まで store から埋める。壊れて読めない行は store と索引から
+    /// 落とす (戻り値 = 落とした件数)
+    fn refill(&mut self) -> usize {
+        let mut skipped = 0;
+        while self.entries.len() < self.window {
+            let Some(&seq) = self.index.get(self.entries.len()) else {
+                break;
+            };
+            match self.store.get(seq).as_deref().and_then(parse_line) {
+                Some(entry) => self.entries.push_back(entry),
+                None => {
+                    self.store.remove(seq);
+                    self.index.remove(self.entries.len());
+                    skipped += 1;
+                }
+            }
+        }
+        skipped
     }
 
-    /// NVS 保存用の改行区切り文字列 (restore と対)
-    pub fn serialize(&self) -> String {
-        self.entries
-            .iter()
-            .map(|e| {
-                // payload は restore/push で検証済みのため必ずオブジェクト
-                let payload: Value = serde_json::from_str(&e.payload).expect("validated payload");
-                let mut line = json!({
-                    "seq": e.seq,
-                    "recorded_at_ms": e.recorded_at_ms,
-                    "kind": e.kind,
-                    "payload": payload,
-                });
-                if let Some(session_id) = &e.session_id {
-                    line["session_id"] = json!(session_id);
-                }
-                if let Some(uptime_ms) = e.uptime_ms {
-                    line["uptime_ms"] = json!(uptime_ms);
-                }
-                if let Some(boot_id) = e.boot_id {
-                    line["boot_id"] = json!(boot_id);
-                }
-                line.to_string()
+    /// 1 件を store・索引・窓・未同期リストから消す
+    fn forget(&mut self, seq: u64) {
+        self.store.remove(seq);
+        self.index.retain(|&s| s != seq);
+        self.entries.retain(|e| e.seq != seq);
+        self.unsynced.retain(|&(s, _)| s != seq);
+    }
+
+    /// 最古の 1 件を捨てる (容量不足のとき。現行方針 = 新しい方を残す)
+    fn drop_oldest(&mut self) -> Option<DroppedEntry> {
+        let seq = *self.index.first()?;
+        let kind = self
+            .entries
+            .front()
+            .filter(|e| e.seq == seq)
+            .map(|e| e.kind.clone())
+            .or_else(|| {
+                self.store
+                    .get(seq)
+                    .as_deref()
+                    .and_then(parse_line)
+                    .map(|e| e.kind)
             })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .unwrap_or_else(|| "?".to_string());
+        self.forget(seq);
+        Some(DroppedEntry { seq, kind })
     }
 
-    /// 測定を採番してキューへ積む。上限超過時は最古のエントリを捨てる
-    /// (戻り値 .1 = 捨てたエントリの seq)。payload が不正なら積まない。
+    /// 測定を採番して積む。payload が不正・行が長すぎる・保存先が空かない場合は
+    /// Err (そのとき採番はしない = seq を無駄にしない)
     pub fn push(
         &mut self,
         kind: &str,
         recorded_at_ms: u64,
         payload: &str,
-    ) -> Result<(u64, Option<u64>), String> {
+    ) -> Result<Pushed, PushFailed> {
         self.push_with_session(kind, recorded_at_ms, payload, None)
     }
 
@@ -387,7 +539,7 @@ impl UplinkQueue {
         recorded_at_ms: u64,
         payload: &str,
         session_id: Option<&str>,
-    ) -> Result<(u64, Option<u64>), String> {
+    ) -> Result<Pushed, PushFailed> {
         self.push_record(kind, recorded_at_ms, payload, session_id, None, None)
     }
 
@@ -401,70 +553,132 @@ impl UplinkQueue {
         session_id: Option<&str>,
         uptime_ms: Option<u64>,
         boot_id: Option<u32>,
-    ) -> Result<(u64, Option<u64>), String> {
-        // 正規化して保存する (serialize/restore の roundtrip をキー順に依らず
+    ) -> Result<Pushed, PushFailed> {
+        // 正規化して保存する (line/parse_line の roundtrip をキー順に依らず
         // 一致させるため。measurement_frame にもこの正規化済み文字列が渡る)
-        let payload = payload_object(payload)?.to_string();
-        self.last_seq += 1;
-        let seq = self.last_seq;
-        self.entries.push_back(QueueEntry {
+        let payload = payload_object(payload).map_err(|reason| PushFailed {
+            reason,
+            dropped: None,
+        })?;
+        let seq = self.last_seq + 1;
+        let entry = QueueEntry {
             seq,
             recorded_at_ms,
             kind: kind.to_string(),
-            payload,
+            payload: payload.to_string(),
             session_id: session_id.map(str::to_string),
             uptime_ms,
             boot_id,
-        });
-        let dropped = if self.entries.len() > self.max {
-            self.entries.pop_front().map(|e| e.seq)
-        } else {
-            None
         };
-        Ok((seq, dropped))
-    }
-
-    /// 時計が同期すれば補正できるエントリ (同じ起動・稼働時間つき・未同期時刻) があるか。
-    /// 送信を NTP 同期まで待つかの判断に使う (should_wait_for_clock)
-    pub fn has_correctable(&self, boot_id: u32) -> bool {
-        self.entries.iter().any(|e| {
-            e.recorded_at_ms < MIN_SYNCED_MS && e.boot_id == Some(boot_id) && e.uptime_ms.is_some()
-        })
-    }
-
-    /// NTP 未同期で記録されたエントリの時刻を実時刻へ直す (corrected_recorded_at)。
-    /// 戻り値は補正した件数。送信の直前に呼び、0 でなければ NVS へ書き戻す
-    pub fn fix_unsynced_times(&mut self, now_epoch_ms: u64, now_uptime_ms: u64, boot_id: u32) -> usize {
-        let mut fixed = 0;
-        for e in self.entries.iter_mut() {
-            if let Some(t) = corrected_recorded_at(e, now_epoch_ms, now_uptime_ms, boot_id) {
-                e.recorded_at_ms = t;
-                fixed += 1;
+        let text = line(&entry);
+        if text.len() >= MAX_LINE_BYTES {
+            return Err(PushFailed {
+                reason: format!("1 行が保存上限を超えています ({} バイト)", text.len()),
+                dropped: None,
+            });
+        }
+        let mut dropped = None;
+        if self.store.put(seq, &text).is_err() {
+            // 容量不足: 最古を捨てて 1 回だけ再試行する
+            dropped = self.drop_oldest();
+            if self.store.put(seq, &text).is_err() {
+                return Err(PushFailed {
+                    reason: "保存先の容量不足で保存できません".to_string(),
+                    dropped,
+                });
             }
+        }
+        self.last_seq = seq;
+        self.index.push(seq);
+        if recorded_at_ms < MIN_SYNCED_MS && uptime_ms.is_some() {
+            if let Some(boot_id) = boot_id {
+                self.unsynced.push((seq, boot_id));
+            }
+        }
+        // 窓が空いていて、新しい件が窓末尾のすぐ次なら窓へ直に載せる
+        // (そうでなければ store から読み直す = 最古を捨てた後の穴埋め)
+        if self.entries.len() < self.window && self.index.len() == self.entries.len() + 1 {
+            self.entries.push_back(entry);
+        } else {
+            self.refill();
+        }
+        Ok(Pushed { seq, dropped })
+    }
+
+    /// 時計が同期すれば補正できるエントリ (この起動で未同期時刻のまま記録した
+    /// もの) があるか。送信を NTP 同期まで待つかの判断に使う
+    /// (should_wait_for_clock)。**再起動をまたいだ古いエントリは boot_id が
+    /// 違うので対象外** — 索引を全走査せず未同期リストだけを見る
+    pub fn has_correctable(&self, boot_id: u32) -> bool {
+        self.unsynced.iter().any(|&(_, b)| b == boot_id)
+    }
+
+    /// NTP 未同期で記録されたエントリの時刻を実時刻へ直す
+    /// (corrected_recorded_at)。**store 側も書き戻す**ので、直後に電源が落ちても
+    /// 補正は残る。戻り値は補正した件数
+    pub fn fix_unsynced_times(
+        &mut self,
+        now_epoch_ms: u64,
+        now_uptime_ms: u64,
+        boot_id: u32,
+    ) -> usize {
+        let targets: Vec<u64> = self
+            .unsynced
+            .iter()
+            .filter(|&&(_, b)| b == boot_id)
+            .map(|&(s, _)| s)
+            .collect();
+        let mut fixed = 0;
+        for seq in targets {
+            let Some(mut entry) = self.store.get(seq).as_deref().and_then(parse_line) else {
+                // 読めない行は索引ごと落とす (refill と同じ扱い)
+                self.forget(seq);
+                self.refill();
+                continue;
+            };
+            let Some(at) = corrected_recorded_at(&entry, now_epoch_ms, now_uptime_ms, boot_id)
+            else {
+                continue;
+            };
+            entry.recorded_at_ms = at;
+            if self.store.put(seq, &line(&entry)).is_err() {
+                continue;
+            }
+            if let Some(windowed) = self.entries.iter_mut().find(|e| e.seq == seq) {
+                windowed.recorded_at_ms = at;
+            }
+            self.unsynced.retain(|&(s, _)| s != seq);
+            fixed += 1;
         }
         fixed
     }
 
-    /// ack された seq をキューから消す。該当が無ければ false
+    /// ack された seq を消し込み、空いた窓を store から埋める。
+    /// 該当が無ければ false
     pub fn ack(&mut self, seq: u64) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(|e| e.seq != seq);
-        self.entries.len() != before
+        if !self.index.contains(&seq) {
+            return false;
+        }
+        self.forget(seq);
+        self.refill();
+        true
     }
 
     pub fn last_seq(&self) -> u64 {
         self.last_seq
     }
 
+    /// **保存先にある未 ack の総件数** (窓の大きさではない)。STATUS / ログ用
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.index.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.index.is_empty()
     }
 
-    /// 未 ack エントリ (古い順)。再送も同じ seq で行う
+    /// いま送ってよい未 ack エントリ (古い順、最大 window 件)。
+    /// 再送も同じ seq で行う
     pub fn entries(&self) -> impl Iterator<Item = &QueueEntry> {
         self.entries.iter()
     }
@@ -473,6 +687,8 @@ impl UplinkQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
 
     const PAYLOAD: &str = r#"{"type":"temperature","value":36.5,"unit":"celsius"}"#;
 
@@ -516,38 +732,6 @@ mod tests {
         let v: Value = serde_json::from_str(&measurement_frame(&e).unwrap()).unwrap();
         assert_eq!(v["session_id"], "7-1");
     }
-
-    #[test]
-    fn push_with_session_roundtrips_through_nvs_serialize() {
-        let (mut q, _) = UplinkQueue::restore(0, "", 10);
-        q.push_with_session("alcohol", 100, PAYLOAD, Some("7-1"))
-            .unwrap();
-        q.push_with_session("temperature", 200, PAYLOAD, Some("7-1"))
-            .unwrap();
-        // 点呼外の単発は None のまま
-        q.push("temperature", 300, PAYLOAD).unwrap();
-
-        let (restored, skipped) = UplinkQueue::restore(0, &q.serialize(), 10);
-        assert_eq!(skipped, 0);
-        let ids: Vec<Option<String>> = restored.entries().map(|e| e.session_id.clone()).collect();
-        assert_eq!(
-            ids,
-            vec![Some("7-1".into()), Some("7-1".into()), None],
-            "NVS 復元でセッションが失われてはならない"
-        );
-    }
-
-    #[test]
-    fn restore_accepts_old_lines_without_session_id() {
-        // session_id を知らない旧ファームが書いた NVS データを復元しても壊れない
-        let line =
-            format!(r#"{{"seq":1,"recorded_at_ms":100,"kind":"alcohol","payload":{PAYLOAD}}}"#);
-        let (q, skipped) = UplinkQueue::restore(0, &line, 10);
-        assert_eq!(skipped, 0);
-        assert_eq!(q.entries().count(), 1);
-        assert_eq!(q.entries().next().unwrap().session_id, None);
-    }
-
     #[test]
     fn measurement_frame_rejects_bad_payload() {
         let mut e = QueueEntry {
@@ -647,81 +831,6 @@ mod tests {
         assert!(parse_downlink(r#"{"seq":1}"#).is_err());
         assert!(parse_downlink(r#"{"type":"ack"}"#).is_err());
     }
-
-    #[test]
-    fn queue_push_ack_and_seq_monotonic() {
-        let (mut q, skipped) = UplinkQueue::restore(0, "", 10);
-        assert_eq!(skipped, 0);
-        assert!(q.is_empty());
-        let (s1, d1) = q.push("temperature", 100, PAYLOAD).unwrap();
-        let (s2, d2) = q.push("temperature", 200, PAYLOAD).unwrap();
-        assert_eq!((s1, s2), (1, 2));
-        assert_eq!((d1, d2), (None, None));
-        assert_eq!(q.len(), 2);
-        assert!(q.ack(1));
-        assert!(!q.ack(1)); // 二重 ack は false
-        assert_eq!(q.len(), 1);
-        // 空になっても seq は戻らない
-        assert!(q.ack(2));
-        assert!(q.is_empty());
-        let (s3, _) = q.push("temperature", 300, PAYLOAD).unwrap();
-        assert_eq!(s3, 3);
-        assert_eq!(q.last_seq(), 3);
-    }
-
-    #[test]
-    fn queue_rejects_bad_payload() {
-        let (mut q, _) = UplinkQueue::restore(0, "", 10);
-        assert!(q.push("k", 0, "not json").is_err());
-        assert!(q.is_empty());
-        assert_eq!(q.last_seq(), 0); // 失敗時は採番しない
-    }
-
-    #[test]
-    fn queue_overflow_drops_oldest() {
-        let (mut q, _) = UplinkQueue::restore(0, "", 2);
-        q.push("k", 1, PAYLOAD).unwrap();
-        q.push("k", 2, PAYLOAD).unwrap();
-        let (s3, dropped) = q.push("k", 3, PAYLOAD).unwrap();
-        assert_eq!(s3, 3);
-        assert_eq!(dropped, Some(1));
-        let seqs: Vec<u64> = q.entries().map(|e| e.seq).collect();
-        assert_eq!(seqs, vec![2, 3]);
-    }
-
-    #[test]
-    fn queue_serialize_restore_roundtrip() {
-        let (mut q, _) = UplinkQueue::restore(5, "", 10);
-        q.push("temperature", 100, PAYLOAD).unwrap();
-        q.push("blood_pressure", 200, r#"{"systolic":120}"#).unwrap();
-        let saved = q.serialize();
-        let (r, skipped) = UplinkQueue::restore(q.last_seq(), &saved, 10);
-        assert_eq!(skipped, 0);
-        assert_eq!(r, q);
-    }
-
-    #[test]
-    fn queue_restore_skips_corrupt_lines_and_keeps_seq() {
-        let lines = concat!(
-            r#"{"seq":8,"recorded_at_ms":1,"kind":"k","payload":{"a":1}}"#,
-            "\n",
-            "garbage\n",
-            "\n",
-            r#"{"seq":9,"recorded_at_ms":2,"kind":"k","payload":3}"#, // payload 非オブジェクト
-            "\n",
-            r#"{"seq":10,"recorded_at_ms":3,"kind":"k","payload":{}}"#,
-        );
-        // 保存済み last_seq (12) がエントリの最大 seq より大きい場合はそちらを保つ
-        let (q, skipped) = UplinkQueue::restore(12, lines, 10);
-        assert_eq!(skipped, 2);
-        assert_eq!(q.len(), 2);
-        assert_eq!(q.last_seq(), 12);
-        // last_seq がエントリ最大 seq より小さい (NVS 書き込み順のずれ) 場合は
-        // エントリ側に合わせる
-        let (q, _) = UplinkQueue::restore(0, lines, 10);
-        assert_eq!(q.last_seq(), 10);
-    }
-
     #[test]
     fn command_action_lowercases_and_rejects() {
         assert_eq!(
@@ -836,17 +945,6 @@ mod tests {
         assert!(base64_decode("AA!A").is_none()); // 3 文字目 alphabet 外 (非パディング)
         assert!(base64_decode("AAA!").is_none()); // 4 文字目 alphabet 外 (非パディング)
     }
-
-    #[test]
-    fn queue_restore_enforces_cap() {
-        let lines: Vec<String> = (1..=5)
-            .map(|i| format!(r#"{{"seq":{i},"recorded_at_ms":0,"kind":"k","payload":{{}}}}"#))
-            .collect();
-        let (q, _) = UplinkQueue::restore(0, &lines.join("\n"), 3);
-        let seqs: Vec<u64> = q.entries().map(|e| e.seq).collect();
-        assert_eq!(seqs, vec![3, 4, 5]);
-    }
-
     fn entry(recorded_at_ms: u64, uptime_ms: Option<u64>, boot_id: Option<u32>) -> QueueEntry {
         QueueEntry {
             seq: 1,
@@ -893,33 +991,384 @@ mod tests {
         assert_eq!(corrected_recorded_at(&future, SYNCED, 65_000, 7), None);
     }
 
+    // ---- 送信キュー (flash 本体 + 送信窓、Refs #142) ----
+
+    /// テスト用の store。中身を覗け、読み出し失敗・書き込み失敗を注入できる
+    /// (実機の NVS が返すエラー経路を再現する)。`UplinkQueue` は Box で所有するので
+    /// 検査用にクローンを 1 つ手元へ残す
+    #[derive(Clone, Default)]
+    struct TestStore {
+        inner: Rc<RefCell<MemStore>>,
+        /// get が None を返す seq (0 = 無し。seq は 1 始まりなので衝突しない)
+        unreadable: Rc<Cell<u64>>,
+        /// true の間 put が必ず StoreFull
+        put_fails: Rc<Cell<bool>>,
+    }
+
+    impl TestStore {
+        fn new(capacity: usize) -> Self {
+            Self {
+                inner: Rc::new(RefCell::new(MemStore::new(capacity))),
+                ..Default::default()
+            }
+        }
+
+        /// 保存されている行 (seq 昇順)
+        fn lines(&self) -> Vec<String> {
+            self.inner.borrow().lines()
+        }
+
+        /// 生の行を直に置く (旧フォーマット / 壊れた行の再現)
+        fn seed(&self, seq: u64, line: &str) {
+            self.inner.borrow_mut().put(seq, line).unwrap();
+        }
+    }
+
+    impl UplinkStore for TestStore {
+        fn put(&mut self, seq: u64, line: &str) -> Result<(), StoreFull> {
+            if self.put_fails.get() {
+                return Err(StoreFull);
+            }
+            self.inner.borrow_mut().put(seq, line)
+        }
+
+        fn remove(&mut self, seq: u64) {
+            self.inner.borrow_mut().remove(seq);
+        }
+
+        fn get(&self, seq: u64) -> Option<String> {
+            if self.unreadable.get() == seq {
+                return None;
+            }
+            self.inner.borrow().get(seq)
+        }
+
+        fn seqs(&self) -> Vec<u64> {
+            self.inner.borrow().seqs()
+        }
+    }
+
+    fn open_queue(store: &TestStore, window: usize) -> UplinkQueue {
+        let (q, skipped) = UplinkQueue::open(0, Box::new(store.clone()), window);
+        assert_eq!(skipped, 0);
+        q
+    }
+
+    /// seq だけ差し替えた保存行
+    fn stored_line(seq: u64) -> String {
+        line(&QueueEntry {
+            seq,
+            recorded_at_ms: 100 + seq,
+            kind: "timecard".into(),
+            payload: PAYLOAD.into(),
+            session_id: None,
+            uptime_ms: None,
+            boot_id: None,
+        })
+    }
+
     #[test]
-    fn queue_fix_unsynced_times_rewrites_only_eligible_entries() {
-        let mut q = UplinkQueue::restore(0, "", 10).0;
+    fn open_sorts_index_and_takes_max_seq() {
+        let store = TestStore::new(10);
+        // seqs() が順不同で返っても昇順に並べ直す
+        for seq in [3u64, 1, 2] {
+            store.seed(seq, &stored_line(seq));
+        }
+        let (q, skipped) = UplinkQueue::open(0, Box::new(store.clone()), 2);
+        assert_eq!(skipped, 0);
+        // flash 上は 3 件、窓は 2 件まで
+        assert_eq!(q.len(), 3);
+        assert_eq!(q.entries().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+        // 保存済み last_seq が無くても store 上の最大 seq を引き継ぐ
+        assert_eq!(q.last_seq(), 3);
+        // 保存済み last_seq の方が大きければそちらを保つ
+        let (q, _) = UplinkQueue::open(9, Box::new(store.clone()), 2);
+        assert_eq!(q.last_seq(), 9);
+        assert!(!q.is_empty());
+    }
+
+    #[test]
+    fn window_stays_bounded_and_refills_on_ack() {
+        let store = TestStore::new(10);
+        let mut q = open_queue(&store, 2);
+        for i in 1..=4 {
+            q.push("timecard", i, PAYLOAD).unwrap();
+        }
+        // flash は 4 件、RAM の窓は 2 件
+        assert_eq!(q.len(), 4);
+        assert_eq!(q.entries().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+        // ack すると次が窓へ載る
+        assert!(q.ack(1));
+        assert_eq!(q.entries().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
+        assert!(q.ack(2));
+        assert_eq!(q.entries().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4]);
+        // 二重 ack / 未知の seq は false
+        assert!(!q.ack(2));
+        assert_eq!(q.len(), 2);
+        assert_eq!(store.lines().len(), 2);
+        // 空になっても seq は戻らない
+        assert!(q.ack(3) && q.ack(4));
+        assert!(q.is_empty());
+        assert_eq!(q.push("timecard", 5, PAYLOAD).unwrap().seq, 5);
+        assert_eq!(q.last_seq(), 5);
+    }
+
+    #[test]
+    fn push_full_store_drops_oldest_then_retries() {
+        let store = TestStore::new(3);
+        let mut q = open_queue(&store, 2);
+        for i in 1..=3 {
+            assert_eq!(q.push("timecard", i, PAYLOAD).unwrap().dropped, None);
+        }
+        // 4 件目で容量不足 → 最古 (seq=1) を捨てて 1 回だけ再試行する
+        let pushed = q.push("timecard", 4, PAYLOAD).unwrap();
+        assert_eq!(pushed.seq, 4);
+        assert_eq!(
+            pushed.dropped,
+            Some(DroppedEntry {
+                seq: 1,
+                kind: "timecard".into()
+            })
+        );
+        assert_eq!(q.len(), 3);
+        // 窓は index の先頭 2 件のまま (捨てた穴は store から埋め直す)
+        assert_eq!(q.entries().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
+    }
+
+    #[test]
+    fn push_fails_when_store_never_accepts() {
+        // 容量 0 の store: 捨てる最古すら無いので dropped は None
+        let store = TestStore::new(0);
+        let mut q = open_queue(&store, 2);
+        let err = q.push("timecard", 1, PAYLOAD).unwrap_err();
+        assert!(err.reason.contains("容量不足"), "{}", err.reason);
+        assert_eq!(err.dropped, None);
+        // 失敗時は採番しない (seq を無駄に進めない)
+        assert_eq!(q.last_seq(), 0);
+        assert!(q.is_empty());
+
+        // 1 件入ったあとに store 全体が書けなくなった場合は、最古を捨てても失敗する
+        let store = TestStore::new(5);
+        let mut q = open_queue(&store, 2);
+        q.push("timecard", 1, PAYLOAD).unwrap();
+        store.put_fails.set(true);
+        let err = q.push("timecard", 2, PAYLOAD).unwrap_err();
+        assert_eq!(
+            err.dropped,
+            Some(DroppedEntry {
+                seq: 1,
+                kind: "timecard".into()
+            })
+        );
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn dropped_kind_comes_from_store_when_outside_window() {
+        // 窓 0 件 = 捨てる対象が RAM に無い → store の行から kind を引く
+        let store = TestStore::new(1);
+        let mut q = open_queue(&store, 0);
+        q.push("timecard", 1, PAYLOAD).unwrap();
+        let pushed = q.push("temperature", 2, PAYLOAD).unwrap();
+        assert_eq!(
+            pushed.dropped,
+            Some(DroppedEntry {
+                seq: 1,
+                kind: "timecard".into()
+            })
+        );
+
+        // 行が壊れていて kind が読めないときは "?"
+        let store = TestStore::new(1);
+        store.seed(7, "garbage");
+        let (mut q, skipped) = UplinkQueue::open(0, Box::new(store.clone()), 0);
+        assert_eq!(skipped, 0); // 窓 0 件なので open では読まない
+        let pushed = q.push("timecard", 1, PAYLOAD).unwrap();
+        assert_eq!(
+            pushed.dropped,
+            Some(DroppedEntry {
+                seq: 7,
+                kind: "?".into()
+            })
+        );
+        assert_eq!(pushed.seq, 8); // last_seq は store 上の最大 seq を引き継いでいる
+    }
+
+    #[test]
+    fn corrupt_lines_are_dropped_on_open_and_on_refill() {
+        let store = TestStore::new(10);
+        store.seed(1, &stored_line(1));
+        store.seed(2, "garbage");
+        store.seed(3, &stored_line(3));
+        // open: 窓を埋める途中で壊れた行を索引ごと落とす
+        let (q, skipped) = UplinkQueue::open(0, Box::new(store.clone()), 3);
+        assert_eq!(skipped, 1);
+        assert_eq!(q.entries().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(q.len(), 2);
+
+        // refill (ack 後の穴埋め) でも同じ
+        let store = TestStore::new(10);
+        store.seed(1, &stored_line(1));
+        store.seed(2, "garbage");
+        store.seed(3, &stored_line(3));
+        let mut q = open_queue(&store, 1);
+        assert!(q.ack(1));
+        assert_eq!(q.entries().map(|e| e.seq).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn push_rejects_line_over_nvs_string_limit() {
+        let store = TestStore::new(10);
+        let mut q = open_queue(&store, 2);
+        let big = format!(r#"{{"note":"{}"}}"#, "a".repeat(MAX_LINE_BYTES));
+        let err = q.push("timecard", 1, &big).unwrap_err();
+        assert!(err.reason.contains("保存上限"), "{}", err.reason);
+        assert_eq!(err.dropped, None);
+        assert_eq!(q.last_seq(), 0);
+        assert!(store.lines().is_empty());
+    }
+
+    #[test]
+    fn seq_key_is_lowercase_hex_within_nvs_key_limit() {
+        assert_eq!(seq_key(0), "0");
+        assert_eq!(seq_key(255), "ff");
+        assert_eq!(seq_key(1_000_000_000), "3b9aca00");
+        // NVS のキーは 15 文字まで。実運用の seq (打刻 1 件 1 採番) は
+        // 16^15 に遠く届かないが、境界を固定しておく
+        assert_eq!(seq_key(u64::MAX >> 4).len(), MAX_KEY_LEN);
+        assert!(seq_key(u64::MAX).len() > MAX_KEY_LEN);
+    }
+
+    #[test]
+    fn queue_rejects_bad_payload() {
+        let store = TestStore::new(10);
+        let mut q = open_queue(&store, 2);
+        let err = q.push("k", 0, "not json").unwrap_err();
+        assert!(err.reason.contains("JSON"), "{}", err.reason);
+        assert!(q.is_empty());
+        assert_eq!(q.last_seq(), 0); // 失敗時は採番しない
+    }
+
+    #[test]
+    fn push_with_session_roundtrips_through_store() {
+        let store = TestStore::new(10);
+        let mut q = open_queue(&store, 10);
+        q.push_with_session("alcohol", 100, PAYLOAD, Some("7-1"))
+            .unwrap();
+        q.push_with_session("temperature", 200, PAYLOAD, Some("7-1"))
+            .unwrap();
+        // 点呼外の単発は None のまま
+        q.push("temperature", 300, PAYLOAD).unwrap();
+
+        // 再起動を模して同じ store から開き直す
+        let restored = open_queue(&store, 10);
+        let ids: Vec<Option<String>> = restored.entries().map(|e| e.session_id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![Some("7-1".into()), Some("7-1".into()), None],
+            "保存先の復元でセッションが失われてはならない"
+        );
+        assert_eq!(restored.last_seq(), 3);
+    }
+
+    #[test]
+    fn open_accepts_old_lines_without_session_id() {
+        // session_id を知らない旧ファームが書いた行を復元しても壊れない
+        let store = TestStore::new(10);
+        store.seed(
+            1,
+            &format!(r#"{{"seq":1,"recorded_at_ms":100,"kind":"alcohol","payload":{PAYLOAD}}}"#),
+        );
+        let q = open_queue(&store, 10);
+        assert_eq!(q.entries().count(), 1);
+        assert_eq!(q.entries().next().unwrap().session_id, None);
+    }
+
+    #[test]
+    fn uptime_and_boot_id_roundtrip_through_stored_lines() {
+        let store = TestStore::new(10);
+        let mut q = open_queue(&store, 10);
+        q.push_record("alcohol", 5_000, PAYLOAD, None, Some(5_000), Some(7))
+            .unwrap();
+        q.push_with_session("alcohol", 6_000, PAYLOAD, None).unwrap();
+        let lines = store.lines();
+        assert!(lines[0].contains("\"uptime_ms\":5000") && lines[0].contains("\"boot_id\":7"));
+        assert!(!lines[1].contains("uptime_ms") && !lines[1].contains("boot_id"));
+        // フレームには出さない (サーバ形式は据え置き)
+        let restored = open_queue(&store, 10);
+        let frame = measurement_frame(restored.entries().next().unwrap()).unwrap();
+        assert!(!frame.contains("uptime_ms") && !frame.contains("boot_id"));
+    }
+
+    #[test]
+    fn fix_unsynced_times_rewrites_window_and_store() {
+        let store = TestStore::new(10);
+        // 窓 1 件 = 補正対象が窓の外にも居る状態にする
+        let mut q = open_queue(&store, 1);
         q.push_record("alcohol", 5_000, PAYLOAD, None, Some(5_000), Some(7))
             .unwrap();
         q.push_record("temperature", 9_000, PAYLOAD, Some("7-1"), Some(9_000), Some(6))
             .unwrap();
         q.push_record("alcohol", SYNCED, PAYLOAD, None, Some(20_000), Some(7))
             .unwrap();
+        // まだ時計が同期していないうちは何も直さない (直す材料が無い)
+        assert_eq!(q.fix_unsynced_times(50_000, 65_000, 7), 0);
         assert_eq!(q.fix_unsynced_times(SYNCED + 100_000, 65_000, 7), 1);
-        let times: Vec<u64> = q.entries().map(|e| e.recorded_at_ms).collect();
-        assert_eq!(times, vec![SYNCED + 40_000, 9_000, SYNCED]);
+        // 窓 (seq=1) が直っている
+        assert_eq!(
+            q.entries().next().unwrap().recorded_at_ms,
+            SYNCED + 40_000
+        );
+        // store 側も書き戻されている (直後に電源が落ちても補正が残る)
+        assert!(store.lines()[0].contains(&format!("\"recorded_at_ms\":{}", SYNCED + 40_000)));
+        assert!(store.lines()[1].contains("\"recorded_at_ms\":9000"));
         // 2 回目は補正対象が残っていない
         assert_eq!(q.fix_unsynced_times(SYNCED + 100_000, 65_000, 7), 0);
     }
 
     #[test]
+    fn fix_unsynced_times_survives_store_failures() {
+        // 書き戻しに失敗した分は「補正済み」に数えない (次の周期で再試行できる)
+        let store = TestStore::new(10);
+        let mut q = open_queue(&store, 2);
+        q.push_record("alcohol", 5_000, PAYLOAD, None, Some(5_000), Some(7))
+            .unwrap();
+        store.put_fails.set(true);
+        assert_eq!(q.fix_unsynced_times(SYNCED, 65_000, 7), 0);
+        store.put_fails.set(false);
+        assert_eq!(q.fix_unsynced_times(SYNCED, 65_000, 7), 1);
+
+        // 読めなくなった行は索引ごと落とす (窓も詰め直す)
+        let store = TestStore::new(10);
+        let mut q = open_queue(&store, 1);
+        q.push_record("alcohol", 5_000, PAYLOAD, None, Some(5_000), Some(7))
+            .unwrap();
+        q.push("timecard", SYNCED, PAYLOAD).unwrap();
+        store.unreadable.set(1);
+        assert_eq!(q.fix_unsynced_times(SYNCED, 65_000, 7), 0);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.entries().map(|e| e.seq).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
     fn has_correctable_and_wait_for_clock() {
-        let mut q = UplinkQueue::restore(0, "", 10).0;
+        let store = TestStore::new(10);
+        let mut q = open_queue(&store, 2);
         assert!(!q.has_correctable(7));
         // 旧データ (足場なし) / 別起動 / 同期済み は対象外
         q.push_with_session("alcohol", 5_000, PAYLOAD, None).unwrap();
-        q.push_record("alcohol", 5_000, PAYLOAD, None, Some(5_000), Some(6)).unwrap();
-        q.push_record("alcohol", SYNCED, PAYLOAD, None, Some(5_000), Some(7)).unwrap();
+        q.push_record("alcohol", 5_000, PAYLOAD, None, Some(5_000), Some(6))
+            .unwrap();
+        q.push_record("alcohol", SYNCED, PAYLOAD, None, Some(5_000), Some(7))
+            .unwrap();
         assert!(!q.has_correctable(7));
-        q.push_record("temperature", 23_000, PAYLOAD, None, Some(23_000), Some(7)).unwrap();
+        q.push_record("temperature", 23_000, PAYLOAD, None, Some(23_000), Some(7))
+            .unwrap();
         assert!(q.has_correctable(7));
+        // ack すれば未同期リストからも消える
+        assert!(q.ack(4));
+        assert!(!q.has_correctable(7));
 
         // 未同期 + 補正候補あり + 接続直後 → 待つ
         assert!(should_wait_for_clock(23_000, 0, true));
@@ -931,20 +1380,18 @@ mod tests {
     }
 
     #[test]
-    fn uptime_and_boot_id_roundtrip_through_nvs_lines() {
-        let mut q = UplinkQueue::restore(0, "", 10).0;
-        q.push_record("alcohol", 5_000, PAYLOAD, None, Some(5_000), Some(7))
-            .unwrap();
-        q.push_with_session("alcohol", 6_000, PAYLOAD, None).unwrap();
-        let text = q.serialize();
-        let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[0].contains("\"uptime_ms\":5000") && lines[0].contains("\"boot_id\":7"));
-        assert!(!lines[1].contains("uptime_ms") && !lines[1].contains("boot_id"));
-        let (restored, skipped) = UplinkQueue::restore(0, &text, 10);
-        assert_eq!(skipped, 0);
-        assert_eq!(restored, q);
-        // フレームには出さない (サーバ形式は据え置き)
-        let frame = measurement_frame(restored.entries().next().unwrap()).unwrap();
-        assert!(!frame.contains("uptime_ms") && !frame.contains("boot_id"));
+    fn mem_store_is_a_bounded_map() {
+        // punchq / legacy と同じ契約を RAM で満たす参照実装
+        let mut s = MemStore::new(1);
+        assert!(s.put(2, "b").is_ok());
+        // 同じ seq への上書きは容量を消費しない
+        assert!(s.put(2, "B").is_ok());
+        assert_eq!(s.put(3, "c"), Err(StoreFull));
+        assert_eq!(s.get(2).as_deref(), Some("B"));
+        assert_eq!(s.get(3), None);
+        assert_eq!(s.seqs(), vec![2]);
+        assert_eq!(s.lines(), vec!["B".to_string()]);
+        s.remove(2);
+        assert!(s.seqs().is_empty());
     }
 }
