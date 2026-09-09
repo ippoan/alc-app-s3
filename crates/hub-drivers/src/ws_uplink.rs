@@ -190,6 +190,8 @@ fn run(
     let mut backoff_until: u64 = 0;
     let mut last_ping: u64 = 0;
     let mut last_flush: u64 = 0;
+    // ack で窓に次のぶんが載った → 次の周回で未送信ぶんだけ即座に送る
+    let mut send_unsent = false;
     // 接続不能の連続ログを抑制する (1 回目だけ warn)
     let mut connect_warned = false;
     // ヒープ不足ログの最終出力時刻
@@ -226,6 +228,9 @@ fn run(
                     connect_warned = false;
                     println!("EVT WS_CONNECTED");
                     crate::crashlog::note("EVT WS_CONNECTED");
+                    // 前の接続で送った分がサーバに届いたかは分からないので、
+                    // 送信済みの印を落として窓の全件を送り直す
+                    queue.reset_sent();
                     last_flush = 0; // 接続直後にキューを流す
                     dirty = true;
                 }
@@ -254,7 +259,7 @@ fn run(
                         &status,
                         &ev_tx,
                     ) {
-                        last_flush = 0;
+                        send_unsent = true;
                     }
                     dirty = true;
                 }
@@ -347,7 +352,11 @@ fn run(
         if !wait_clock {
             clock_wait_logged = false;
         }
-        if !wait_clock && !ble_busy && !queue.is_empty() && now.saturating_sub(last_flush) >= RESEND_INTERVAL_MS {
+        // 定期の再送周期か、ack で窓に次のぶんが載った直後 (即時送信) に送る。
+        // **即時送信は未送信ぶんだけ** — 窓の全件を送ると ack 1 件ごとに
+        // まだ ack 待ちの最大 WINDOW-1 件も送り直すことになる (Refs #142)
+        let periodic = now.saturating_sub(last_flush) >= RESEND_INTERVAL_MS;
+        if !wait_clock && !ble_busy && !queue.is_empty() && (periodic || send_unsent) {
             // NTP 未同期 (ネットワーク無し) で記録した測定は recorded_at_ms が 1970 起点
             // になっている。今は同期済み (接続できている = ネットワークがある) なので、
             // 記録時と今の稼働時間の差で実時刻へ直してから送る (同じ起動の分だけ)
@@ -357,31 +366,17 @@ fn run(
                 println!("EVT WS_TIME_FIXED {fixed}");
                 persist(&settings, &queue);
             }
+            send_unsent = false;
             // 再送も同じ seq (サーバ冪等)。send 失敗は接続破棄 → 再接続
-            let mut failed = false;
-            {
-                let c = conn.as_mut().expect("connected implies conn");
-                for entry in queue.entries() {
-                    match measurement_frame(entry) {
-                        Ok(frame) => {
-                            if let Err(e) = c.client.send(FrameType::Text(false), frame.as_bytes())
-                            {
-                                log::warn!("ws_uplink: 送信失敗 seq={}: {e:?}", entry.seq);
-                                failed = true;
-                                break;
-                            }
-                        }
-                        Err(e) => log::error!("ws_uplink: フレーム組立失敗 seq={}: {e}", entry.seq),
-                    }
-                }
-            }
-            if failed {
+            if flush_queue(&mut conn, &mut queue, !periodic) {
                 mark_disconnected(&mut conn, "測定の送信失敗", &queue);
                 backoff_until = now + RECONNECT_BACKOFF_MS;
                 publish_status(&status, &queue, false);
                 continue;
             }
-            last_flush = now;
+            if periodic {
+                last_flush = now;
+            }
         }
 
         // --- 5. keep-alive ping (キューが空の間も下り command を受けるため) ---
@@ -420,6 +415,41 @@ fn heap_headroom_ok(now: u64, last_log: &mut u64) -> bool {
         return false;
     }
     true
+}
+
+/// 窓の測定を送り、送れたものに送信済みの印を付ける。
+///
+/// `unsent_only` が true なら**まだこの接続で送っていないぶんだけ**送る
+/// (ack 駆動の即時送信)。false なら窓の全件を送る (再送周期・接続直後)。
+/// 戻り値 true = 送信に失敗したので接続を捨てて再接続すべき
+fn flush_queue(conn: &mut Option<Conn>, queue: &mut UplinkQueue, unsent_only: bool) -> bool {
+    // 先に seq だけ集め、フレームは 1 件ずつ組む (窓 20 件ぶんの文字列を
+    // 同時にヒープへ置かない)
+    let targets: Vec<u64> = if unsent_only {
+        queue.entries_unsent().map(|e| e.seq).collect()
+    } else {
+        queue.entries().map(|e| e.seq).collect()
+    };
+    let Some(c) = conn.as_mut() else {
+        return false;
+    };
+    for seq in targets {
+        let frame = match queue.entries().find(|e| e.seq == seq).map(measurement_frame) {
+            Some(Ok(frame)) => frame,
+            Some(Err(e)) => {
+                log::error!("ws_uplink: フレーム組立失敗 seq={seq}: {e}");
+                continue;
+            }
+            // 送る前に窓から外れた (ここへは来ない)
+            None => continue,
+        };
+        if let Err(e) = c.client.send(FrameType::Text(false), frame.as_bytes()) {
+            log::warn!("ws_uplink: 送信失敗 seq={seq}: {e:?}");
+            return true;
+        }
+        queue.mark_sent(seq);
+    }
+    false
 }
 
 /// WS の接続を「切れた」状態にする。**client は drop しない。**

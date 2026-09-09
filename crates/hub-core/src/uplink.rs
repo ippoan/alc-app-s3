@@ -460,6 +460,10 @@ pub struct UplinkQueue {
     /// NTP 未同期で記録した (seq, boot_id)。fix_unsynced_times の対象を
     /// 索引全走査せずに引くために持つ
     unsynced: Vec<(u64, u32)>,
+    /// **今の接続で送信済み**の seq (窓の中のものだけ。RAM のみで flash には
+    /// 書かない)。ack 駆動の即時送信 (Refs #142) が、まだ ack 待ちの分まで
+    /// 送り直さないようにするための印。再接続時は reset_sent で全部落とす
+    sent: Vec<u64>,
 }
 
 impl UplinkQueue {
@@ -478,6 +482,7 @@ impl UplinkQueue {
             window,
             last_seq,
             unsynced: Vec::new(),
+            sent: Vec::new(),
         };
         let (_, skipped) = queue.refill();
         (queue, skipped)
@@ -513,6 +518,7 @@ impl UplinkQueue {
         self.index.retain(|&s| s != seq);
         self.entries.retain(|e| e.seq != seq);
         self.unsynced.retain(|&(s, _)| s != seq);
+        self.sent.retain(|&s| s != seq);
     }
 
     /// 最古の 1 件を捨てる (容量不足のとき。現行方針 = 新しい方を残す)
@@ -703,6 +709,26 @@ impl UplinkQueue {
     /// 再送も同じ seq で行う
     pub fn entries(&self) -> impl Iterator<Item = &QueueEntry> {
         self.entries.iter()
+    }
+
+    /// 窓のうち**まだこの接続で送っていない**エントリ (古い順)。
+    /// ack で窓が埋まったときの即時送信はこれだけを送る — 窓の全件を送ると
+    /// ack 1 件ごとに ack 待ちの最大 window-1 件も送り直すことになる (Refs #142)
+    pub fn entries_unsent(&self) -> impl Iterator<Item = &QueueEntry> {
+        self.entries.iter().filter(|e| !self.sent.contains(&e.seq))
+    }
+
+    /// 送信済みの印を付ける (窓から外れた seq への呼び出しは forget が掃除する)
+    pub fn mark_sent(&mut self, seq: u64) {
+        if !self.sent.contains(&seq) {
+            self.sent.push(seq);
+        }
+    }
+
+    /// 全部を未送信に戻す。**再接続時に呼ぶ** — 前の接続で送った分はサーバに
+    /// 届いたか分からないので、改めて全件送り直す
+    pub fn reset_sent(&mut self) {
+        self.sent.clear();
     }
 }
 
@@ -1427,6 +1453,50 @@ mod tests {
         assert!(!should_wait_for_clock(23_000, CLOCK_WAIT_MS, true));
         assert!(!should_wait_for_clock(23_000, 0, false));
         assert!(!should_wait_for_clock(SYNCED, 0, true));
+    }
+
+    #[test]
+    fn unsent_marks_track_the_window_not_the_flash() {
+        let store = TestStore::new(10);
+        let mut q = open_queue(&store, 2);
+        for i in 1..=4 {
+            q.push("timecard", i, PAYLOAD).unwrap();
+        }
+        let unsent = |q: &UplinkQueue| q.entries_unsent().map(|e| e.seq).collect::<Vec<_>>();
+        // 積んだ直後はどれも未送信
+        assert_eq!(unsent(&q), vec![1, 2]);
+        // 送った分だけ落ちる (二重の mark_sent は増やさない)
+        q.mark_sent(1);
+        q.mark_sent(1);
+        assert_eq!(unsent(&q), vec![2]);
+        q.mark_sent(2);
+        assert!(unsent(&q).is_empty());
+        // ack で窓に載った次のぶんは未送信 = 即時送信の対象になる
+        assert_eq!(q.ack(1).refilled, 1);
+        assert_eq!(unsent(&q), vec![3]);
+        // 送信済みの印は窓の中だけの話で、entries() 側は変わらない
+        assert_eq!(q.entries().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
+        // 再接続: 全部を送り直す
+        q.mark_sent(3);
+        assert!(unsent(&q).is_empty());
+        q.reset_sent();
+        assert_eq!(unsent(&q), vec![2, 3]);
+    }
+
+    #[test]
+    fn ack_clears_the_sent_mark_so_seq_reuse_cannot_hide_an_entry() {
+        // ack で消えた seq の印が残っていると、万一同じ seq が窓へ戻ったときに
+        // 「送信済み」と誤認して永久に送られない。forget が印も落とすことを固定する
+        let store = TestStore::new(10);
+        let mut q = open_queue(&store, 2);
+        q.push("timecard", 1, PAYLOAD).unwrap();
+        q.mark_sent(1);
+        assert!(q.entries_unsent().next().is_none());
+        assert!(q.ack(1).removed);
+        // 同じ seq の行を保存先へ戻して開き直しても未送信として扱われる
+        store.seed(1, &stored_line(1));
+        let q = open_queue(&store, 2);
+        assert_eq!(q.entries_unsent().map(|e| e.seq).collect::<Vec<_>>(), vec![1]);
     }
 
     #[test]
