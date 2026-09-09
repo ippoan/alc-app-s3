@@ -35,6 +35,13 @@ pub mod lan;
 // その component を取り込む crate だけが有効化できる
 #[cfg(feature = "nfc")]
 pub mod nfc;
+// 打刻 (kind = "timecard") の組み立て: NfcEvent → UplinkRecord (#188)。
+// atoms3-timecard と CoreS3 の両方が呼ぶ。純粋部分は alc_hub_core::timecard
+// (host test 付き) で、ここは NfcEvent (本 crate) と UplinkRecord を結ぶだけ —
+// どちらも hub-core より下流なので hub-core には置けない。**nfc と同じ cfg**
+// (NfcEvent を使うため)
+#[cfg(feature = "nfc")]
+pub mod timecard;
 pub mod ntp;
 pub mod ota;
 pub mod printer;
