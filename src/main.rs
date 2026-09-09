@@ -194,6 +194,13 @@ fn main() -> Result<()> {
     let (gw_tx, gw_rx) = mpsc::channel();
     gw_link::start(gw_rx, tx.clone(), Arc::clone(&status), settings.clone())?;
 
+    // NFC タッチの打刻 (kind="timecard", issue #188) も同じ送信キューへ積む。
+    // recorder が測定値でやっているのと同じ形で、コールバックには clone を渡す
+    // (下の recorder::start が ws_tx 本体を move するため、ここで取っておく)。
+    // 圏外・未ペアリングでも punchq が NVS へ退避するので打刻は失われない
+    #[cfg(feature = "nfc-verify")]
+    let ws_for_nfc = ws_tx.clone();
+
     // 測定値レコーダ (BLE コールバックを軽量に保つための専用スレッド):
     // JSON 出力 + NVS 記録 + 画面通知 + WS/GW fan-out を担う
     recorder::start(
@@ -350,6 +357,9 @@ fn main() -> Result<()> {
         // 実装時にそちらへ移す。速報性のため send 失敗 (スピーカー初期化失敗で
         // 受信側を落とした場合) は無視する
         let ui_for_nfc = tx.clone();
+        // 打刻の画面表示を出してよいか (点呼中か) の判定に読むだけ。
+        // hub-ui は Measuring にいる間だけ session_id を立てる (Refs #112)
+        let status_for_nfc = Arc::clone(&status);
         // I2C_NUM_1: main.rs の内部バス (I2C_NUM_0, G12/G11 電源IC/タッチ) とは別ポート。
         // Rust 側で I2cDriver を作らず番号だけ C++ (nfc_shim → M5HAL) へ渡す
         alc_hub_drivers::nfc::start(
@@ -372,13 +382,47 @@ fn main() -> Result<()> {
                 }
                 let _ = speaker_tx.send(alc_hub_drivers::speaker::Sound::BeepOk);
                 let _ = speaker_tx.send(alc_hub_drivers::speaker::Sound::Registered);
-                if let NfcEvent::License { issue, expiry } = e {
-                    let _ = ui_for_nfc.send(alc_hub_common::ui_api::UiCommand::License(
-                        alc_hub_common::ui_api::LicenseCard {
-                            issue: issue.clone(),
-                            expiry: expiry.clone(),
-                        },
-                    ));
+                // 打刻 (kind="timecard", issue #188): **読み取れたタッチは全部**
+                // 送る (免許証 / FeliCa IDm / NFC-A UID)。点呼を免許証で始めた
+                // タッチは打刻 + 点呼の 2 行になるが許容 — firmware には「いま
+                // 点呼中か」の判定材料が無く、下流 (rust-alc-api / alc-app) は
+                // license を「点呼」として区別表示する。
+                // 何を打刻にしないか (2 枚検知 / 読取失敗 / 電子車検証 / 日付の
+                // 壊れた免許証) は VoiceS3R と共有 (alc_hub_drivers::timecard)。
+                // 圏外でも punchq が NVS へ退避するので復帰後に届く。
+                // **打刻の `EVT …` 行は CoreS3 では出さない** (VoiceS3R だけが出す)
+                // — USB 先の PWA が読む行種を増やさない (ブラウザの classify()
+                // は `EVT NFC_LICENSE` のまま据え置き)
+                let punched = alc_hub_drivers::timecard::punch_record(
+                    e,
+                    alc_hub_common::status::now_ms(),
+                    alc_hub_common::status::epoch_ms(),
+                )
+                .is_some_and(|rec| ws_for_nfc.send(rec).is_ok());
+                match e {
+                    // 免許証は従来どおり点呼確認画面へ直行させる (#121 / #125)。
+                    // **打刻の画面は出さない** — 同じ 1 タップで 2 画面送ると
+                    // 点呼確認が潰れる (主動線を打刻の通知で塞がない)
+                    NfcEvent::License { issue, expiry } => {
+                        let _ = ui_for_nfc.send(alc_hub_common::ui_api::UiCommand::License(
+                            alc_hub_common::ui_api::LicenseCard {
+                                issue: issue.clone(),
+                                expiry: expiry.clone(),
+                            },
+                        ));
+                    }
+                    // FeliCa / NFC-A は点呼の入口ではないので、打刻できたことを
+                    // 画面で返す (Screen::Result = RESULT_AUTO_CLOSE_MS で自動的に
+                    // 消える既存の仕組み。新しい画面は作らない)。
+                    // **積めなかったときは出さない** — 「表示 = 打刻を預かった」を
+                    // 崩さない (VoiceS3R が音でやっているのと同じ、#155)
+                    _ if punched && !in_tenko(&status_for_nfc) => {
+                        let _ = ui_for_nfc.send(alc_hub_common::ui_api::UiCommand::Result {
+                            ok: true,
+                            value: punch_label(),
+                        });
+                    }
+                    _ => {}
                 }
             },
         )?;
@@ -423,4 +467,34 @@ fn main() -> Result<()> {
         ui_meas_tx,
         alarm_monitor,
     )
+}
+
+/// 点呼 (Measuring) の最中か。**打刻の画面表示を出すかどうかにだけ使う。**
+///
+/// hub-ui は `UiCommand::Result` を点呼中だけ「アルコール欄の更新」として
+/// 解釈する — 点呼中に交通系 IC がかざされると、打刻の文言がアルコールの
+/// 測定結果として入り、点呼が揃ったことにされてしまう。打刻そのもの
+/// (サーバ送信) は点呼中でも変わらず送る。
+///
+/// `session_id` は hub-ui が Measuring にいる間だけ立てる (Refs #112)
+#[cfg(feature = "nfc-verify")]
+fn in_tenko(status: &SharedStatus) -> bool {
+    status.lock().map_or(false, |st| st.session_id.is_some())
+}
+
+/// 打刻できたことを画面へ返す 1 行 (issue #188)。**組み立てはここ 1 か所。**
+///
+/// 端末時計が NTP 同期済みなら "打刻 HH:MM" (日本時間)、未同期なら時刻を
+/// 出さず "打刻しました" だけにする — 1970 起点の値を時刻として見せない
+#[cfg(feature = "nfc-verify")]
+fn punch_label() -> String {
+    let jst = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| alc_hub_core::clock::format_jst(d.as_secs() as i64));
+    match jst {
+        // format_jst は "MM/DD HH:MM:SS" (ASCII) を返す。時刻だけ取り出す
+        Some(s) if s.len() >= 11 => format!("打刻 {}", &s[6..11]),
+        _ => "打刻しました".to_string(),
+    }
 }
