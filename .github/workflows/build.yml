@@ -519,6 +519,14 @@ jobs:
           env ${{ matrix.build_env }} cargo build --release --locked -p ${{ matrix.bin }}
           sccache --show-stats
 
+      # punchq (オフライン送信キュー、#142) の先頭オフセットを partitions.csv から
+      # 読む。Web インストーラー用の main 部をここで切ることで、再インストールでも
+      # 未送信の打刻が消えない。punchq を持たない機種 (print / nfc) では空になり、
+      # 従来どおり末尾まで書く
+      - name: Resolve punchq offset
+        run: |
+          echo "PUNCHQ_OFFSET=$(awk -F, '$1 == "punchq" { gsub(/[[:space:]]/, "", $4); print $4 }' ${{ matrix.partition_table }})" >> "$GITHUB_ENV"
+
       - name: Save merged flashable image
         run: |
           espflash save-image --chip esp32s3 --merge \
@@ -533,16 +541,24 @@ jobs:
       # たびに device credential・プリンター宛先が飛ぶため。
       # - boot 部 [0x0, 0x9000): bootloader + partition table (espflash が
       #   flash-size ヘッダをパッチ済みのバイトをそのまま使う)
-      # - main 部 [0x10000, 末尾): otadata (blank 0xFF) + ota_0 app。otadata を
-      #   blank で書くことで、OTA 済み (ota_1 起動中) デバイスへの再インストール
-      #   でも必ず書き込んだ ota_0 から起動する
-      # 分割オフセットは両機種の partitions.csv で共通 (nvs=0x9000 /
-      # otadata=0x10000)。変更時はここも合わせること
+      # - main 部 [0x10000, punchq or 末尾): otadata (blank 0xFF) + ota_0 app。
+      #   otadata を blank で書くことで、OTA 済み (ota_1 起動中) デバイスへの
+      #   再インストールでも必ず書き込んだ ota_0 から起動する。**punchq (#142) を
+      #   持つ機種はその手前で切る** — 末尾まで書くとオフライン送信キューが
+      #   再インストールのたびに消えるため
+      # 分割オフセットは全機種の partitions.csv で共通 (nvs=0x9000 /
+      # otadata=0x10000)。末尾側だけ機種ごとに punchq の有無で変わる (csv から
+      # 読む、Resolve punchq offset step)。変更時はここも合わせること
       - name: Split web-installer images (NVS 温存)
         run: |
           test "$(stat -c %s ${{ matrix.bin }}-merged.bin)" -gt $((0x10000))
           head -c $((0x9000)) ${{ matrix.bin }}-merged.bin > ${{ matrix.bin }}-boot.bin
-          tail -c +$((0x10000 + 1)) ${{ matrix.bin }}-merged.bin > ${{ matrix.bin }}-main.bin
+          if [ -n "$PUNCHQ_OFFSET" ]; then
+            tail -c +$((0x10000 + 1)) ${{ matrix.bin }}-merged.bin \
+              | head -c $((PUNCHQ_OFFSET - 0x10000)) > ${{ matrix.bin }}-main.bin
+          else
+            tail -c +$((0x10000 + 1)) ${{ matrix.bin }}-merged.bin > ${{ matrix.bin }}-main.bin
+          fi
 
       # OTA (`OTA <url>` / WS 下り {"action":"ota"}) 用の app 単体イメージ。
       # merged と違い bootloader/partition table を含まない (ota.rs 参照)
@@ -582,7 +598,12 @@ jobs:
             ${{ matrix.bin }}-dev-app.bin
           # Web インストーラー用 2 分割 (通常ビルドの Split step と同じ、Refs #48)
           head -c $((0x9000)) ${{ matrix.bin }}-dev-merged.bin > ${{ matrix.bin }}-dev-boot.bin
-          tail -c +$((0x10000 + 1)) ${{ matrix.bin }}-dev-merged.bin > ${{ matrix.bin }}-dev-main.bin
+          if [ -n "$PUNCHQ_OFFSET" ]; then
+            tail -c +$((0x10000 + 1)) ${{ matrix.bin }}-dev-merged.bin \
+              | head -c $((PUNCHQ_OFFSET - 0x10000)) > ${{ matrix.bin }}-dev-main.bin
+          else
+            tail -c +$((0x10000 + 1)) ${{ matrix.bin }}-dev-merged.bin > ${{ matrix.bin }}-dev-main.bin
+          fi
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
