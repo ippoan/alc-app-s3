@@ -214,6 +214,25 @@ pub fn command_print_url(payload: &str) -> Option<String> {
     (url.starts_with("https://") || url.starts_with("http://")).then(|| url.to_string())
 }
 
+/// `get_log` command (#195) の応答上限の既定 (バイト)。
+pub const LOG_DEFAULT_BYTES: usize = 3000;
+/// `get_log` command の応答上限の最大 (バイト)。command_result は NVS キュー
+/// ([`MAX_LINE_BYTES`]) を通らず socket 直書きだが、JSON エスケープの膨張分の
+/// 余裕を見てここで固定する。
+pub const LOG_MAX_BYTES: usize = 3800;
+
+/// 下り `get_log` command payload (`{"action":"get_log","max_bytes":N}`) の
+/// `max_bytes` を取り出す。省略・整数でない値は [`LOG_DEFAULT_BYTES`]、
+/// 指定があれば `1..=`[`LOG_MAX_BYTES`] にクランプする。
+pub fn command_log_max_bytes(payload: &str) -> usize {
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|v| v.get("max_bytes")?.as_i64())
+        .map_or(LOG_DEFAULT_BYTES, |n| {
+            n.clamp(1, LOG_MAX_BYTES as i64) as usize
+        })
+}
+
 /// WS push 印刷 (#38) の 1 チャンク。`print_data` command payload
 /// (`{"action":"print_data","seq":N,"chunk":"<base64>","last":bool}`) を
 /// デコードした結果。`data` は base64 デコード済みの生バイト列。
@@ -939,6 +958,40 @@ mod tests {
         assert_eq!(command_gw_url(r#"{"action":"gw_url","url":1}"#), None);
         assert_eq!(command_gw_url(r#"{"action":"gw_url"}"#), None);
         assert_eq!(command_gw_url("{oops"), None);
+    }
+
+    #[test]
+    fn command_log_max_bytes_defaults_and_clamps() {
+        assert_eq!(
+            command_log_max_bytes(r#"{"action":"get_log"}"#),
+            LOG_DEFAULT_BYTES
+        );
+        assert_eq!(
+            command_log_max_bytes(r#"{"action":"get_log","max_bytes":500}"#),
+            500
+        );
+        assert_eq!(
+            command_log_max_bytes(r#"{"action":"get_log","max_bytes":99999}"#),
+            LOG_MAX_BYTES
+        );
+        assert_eq!(
+            command_log_max_bytes(r#"{"action":"get_log","max_bytes":0}"#),
+            1
+        );
+        assert_eq!(
+            command_log_max_bytes(r#"{"action":"get_log","max_bytes":-5}"#),
+            1
+        );
+        // 整数でない指定 (文字列 / 小数) は既定に落とす
+        assert_eq!(
+            command_log_max_bytes(r#"{"action":"get_log","max_bytes":"3"}"#),
+            LOG_DEFAULT_BYTES
+        );
+        assert_eq!(
+            command_log_max_bytes(r#"{"action":"get_log","max_bytes":1.5}"#),
+            LOG_DEFAULT_BYTES
+        );
+        assert_eq!(command_log_max_bytes("{oops"), LOG_DEFAULT_BYTES);
     }
 
     #[test]

@@ -109,14 +109,14 @@ pub fn note(line: &str) {
     ring_write(b"\n");
 }
 
-/// リングの現在内容をホストへ吐き出す (`LOG DUMP`)。
+/// リングの現在内容を sanitize 済みの文字列で返す (古い順、`\n` 区切り)。
 ///
 /// クラッシュ由来のリセットを待たずに読めるのが `report()` との違い。
-/// 「LAN が切れたが再起動はしていない」ような、事象後に誰も繋いでいなかった
-/// 障害の原因を後から取りに行くための口 (Refs #74)。
-/// 応答は `LOGDUMP BEGIN` / `LOGDUMP <行>` … / `LOGDUMP END <行数>`。
-pub fn dump() {
-    let text = unsafe {
+/// 出口は 3 つ — `LOG DUMP` (シリアル、[`dump`]) と WS 下り command `get_log`
+/// (command_result、ws_uplink.rs、#195) がここを共有する。
+/// 帳簿が壊れている (init 前・電源断直後) なら空。
+pub fn snapshot_text() -> String {
+    unsafe {
         let r = ring_ptr();
         if (*r).magic == MAGIC && pure::ring_valid(RING_CAP, (*r).pos, (*r).len) {
             let raw = pure::ring_snapshot(&(*r).data, (*r).pos, (*r).len);
@@ -124,7 +124,16 @@ pub fn dump() {
         } else {
             String::new()
         }
-    };
+    }
+}
+
+/// リングの現在内容をホストへ吐き出す (`LOG DUMP`)。
+///
+/// 「LAN が切れたが再起動はしていない」ような、事象後に誰も繋いでいなかった
+/// 障害の原因を後から取りに行くための口 (Refs #74)。
+/// 応答は `LOGDUMP BEGIN` / `LOGDUMP <行>` … / `LOGDUMP END <行数>`。
+pub fn dump() {
+    let text = snapshot_text();
     println!("LOGDUMP BEGIN");
     let mut n = 0usize;
     for line in text.lines() {
