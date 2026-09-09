@@ -17,7 +17,8 @@
 //! | `ERROR <message>` | エラー画面を表示 |
 //! | `RESET` | 待機画面へ戻す |
 //! | `ROTATE <0\|90\|180\|270>` | 画面向きを変更 (NVS 保存、次回起動も維持) |
-//! | `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0 BOARD=cores3` を返す |
+//! | `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0 BOARD=cores3 ALARM=idle/none/-` を返す |
+//! | `HB OK` / `HB NG <reason>` | 運行者 PWA の heartbeat (3 秒ごと)。沈黙警告の判定器へ渡す。**応答しない** |
 //! | `AUTH SET <id> <secret> <tenant>` | device credential を注入 (USB provisioning) |
 //! | `AUTH UNPAIR` | 保存済み device credential を破棄 (ローカルのみ) |
 //! | `AUTH STATUS` | `AUTH PAIRED <tenant> <id>` / `AUTH UNPAIRED` を返す |
@@ -61,6 +62,7 @@ use alc_hub_common::{
     status::{now_ms, SharedStatus},
     ui_api::UiCommand,
 };
+use alc_hub_core::alarm::SharedMonitor;
 use alc_hub_wifi::{improv::Improv, wifi::Wifi};
 
 use crate::console;
@@ -72,6 +74,7 @@ pub fn start(
     wifi: Wifi,
     pair_flag: PairFlag,
     mut improv: Improv,
+    alarm: SharedMonitor,
 ) -> Result<()> {
     // stdin のブロッキング読み出しを可能にする (console.rs と同じ設置)。
     // 本 crate は Improv (バイナリフレーム) を混ぜるため console::spawn_reader は
@@ -98,6 +101,7 @@ pub fn start(
                             &wifi,
                             &pair_flag,
                             &mut improv,
+                            &alarm,
                         );
                     }
                     Err(_) => FreeRtos::delay_ms(100),
@@ -108,6 +112,7 @@ pub fn start(
 }
 
 /// バッファ先頭から処理できる単位 (IMPROV フレーム / テキスト行) を消費する
+#[allow(clippy::too_many_arguments)]
 fn drain_buffer(
     acc: &mut Vec<u8>,
     tx: &Sender<UiCommand>,
@@ -116,6 +121,7 @@ fn drain_buffer(
     wifi: &Wifi,
     pair_flag: &PairFlag,
     improv: &mut Improv,
+    alarm: &SharedMonitor,
 ) {
     loop {
         if acc.is_empty() {
@@ -140,7 +146,7 @@ fn drain_buffer(
                     console::discard_overlong(acc);
                     return;
                 };
-                handle_line(&line, tx, status, settings, wifi, pair_flag);
+                handle_line(&line, tx, status, settings, wifi, pair_flag, alarm);
             }
         }
     }
@@ -148,6 +154,7 @@ fn drain_buffer(
 
 /// 1 行を処理する。解析は alc-hub-core::protocol (純粋・テスト済み)、
 /// 副作用 (画面遷移・NVS 保存・応答出力) はここで行う。
+#[allow(clippy::too_many_arguments)]
 fn handle_line(
     line: &str,
     tx: &Sender<UiCommand>,
@@ -155,6 +162,7 @@ fn handle_line(
     settings: &Settings,
     wifi: &Wifi,
     pair_flag: &PairFlag,
+    alarm: &SharedMonitor,
 ) {
     let command = match parse_line(line, config::QR_DEFAULT_TIMEOUT_MS) {
         Ok(Some(command)) => command,
@@ -208,16 +216,29 @@ fn handle_line(
                 println!("ERR ROTATE: 保存に失敗しました");
             }
         },
+        // 運行者 PWA からの heartbeat (`HB OK`、3 秒ごと)。**応答は返さない**。
+        // 途切れたら鳴らすのは鳴動ループ (src/main.rs)、判定は alc_hub_core::alarm。
+        // 初回のこの行が沈黙警告を**武装**する (それまでは鳴らない、#187)
+        HostCommand::Heartbeat { ok, reason, call } => {
+            crate::alarm::apply_heartbeat(alarm, ok, reason.as_deref(), call);
+        }
+        // ★ 行頭 (`STATUS LAN=…`) は変えないこと。ブラウザ側 (`useCoreS3Serial` の
+        //   `classify()`) は行頭 `STATUS alarm` を「警告デバイス = 別機種」と判定して
+        //   **CoreS3 のポートを reject する**。鳴動状態は**行末**に足す (#187)
         HostCommand::Status => {
             let st = status.lock().map(|s| s.clone()).unwrap_or_default();
+            // lock できなかったときも行の形は保つ (ブラウザは key=value で読む)
+            let mut alarm_field = "ALARM=unknown".to_string();
+            crate::alarm::with_monitor(alarm, |m, now| alarm_field = m.status_field(now));
             println!(
-                "STATUS LAN={} RS232={} BLE={} WIFI={} ROT={} BOARD={}",
+                "STATUS LAN={} RS232={} BLE={} WIFI={} ROT={} BOARD={} {}",
                 u8::from(st.lan_link),
                 u8::from(st.rs232_active(now_ms(), config::RS232_ACTIVE_WINDOW_MS)),
                 u8::from(st.ble_connected),
                 u8::from(st.wifi_connected),
                 settings.rotation(),
                 st.board.label(),
+                alarm_field,
             );
         }
         // 設定エクスポート: 1 行 JSON を CFG プレフィックスで返す

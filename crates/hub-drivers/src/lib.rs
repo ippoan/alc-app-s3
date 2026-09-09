@@ -4,6 +4,10 @@
 //! alc-hub-board、共有基盤 (状態/設定/UI コマンド) は alc-hub-common に分離
 //! されている (依存を枝分かれさせて並列ビルドを可能にするため)。
 
+// 警告デバイスの配線 (判定器の共有 + Action の実行)。判定そのものは
+// alc_hub_core::alarm (ホストでテスト済みの純粋ロジック)。**VoiceS3R
+// (atoms3-alarm) と CoreS3 の両方がここを通る** — 機種ごとに書き写さない
+pub mod alarm;
 pub mod auth_link;
 pub mod console;
 pub mod crashlog;

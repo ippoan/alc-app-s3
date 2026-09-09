@@ -34,13 +34,26 @@
 //! [`Action::PlayMutedTick`] を出す。**完全な無音にはしない** — 異常が続いて
 //! いることを忘れられるため (2026-09-09 の実機確認でのユーザー要望)。
 
+use std::sync::{Arc, Mutex};
+
+/// 鳴動判定の共有ハンドル。**音を出すループ (firmware) / heartbeat の受け手
+/// (ホストコンソール) / 画面のタップ**の 3 者で共有する。ロックして現在時刻と
+/// ともに渡す手続きは `alc_hub_drivers::alarm` 側 (単調時刻 `now_ms` は
+/// esp-idf に触るため、ホストでテストするこのクレートには置けない)
+pub type SharedMonitor = Arc<Mutex<AlarmMonitor>>;
+
 /// 最後の heartbeat からこれだけ間が空いたら沈黙 = 異常とみなす。
 /// キオスク側の送信間隔は 3 秒 (背面タブの `setInterval` スロットルは 1 秒までなので
 /// 3 秒間隔なら間に合う) で、その 3 回ぶんの余裕を見た初期値 (plan §4.1)
 pub const SILENCE_MS: u64 = 10_000;
 
 /// 起動直後の猶予。**一度も heartbeat を受け取っていない**あいだはこの時間まで
-/// 鳴らさない。USB を挿してブラウザを開くまでの間にいきなり鳴るのを避ける
+/// 鳴らさない。USB を挿してブラウザを開くまでの間にいきなり鳴るのを避ける。
+///
+/// これを使うのは**猶予つきで武装する機 (VoiceS3R)** だけ。据置ハブ (CoreS3) は
+/// [`AlarmMonitor::with_boot_grace(None)`](AlarmMonitor::with_boot_grace) で
+/// **初回 heartbeat を受けるまで鳴らない**側に倒す — キオスク PWA を繋がない
+/// 設置 (ハブ単体) では猶予方式だと 30 秒後から鳴り続けるため (issue #187)
 pub const BOOT_GRACE_MS: u64 = 30_000;
 
 /// 鳴動中に警告音を出し直す周期。**繰り返しはこのモニタが刻む** — 再生スレッド側で
@@ -142,6 +155,12 @@ pub struct AlarmMonitor {
     state: State,
     /// 最後に heartbeat を受けた時刻。`None` = 起動後まだ一度も受けていない
     last_hb_at: Option<u64>,
+    /// 一度も heartbeat を受けていないときに沈黙とみなすまでの猶予。
+    /// `None` = **初回 heartbeat を受けるまで沈黙警告を出さない** (武装方式)
+    boot_grace_ms: Option<u64>,
+    /// 画面タップ ([`AlarmMonitor::request_button`]) の予約。次の
+    /// [`AlarmMonitor::tick`] が消費する
+    button_pending: bool,
     hb_ok: bool,
     hb_reason: Option<String>,
     hb_call: bool,
@@ -157,12 +176,29 @@ impl Default for AlarmMonitor {
 }
 
 impl AlarmMonitor {
+    /// 起動猶予つき ([`BOOT_GRACE_MS`]) の既定構成。**据置ハブ (CoreS3) は
+    /// これではなく [`Self::with_boot_grace(None)`](Self::with_boot_grace)**
     pub fn new() -> Self {
+        Self::with_boot_grace(Some(BOOT_GRACE_MS))
+    }
+
+    /// 起動猶予を指定して作る。
+    ///
+    /// - `Some(ms)` — 一度も heartbeat が来なくても、起動から `ms` 経てば
+    ///   沈黙 = 異常とみなす (VoiceS3R。USB を挿したら鳴るのが正しい機)
+    /// - `None` — **初回 heartbeat を受けるまで沈黙警告を出さない** (CoreS3。
+    ///   キオスク PWA を繋がない設置でも一度も鳴らない = 武装方式、issue #187)
+    ///
+    /// どちらでも**武装後の判定は同じ** ([`SILENCE_MS`] の途絶で `Cause::Silence`)。
+    /// モードで分岐を増やさないのは、鳴り方が 2 通りに割れないようにするため
+    pub fn with_boot_grace(boot_grace_ms: Option<u64>) -> Self {
         Self {
             state: State::Idle,
             last_hb_at: None,
+            boot_grace_ms,
+            button_pending: false,
             // 未受信のあいだは「正常」に倒しておく。この間の異常判定は
-            // BOOT_GRACE_MS の沈黙だけが担う
+            // 起動猶予 (boot_grace_ms) の沈黙だけが担う
             hb_ok: true,
             hb_reason: None,
             hb_call: false,
@@ -211,9 +247,31 @@ impl AlarmMonitor {
         out
     }
 
+    /// 画面タップ (CoreS3) を押下として**予約**する。鳴動中 / 黙らせている
+    /// 最中だけ受け付け、受け付けたら `true` (= そのタップは警告に消費された
+    /// ので、呼び出し側は画面の通常操作に渡さない)。Idle のタップは `false` で
+    /// 素通しする。
+    ///
+    /// **トグルと音は次の [`Self::tick`] で起こる** — 画面スレッドはスピーカーの
+    /// 送信口を持たないので、ここで [`Self::on_button`] を呼ぶと戻り値の
+    /// [`Action`] を鳴らす相手が居ない。予約にしておけば、鳴動ループが
+    /// VoiceS3R と同じ 1 か所で音を出せる
+    pub fn request_button(&mut self) -> bool {
+        if matches!(self.state, State::Idle) {
+            return false;
+        }
+        self.button_pending = true;
+        true
+    }
+
     /// 時間を進めて副作用を取り出す。firmware 側から短い周期で呼ぶ
     pub fn tick(&mut self, now_ms: u64) -> Vec<Action> {
         let mut out = Vec::new();
+        // 画面タップの予約をここで消費する。押下 → tick の順は VoiceS3R の
+        // 鳴動ループ (on_button の結果に tick の結果を継ぐ) と同じ
+        if std::mem::take(&mut self.button_pending) {
+            out.extend(self.on_button(now_ms));
+        }
         let cause = self.cause_at(now_ms);
         let abnormal = !matches!(cause, Cause::None);
         match self.state {
@@ -283,16 +341,37 @@ impl AlarmMonitor {
     /// 先頭 2 トークン `STATUS alarm` は**ブラウザ側が機種を識別する目印**なので変えない
     /// — CoreS3 と VoiceS3R は USB の VID/PID が同一で記述子では見分けられない
     pub fn status_line(&self, now_ms: u64) -> String {
-        let age = match self.last_hb_at {
-            Some(t) => now_ms.saturating_sub(t).to_string(),
-            None => "-".to_string(),
-        };
         format!(
             "STATUS alarm state={} cause={} hb_age_ms={}",
             self.state.label(),
             self.cause_at(now_ms).label(),
-            age,
+            self.hb_age_label(now_ms),
         )
+    }
+
+    /// **自前の `STATUS` 行を持つ機 (CoreS3)** が行末に足す 1 トークン
+    /// (`ALARM=<state>/<cause>/<hb_age_ms>`)。
+    ///
+    /// ★ CoreS3 は [`Self::status_line`] を使わないこと — ブラウザ側
+    /// (`useCoreS3Serial` の `classify()`) は行頭 `STATUS alarm` と `EVT ALARM` を
+    /// 「警告デバイス = 別機種」と判定し、**CoreS3 のポートを reject する**。
+    /// 行頭 `STATUS LAN=… BOARD=cores3 …` のまま末尾に足せば、どちらの判定にも
+    /// 触らずに鳴動状態を渡せる (issue #187)
+    pub fn status_field(&self, now_ms: u64) -> String {
+        format!(
+            "ALARM={}/{}/{}",
+            self.state.label(),
+            self.cause_at(now_ms).label(),
+            self.hb_age_label(now_ms),
+        )
+    }
+
+    /// 最後の heartbeat からの経過 ms。一度も受けていなければ `-`
+    fn hb_age_label(&self, now_ms: u64) -> String {
+        match self.last_hb_at {
+            Some(t) => now_ms.saturating_sub(t).to_string(),
+            None => "-".to_string(),
+        }
     }
 
     /// 異常が解消したときの共通処理 (鳴動中でもボタンで黙らせた後でも同じ)
@@ -315,8 +394,12 @@ impl AlarmMonitor {
     /// 今の時刻での異常の有無と理由
     fn cause_at(&self, now_ms: u64) -> Cause {
         let silence = match self.last_hb_at {
-            // 一度も受けていないうちは起動猶予いっぱいまで待つ
-            None => now_ms >= BOOT_GRACE_MS,
+            // 一度も受けていないうちは起動猶予いっぱいまで待つ。猶予が `None`
+            // (武装方式) なら**初回 heartbeat が来るまで沈黙とみなさない**
+            None => match self.boot_grace_ms {
+                Some(grace) => now_ms >= grace,
+                None => false,
+            },
             Some(t) => now_ms.saturating_sub(t) >= SILENCE_MS,
         };
         if silence {
@@ -618,6 +701,85 @@ mod tests {
         assert_eq!(m.tick(t + SILENCE_TICK_MS - 1), vec![]);
         assert_eq!(
             m.tick(t + SILENCE_TICK_MS),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+        );
+    }
+
+    /// 据置ハブ (CoreS3) の武装方式: **一度も heartbeat が来ないうちは鳴らない**。
+    /// キオスク PWA を繋がない設置 (ハブ単体) で鳴り続けないための決定 (#187)
+    #[test]
+    fn without_a_boot_grace_the_first_heartbeat_arms_the_alarm() {
+        let mut m = AlarmMonitor::with_boot_grace(None);
+        assert_eq!(m.tick(0), vec![]);
+        // 起動猶予つきなら鳴っている時刻 (BOOT_GRACE_MS) を過ぎても鳴らない
+        assert_eq!(m.tick(BOOT_GRACE_MS), vec![emit("idle", "none")]);
+        // 60 秒経っても出るのはバナーだけ (音は 1 度も鳴らない)
+        assert_eq!(m.tick(60_000), vec![emit("idle", "none")]);
+        assert_eq!(m.status_field(60_000), "ALARM=idle/none/-");
+    }
+
+    /// 武装後は VoiceS3R と同じ判定 — 初回 heartbeat から 10 秒の途絶で鳴る
+    #[test]
+    fn after_the_first_heartbeat_silence_alarms_like_the_default() {
+        let mut m = AlarmMonitor::with_boot_grace(None);
+        m.on_heartbeat(60_000, true, None, false);
+        assert_eq!(m.tick(60_000), vec![emit("idle", "none")]);
+        // 10 秒に 1ms 足りないうちは鳴らない (出るのはバナーだけ)
+        assert_eq!(m.tick(60_000 + SILENCE_MS - 1), vec![emit("idle", "none")]);
+        assert_eq!(
+            m.tick(60_000 + SILENCE_MS),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+        );
+        assert_eq!(
+            m.status_field(60_000 + SILENCE_MS),
+            "ALARM=alarming/silence/10000"
+        );
+    }
+
+    /// heartbeat が戻れば解消する (武装は解けない = 再び途絶したらまた鳴る)
+    #[test]
+    fn the_alarm_clears_when_the_heartbeat_comes_back() {
+        let mut m = AlarmMonitor::with_boot_grace(None);
+        m.on_heartbeat(0, true, None, false);
+        assert_eq!(
+            m.tick(SILENCE_MS),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+        );
+        m.on_heartbeat(SILENCE_MS + 500, true, None, false);
+        assert_eq!(
+            m.tick(SILENCE_MS + 500),
+            vec![Action::PlayResolved, emit("idle", "none")]
+        );
+        assert_eq!(m.status_field(SILENCE_MS + 500), "ALARM=idle/none/0");
+        // 一度武装したら解けない: また 10 秒途絶すれば鳴る
+        assert_eq!(
+            m.tick(SILENCE_MS + 500 + SILENCE_MS),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+        );
+    }
+
+    /// 画面タップ (CoreS3): 鳴動中だけ受け付け、トグルと音は次の tick で出る
+    #[test]
+    fn a_screen_tap_is_only_taken_while_the_alarm_is_up() {
+        let mut m = AlarmMonitor::with_boot_grace(None);
+        // Idle のタップは受け付けない (画面の通常操作へ素通しする)
+        assert!(!m.request_button());
+        assert_eq!(m.tick(0), vec![]);
+        m.on_heartbeat(0, true, None, false);
+        assert_eq!(
+            m.tick(SILENCE_MS),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+        );
+        // 鳴動中のタップは受け付け、次の tick で黙る (音は鳴らさない)
+        assert!(m.request_button());
+        let t = SILENCE_MS + 50;
+        assert_eq!(m.tick(t), vec![emit("muted", "silence")]);
+        assert_eq!(m.status_field(t), "ALARM=muted/silence/10050");
+        // 黙らせている最中のタップも受け付け、次の tick で鳴動へ戻る
+        assert!(m.request_button());
+        let t = t + 50;
+        assert_eq!(
+            m.tick(t),
             vec![Action::PlaySilenceTick, emit("alarming", "silence")]
         );
     }
