@@ -241,7 +241,10 @@ fn run(
                     dirty = true;
                 }
                 WsEvent::Text(text) => {
-                    handle_downlink(
+                    // ack で窓に次のぶんが載ったら再送周期 (15 秒) を待たずに送る。
+                    // 待つと保存先に溜まった分の排出が「窓 20 件 / 15 秒」に
+                    // 律速される (2,000 件で 25 分かかる、Refs #142)
+                    if handle_downlink(
                         &text,
                         &mut queue,
                         &settings,
@@ -250,7 +253,9 @@ fn run(
                         &ui_tx,
                         &status,
                         &ev_tx,
-                    );
+                    ) {
+                        last_flush = 0;
+                    }
                     dirty = true;
                 }
                 WsEvent::Outbound(frame) => {
@@ -492,7 +497,8 @@ fn publish_status(status: &SharedStatus, queue: &UplinkQueue, connected: bool) {
     }
 }
 
-/// 下りフレームの処理 (ack 消し込み / command 中継)
+/// 下りフレームの処理 (ack 消し込み / command 中継)。
+/// **戻り値 true = 窓に次の送信対象が載ったので即座に送ってよい** (Refs #142)
 #[allow(clippy::too_many_arguments)]
 fn handle_downlink(
     text: &str,
@@ -503,12 +509,15 @@ fn handle_downlink(
     ui_tx: &Sender<UiCommand>,
     status: &SharedStatus,
     ev_tx: &mpsc::Sender<WsEvent>,
-) {
+) -> bool {
     match parse_downlink(text) {
         Ok(Downlink::Ack { seq }) => {
-            if queue.ack(seq) {
+            let acked = queue.ack(seq);
+            if acked.removed {
                 persist(settings, queue);
             }
+            // 窓が保存先から埋まったぶんだけ、続けて送る対象がある
+            return acked.refilled > 0;
         }
         Ok(Downlink::ServerError { seq, message }) => {
             // キューに残して次の再送周期で送り直す
@@ -721,6 +730,8 @@ fn handle_downlink(
         Ok(Downlink::Connected) | Ok(Downlink::Pong) => {}
         Err(e) => log::warn!("ws_uplink: 下りフレーム解析失敗: {e} ({text})"),
     }
+    // ack 以外は窓を動かさないので、送信を早める理由が無い
+    false
 }
 
 /// command への即時 command_result を送る (接続が生きていれば best-effort)。

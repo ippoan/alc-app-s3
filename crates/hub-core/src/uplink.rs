@@ -370,6 +370,17 @@ pub struct DroppedEntry {
     pub kind: String,
 }
 
+/// ack の結果。`refilled` が 0 より大きいときは**窓に新しい送信対象が載った**ので、
+/// 呼び側は再送周期を待たずに送ってよい (待つと flash に溜まった分の排出が
+/// 「窓 20 件 × 再送周期」に律速される、Refs #142)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Acked {
+    /// 該当 seq がキューにあり消し込めた
+    pub removed: bool,
+    /// 空いた窓へ保存先から新しく読み込んだ件数
+    pub refilled: usize,
+}
+
 /// push 成功。`dropped` は容量確保のために捨てた最古のエントリ
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pushed {
@@ -468,20 +479,24 @@ impl UplinkQueue {
             last_seq,
             unsynced: Vec::new(),
         };
-        let skipped = queue.refill();
+        let (_, skipped) = queue.refill();
         (queue, skipped)
     }
 
     /// 窓を `window` 件まで store から埋める。壊れて読めない行は store と索引から
-    /// 落とす (戻り値 = 落とした件数)
-    fn refill(&mut self) -> usize {
+    /// 落とす。戻り値は (新しく窓へ載せた件数, 壊れていて落とした件数)
+    fn refill(&mut self) -> (usize, usize) {
+        let mut loaded = 0;
         let mut skipped = 0;
         while self.entries.len() < self.window {
             let Some(&seq) = self.index.get(self.entries.len()) else {
                 break;
             };
             match self.store.get(seq).as_deref().and_then(parse_line) {
-                Some(entry) => self.entries.push_back(entry),
+                Some(entry) => {
+                    self.entries.push_back(entry);
+                    loaded += 1;
+                }
                 None => {
                     self.store.remove(seq);
                     self.index.remove(self.entries.len());
@@ -489,7 +504,7 @@ impl UplinkQueue {
                 }
             }
         }
-        skipped
+        (loaded, skipped)
     }
 
     /// 1 件を store・索引・窓・未同期リストから消す
@@ -654,14 +669,21 @@ impl UplinkQueue {
     }
 
     /// ack された seq を消し込み、空いた窓を store から埋める。
-    /// 該当が無ければ false
-    pub fn ack(&mut self, seq: u64) -> bool {
+    /// **窓に新しく載った件数も返す** — 呼び側はそれが 0 より大きいとき、
+    /// 再送周期を待たずに送ることで溜まった分を連続排出できる (Refs #142)
+    pub fn ack(&mut self, seq: u64) -> Acked {
         if !self.index.contains(&seq) {
-            return false;
+            return Acked {
+                removed: false,
+                refilled: 0,
+            };
         }
         self.forget(seq);
-        self.refill();
-        true
+        let (refilled, _) = self.refill();
+        Acked {
+            removed: true,
+            refilled,
+        }
     }
 
     pub fn last_seq(&self) -> u64 {
@@ -1097,17 +1119,38 @@ mod tests {
         // flash は 4 件、RAM の窓は 2 件
         assert_eq!(q.len(), 4);
         assert_eq!(q.entries().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
-        // ack すると次が窓へ載る
-        assert!(q.ack(1));
+        // ack すると次が窓へ載り、「新しく載った」ことが呼び側へ伝わる
+        // (呼び側はこれを見て再送周期を待たずに送る = 溜まった分の連続排出)
+        assert_eq!(
+            q.ack(1),
+            Acked {
+                removed: true,
+                refilled: 1
+            }
+        );
         assert_eq!(q.entries().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
-        assert!(q.ack(2));
+        assert_eq!(q.ack(2).refilled, 1);
         assert_eq!(q.entries().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4]);
-        // 二重 ack / 未知の seq は false
-        assert!(!q.ack(2));
+        // 二重 ack / 未知の seq は消し込みも補充もしない
+        assert_eq!(
+            q.ack(2),
+            Acked {
+                removed: false,
+                refilled: 0
+            }
+        );
         assert_eq!(q.len(), 2);
         assert_eq!(store.lines().len(), 2);
+        // 保存先に残りが無ければ補充は 0 (呼び側は即送信しない)
+        assert_eq!(
+            q.ack(3),
+            Acked {
+                removed: true,
+                refilled: 0
+            }
+        );
         // 空になっても seq は戻らない
-        assert!(q.ack(3) && q.ack(4));
+        assert!(q.ack(4).removed);
         assert!(q.is_empty());
         assert_eq!(q.push("timecard", 5, PAYLOAD).unwrap().seq, 5);
         assert_eq!(q.last_seq(), 5);
@@ -1212,7 +1255,14 @@ mod tests {
         store.seed(2, "garbage");
         store.seed(3, &stored_line(3));
         let mut q = open_queue(&store, 1);
-        assert!(q.ack(1));
+        // 壊れた行を飛ばして次の行が載るので refilled は 1
+        assert_eq!(
+            q.ack(1),
+            Acked {
+                removed: true,
+                refilled: 1
+            }
+        );
         assert_eq!(q.entries().map(|e| e.seq).collect::<Vec<_>>(), vec![3]);
         assert_eq!(q.len(), 1);
     }
@@ -1367,7 +1417,7 @@ mod tests {
             .unwrap();
         assert!(q.has_correctable(7));
         // ack すれば未同期リストからも消える
-        assert!(q.ack(4));
+        assert!(q.ack(4).removed);
         assert!(!q.has_correctable(7));
 
         // 未同期 + 補正候補あり + 接続直後 → 待つ
