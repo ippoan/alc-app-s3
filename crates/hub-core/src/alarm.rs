@@ -15,9 +15,19 @@
 //!   ┌──────────────────────────┐        ┌──────────────────────────────┐
 //!   │                          ▼        │                              ▼
 //!  Idle ──abnormal──▶ Alarming ──ボタン──▶ Muted ──!abnormal──▶ Idle (PlayResolved)
-//!         PlayAlert   1.8 秒ごとに   ▲          │  5 秒ごとに PlayMutedTick
-//!                     PlayAlert      └──ボタン──┘  (短い単発)
+//!         (即 1 回)   call / ng:  1.8 秒ごとに   ▲          │  5 秒ごとに PlayMutedTick
+//!                                 PlayAlert (3 連) └──ボタン──┘  (短い単発)
+//!                     silence:    5 秒ごとに
+//!                                 PlaySilenceTick (短い 2 連)
 //! ```
+//!
+//! **鳴動中の音は理由で変える** — 沈黙 (`Cause::Silence` = USB が抜けた / ブラウザを
+//! 閉じた / 運行管理者タブから離れた) は [`SILENCE_TICK_MS`] ごとの短い 2 連
+//! ([`Action::PlaySilenceTick`])、着信 (`Cause::Call`) と NG は [`ALERT_PERIOD_MS`]
+//! ごとの 3 連 ([`Action::PlayAlert`]) のまま。人を呼ぶ音は強いままにし、
+//! 「繋がっていない」は 5 秒に 1 回程度でよいというユーザー要望 (2026-09-09、
+//! 運行管理者 PC での実機確認後)。音の種類が変わった瞬間 (沈黙中に着信が来た等) は
+//! 周期を待たずに新しい音を 1 回出し、周期をそこから引き直す。
 //!
 //! **ボタンはトグル** — 鳴動中に押すと黙り、黙っているあいだにもう一度押すと
 //! 鳴動へ戻る。黙らせているあいだも [`MUTED_TICK_MS`] ごとに
@@ -47,6 +57,13 @@ pub const BANNER_MS: u64 = 5_000;
 /// 「鳴っている」ではなく「まだ直っていない」と伝わる間隔にしてある
 pub const MUTED_TICK_MS: u64 = 5_000;
 
+/// 沈黙 (heartbeat が来ない = USB 抜け / ブラウザを閉じた / 運行管理者タブから離れた)
+/// で鳴動中に短い 2 連 ([`Action::PlaySilenceTick`]) を出す周期。
+/// 「S3 と Windows が繋がっていない」ときの警告は **5 秒に 1 回程度でいい**という
+/// ユーザー要望 (2026-09-09、運行管理者 PC での実機確認後)。着信 / NG の 3 連
+/// (`ALERT_PERIOD_MS`) はそのまま — 人を呼ぶ音は強いままにする
+pub const SILENCE_TICK_MS: u64 = 5_000;
+
 /// `HB NG` に理由ラベルが付いていなかったときに使う既定の理由。
 /// `cause=ng:` のように空で出すと行の文法 (`ng:<reason>`) が崩れるため
 pub const DEFAULT_NG_REASON: &str = "unspecified";
@@ -66,6 +83,10 @@ pub enum Action {
     /// 鳴動へ戻すのはボタンだけで、これは「まだ直っていない」ことを思い出させる
     /// ための最小限の合図 (plan/standing-devices.md §4.4)
     PlayMutedTick,
+    /// 沈黙で鳴動中の短い 2 連 (`Sound::SilenceTick` = 3000Hz 60ms ×2)。
+    /// [`SILENCE_TICK_MS`] ごとに出る。**Muted の単発 ([`Self::PlayMutedTick`]) と
+    /// 聞き分けられるよう 2 連**、着信 / NG の 3 連 ([`Self::PlayAlert`]) より弱い音
+    PlaySilenceTick,
     /// この行をホスト (キオスク) へ書き出す (`EVT ALARM state=... cause=...`)
     Emit(String),
 }
@@ -163,8 +184,8 @@ impl AlarmMonitor {
     /// 黙らせているあいだに押されたら鳴動へ戻す。
     ///
     /// 黙らせるときは**音を鳴らさない** (「直った」合図と紛れさせないため)。
-    /// 鳴動へ戻すときは押した手応えを兼ねて即 [`Action::PlayAlert`] を出し、
-    /// 次の周期を `now + ALERT_PERIOD_MS` に置く (Idle → Alarming と同じ入り方)。
+    /// 鳴動へ戻すときは押した手応えを兼ねて即 1 回鳴らし (音と周期は理由で選ぶ —
+    /// `alarm_sound`)、次の周期を `now + 周期` に置く (Idle → Alarming と同じ入り方)。
     /// Idle での押下は何も起こさない
     pub fn on_button(&mut self, now_ms: u64) -> Vec<Action> {
         let mut out = Vec::new();
@@ -177,11 +198,12 @@ impl AlarmMonitor {
                 self.emit(now_ms, &cause, &mut out);
             }
             State::Muted { .. } => {
-                self.state = State::Alarming {
-                    next_beep_at: now_ms + ALERT_PERIOD_MS,
-                };
-                out.push(Action::PlayAlert);
                 let cause = self.cause_at(now_ms);
+                let (sound, period) = alarm_sound(&cause);
+                self.state = State::Alarming {
+                    next_beep_at: now_ms + period,
+                };
+                out.push(sound);
                 self.emit(now_ms, &cause, &mut out);
             }
             State::Idle => {}
@@ -197,22 +219,33 @@ impl AlarmMonitor {
         match self.state {
             State::Idle => {
                 if abnormal {
+                    let (sound, period) = alarm_sound(&cause);
                     self.state = State::Alarming {
-                        next_beep_at: now_ms + ALERT_PERIOD_MS,
+                        next_beep_at: now_ms + period,
                     };
-                    out.push(Action::PlayAlert);
+                    out.push(sound);
                     self.emit(now_ms, &cause, &mut out);
                 }
             }
             State::Alarming { next_beep_at } => {
                 if abnormal {
-                    if now_ms >= next_beep_at {
-                        out.push(Action::PlayAlert);
+                    let (sound, period) = alarm_sound(&cause);
+                    if sound != alarm_sound(&self.last_cause).0 {
+                        // 音の種類が変わった (沈黙 ⇄ 着信 / NG)。周期を待たずに
+                        // 新しい音を 1 回出し、周期をここから引き直す — 沈黙中に
+                        // 着信が来たら 5 秒待たずに 3 連へ切り替わる
+                        out.push(sound);
                         self.state = State::Alarming {
-                            next_beep_at: next_beep_at + ALERT_PERIOD_MS,
+                            next_beep_at: now_ms + period,
+                        };
+                    } else if now_ms >= next_beep_at {
+                        out.push(sound);
+                        self.state = State::Alarming {
+                            next_beep_at: next_beep_at + period,
                         };
                     }
-                    // 鳴らし直しはしないが、理由が変わったらホストへは伝える
+                    // 同じ種類の音のまま理由だけ変わった (ng の reason 等) なら
+                    // 鳴らし直さないが、ホストへは伝える
                     if cause != self.last_cause {
                         self.emit(now_ms, &cause, &mut out);
                     }
@@ -303,6 +336,16 @@ impl AlarmMonitor {
     }
 }
 
+/// 鳴動中に出す音とその周期を理由で選ぶ。沈黙は短い 2 連を [`SILENCE_TICK_MS`]
+/// ごと、着信 / NG は 3 連を [`ALERT_PERIOD_MS`] ごと。`Cause::None` は鳴動中には
+/// 来ない (先に `resolve` へ落ちる) が、来ても 3 連側に倒す
+fn alarm_sound(cause: &Cause) -> (Action, u64) {
+    match cause {
+        Cause::Silence => (Action::PlaySilenceTick, SILENCE_TICK_MS),
+        Cause::Call | Cause::Ng(_) | Cause::None => (Action::PlayAlert, ALERT_PERIOD_MS),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,10 +365,10 @@ mod tests {
             m.status_line(BOOT_GRACE_MS - 1),
             "STATUS alarm state=idle cause=none hb_age_ms=-"
         );
-        // 猶予を過ぎても届かなければ沈黙 = 異常
+        // 猶予を過ぎても届かなければ沈黙 = 異常 (沈黙は短い 2 連から)
         assert_eq!(
             m.tick(BOOT_GRACE_MS),
-            vec![Action::PlayAlert, emit("alarming", "silence")]
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
         );
         assert_eq!(
             m.status_line(BOOT_GRACE_MS),
@@ -346,19 +389,21 @@ mod tests {
         assert_eq!(m.tick(1_000 + SILENCE_MS - 1), vec![emit("idle", "none")]);
         assert_eq!(
             m.tick(1_000 + SILENCE_MS),
-            vec![Action::PlayAlert, emit("alarming", "silence")]
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
         );
-        // 周期が来るまでは鳴らし直さない
-        assert_eq!(m.tick(1_000 + SILENCE_MS + ALERT_PERIOD_MS - 1), vec![]);
-        // 周期が来たら音だけ (cause は変わっていないので EVT は出さない)
+        // 沈黙は 5 秒周期。3 連の周期 (1.8 秒) では鳴らし直さない
+        assert_eq!(m.tick(1_000 + SILENCE_MS + ALERT_PERIOD_MS), vec![]);
+        // 1ms 足りないうちは出ない (バナーは emit の 5 秒後なので同時に来る)
+        assert_eq!(m.tick(1_000 + SILENCE_MS + SILENCE_TICK_MS - 1), vec![]);
+        // 周期が来たら短い 2 連 (cause は変わっていないので EVT はバナーぶんだけ)
         assert_eq!(
-            m.tick(1_000 + SILENCE_MS + ALERT_PERIOD_MS),
-            vec![Action::PlayAlert]
+            m.tick(1_000 + SILENCE_MS + SILENCE_TICK_MS),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
         );
         // heartbeat が戻ったら「直った」合図
-        m.on_heartbeat(13_000, true, None, false);
+        m.on_heartbeat(17_000, true, None, false);
         assert_eq!(
-            m.tick(13_000),
+            m.tick(17_000),
             vec![Action::PlayResolved, emit("idle", "none")]
         );
     }
@@ -489,6 +534,95 @@ mod tests {
     }
 
     #[test]
+    fn call_keeps_the_triple_beep_on_its_own_period() {
+        let mut m = AlarmMonitor::new();
+        m.on_heartbeat(0, true, None, true);
+        assert_eq!(m.tick(0), vec![Action::PlayAlert, emit("alarming", "call")]);
+        // 着信は 1.8 秒周期の 3 連のまま (人を呼ぶ音は強いまま)
+        assert_eq!(m.tick(ALERT_PERIOD_MS - 1), vec![]);
+        assert_eq!(m.tick(ALERT_PERIOD_MS), vec![Action::PlayAlert]);
+        assert_eq!(m.tick(2 * ALERT_PERIOD_MS), vec![Action::PlayAlert]);
+    }
+
+    #[test]
+    fn a_call_during_silence_switches_to_the_alert_immediately() {
+        let mut m = AlarmMonitor::new();
+        m.on_heartbeat(0, true, None, false);
+        assert_eq!(
+            m.tick(SILENCE_MS),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+        );
+        // 沈黙中に着信 (HB call=1) が来たら、5 秒待たずに即 3 連へ切り替わる
+        let t = SILENCE_MS + 100;
+        m.on_heartbeat(t, true, None, true);
+        assert_eq!(m.tick(t), vec![Action::PlayAlert, emit("alarming", "call")]);
+        // 周期は切り替えた時刻から 1.8 秒で引き直す
+        assert_eq!(m.tick(t + ALERT_PERIOD_MS - 1), vec![]);
+        assert_eq!(m.tick(t + ALERT_PERIOD_MS), vec![Action::PlayAlert]);
+        // 元の沈黙の周期 (SILENCE_MS + 5 秒) が来ても 2 連は出ない (3 連の続きだけ)
+        assert_eq!(
+            m.tick(SILENCE_MS + SILENCE_TICK_MS),
+            vec![Action::PlayAlert]
+        );
+    }
+
+    #[test]
+    fn losing_the_heartbeat_during_a_call_falls_back_to_the_silence_tick() {
+        let mut m = AlarmMonitor::new();
+        m.on_heartbeat(0, true, None, true);
+        assert_eq!(m.tick(0), vec![Action::PlayAlert, emit("alarming", "call")]);
+        assert_eq!(m.tick(ALERT_PERIOD_MS), vec![Action::PlayAlert]);
+        // 3 連の周期 (3.6 秒) とバナー (5 秒) が同時に来る
+        assert_eq!(
+            m.tick(BANNER_MS),
+            vec![Action::PlayAlert, emit("alarming", "call")]
+        );
+        // HB が止まって沈黙が成立したら、次の 3 連を待たずに短い 2 連へ落ちる
+        assert_eq!(
+            m.tick(SILENCE_MS),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+        );
+        // 以後は 5 秒周期。1.8 秒では鳴らない
+        assert_eq!(m.tick(SILENCE_MS + ALERT_PERIOD_MS), vec![]);
+        assert_eq!(m.tick(SILENCE_MS + SILENCE_TICK_MS - 1), vec![]);
+        assert_eq!(
+            m.tick(SILENCE_MS + SILENCE_TICK_MS),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+        );
+    }
+
+    #[test]
+    fn button_toggle_uses_the_silence_tick_while_silent() {
+        let mut m = AlarmMonitor::new();
+        m.on_heartbeat(0, true, None, false);
+        assert_eq!(
+            m.tick(SILENCE_MS),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+        );
+        // 黙らせるときは音を鳴らさない
+        assert_eq!(
+            m.on_button(SILENCE_MS + 100),
+            vec![emit("muted", "silence")]
+        );
+        // 黙らせているあいだの合図は単発 (2 連とは別)
+        assert_eq!(
+            m.tick(SILENCE_MS + 100 + MUTED_TICK_MS),
+            vec![Action::PlayMutedTick, emit("muted", "silence")]
+        );
+        // 鳴動へ戻すときは理由が沈黙なので 2 連から
+        let t = SILENCE_MS + 100 + MUTED_TICK_MS + 100;
+        assert_eq!(
+            m.on_button(t),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+        );
+        assert_eq!(m.tick(t + SILENCE_TICK_MS - 1), vec![]);
+        assert_eq!(
+            m.tick(t + SILENCE_TICK_MS),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+        );
+    }
+
+    #[test]
     fn default_is_idle_and_the_types_are_printable() {
         let m = AlarmMonitor::default();
         assert_eq!(
@@ -500,6 +634,7 @@ mod tests {
             Action::PlayAlert,
             Action::PlayResolved,
             Action::PlayMutedTick,
+            Action::PlaySilenceTick,
             Action::Emit("x".into()),
         ] {
             assert!(!format!("{:?}", a.clone()).is_empty());
