@@ -174,6 +174,15 @@ pub enum Sound {
     /// 見に行く必要があり、状態解消なら放置でよい。同じ音だとこの区別が現場で
     /// つかないため、警告音と高さを変えて分けている (plan §2.1)
     AlertResolved,
+    /// ボタンで**黙らせているあいだ**の短い合図 (3000Hz 60ms ×1)。警告デバイス (issue #135)。
+    ///
+    /// [`alc_hub_core::alarm::MUTED_TICK_MS`] ごとに送られる。**完全な無音にすると
+    /// 異常が続いていることを忘れられる**ため、思い出させるための最小限の合図
+    /// (2026-09-09 の実機確認でのユーザー要望)。
+    ///
+    /// **1 発だけ**にしてあるのは [`Sound::Alert`] の 3 連と紛れないため。
+    /// 3000Hz は実測 — 小型スピーカーの共振帯域 (plan §2)
+    MutedTick,
 }
 
 /// 再生専用スレッドを立て、送信ハンドルを返す (issue #102)。
@@ -198,6 +207,7 @@ pub fn start_player(mut speaker: Speaker) -> Result<std::sync::mpsc::Sender<Soun
                     Sound::PunchNg => speaker.beep(3000.0, 400),
                     Sound::Alert => speaker.beep_train(3000.0, 200, 200, 3),
                     Sound::AlertResolved => speaker.beep(1200.0, 150),
+                    Sound::MutedTick => speaker.beep(3000.0, 60),
                 };
                 if let Err(e) = r {
                     log::warn!("speaker: 再生失敗: {e:#}");
