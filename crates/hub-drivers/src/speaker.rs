@@ -183,6 +183,15 @@ pub enum Sound {
     /// **1 発だけ**にしてあるのは [`Sound::Alert`] の 3 連と紛れないため。
     /// 3000Hz は実測 — 小型スピーカーの共振帯域 (plan §2)
     MutedTick,
+    /// **沈黙** (heartbeat が来ない = USB 抜け / ブラウザを閉じた / 運行管理者タブから
+    /// 離れた) で鳴動中の短い 2 連 (3000Hz 60ms ×2、間隔 40ms = [`Sound::PunchOk`] と
+    /// 同じ「ピピッ」)。警告デバイス (issue #135)。
+    ///
+    /// [`alc_hub_core::alarm::SILENCE_TICK_MS`] ごとに送られる。「繋がっていない」の
+    /// 警告は **5 秒に 1 回程度でいい**というユーザー要望 (2026-09-09) で、
+    /// 着信 / NG の [`Sound::Alert`] (3 連) より弱く、[`Sound::MutedTick`] (単発) と
+    /// 聞き分けられるよう 2 連にしてある。3000Hz は実測の共振帯域 (plan §2)
+    SilenceTick,
 }
 
 /// 再生専用スレッドを立て、送信ハンドルを返す (issue #102)。
@@ -208,6 +217,7 @@ pub fn start_player(mut speaker: Speaker) -> Result<std::sync::mpsc::Sender<Soun
                     Sound::Alert => speaker.beep_train(3000.0, 200, 200, 3),
                     Sound::AlertResolved => speaker.beep(1200.0, 150),
                     Sound::MutedTick => speaker.beep(3000.0, 60),
+                    Sound::SilenceTick => speaker.beep_train(3000.0, 60, 40, 2),
                 };
                 if let Err(e) = r {
                     log::warn!("speaker: 再生失敗: {e:#}");

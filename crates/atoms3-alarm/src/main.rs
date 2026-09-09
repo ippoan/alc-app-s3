@@ -209,6 +209,8 @@ fn main() -> Result<()> {
                 // 黙らせているあいだの短い合図 (alarm::MUTED_TICK_MS ごと)。
                 // 完全な無音だと異常が続いていることを忘れられる
                 Action::PlayMutedTick => send(&speaker_tx, Sound::MutedTick),
+                // 沈黙 (繋がっていない) のときの短い 2 連 (alarm::SILENCE_TICK_MS ごと)
+                Action::PlaySilenceTick => send(&speaker_tx, Sound::SilenceTick),
                 // キオスクのバナー用。遷移のたび + BANNER_MS ごとに出る
                 Action::Emit(line) => println!("{line}"),
             }
