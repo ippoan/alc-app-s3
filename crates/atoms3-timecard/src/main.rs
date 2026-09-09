@@ -81,9 +81,9 @@ use alc_hub_common::{
     settings::Settings,
     status::{epoch_ms, now_ms, HubStatus, SharedStatus},
 };
-use alc_hub_core::timecard::{payload_json, CardKind};
 use alc_hub_drivers::nfc::NfcEvent;
 use alc_hub_drivers::speaker::Sound;
+use alc_hub_drivers::timecard::Punch;
 use alc_hub_drivers::{crashlog, es8311, eth_w5500, heap, nfc, ntp, ota, speaker, ws_uplink};
 use anyhow::Result;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -248,6 +248,11 @@ fn main() -> Result<()> {
 
 /// カードを 1 枚読めたときの処理: 打刻イベントを送信キューへ積む。
 ///
+/// `NfcEvent` → 打刻キー → `UplinkRecord` の判定は hub-drivers の
+/// `timecard::Punch` (CoreS3 と共有、#188)。**音と `EVT …` の println は
+/// ここに残す** — `ReadFailed` で鳴らさない / 送信キューへ積めたときだけ
+/// 鳴らす (#155) の分岐を共有側に隠さないため。
+///
 /// **`card_id` は生値のまま**送る (接頭辞を付けると punch のカード照合が
 /// 必ず外れる — alc_hub_core::timecard の doc 参照)。`session_id` は
 /// 点呼ではないので付けない。
@@ -256,67 +261,36 @@ fn on_card(
     ws_tx: &mpsc::Sender<UplinkRecord>,
     speaker: Option<&mpsc::Sender<Sound>>,
 ) {
-    let (card_id, kind) = match event {
-        NfcEvent::Felica { idm } => (idm.clone(), CardKind::FelicaIdm),
-        // スマホ (HCE) のランダム UID はここに来ない — hub-drivers の nfc.rs が gate に載せる前に
-        // 弾く (#155、alc_hub_core::nfca_uid)。実タグ (7B の NTAG / MIFARE) はそのまま打刻
-        NfcEvent::NfcaUid { uid } => (uid.clone(), CardKind::NfcaUid),
-        // 免許証は「交付日 8 桁 + 有効期限 8 桁」= alc-app タブレットが使う
-        // employees.nfc_id と同じキー。punch はカード未登録なら
-        // employees.nfc_id へフォールバックするので、この 16 桁で当たる
-        NfcEvent::License { issue, expiry } => {
-            let card = alc_hub_core::tenko_prompt::LicenseCard {
-                issue: issue.clone(),
-                expiry: expiry.clone(),
-            };
-            match card.nfc_id() {
-                Some(id) => (id, CardKind::License),
-                None => {
-                    // 日付が 8 桁数字でなければキーにできない (壊れた読み取り)
-                    log::warn!("timecard: 免許証の日付が想定外 issue={issue} expiry={expiry}");
-                    return;
-                }
-            }
-        }
-        // 電子車検証は人ではないので打刻にしない (検知ログだけ nfc.rs が出す)
-        NfcEvent::CarInspection { .. } => return,
-        // **2 枚見えたら、どちらも打刻しない** (issue #143)。財布に 2 枚
-        // 入っていると、どちらの人の打刻か決められないまま 2 人ぶん記録して
-        // しまう — 賃金データなので曖昧なら記録しない方を採る。
+    let Some(punch) = Punch::from_event(event) else {
+        // 打刻にしないイベント (どれを弾くかは Punch::from_event の doc)。
         //
-        // **サーバへは何も送らない** (UplinkRecord を作らない)。`hub_measurements`
-        // に新しい kind を足すと rust-alc-api の HUB_MEASUREMENT_KINDS と alc-app
-        // の型・一覧まで波及するので、まず端末内 (serial ログ) で完結させ、
-        // 運用で「エラーが見えない」と分かってから足す。**本機に LED は無い**
-        // ので、現場から見える形にするのは音 (ES8311) を入れる別 issue
-        // **黙って捨ててはいけない** (#155)。本機に LED は無いので、打刻しないと
-        // 端末が**完全に無反応**になる。実機で 2 枚検知を利用者が
+        // **2 枚検知は黙って捨ててはいけない** (#155)。本機に LED は無いので、
+        // 打刻しないと端末が**完全に無反応**になる。実機で 2 枚検知を利用者が
         // **「壊れている」と受け取った** (2026-09-06)。**断ったことを音で返す**
-        NfcEvent::MultipleCards => {
-            println!("EVT NFC_MULTI_CARD");
-            if let Some(tx) = speaker {
-                let _ = tx.send(Sound::PunchNg);
-            }
-            return;
-        }
-        // **ここでは鳴らさない** (#155)。`ReadFailed` は「カードが載っている間の
+        //
+        // `ReadFailed` は**ここでは鳴らさない** (#155)。「カードが載っている間の
         // 再読が失敗した」ときにも出る — 実機ログでは**打刻成功の直後に必ず**
         // `rc=-6 (READ BINARY 失敗)` / `rc=-4 (SELECT MF 失敗)` が続いている
         // (2026-09-06)。ここで鳴らすと**打刻できたのにエラー音が鳴り**、
         // 「断った」ことを伝えるどころか誤解を増やす。
         // 読めなかったときの無反応は、**かざし直せば済む**ぶん 2 枚検知より軽い
-        NfcEvent::ReadFailed { .. } => return,
+        if let NfcEvent::MultipleCards = event {
+            println!("EVT NFC_MULTI_CARD");
+            if let Some(tx) = speaker {
+                let _ = tx.send(Sound::PunchNg);
+            }
+        }
+        return;
     };
 
-    let record = UplinkRecord {
-        kind: "timecard",
-        payload: payload_json(&card_id, kind),
-        // 打刻時刻。NTP 未同期なら ws_uplink が送信時に稼働時間の差で補正する
-        recorded_at_ms: epoch_ms(),
-        at_ms: now_ms(),
-        session_id: None,
-    };
-    println!("EVT TIMECARD card_id={card_id} card_kind={}", kind.label());
+    // 打刻時刻。NTP 未同期なら ws_uplink が送信時に稼働時間の差で補正する
+    let recorded_at_ms = epoch_ms();
+    let record = punch.record(now_ms(), recorded_at_ms);
+    println!(
+        "EVT TIMECARD card_id={} card_kind={}",
+        punch.card_id,
+        punch.kind.label()
+    );
     if ws_tx.send(record).is_err() {
         // ws_uplink スレッドが死んでいる = 送信不能。**鳴らさない** —
         // 「鳴った = 打刻を預かった」を崩さないため
