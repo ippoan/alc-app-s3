@@ -9,8 +9,8 @@
 //!
 //! | コマンド | 説明 |
 //! |---|---|
-//! | `HB OK` / `HB NG <reason>` | heartbeat。3 秒ごと。末尾に任意で `call=0` / `call=1`。**返信しない** |
-//! | `STATUS` | `STATUS alarm state=… cause=… hb_age_ms=… VER=…` 応答 |
+//! | `HB OK` / `HB NG <reason>` | heartbeat。3 秒ごと。末尾に任意で `call=0` / `call=1`、意図した reload の直前は `grace=<秒>` (#192)。**返信しない** |
+//! | `STATUS` | `STATUS alarm state=… cause=… hb_age_ms=… [grace_left_ms=…] VER=…` 応答 (`grace_left_ms` は猶予中のみ) |
 //! | `PING` | 疎通確認 (`PONG` 応答、共通実装) |
 //! | `HEAP` / `HEAP DUMP` / `LOG DUMP` | ヒープ概況 / 詳細 / 直近ログ (共通実装) |
 //!
@@ -63,8 +63,13 @@ fn handle_line(line: &str, monitor: &SharedMonitor, status: &SharedStatus, setti
         // 状態遷移はここでは起こさず、次の tick (main の鳴動ループ) が判定する。
         // reason が無い `HB NG` も受理する (monitor が
         // `alarm::DEFAULT_NG_REASON` に落として `cause=ng:unspecified` にする)
-        HostCommand::Heartbeat { ok, reason, call } => {
-            alarm::apply_heartbeat(monitor, ok, reason.as_deref(), call);
+        HostCommand::Heartbeat {
+            ok,
+            reason,
+            call,
+            grace,
+        } => {
+            alarm::apply_heartbeat(monitor, ok, reason.as_deref(), call, grace);
         }
         // `status_line` は `VER=` を含まない (hub-core からは hub-common が
         // 見えないため)。**呼び出し側で末尾に足す**
