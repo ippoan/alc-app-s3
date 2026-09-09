@@ -293,10 +293,11 @@ fn main() -> Result<()> {
             1,
             nfc_sda,
             nfc_scl,
-            // CoreS3 は従来どおり F → A → B (#155 step 4 の B 先行は atoms3-timecard だけ)
-            alc_hub_drivers::nfc::PollOrder::FelicaFirst,
-            // 存在検知ゲートも従来どおり (#175 の AlwaysPoll は atoms3-timecard だけ。CoreS3 は未計測)
-            alc_hub_drivers::nfc::PresenceGate::Adaptive,
+            // 免許証で点呼を始める (#125) ので B 先行 + B 粘着 (#163)。FeliCa / Type-A は
+            // 下のコールバックでビープだけなので F 先行の必然は無い (#162 候補 C)
+            alc_hub_drivers::nfc::PollOrder::LicenseFirst,
+            // 置き方で振幅/位相が動かずゲートが開かない (#175) ので待機中も B を打つ (#176)
+            alc_hub_drivers::nfc::PresenceGate::AlwaysPoll,
             Arc::clone(&status),
             move |e: &alc_hub_drivers::nfc::NfcEvent| {
                 use alc_hub_drivers::nfc::NfcEvent;
