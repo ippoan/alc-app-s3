@@ -138,6 +138,14 @@ jobs:
           - { name: atoms3-alarm,
               cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-alarm cargo check --release --locked -p alc-hub-atoms3-alarm",
               cache_key: build-alarm-s3r }
+          # ベンチ検証機 atoms3-nfc (AtomS3 Lite + Unit NFC、#149)。sdkconfig は
+          # print / timecard / alarm のどれとも違う (#146 で esp_websocket_client と
+          # CERTIFICATE_BUNDLE / TRACE_FACILITY を足した) ため cache_key は**新規**。
+          # 使い回すと esp-idf-sys が永遠に cold (Refs #63)。
+          # build の leg (下) と**同じキーにすること**
+          - { name: atoms3-nfc,
+              cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-nfc cargo check --release --locked -p alc-hub-atoms3-nfc",
+              cache_key: build-nfc-lite }
 
     steps:
       - name: Checkout
@@ -334,6 +342,16 @@ jobs:
             flash_size: 8mb
             partition_table: crates/atoms3-alarm/partitions.csv
             cache_key: build-alarm-s3r
+          # ベンチ検証機 atoms3-nfc (#149)。**配布しない** — Pages にも manifest にも
+          # 載せない (assemble-pages は触らない)。build の leg は check 側の cache を
+          # main で warm するためだけに要る (check だけだと永久に cold。Refs #63)。
+          # check の leg (上) と**同じキーにすること**
+          - name: atoms3-nfc
+            bin: alc-hub-atoms3-nfc
+            build_env: 'ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-nfc'
+            flash_size: 8mb
+            partition_table: crates/atoms3-nfc/partitions.csv
+            cache_key: build-nfc-lite
 
     steps:
       - name: Checkout
