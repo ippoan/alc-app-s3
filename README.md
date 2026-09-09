@@ -186,7 +186,7 @@ partitions.csv を持ち、`ESP_IDF_SYS_ROOT_CRATE=<crate 名>` を付けてビ�
 | [crates/atoms3-print](crates/atoms3-print) | AtomS3 + Atomic PoE Base | 印刷ブリッジ (PDF → プリンター 9100)、Refs #38 |
 | [crates/atoms3-timecard](crates/atoms3-timecard) | Atom VoiceS3R + Atomic PoE Base + Unit NFC | NFC タイムカード端末 (`kind=timecard` を WS uplink へ)、Refs #134 / #151 |
 | [crates/atoms3-nfc](crates/atoms3-nfc) | AtomS3 Lite + Unit NFC | NFC ベンチ検証機。読み取りループは持たず `hub-drivers/src/nfc.rs` を呼ぶ (#146) |
-| [crates/atoms3-alarm](crates/atoms3-alarm) | Atom VoiceS3R (USB のみ) | 点呼端末の警告デバイス。キオスクの heartbeat が途切れたら鳴る (下記)、Refs #135 |
+| [crates/atoms3-alarm](crates/atoms3-alarm) | Atom VoiceS3R (USB のみ) | 点呼端末の警告デバイス。**運行管理者 PC のブラウザ**の heartbeat が途切れたら鳴る (下記)、Refs #135 |
 
 **NFC の読み取りループ・ホストコンソールを新しい機へ写さないこと。**
 前者は `hub-drivers/src/nfc.rs` (I2C ポートとピンを引数で受け、検知は
@@ -318,29 +318,39 @@ VOICEVOX の利用規約によりクレジット表記が必要 — 本製品を
 
 ## 点呼端末の警告デバイス (crates/atoms3-alarm)
 
-点呼キオスク (ブラウザ) の異常を音で知らせる据置ブザー。機は **Atom VoiceS3R**
-(`crates/atoms3-timecard` と同じ本番機) で、**USB-C でキオスク PC に繋ぐだけ**
+**運行管理者の PC に置く据置ブザー。**運行管理者のブラウザ (alc-app トップ画面の
+「運行管理者」タブ) が開いているかを見張り、閉じられたときと**着信**のときに鳴る。
+機は **Atom VoiceS3R** (`crates/atoms3-timecard` と同じ本番機) で、
+**USB-C で運行管理者 PC に繋ぐだけ**
 — ネットワークもデバイス登録も無い (設計は
 [plan/standing-devices.md](plan/standing-devices.md) §4、Refs #135)。
 
-**ブラウザが「鳴れ」と命令する形にしていない。**キオスクが 3 秒ごとに「正常」を
-送り続け、**途切れたら端末が自分の判断で鳴る**。命令駆動だとブラウザ / PC が
+鳴る条件は 3 つ:
+
+| 鳴る場面 | 端末から見えるもの | 止まるとき |
+|---|---|---|
+| **管理者の画面が開いていない** — タブを閉じた / 別タブへ移った / ブラウザや PC が落ちた | heartbeat が途切れる (10 秒で沈黙) | 画面を開き直す |
+| **着信** — 乗務員がキオスクで点呼を始めた (signaling に room が立った) | `HB OK call=1` | 管理者が遠隔点呼に入る (`call=0`) |
+| **着信を受けられない** — 管理者のブラウザが signaling の `/watch-rooms` に繋がっていない | `HB NG signaling` | 繋がり直す |
+
+**ブラウザが「鳴れ」と命令する形にしていない。**運行管理者のブラウザが 3 秒ごとに
+「正常」を送り続け、**途切れたら端末が自分の判断で鳴る**。命令駆動だとブラウザ / PC が
 落ちたときに命令が来ず沈黙する = **一番危ないケースで鳴らない**。
 沈黙を異常とみなせば、クラッシュ・タブを閉じた・フリーズ・USB 抜けを同じ形で拾える。
 
 | 方向 | 行 | 説明 |
 |---|---|---|
-| キオスク → 端末 | `HB OK` / `HB NG <reason>` | heartbeat。3 秒ごと。末尾に任意で `call=0` / `call=1` (点呼の呼び出し)。reason は `[a-z0-9_]+`。**返信しない** |
-| キオスク → 端末 | `STATUS` | `STATUS alarm state=<idle\|alarming\|muted> cause=<none\|silence\|ng:<reason>\|call> hb_age_ms=<n\|-> VER=…` |
-| 端末 → キオスク | `EVT ALARM state=… cause=…` | 状態が変わるたび + 5 秒ごと (ブラウザのバナー用) |
+| 管理者のブラウザ → 端末 | `HB OK` / `HB NG <reason>` | heartbeat。3 秒ごと。末尾に任意で `call=0` / `call=1` (**着信** = 点呼の呼び出し)。reason は `[a-z0-9_]+` (例 `signaling`)。**返信しない** |
+| 管理者のブラウザ → 端末 | `STATUS` | `STATUS alarm state=<idle\|alarming\|muted> cause=<none\|silence\|ng:<reason>\|call> hb_age_ms=<n\|-> VER=…` |
+| 端末 → 管理者のブラウザ | `EVT ALARM state=… cause=…` | 状態が変わるたび + 5 秒ごと (ブラウザのバナー用) |
 
 `PING` / `HEAP` / `LOG DUMP` は共通実装 (`hub-drivers/src/console.rs`)。
-**`STATUS` 応答の先頭 2 トークン `STATUS alarm` はブラウザ側の機種識別に使う**ので
+**`STATUS` 応答の先頭 2 トークン `STATUS alarm` は管理者のブラウザ側の機種識別に使う**ので
 変えないこと — CoreS3 と VoiceS3R は USB の VID/PID が同一で記述子では見分けられない。
 
 | 値 | 既定 | 意味 |
 |---|---|---|
-| `SILENCE_MS` | 10 秒 | 最後の heartbeat からこれだけ空いたら沈黙 = 異常 (3 秒間隔の 3 回ぶん) |
+| `SILENCE_MS` | 10 秒 | 最後の heartbeat からこれだけ空いたら沈黙 = 異常 (管理者の画面が閉じている。3 秒間隔の 3 回ぶん) |
 | `BOOT_GRACE_MS` | 30 秒 | 起動後まだ一度も受けていないあいだの猶予 |
 | `ALERT_PERIOD_MS` | 1.8 秒 | 鳴動中に警告音を出し直す周期 |
 | `BANNER_MS` | 5 秒 | 状態が変わらなくても `EVT ALARM` を出し直す周期 |
@@ -361,7 +371,8 @@ VOICEVOX の利用規約によりクレジット表記が必要 — 本製品を
 どちらの状態からも異常が解消すれば `Idle` に戻って「直った」合図が鳴る。
 
 書き込みは Pages の[インストーラ](docs/alarm.html) (`manifest-alarm.json`)。
-**USB 給電なので PC の電源が落ちるとブザーも止まる** — 承知の上の割り切り
+焼いたあとは**運行管理者タブ → デバイス管理 → 警告デバイスを接続**でブラウザと繋ぐ。
+**USB 給電なので運行管理者 PC の電源が落ちるとブザーも止まる** — 承知の上の割り切り
 (plan §4.1 の「許容する穴」)。
 
 ## 設定インポート/エクスポート

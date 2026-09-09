@@ -39,9 +39,10 @@
 </head>
 <body>
     <h1>点呼端末の警告デバイス</h1>
-    <p>点呼キオスク (ブラウザ) の異常を音で知らせる据置ブザーの
-       ファームウェア書き込みツールです。
-       キオスクが 3 秒ごとに「正常」を送り、<strong>途切れたら端末が自分の判断で鳴ります</strong>。
+    <p><strong>運行管理者の PC に置く据置ブザー</strong>のファームウェア書き込みツールです。
+       運行管理者の画面 (alc-app トップ画面の「運行管理者」タブ) が
+       3 秒ごとに「正常」を送り、<strong>途切れたら端末が自分の判断で鳴ります</strong>。
+       乗務員から<strong>着信</strong>があったときも鳴ります。
        CoreS3 統合ハブは <a href="index.html">こちら</a>、
        AtomS3 印刷ブリッジは <a href="atoms3-print.html">こちら</a>、
        NFC タイムカード端末は <a href="timecard.html">こちら</a>。</p>
@@ -50,7 +51,7 @@
         <h2>対応機器</h2>
         <div class="device-info">
             <div><strong>マイコン</strong>M5Stack Atom VoiceS3R (Atom EchoS3R / SKU C126-ECHO、8MB PSRAM)</div>
-            <div><strong>接続</strong>USB-C ケーブルで点呼キオスクの PC へ (給電も USB)</div>
+            <div><strong>接続</strong>USB-C ケーブルで運行管理者の PC へ (給電も USB)</div>
             <div><strong>停止ボタン</strong>本体ボタン (G41)</div>
         </div>
         <div class="warning">
@@ -61,10 +62,10 @@
                <strong>PSRAM 無しのまま静かに起動します</strong> (エラーは出ません)。</p>
         </div>
         <div class="warning">
-            <h3>PC の電源が落ちるとブザーも止まります</h3>
+            <h3>運行管理者 PC の電源が落ちるとブザーも止まります</h3>
             <p>USB 給電なので、<strong>PC が完全に落ちたときは鳴りません</strong>。
                これは承知の上の割り切りです (人が見れば分かる異常のため)。
-               ブラウザのクラッシュ・タブを閉じた・PC のフリーズ・USB を抜いた場合は、
+               ブラウザのクラッシュ・タブを閉じた・別タブへ移った・PC のフリーズ・USB を抜いた場合は、
                いずれも「沈黙」として検知して鳴ります。</p>
         </div>
     </div>
@@ -80,7 +81,7 @@
             <li><strong>書き込みが終わったら、ボタンから指を離して USB を挿し直す</strong> —
                 押したままだと起動のたびにダウンロードモードに入り、
                 <strong>焼けているのにアプリが動きません</strong></li>
-            <li>起動から 30 秒たっても点呼キオスクを開いていなければ、
+            <li>起動から 30 秒たっても運行管理者の画面を開いていなければ、
                 <strong>「沈黙」として鳴り始めます</strong> (これが正常動作です)。
                 本体ボタンを押すと止まります。<strong>もう一度押すと鳴動に戻ります</strong>
                 (ボタンはトグルです)</li>
@@ -131,6 +132,18 @@
     </div>
 
     <div class="card">
+        <h2>つなぎ方 (書き込みのあと)</h2>
+        <p>ブザーは運行管理者の画面から繋ぎます。焼いただけでは「沈黙」として鳴り続けます。</p>
+        <ol>
+            <li>運行管理者の PC で alc-app を開き、<strong>「運行管理者」タブ</strong>へ</li>
+            <li><strong>デバイス管理</strong>を開く</li>
+            <li><strong>「警告デバイスを接続」</strong>を押し、シリアルポートを選ぶ</li>
+            <li>繋がると鳴動が止まります。以降は画面が開いているあいだ 3 秒ごとに
+                「正常」が送られ、閉じる / 別タブへ移ると 10 秒で鳴り始めます</li>
+        </ol>
+    </div>
+
+    <div class="card">
         <h2>鳴り方と止め方</h2>
         <table>
             <tr><th>場面</th><th>音</th></tr>
@@ -156,38 +169,39 @@
         <h2>鳴り出す条件</h2>
         <table>
             <tr><th>条件</th><th>しきい値</th></tr>
-            <tr><td>キオスクからの連絡が途切れた (沈黙)</td><td>最後の受信から <strong>10 秒</strong></td></tr>
+            <tr><td>管理者の画面から連絡が途切れた (沈黙) — 閉じた / 別タブへ移った / ブラウザや PC が落ちた</td><td>最後の受信から <strong>10 秒</strong></td></tr>
             <tr><td>電源を入れてから一度も連絡が来ない</td><td>起動から <strong>30 秒</strong></td></tr>
-            <tr><td>キオスクが異常を自覚している</td><td>即時 (<code>HB NG &lt;理由&gt;</code> 受信時)</td></tr>
-            <tr><td>点呼の呼び出しが来ている</td><td>即時 (<code>call=1</code> 受信時)</td></tr>
+            <tr><td>着信を受けられない — 管理者のブラウザが signaling に繋がっていない</td><td>即時 (<code>HB NG signaling</code> 受信時)</td></tr>
+            <tr><td><strong>着信</strong> — 乗務員が点呼を始めた</td><td>即時 (<code>call=1</code> 受信時。管理者が遠隔点呼に入ると止まります)</td></tr>
         </table>
-        <p>キオスクは 3 秒ごとに送るので、10 秒は 3 回ぶんの取りこぼしを許す設定です
+        <p>管理者の画面は 3 秒ごとに送るので、10 秒は 3 回ぶんの取りこぼしを許す設定です
            (ブラウザの <code>setInterval</code> は背面タブで 1 秒までしか
            絞られないため、3 秒間隔なら背面でも間に合います)。</p>
     </div>
 
     <div class="card">
         <h2>動作確認 (シリアル 115200bps)</h2>
-        <p>点呼キオスク側が自動で <code>HB</code> を送るので、通常は何も打つ必要はありません。
+        <p>運行管理者の画面が自動で <code>HB</code> を送るので、通常は何も打つ必要はありません。
            以下は現地での切り分け用です。</p>
         <ul>
             <li><code>STATUS</code> —
                 <code>STATUS alarm state=idle cause=none hb_age_ms=1200 VER=…</code>。
-                <strong><code>hb_age_ms</code> が 3000 前後で上下していれば</strong>キオスクからの
+                <strong><code>hb_age_ms</code> が 3000 前後で上下していれば</strong>管理者の画面からの
                 連絡が届いています (増え続けるなら届いていません)</li>
             <li><code>HB OK</code> — 手で 1 回ぶんの「正常」を送る (鳴っていれば止まります)</li>
-            <li><code>HB NG serial</code> — 手で「異常」を送る (鳴り始めます)</li>
+            <li><code>HB NG signaling</code> — 手で「着信を受けられない」を送る (鳴り始めます)</li>
+            <li><code>HB OK call=1</code> — 手で「着信」を送る (鳴り始めます)</li>
             <li><code>PING</code> — <code>PONG</code> 応答</li>
             <li><code>LOG DUMP</code> — 起動直後のログ (USB 接続前に流れた分も残ります)</li>
         </ul>
         <p>状態が変わるたび、および 5 秒ごとに
            <code>EVT ALARM state=idle|alarming|muted cause=none|silence|ng:&lt;理由&gt;|call</code>
-           が出ます。キオスク側の画面表示はこの行を読んでいます。</p>
+           が出ます。運行管理者の画面表示はこの行を読んでいます。</p>
         <div class="warning">
             <h3>この端末は点灯で知らせません — 反応は音だけ</h3>
             <p>Atom VoiceS3R には点灯表示がありません。
                起動しても<strong>光りませんが異常ではありません</strong>。
-               生きているかどうかは、<strong>キオスクを閉じて 10 秒待てば鳴る</strong>ことで
+               生きているかどうかは、<strong>運行管理者の画面を閉じて 10 秒待てば鳴る</strong>ことで
                確かめられます。音が全く出ない場合はシリアルに
                <code>EVT SPEAKER_NG</code> が出ていないか確認してください。</p>
         </div>
