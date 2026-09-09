@@ -247,17 +247,21 @@ impl AlarmMonitor {
         out
     }
 
-    /// 画面タップ (CoreS3) を押下として**予約**する。鳴動中 / 黙らせている
-    /// 最中だけ受け付け、受け付けたら `true` (= そのタップは警告に消費された
-    /// ので、呼び出し側は画面の通常操作に渡さない)。Idle のタップは `false` で
-    /// 素通しする。
+    /// 画面タップ (CoreS3) を押下として**予約**する。**鳴動中だけ**受け付け、
+    /// 受け付けたら `true` (= そのタップは警告に消費されたので、呼び出し側は
+    /// 画面の通常操作へ渡さない)。それ以外は `false` で素通しする。
+    ///
+    /// ★ **黙らせている最中 (Muted) のタップは受け付けない** — VoiceS3R の
+    /// 物理ボタン ([`Self::on_button`]) と違い、CoreS3 は画面が主操作系なので、
+    /// 黙らせたあと heartbeat が戻るまで**メニュー操作を全部奪ってしまう**。
+    /// Muted の解消は heartbeat の再開だけに任せる (issue #187)。
     ///
     /// **トグルと音は次の [`Self::tick`] で起こる** — 画面スレッドはスピーカーの
     /// 送信口を持たないので、ここで [`Self::on_button`] を呼ぶと戻り値の
     /// [`Action`] を鳴らす相手が居ない。予約にしておけば、鳴動ループが
     /// VoiceS3R と同じ 1 か所で音を出せる
     pub fn request_button(&mut self) -> bool {
-        if matches!(self.state, State::Idle) {
+        if !matches!(self.state, State::Alarming { .. }) {
             return false;
         }
         self.button_pending = true;
@@ -758,9 +762,11 @@ mod tests {
         );
     }
 
-    /// 画面タップ (CoreS3): 鳴動中だけ受け付け、トグルと音は次の tick で出る
+    /// 画面タップ (CoreS3): **鳴動中だけ**受け付け、トグルと音は次の tick で出る。
+    /// Muted 中は素通し — 画面が主操作系なので、黙らせたあとメニュー操作を
+    /// 奪わないため (issue #187)
     #[test]
-    fn a_screen_tap_is_only_taken_while_the_alarm_is_up() {
+    fn a_screen_tap_is_only_taken_while_the_alarm_is_ringing() {
         let mut m = AlarmMonitor::with_boot_grace(None);
         // Idle のタップは受け付けない (画面の通常操作へ素通しする)
         assert!(!m.request_button());
@@ -775,12 +781,18 @@ mod tests {
         let t = SILENCE_MS + 50;
         assert_eq!(m.tick(t), vec![emit("muted", "silence")]);
         assert_eq!(m.status_field(t), "ALARM=muted/silence/10050");
-        // 黙らせている最中のタップも受け付け、次の tick で鳴動へ戻る
-        assert!(m.request_button());
-        let t = t + 50;
+        // 黙らせている最中のタップは受け付けない (画面の通常操作へ素通し)。
+        // 鳴動へは戻さず、Muted の短い合図もそのまま続く
+        assert!(!m.request_button());
         assert_eq!(
-            m.tick(t),
-            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+            m.tick(t + MUTED_TICK_MS),
+            vec![Action::PlayMutedTick, emit("muted", "silence")]
+        );
+        // 解消するのは heartbeat が戻ったときだけ
+        m.on_heartbeat(t + MUTED_TICK_MS + 10, true, None, false);
+        assert_eq!(
+            m.tick(t + MUTED_TICK_MS + 10),
+            vec![Action::PlayResolved, emit("idle", "none")]
         );
     }
 

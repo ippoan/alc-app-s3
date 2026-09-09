@@ -116,8 +116,8 @@ const BATT_INTERVAL_MS: u64 = 10_000;
 /// UI ループ (メインタスクを占有し、戻らない)。
 ///
 /// `alarm` は沈黙警告の判定器 (`alc_hub_core::alarm`)。**鳴らすのはここではない** —
-/// 画面タップを鳴動の停止 / 再開 (Muted トグル) に使うためだけに持つ。音は
-/// src/main.rs の鳴動スレッドが 1 か所で出す (issue #187)
+/// 鳴動中のタップを「黙らせる」に使うためだけに持つ。音は src/main.rs の
+/// 鳴動スレッドが 1 か所で出す (issue #187)
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     mut display: Cs3Display,
@@ -434,10 +434,14 @@ pub fn run(
             last_touch = Some(*p);
             last_activity = now;
         } else if let Some(p) = last_touch.take() {
-            // 沈黙警告が鳴っている / 黙らせている最中のタップは**警告のトグル**に
-            // 使い、画面の通常操作へは渡さない (VoiceS3R の本体ボタンに相当、#187)。
-            // 鳴っていなければ false が返り、これまでどおりの操作になる。
-            // トグルと音は次の鳴動ループ (src/main.rs) の tick で出る
+            // **鳴っている最中のタップだけ**を「黙らせる」に使い、画面の通常操作へは
+            // 渡さない (VoiceS3R の本体ボタンに相当、#187)。鳴っていなければ false が
+            // 返り、これまでどおりの操作になる。
+            //
+            // ★ 黙らせた後 (Muted) のタップは**素通しする** — CoreS3 は画面が主操作系
+            //   なので、heartbeat が戻るまでメニュー操作を奪ってはいけない。
+            //   Muted の解消は heartbeat の再開だけが行う。
+            // 実際に黙る処理と音は次の鳴動ループ (src/main.rs) の tick で出る
             let consumed_by_alarm = match alarm.lock() {
                 Ok(mut m) => m.request_button(),
                 Err(e) => {

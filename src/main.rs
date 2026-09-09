@@ -411,8 +411,8 @@ fn main() -> Result<()> {
     // リセットで旧スロットへ自動で戻す。ota.rs 参照)
     alc_hub_drivers::ota::mark_boot_valid();
 
-    // UI ループ (メインタスクを占有, 戻らない)。alarm_monitor は画面タップで
-    // 鳴動を黙らせる (Muted トグル) ためだけに渡す — 鳴らすのは上の専用スレッド
+    // UI ループ (メインタスクを占有, 戻らない)。alarm_monitor は**鳴動中の**
+    // 画面タップで黙らせるためだけに渡す — 鳴らすのは上の専用スレッド
     ui::run(
         display,
         i2c,
