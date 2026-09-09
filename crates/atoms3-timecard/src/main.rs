@@ -107,7 +107,7 @@ fn main() -> Result<()> {
     esp_idf_svc::log::EspLogger::initialize_default();
     // 前回リセットの解析 + ログ捕捉 hook (CoreS3 と同じ crashlog 基盤 #43)。
     // heap.rs の note() がリングに書くため、heap::start より前に必ず呼ぶこと
-    let crash = crashlog::init();
+    let (_, crash) = crashlog::init();
     log::info!(
         "alc-hub-atoms3-timecard v{} 起動",
         config::firmware_version_full()

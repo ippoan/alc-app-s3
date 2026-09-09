@@ -39,7 +39,7 @@ fn main() -> Result<()> {
     // 前回リセットの解析 + ログ捕捉 hook (CoreS3 と同じ crashlog 基盤 #43)。
     // heap.rs の note() がリングに書くため、heap::start より前に必ず呼ぶこと
     // (配線漏れで .noinit のゴミ帳簿に書いて boot loop になった実害 2026-07-14)
-    let crash = crashlog::init();
+    let (_, crash) = crashlog::init();
     log::info!(
         "alc-hub-atoms3-print v{} 起動",
         config::firmware_version_full()

@@ -96,7 +96,7 @@ fn main() -> Result<()> {
     // heap.rs の note() がリングに書くため、heap::start より前に必ず呼ぶこと。
     // **crash の中身は送らない** — 本機は uplink を持たないので、
     // 拾った panic 前ログは `LOG DUMP` で現地から読む
-    let _ = crashlog::init();
+    let (reset_code, _) = crashlog::init();
     log::info!(
         "alc-hub-atoms3-alarm v{} 起動",
         config::firmware_version_full()
@@ -113,8 +113,20 @@ fn main() -> Result<()> {
     // ヒープ監視 (OOM 捕捉 + low-water 計測) は重いアロケーションより先に登録
     heap::start(Arc::clone(&status))?;
 
-    // 鳴動判定。コンソールスレッド (heartbeat の受け手) と共有する
-    let monitor = Arc::new(Mutex::new(AlarmMonitor::new()));
+    // 鳴動判定。コンソールスレッド (heartbeat の受け手) と共有する。
+    // USB/JTAG 起因の reset で前回稼働が武装済み (`.noinit` のフラグ) なら
+    // 武装済みで生成する (CoreS3 と同じ分岐、issue #194)。それ以外は従来どおり
+    // 起動猶予つき (BOOT_GRACE_MS)
+    let monitor = Arc::new(Mutex::new(
+        if alc_hub_core::crashlog::is_usb_serial_reset(reset_code)
+            && alarm::restore_armed_flag()
+        {
+            println!("EVT ALARM_RESTORED reset={reset_code}");
+            AlarmMonitor::with_boot_grace(Some(alc_hub_core::alarm::SILENCE_MS))
+        } else {
+            AlarmMonitor::new()
+        },
+    ));
 
     // ホストコンソール (HB / STATUS / PING / HEAP / LOG)
     console::start(Arc::clone(&monitor), Arc::clone(&status), settings.clone())?;

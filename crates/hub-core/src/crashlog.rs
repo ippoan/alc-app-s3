@@ -42,6 +42,18 @@ pub fn is_crash_reset(code: i32) -> bool {
     matches!(code, 4 | 5 | 6 | 7 | 9 | 14 | 15)
 }
 
+/// USB-Serial-JTAG 起因の reset (usb = 11 / jtag = 12) か。
+///
+/// 運行者 PC の PWA タブを閉じると Windows の driver がハンドル解放で
+/// DTR → RTS を落とし、途中の「DTR=0 かつ RTS=1」でチップが reset する
+/// (issue #194)。この reset は core reset で DRAM (`.noinit`) が保持されるので、
+/// 警告デバイスの武装状態を復元してよい reset かどうかの判定に使う。
+/// sw (esp_restart = OTA・RESET コマンド) は**含めない** — 意図した再起動は
+/// 未武装で始めるのが従来どおり。
+pub fn is_usb_serial_reset(code: i32) -> bool {
+    matches!(code, 11 | 12)
+}
+
 /// リングの帳簿 (pos = 次の書き込み位置, len = 有効バイト数) が
 /// 容量 `cap` に対して破綻していないか。`.noinit` は電源断でゴミになるため、
 /// magic チェックと併せて復元可否の判定に使う。
@@ -184,6 +196,16 @@ mod tests {
         }
         for code in [0, 1, 2, 3, 8, 10, 11, 12, 13, 99] {
             assert!(!is_crash_reset(code), "code={code}");
+        }
+    }
+
+    #[test]
+    fn is_usb_serial_reset_classifies() {
+        for code in [11, 12] {
+            assert!(is_usb_serial_reset(code), "code={code}");
+        }
+        for code in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15, 99] {
+            assert!(!is_usb_serial_reset(code), "code={code}");
         }
     }
 
