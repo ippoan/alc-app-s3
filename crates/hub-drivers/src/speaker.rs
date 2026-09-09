@@ -158,6 +158,22 @@ pub enum Sound {
     /// (plan/standing-devices.md §2.1)。**この端末は LED を持たないので、
     /// これがかざした人に伝わる唯一の反応**になる (issue #151)
     PunchOk,
+    /// 警告 (3000Hz 200ms ×3、間隔 200ms)。警告デバイス (issue #135)。
+    ///
+    /// **繰り返しはここで作らない** — 「止めるまで繰り返す」のは
+    /// 呼び出し側 (alarm スレッド) が [`alc_hub_core::alarm::ALERT_PERIOD_MS`]
+    /// ごとにこれを送り直すことで実現する。再生スレッドの中でループすると
+    /// スレッドを長時間占有し、**ボタンで止めたのに鳴り続ける**
+    /// (`rx.recv()` は再生中に次を受け取れない)。
+    ///
+    /// 3000Hz は実測 — 小型スピーカーの共振帯域 (plan §2)。**変えないこと**
+    Alert,
+    /// 警告が**解消した**合図 (1200Hz 150ms ×1)。警告デバイス (issue #135)。
+    ///
+    /// **ボタンで黙らせたときは鳴らさない**。ボタンなら異常は続いているので人が
+    /// 見に行く必要があり、状態解消なら放置でよい。同じ音だとこの区別が現場で
+    /// つかないため、警告音と高さを変えて分けている (plan §2.1)
+    AlertResolved,
 }
 
 /// 再生専用スレッドを立て、送信ハンドルを返す (issue #102)。
@@ -180,6 +196,8 @@ pub fn start_player(mut speaker: Speaker) -> Result<std::sync::mpsc::Sender<Soun
                     // 長く 1 回。`beep` は終端 50ms がフェードアウトなので
                     // 「ピーッ」と減衰して終わる (成功の「ピピッ」と紛れない)
                     Sound::PunchNg => speaker.beep(3000.0, 400),
+                    Sound::Alert => speaker.beep_train(3000.0, 200, 200, 3),
+                    Sound::AlertResolved => speaker.beep(1200.0, 150),
                 };
                 if let Err(e) = r {
                     log::warn!("speaker: 再生失敗: {e:#}");
@@ -293,25 +311,44 @@ impl Speaker {
         Ok(())
     }
 
+    /// 同じ高さのビープを間隔を空けて `count` 回鳴らす
+    /// (打刻成功音 = 2 回 / 警告音 = 3 回、issue #154 / #135)。
+    ///
+    /// **[`Self::beep`] を複数回呼ぶのでは駄目** — 1 回ごとに先頭 20ms のリードイン
+    /// 無音が入るので、間隔が `gap_ms + 20ms` に伸びて「速く 2 回」に聞こえない。
+    /// リードインは先頭に 1 回だけ置き、**1 本のバッファに畳んで 1 回で書き込む**
+    pub fn beep_train(
+        &mut self,
+        freq_hz: f32,
+        on_ms: u32,
+        gap_ms: u32,
+        count: usize,
+    ) -> Result<()> {
+        // black_box: `beep` のリードインと同じ理由 — 呼び出し元の定数が畳み込まれると
+        // 特定長で xtensa LLVM の "Cannot select: Constant" ISel エラーを踏む
+        let n_samples = core::hint::black_box((SAMPLE_RATE_HZ * on_ms / 1000) as usize);
+        let gap = core::hint::black_box((SAMPLE_RATE_HZ * gap_ms / 1000) as usize);
+        let lead_in = lead_in_samples();
+        let mut buf = Vec::with_capacity((lead_in + (n_samples + gap) * count) * 4);
+        push_silence(&mut buf, lead_in);
+        for i in 0..count {
+            if i > 0 {
+                push_silence(&mut buf, gap);
+            }
+            push_square(&mut buf, freq_hz, n_samples);
+        }
+        self.i2s.write_all(&buf, BLOCK)?;
+        Ok(())
+    }
+
     /// 同じ高さのビープを間隔を空けて 2 回鳴らす (打刻成功音、issue #154)。
     /// `Sound::PunchOk` は 3000Hz / 60ms / 間隔 40ms (plan §2.1 で実測確定)。
     ///
-    /// **[`Self::beep`] を 2 回呼ぶのでは駄目** — 1 回ごとに先頭 20ms のリードイン
-    /// 無音が入るので、間隔が `gap_ms + 20ms` に伸びて「速く 2 回」に聞こえない。
-    /// 1 本のバッファに畳んで 1 回で書き込む
+    /// [`Self::beep_train`] の `count = 2` そのもの。**生成されるバッファは
+    /// 畳み込んで書いていた頃と 1 バイトも変わらない** (リードイン → 矩形波 →
+    /// 無音 → 矩形波) ので、**タイムカード本番機の `PunchOk` の鳴りは不変**
     pub fn beep_twice(&mut self, freq_hz: f32, duration_ms: u32, gap_ms: u32) -> Result<()> {
-        // black_box: `beep` のリードインと同じ理由 — 呼び出し元の定数が畳み込まれると
-        // 特定長で xtensa LLVM の "Cannot select: Constant" ISel エラーを踏む
-        let n_samples = core::hint::black_box((SAMPLE_RATE_HZ * duration_ms / 1000) as usize);
-        let gap = core::hint::black_box((SAMPLE_RATE_HZ * gap_ms / 1000) as usize);
-        let lead_in = lead_in_samples();
-        let mut buf = Vec::with_capacity((lead_in + n_samples * 2 + gap) * 4);
-        push_silence(&mut buf, lead_in);
-        push_square(&mut buf, freq_hz, n_samples);
-        push_silence(&mut buf, gap);
-        push_square(&mut buf, freq_hz, n_samples);
-        self.i2s.write_all(&buf, BLOCK)?;
-        Ok(())
+        self.beep_train(freq_hz, duration_ms, gap_ms, 2)
     }
 }
 

@@ -129,6 +129,32 @@ pub enum HostCommand {
     PrinterAddr { addr: String },
     /// プリンター宛先の問い合わせ (`PRINTER <addr>` / `PRINTER UNSET` を応答)
     PrinterStatus,
+    /// 点呼キオスク (ブラウザ) からの heartbeat (issue #135)。**返信しない**。
+    ///
+    /// 警告デバイスの「**沈黙を異常とみなす**」設計の入口。キオスクが 3 秒ごとに
+    /// 自分の測定系 (FC-1200 / NFC ブリッジ) の生死を 1 ビットに畳んで送り、
+    /// 途切れたら端末が自分の判断で鳴る (判定は [`crate::alarm`])。
+    /// 命令駆動 (「鳴れ」を送る形) にしないのは、ブラウザ / PC が落ちた
+    /// **一番危ないケースで鳴らない**ため (plan/standing-devices.md §4.1)。
+    ///
+    /// - `HB OK` … 正常
+    /// - `HB NG <reason>` … キオスクが異常を自覚している (reason は表示用ラベル)
+    /// - 末尾に任意で `call=1` / `call=0` … 点呼の呼び出し (plan §4.2 の案 B)
+    Heartbeat {
+        ok: bool,
+        reason: Option<String>,
+        call: bool,
+    },
+}
+
+/// heartbeat の理由ラベルとして許す形か (`[a-z0-9_]+`)。
+///
+/// **`EVT ALARM cause=ng:<reason>` に素通しで出る**ので、空白・大文字・記号は
+/// ここで弾いて行プロトコルを壊させない
+pub fn valid_hb_reason(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
 /// 画面向きとして有効な角度か
@@ -289,6 +315,32 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
             },
             _ => return Err("ERR TENKO: BP|STATUS が必要です".into()),
         },
+        // 点呼キオスクからの heartbeat (警告デバイス、issue #135)。返信はしない
+        "HB" => {
+            let ok = match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+                Some("OK") => true,
+                Some("NG") => false,
+                _ => return Err("ERR HB: OK|NG が必要です".into()),
+            };
+            let mut reason: Option<String> = None;
+            let mut call = false;
+            for tok in it {
+                if let Some(v) = tok.strip_prefix("call=") {
+                    match v {
+                        "1" => call = true,
+                        "0" => call = false,
+                        _ => return Err("ERR HB: call= には 0|1 が必要です".into()),
+                    }
+                } else if reason.is_some() {
+                    return Err(format!("ERR HB: 余分なトークンです: {tok}"));
+                } else if valid_hb_reason(tok) {
+                    reason = Some(tok.to_string());
+                } else {
+                    return Err("ERR HB: reason は [a-z0-9_]+ のみです".into());
+                }
+            }
+            HostCommand::Heartbeat { ok, reason, call }
+        }
         // `PAIR` または `BLE PAIR`
         "PAIR" => HostCommand::BlePair,
         "BLE" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
@@ -747,5 +799,64 @@ mod tests {
         assert!(parse_line("GW CONNECT", T).is_err());
         assert!(parse_line("GW URL", T).is_err());
         assert!(parse_line("GW URL http://x:9000", T).is_err());
+    }
+
+    fn hb(ok: bool, reason: Option<&str>, call: bool) -> Result<Option<HostCommand>, String> {
+        Ok(Some(HostCommand::Heartbeat {
+            ok,
+            reason: reason.map(|s| s.to_string()),
+            call,
+        }))
+    }
+
+    #[test]
+    fn heartbeat_ok_and_ng() {
+        assert_eq!(parse_line("HB OK", T), hb(true, None, false));
+        // 小文字でも通る (他コマンドと同じ大文字小文字非依存)
+        assert_eq!(parse_line("hb ok", T), hb(true, None, false));
+        assert_eq!(
+            parse_line("HB NG serial", T),
+            hb(false, Some("serial"), false)
+        );
+        // 理由ラベルは任意 — 無くても受ける (cause 側で既定ラベルに落ちる)
+        assert_eq!(parse_line("HB NG", T), hb(false, None, false));
+    }
+
+    #[test]
+    fn heartbeat_call_flag() {
+        assert_eq!(parse_line("HB OK call=1", T), hb(true, None, true));
+        assert_eq!(parse_line("HB OK call=0", T), hb(true, None, false));
+        assert_eq!(
+            parse_line("HB NG nfc_bridge call=1", T),
+            hb(false, Some("nfc_bridge"), true)
+        );
+        assert_eq!(
+            parse_line("HB NG nfc_bridge call=0", T),
+            hb(false, Some("nfc_bridge"), false)
+        );
+    }
+
+    #[test]
+    fn heartbeat_rejects_bad_tokens() {
+        // OK|NG が要る
+        assert!(parse_line("HB", T).is_err());
+        assert!(parse_line("HB MAYBE", T).is_err());
+        // reason は EVT ALARM cause=ng:<reason> に素通しで出るので厳しく検査する
+        assert!(parse_line("HB NG Serial", T).is_err());
+        assert!(parse_line("HB NG se-rial", T).is_err());
+        assert!(parse_line("HB NG ng:x", T).is_err());
+        // call= の値は 0|1 のみ
+        assert!(parse_line("HB OK call=yes", T).is_err());
+        // 理由は 1 つだけ
+        assert!(parse_line("HB NG serial extra", T).is_err());
+    }
+
+    #[test]
+    fn hb_reason_validator() {
+        assert!(valid_hb_reason("serial"));
+        assert!(valid_hb_reason("nfc_bridge2"));
+        assert!(!valid_hb_reason(""));
+        assert!(!valid_hb_reason("Serial"));
+        assert!(!valid_hb_reason("se rial"));
     }
 }
