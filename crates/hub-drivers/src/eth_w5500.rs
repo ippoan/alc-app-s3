@@ -16,16 +16,21 @@
 //!
 //! | イベント | 意味 |
 //! |---|---|
+//! | `EVT ETH_PROBE_OK n=<回数>` | W5500 が SPI に応答した (n = probe 回数) |
 //! | `EVT ETH_CONNECTED <ip>` | リンクアップ + IP 取得 |
 //! | `EVT ETH_DISCONNECTED` | リンクダウン |
 //! | `EVT ETH NG <理由>` | 初期化失敗 (機能無効のまま稼働継続) |
+
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use esp_idf_svc::eth::{EspEth, EthDriver, SpiEthChipset, SpiEventSource};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::delay::FreeRtos;
-use esp_idf_svc::hal::gpio::AnyOutputPin;
-use esp_idf_svc::hal::spi::SpiDriver;
+use esp_idf_svc::hal::gpio::{AnyOutputPin, Pin, PinDriver, PinId};
+use esp_idf_svc::hal::spi::{
+    config::Config as SpiConfig, config::MODE_0, SpiDeviceDriver, SpiDriver,
+};
 use esp_idf_svc::hal::units::Hertz;
 use esp_idf_svc::sys;
 
@@ -38,6 +43,22 @@ const SPI_BAUDRATE_HZ: u32 = 20_000_000;
 const POLL_INTERVAL_MS: u64 = 10;
 /// リンク状態の監視間隔
 const LINK_CHECK_INTERVAL_MS: u32 = 500;
+/// probe (VERSIONR 読み) の SPI クロック。存在確認だけなので、電源が来た直後や
+/// スタック接続の信号品質が悪い状態でも読めるよう本転送より十分低くする
+const PROBE_BAUDRATE_HZ: u32 = 2_000_000;
+/// W5500 が応答するまでの probe 間隔。上限は設けない — 据置機なので
+/// PoE (= ベースの 5V) が来るまで待ち続ける
+const ETH_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+/// VERSIONR (共通レジスタ 0x0039) の読み出しフレーム。アドレス上位 / 下位 /
+/// コントロールバイト (BSB=0 共通レジスタ, RWB=0 read, OM=00 可変長データモード)
+/// に、値を受け取るためのダミー 1 バイトを足した 4 バイトを全二重で往復する
+const W5500_VERSIONR_FRAME: [u8; 4] = [0x00, 0x39, 0x00, 0x00];
+/// VERSIONR の固定値 (W5500 データシート)。これが返れば W5500 に電源が来ている
+const W5500_VERSION: u8 = 0x04;
+/// ハードリセットの L 幅と、その後 PLL が安定するまでの待ち
+/// (データシートの最小値 500us / 1ms に対して余裕を取る)
+const RST_LOW_MS: u32 = 5;
+const RST_SETTLE_MS: u32 = 10;
 
 /// W5500 を初期化しリンク監視スレッドを起動する。
 /// 初期化失敗はイベント出力のみで呼び出し元へはエラーを返さない
@@ -61,12 +82,100 @@ pub fn start(
         .name("eth_w5500".into())
         // TCP/IP イベント + ドライバ初期化を考慮して余裕を持たせる
         .stack_size(8 * 1024)
-        .spawn(move || match init(spi, cs, rst, sysloop) {
-            Ok(eth) => monitor_loop(eth, status),
-            Err(e) => println!("EVT ETH NG {e:#}"),
+        .spawn(move || {
+            // pin 番号だけ控えておく。probe 用の一時デバイスは steal した複製を
+            // 使い、init には元の cs / rst をそのまま渡す (所有権は動かさない)
+            let cs_num = cs.pin();
+            let rst_num = rst.as_ref().map(|p| p.pin());
+
+            // 電源が後から来た W5500 のためにハードリセットを 1 回だけ打つ。
+            // probe の間は H に保ち、init の直前に手放す — init 側の driver が
+            // 同じ番号を reset_gpio_num で取り直すので、二重取得を避ける
+            let rst_drv = rst_num.and_then(pulse_reset);
+
+            let n = wait_for_w5500(spi, cs_num);
+            drop(rst_drv);
+            println!("EVT ETH_PROBE_OK n={n}");
+
+            match init(spi, cs, rst, sysloop) {
+                Ok(eth) => monitor_loop(eth, status),
+                Err(e) => println!("EVT ETH NG {e:#}"),
+            }
         })
         .context("eth_w5500 スレッド起動失敗")?;
     Ok(())
+}
+
+/// W5500 の RST 線を L (数 ms) → H に打ち、開いたままの `PinDriver` を返す。
+/// 取得に失敗しても probe と init は続行する (RST 未配線の基板もあるため)
+fn pulse_reset(num: PinId) -> Option<PinDriver<'static, esp_idf_svc::hal::gpio::Output>> {
+    // Safety: この番号のピンは呼び出し元が所有する rst と同一で、この関数が
+    // 返す PinDriver を drop するまで他の driver へは渡らない
+    let pin = unsafe { AnyOutputPin::steal(num) };
+    let mut drv = match PinDriver::output(pin) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("EVT ETH NG w5500 rst pin の取得に失敗 ({e})");
+            return None;
+        }
+    };
+    if let Err(e) = drv.set_low() {
+        println!("EVT ETH NG w5500 rst の L 出力に失敗 ({e})");
+        return None;
+    }
+    FreeRtos::delay_ms(RST_LOW_MS);
+    if let Err(e) = drv.set_high() {
+        println!("EVT ETH NG w5500 rst の H 出力に失敗 ({e})");
+        return None;
+    }
+    FreeRtos::delay_ms(RST_SETTLE_MS);
+    Some(drv)
+}
+
+/// 生 SPI で VERSIONR を 1 バイト読む。一時デバイスはこの関数を抜けるときに
+/// Drop され (`spi_bus_remove_device`)、バスのデバイス枠が戻る
+fn probe_versionr(spi: &'static SpiDriver<'static>, cs_num: PinId) -> Result<u8> {
+    // Safety: cs は init に渡すまでこのスレッドしか使わず、一時デバイスは
+    // この関数を抜けるときに必ず外れる
+    let cs = unsafe { AnyOutputPin::steal(cs_num) };
+    let config = SpiConfig::new()
+        .baudrate(Hertz(PROBE_BAUDRATE_HZ))
+        .data_mode(MODE_0);
+    let mut dev = SpiDeviceDriver::new(spi, Some(cs), &config)
+        .context("probe 用 SPI デバイスの追加に失敗")?;
+    let mut rx = [0u8; 4];
+    dev.transfer(&mut rx, &W5500_VERSIONR_FRAME)
+        .context("VERSIONR の読み出しに失敗")?;
+    Ok(rx[3])
+}
+
+/// W5500 が応答する (VERSIONR = 0x04) まで `ETH_PROBE_INTERVAL` ごとに待ち、
+/// かかった probe 回数を返す。driver の install は「応答してから 1 回だけ」に
+/// したいのでここで待つ — 無電源の W5500 に対して install を繰り返すと
+/// esp-idf-svc が失敗時に MAC/PHY を解放せず、SPI ホストのデバイス枠
+/// (LCD と共有) が埋まって別の理由で永久に失敗するため。
+/// 失敗ログは理由が変わったときだけ出す (10 秒ごとに同じ行を吐き続けない)
+fn wait_for_w5500(spi: &'static SpiDriver<'static>, cs_num: PinId) -> u32 {
+    let mut n: u32 = 0;
+    let mut last: Option<String> = None;
+    loop {
+        n += 1;
+        let reason = match probe_versionr(spi, cs_num) {
+            Ok(W5500_VERSION) => return n,
+            // 0x00 / 0xFF はベースに 5V が無い (PoE 未接続) か未接続。
+            // それ以外の値は配線か SPI モードを疑う
+            Ok(v) => format!("versionr=0x{v:02X}"),
+            Err(e) => format!("spi_err={e:#}"),
+        };
+        if last.as_deref() != Some(reason.as_str()) {
+            log::warn!(
+                "eth_w5500: W5500 が応答しない ({reason}) — {ETH_PROBE_INTERVAL:?} ごとに probe する"
+            );
+            println!("EVT ETH NG w5500 not responding {reason}");
+            last = Some(reason);
+        }
+        FreeRtos::delay_ms(ETH_PROBE_INTERVAL.as_millis() as u32);
+    }
 }
 
 fn init(
