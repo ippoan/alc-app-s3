@@ -10,9 +10,15 @@
 # 0x20000 に置かれるため、espflash 既定テーブルだとオフセットがずれる)。
 # app スロットは実測 ~1.9MB に対し各 6MB (将来の余裕 + 残り ~3.8MB は
 # 追加 data パーティション用に温存)。
+#
+# punchq = オフライン送信キュー (#142)。**CLI で merged.bin を offset 0 から
+# 一括で焼くと消える** (Web インストーラーは Split で避ける)。OTA では
+# パーティションテーブルは更新されないので、この行が無い機は既定 nvs の
+# ws_queue 文字列 (上限 20 件) にフォールバックする (hub-drivers/punchq.rs)。
 # Name,   Type, SubType, Offset,   Size,   Flags
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,
 otadata,  data, ota,     0x10000,  0x2000,
 ota_0,    app,  ota_0,   0x20000,  6M,
 ota_1,    app,  ota_1,   0x620000, 6M,
+punchq,   data, nvs,     0xC20000, 0x80000,

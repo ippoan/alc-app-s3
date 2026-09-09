@@ -23,7 +23,8 @@
 //! |---|---|
 //! | `EVT WS_CONNECTED` / `EVT WS_DISCONNECTED` | WS 接続状態の変化 |
 //! | `EVT WS_COMMAND <id> <payload>` | 下り command を受信 |
-//! | `EVT WS_DROPPED <seq>` | キュー上限で最古の未送信測定を破棄 |
+//! | `EVT WS_DROPPED <seq> <kind>` | 保存先が一杯で最古の未送信測定を破棄 |
+//! | `EVT PUNCHQ <mode> count=<n>` | 送信キューの保存先と未送信件数 (punchq.rs) |
 
 use std::io::Write;
 use std::net::TcpStream;
@@ -32,7 +33,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use alc_hub_core::uplink::{
     command_action, command_gw_url, command_ota_url, command_print_chunk, command_print_url,
     command_result_frame, measurement_frame, parse_downlink, should_wait_for_clock, Downlink,
-    UplinkQueue, PING_FRAME,
+    DroppedEntry, UplinkQueue, PING_FRAME,
 };
 use anyhow::Result;
 use esp_idf_svc::ws::client::{
@@ -46,10 +47,13 @@ use alc_hub_common::{
     ui_api::UiCommand,
 };
 
-use crate::auth_link;
+use crate::{auth_link, punchq};
 
-/// NVS キューの最大保持件数 (NVS 文字列 4KB 制限に収める)
-const MAX_QUEUE: usize = 20;
+/// 送信窓 = RAM に載せる未 ack エントリの件数 (Refs #142)。
+/// **保持できる総件数はここではなく保存先 (punchq パーティション) の容量で決まる**
+/// — flash がキューの本体で、窓が空いたら次を読み込む。RAM 使用量は総件数に
+/// 依存しないので、PSRAM の有無を見る必要も無い
+const WINDOW: usize = 20;
 /// 接続タイムアウト
 const CONNECT_TIMEOUT_S: u64 = 10;
 /// keep-alive ping の間隔
@@ -160,11 +164,17 @@ fn run(
     settings: Settings,
     boot_id: u32,
 ) {
-    let (restored, skipped) =
-        UplinkQueue::restore(settings.ws_last_seq(), &settings.ws_queue(), MAX_QUEUE);
+    // 保存先は専用 NVS パーティション punchq。無い機 (OTA だけで更新した機) は
+    // 既定 nvs の文字列へフォールバックする (punchq::open_store)
+    let (store, mode) = punchq::open_store(&settings);
+    let (restored, skipped) = UplinkQueue::open(settings.ws_last_seq(), store, WINDOW);
     let mut queue = restored;
+    log::info!(
+        "ws_uplink: 送信キュー = {mode} (未送信 {} 件、窓 {WINDOW} 件)",
+        queue.len()
+    );
     if skipped > 0 {
-        log::warn!("ws_uplink: NVS キューの壊れた行を {skipped} 件読み飛ばし");
+        log::warn!("ws_uplink: 保存先の壊れた行を {skipped} 件読み飛ばし");
     }
     publish_status(&status, &queue, false);
 
@@ -445,28 +455,33 @@ fn mark_disconnected(conn: &mut Option<Conn>, reason: &str, queue: &UplinkQueue)
 /// 測定をキューへ積み NVS へ永続化する。記録時の稼働時間と boot_id も持たせ、
 /// NTP 未同期で記録した時刻を送信時に補正できるようにする (fix_unsynced_times)
 fn enqueue(queue: &mut UplinkQueue, settings: &Settings, rec: &UplinkRecord, boot_id: u32) {
-    match queue.push_record(
+    let result = queue.push_record(
         rec.kind,
         rec.recorded_at_ms,
         &rec.payload,
         rec.session_id.as_deref(),
         Some(rec.at_ms),
         Some(boot_id),
-    ) {
-        Ok((_, dropped)) => {
-            if let Some(seq) = dropped {
-                log::warn!("ws_uplink: キュー上限で seq={seq} を破棄");
-                println!("EVT WS_DROPPED {seq}");
-            }
-            persist(settings, queue);
-        }
-        Err(e) => log::error!("ws_uplink: 不正 payload を破棄: {e}"),
+    );
+    let dropped = match &result {
+        Ok(pushed) => pushed.dropped.as_ref(),
+        Err(failed) => failed.dropped.as_ref(),
+    };
+    if let Some(DroppedEntry { seq, kind }) = dropped {
+        // 捨てられたのが打刻だと賃金計算のデータが欠けるので kind まで出す
+        log::warn!("ws_uplink: 保存先が一杯で seq={seq} ({kind}) を破棄");
+        println!("EVT WS_DROPPED {seq} {kind}");
+    }
+    match result {
+        Ok(_) => persist(settings, queue),
+        Err(failed) => log::error!("ws_uplink: 測定を保存できません: {}", failed.reason),
     }
 }
 
+/// 採番カウンタだけを永続化する。**未 ack エントリ本体は push/ack のたびに
+/// 保存先 (punchq) が 1 件単位で書いている**ので、ここでの書き戻しは無い
 fn persist(settings: &Settings, queue: &UplinkQueue) {
     settings.set_ws_last_seq(queue.last_seq());
-    settings.set_ws_queue(&queue.serialize());
 }
 
 fn publish_status(status: &SharedStatus, queue: &UplinkQueue, connected: bool) {
