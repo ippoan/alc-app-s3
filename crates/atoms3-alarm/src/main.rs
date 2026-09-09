@@ -23,9 +23,13 @@
 //! # 判定はここに書かない
 //!
 //! 沈黙・NG・呼び出しの判定と状態機械は [`alc_hub_core::alarm`] (ホストで
-//! テスト済みの純粋ロジック)。本ファイルがやるのは **[`Action`] を実行すること
-//! だけ** — 音を鳴らす / ホストへ行を書き出す。閾値 (`SILENCE_MS` 等) を
-//! ここに書き写さないこと: 2 か所に数値があると片方だけ直る。
+//! テスト済みの純粋ロジック)。閾値 (`SILENCE_MS` 等) をここに書き写さないこと:
+//! 2 か所に数値があると片方だけ直る。
+//!
+//! `Action` の実行 (音を鳴らす / ホストへ行を書き出す) と、判定器を lock して
+//! heartbeat を渡す手続きも **[`alc_hub_drivers::alarm`] の共通実装**を通る —
+//! CoreS3 (root の `alc-hub-cores3`) も同じ関数を使うため、ここに書き写すと
+//! 実機の鳴り方が機種で割れる (issue #187)。
 //!
 //! # ハード構成
 //!
@@ -65,9 +69,8 @@ use alc_hub_common::{
     settings::Settings,
     status::{now_ms, HubStatus, SharedStatus},
 };
-use alc_hub_core::alarm::{Action, AlarmMonitor};
-use alc_hub_drivers::speaker::Sound;
-use alc_hub_drivers::{crashlog, es8311, heap, speaker};
+use alc_hub_core::alarm::AlarmMonitor;
+use alc_hub_drivers::{alarm, crashlog, es8311, heap, speaker};
 use anyhow::Result;
 use esp_idf_svc::hal::{
     delay::FreeRtos,
@@ -77,7 +80,7 @@ use esp_idf_svc::hal::{
     units::Hertz,
 };
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 
 /// 鳴動ループの周期。`ALERT_PERIOD_MS` (1800) に対して十分細かく、
 /// ボタンのデバウンス 3 サンプル = 150ms が体感で遅れない値
@@ -199,29 +202,9 @@ fn main() -> Result<()> {
             Err(e) => log::error!("alarm: monitor の lock に失敗: {e}"),
         }
 
-        for action in actions {
-            match action {
-                // 鳴らし直しの周期は monitor が刻む (alarm::ALERT_PERIOD_MS)。
-                // **再生スレッド側でループを作らない** — 占有するとボタンで
-                // 止めたのに鳴り続ける (speaker.rs の Sound::Alert の doc)
-                Action::PlayAlert => send(&speaker_tx, Sound::Alert),
-                Action::PlayResolved => send(&speaker_tx, Sound::AlertResolved),
-                // 黙らせているあいだの短い合図 (alarm::MUTED_TICK_MS ごと)。
-                // 完全な無音だと異常が続いていることを忘れられる
-                Action::PlayMutedTick => send(&speaker_tx, Sound::MutedTick),
-                // 沈黙 (繋がっていない) のときの短い 2 連 (alarm::SILENCE_TICK_MS ごと)
-                Action::PlaySilenceTick => send(&speaker_tx, Sound::SilenceTick),
-                // キオスクのバナー用。遷移のたび + BANNER_MS ごとに出る
-                Action::Emit(line) => println!("{line}"),
-            }
-        }
-    }
-}
-
-/// 再生依頼をキューへ積む。**ここで待たない** — I2S の write はブロッキングで、
-/// 直接鳴らすと鳴動ループが 1 秒近く止まりボタンの反映が遅れる
-fn send(speaker: &Option<mpsc::Sender<Sound>>, sound: Sound) {
-    if let Some(tx) = speaker {
-        let _ = tx.send(sound);
+        // 音とホストへの行は共通実装へ (alc_hub_drivers::alarm)。CoreS3 も
+        // 同じ関数を通る — **本機だけ直しても実機の鳴り方が割れる**。
+        // 本機は `EVT ALARM` を出す (キオスクのバナー用) ので emit_lines = true
+        alarm::run_actions(actions, &speaker_tx, true);
     }
 }

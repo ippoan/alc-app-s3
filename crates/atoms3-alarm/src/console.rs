@@ -29,14 +29,12 @@
 //!   見分けられない。
 
 use alc_hub_common::{config, settings::Settings, status::SharedStatus};
-use alc_hub_core::alarm::AlarmMonitor;
+// 鳴動判定の共有ハンドル (main の鳴動ループと共有) と、lock して現在時刻を
+// 渡す手続きは共通実装。**CoreS3 も同じものを通る** (issue #187)
+use alc_hub_core::alarm::SharedMonitor;
 use alc_hub_core::protocol::{parse_line, HostCommand};
-use alc_hub_drivers::console;
+use alc_hub_drivers::{alarm, console};
 use anyhow::Result;
-use std::sync::{Arc, Mutex};
-
-/// 鳴動判定の共有ハンドル (main の鳴動ループと共有)
-pub type SharedMonitor = Arc<Mutex<AlarmMonitor>>;
 
 pub fn start(monitor: SharedMonitor, status: SharedStatus, settings: Settings) -> Result<()> {
     console::spawn_reader(c"console", 8 * 1024, move |line| {
@@ -66,14 +64,12 @@ fn handle_line(line: &str, monitor: &SharedMonitor, status: &SharedStatus, setti
         // reason が無い `HB NG` も受理する (monitor が
         // `alarm::DEFAULT_NG_REASON` に落として `cause=ng:unspecified` にする)
         HostCommand::Heartbeat { ok, reason, call } => {
-            with_monitor(monitor, |m, now| {
-                m.on_heartbeat(now, ok, reason.as_deref(), call)
-            });
+            alarm::apply_heartbeat(monitor, ok, reason.as_deref(), call);
         }
         // `status_line` は `VER=` を含まない (hub-core からは hub-common が
         // 見えないため)。**呼び出し側で末尾に足す**
         HostCommand::Status => {
-            with_monitor(monitor, |m, now| {
+            alarm::with_monitor(monitor, |m, now| {
                 println!(
                     "{} VER={}",
                     m.status_line(now),
@@ -86,19 +82,5 @@ fn handle_line(line: &str, monitor: &SharedMonitor, status: &SharedStatus, setti
             log::debug!("console: unsupported command: {other:?}");
             println!("ERR UNSUPPORTED (alarm)");
         }
-    }
-}
-
-/// 判定器を lock して現在時刻とともに渡す。
-///
-/// **lock 失敗時に黙って捨てない** — heartbeat を落とすと沈黙とみなされて
-/// 鳴り出すので、なぜ落としたかがログに残っている必要がある
-fn with_monitor(monitor: &SharedMonitor, f: impl FnOnce(&mut AlarmMonitor, u64)) {
-    match monitor.lock() {
-        Ok(mut m) => {
-            let now = alc_hub_common::status::now_ms();
-            f(&mut m, now)
-        }
-        Err(e) => log::error!("console: monitor の lock に失敗: {e}"),
     }
 }

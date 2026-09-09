@@ -31,6 +31,9 @@ use alc_hub_ui as ui;
 use alc_hub_wifi::{improv, wifi};
 use anyhow::Result;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
+// 鳴動ループ (speaker feature) の待ちにだけ使う
+#[cfg(feature = "speaker")]
+use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::{
     i2c::{config::Config as I2cConfig, I2cDriver},
     peripherals::Peripherals,
@@ -38,6 +41,12 @@ use esp_idf_svc::hal::{
     units::Hertz,
 };
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
+
+/// 沈黙警告の鳴動ループの周期。VoiceS3R (atoms3-alarm) と同じ 50ms —
+/// `ALERT_PERIOD_MS` (1800) / `SILENCE_TICK_MS` (5000) に対して十分細かく、
+/// 画面タップの反映も体感で遅れない
+#[cfg(feature = "speaker")]
+const ALARM_TICK_MS: u32 = 50;
 
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -196,6 +205,17 @@ fn main() -> Result<()> {
         gw_tx,
     )?;
 
+    // 沈黙警告 (issue #187): 運行者 PWA からの `HB OK` が途切れたら自分の判断で
+    // 鳴る。判定は VoiceS3R と同じ純粋ロジック (alc_hub_core::alarm) で、
+    // host_link (HB の受け手 + STATUS)・鳴動スレッド・画面タップの 3 者で共有する。
+    //
+    // ★ **武装方式** (`with_boot_grace(None)`): **初回 heartbeat を受けるまで
+    //   鳴らない**。CoreS3 は据置ハブとして PWA 無しでも動くので、VoiceS3R の
+    //   起動猶予方式 (30 秒で鳴り出す) だと PWA を繋がない設置で鳴り続ける
+    let alarm_monitor: alc_hub_core::alarm::SharedMonitor = Arc::new(Mutex::new(
+        alc_hub_core::alarm::AlarmMonitor::with_boot_grace(None),
+    ));
+
     // auth-worker device JWT 交換 (AUTH TOKEN 自己診断) は host_link が
     // auth_link::spawn_mint_test で一時スレッド起動する (常駐させない —
     // TLS 用 20KB スタックは診断中だけ確保。credential は AUTH SET で注入)
@@ -206,6 +226,7 @@ fn main() -> Result<()> {
         wifi,
         pair_flag.clone(),
         improv,
+        Arc::clone(&alarm_monitor),
     )?;
     // FC-1200 (RS232M Module 13.2) のピン。次期構成 (cores3-se feature) では
     // RS232M のジャンパを TX=G10 / RX=G6 へ移し、空いた Port C (G17/G18) を NFC
@@ -224,27 +245,24 @@ fn main() -> Result<()> {
         meas_tx.clone(),
         tx.clone(),
     )?;
-    // Unit NFC (ST25R3916) (issue #84 / #101)。DIN Base Port A (SDA=G2 / SCL=G1)
-    // に配線 (AtomS3 ベンチと同一ピン番号)。SCL=G1 は Base LAN PoE v1.2 本体の
-    // DB9 (TX=G1) と衝突するため、その DB9 は使わない。
-    // I2C1 は C++ 側 (components/nfc_shim → M5HAL) が所有するため p.i2c1 は take しない
-    // (I2C0=内部バス G12/G11 電源IC/タッチとは完全に別ポート)。
-    // 内蔵スピーカー (I2S DOUT=G13) は Base LAN PoE v1.2 (CS=G9) とは競合しない。
-    // 読み取りビープは issue #101 PR2
-    #[cfg(feature = "nfc-verify")]
-    {
-        // 発音の成立条件 (issue #102 実機切り分けで確定):
-        //   1. サンプルレートは 48kHz (44.1kHz は分数分周ジッタで AW88298 の
-        //      PLL がロックせず完全無音。speaker.rs の SAMPLE_RATE_HZ 参照)
-        //   2. アンプ初期化はクロック供給下で行う — 新 I2S ドライバは FIFO 空で
-        //      BCK を止めるため、init_amp の前に feed_silence で実際に流す
-        //
-        // スピーカー初期化は**致命にしない**。nfc-verify が既定 on になって全機に
-        // 載るため、ここで `?` を返すと AW88298 が黙っている個体が起動不能になり、
-        // WS が上がらないので OTA でも戻せない (USB 復旧が要る)。音が出なくても
-        // NFC の読み取り自体は成立するので、失敗時は受信側を落とした Sender を
-        // 渡して無音で継続する (nfc.rs の beep_ok は send 失敗を無視する)
-        let speaker_tx = match (|| -> Result<_> {
+    // 内蔵スピーカー (AW88298)。**NFC の検知音と沈黙警告の鳴動で共用する** —
+    // 再生キューは 1 本 (speaker::start_player) で、先客の音声 (≤1.6 秒) を
+    // 待ってから鳴る。その遅延は許容する判断 (issue #187)。
+    //
+    // 発音の成立条件 (issue #102 実機切り分けで確定):
+    //   1. サンプルレートは 48kHz (44.1kHz は分数分周ジッタで AW88298 の
+    //      PLL がロックせず完全無音。speaker.rs の SAMPLE_RATE_HZ 参照)
+    //   2. アンプ初期化はクロック供給下で行う — 新 I2S ドライバは FIFO 空で
+    //      BCK を止めるため、init_amp の前に feed_silence で実際に流す
+    //
+    // スピーカー初期化は**致命にしない**。既定 on で全機に載るため、ここで `?` を
+    // 返すと AW88298 が黙っている個体が起動不能になり、WS が上がらないので OTA でも
+    // 戻せない (USB 復旧が要る)。音が出なくても NFC の読み取りと点呼自体は成立する
+    // ので、失敗時は受信側を落とした Sender を渡して無音で継続する
+    // (nfc.rs の beep_ok も alarm::run_actions も send 失敗を無視する)
+    #[cfg(feature = "speaker")]
+    let speaker_tx = {
+        match (|| -> Result<_> {
             let mut speaker = alc_hub_drivers::speaker::Speaker::new(
                 p.i2s1,
                 p.pins.gpio34.into(),
@@ -266,11 +284,56 @@ fn main() -> Result<()> {
         })() {
             Ok(tx) => tx,
             Err(e) => {
-                log::warn!("speaker: 初期化失敗 — NFC は無音で継続する: {e:#}");
+                log::warn!("speaker: 初期化失敗 — 無音で継続する: {e:#}");
                 let (tx, _rx) = mpsc::channel();
                 tx
             }
-        };
+        }
+    };
+
+    // 沈黙警告の鳴動ループ (50ms)。**判定は alarm_monitor が持ち、ここは Action の
+    // 実行だけ** — 音とホスト行の変換は VoiceS3R と同じ共通実装を通る。
+    // 専用スレッドにするのは、メインタスクが ui::run に占有されて戻らないため。
+    //
+    // ★ `emit_lines = false`: **CoreS3 は `EVT ALARM` を出さない** — ブラウザ側
+    //   (`useCoreS3Serial` の `classify()`) が行頭 `EVT ALARM` / `STATUS alarm` を
+    //   「警告デバイス = 別機種」と判定し、CoreS3 のポートを reject する。
+    //   鳴動状態は `STATUS` 行末の `ALARM=…` で渡す (host_link.rs)
+    #[cfg(feature = "speaker")]
+    {
+        let monitor = Arc::clone(&alarm_monitor);
+        let speaker = Some(speaker_tx.clone());
+        alc_hub_drivers::task::name_next(c"alarm");
+        std::thread::Builder::new()
+            .name("alarm".into())
+            .stack_size(4 * 1024)
+            .spawn(move || loop {
+                FreeRtos::delay_ms(ALARM_TICK_MS);
+                let now = alc_hub_common::status::now_ms();
+                // lock 失敗 (host_link スレッドが panic した) なら判定は進められない。
+                // ログだけ残してループは回し続ける (再起動は人の判断に委ねる)
+                let actions = match monitor.lock() {
+                    Ok(mut m) => m.tick(now),
+                    Err(e) => {
+                        log::error!("alarm: monitor の lock に失敗: {e}");
+                        Vec::new()
+                    }
+                };
+                alc_hub_drivers::alarm::run_actions(actions, &speaker, false);
+            })?;
+    }
+
+    // Unit NFC (ST25R3916) (issue #84 / #101)。DIN Base Port A (SDA=G2 / SCL=G1)
+    // に配線 (AtomS3 ベンチと同一ピン番号)。SCL=G1 は Base LAN PoE v1.2 本体の
+    // DB9 (TX=G1) と衝突するため、その DB9 は使わない。
+    // I2C1 は C++ 側 (components/nfc_shim → M5HAL) が所有するため p.i2c1 は take しない
+    // (I2C0=内部バス G12/G11 電源IC/タッチとは完全に別ポート)。
+    // 内蔵スピーカー (I2S DOUT=G13) は Base LAN PoE v1.2 (CS=G9) とは競合しない。
+    // 読み取りビープは issue #101 PR2
+    #[cfg(feature = "nfc-verify")]
+    {
+        // NFC の検知音は上で作った共用キューへ流す (再生スレッドは 1 本)
+        let speaker_tx = speaker_tx.clone();
         // 現行: Port A (SDA=G2 / SCL=G1)。次期構成 (cores3-se): Port C (G17/G18、
         // RS232M 退去で空く)。SDA/SCL の対応が未確定なので ack しなければ入替
         #[cfg(not(feature = "cores3-se"))]
@@ -348,6 +411,16 @@ fn main() -> Result<()> {
     // リセットで旧スロットへ自動で戻す。ota.rs 参照)
     alc_hub_drivers::ota::mark_boot_valid();
 
-    // UI ループ (メインタスクを占有, 戻らない)
-    ui::run(display, i2c, rx, status, rotation, boot_id, ui_meas_tx)
+    // UI ループ (メインタスクを占有, 戻らない)。alarm_monitor は**鳴動中の**
+    // 画面タップで黙らせるためだけに渡す — 鳴らすのは上の専用スレッド
+    ui::run(
+        display,
+        i2c,
+        rx,
+        status,
+        rotation,
+        boot_id,
+        ui_meas_tx,
+        alarm_monitor,
+    )
 }
