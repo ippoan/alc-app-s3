@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>alc-hub Alarm - Firmware Writer</title>
+    <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px; margin: 0 auto; padding: 20px;
+            background: #f5f5f5; color: #333;
+        }
+        h1 { color: #1a73e8; border-bottom: 2px solid #1a73e8; padding-bottom: 10px; }
+        .card { background: white; border-radius: 12px; padding: 24px; margin: 20px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .card h2 { margin-top: 0; color: #333; }
+        .requirements { background: #e8f5e9; border-left: 4px solid #4caf50; padding: 16px; margin: 16px 0; }
+        .requirements h3 { margin-top: 0; color: #2e7d32; }
+        .warning { background: #fff3e0; border-left: 4px solid #ff9800; padding: 16px; margin: 16px 0; }
+        .warning h3 { margin-top: 0; color: #e65100; }
+        .install-section {
+            text-align: center; padding: 40px 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 12px; color: white;
+        }
+        .install-section h2 { color: white; margin-bottom: 20px; }
+        esp-web-install-button { --esp-tools-button-color: #4caf50; --esp-tools-button-text-color: white; }
+        .device-info { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-top: 16px; }
+        .device-info div { background: #f8f9fa; padding: 12px; border-radius: 8px; }
+        .device-info strong { display: block; color: #666; font-size: 12px; margin-bottom: 4px; }
+        code { background: #f0f0f0; padding: 2px 6px; border-radius: 4px; }
+        footer { text-align: center; margin-top: 40px; color: #666; font-size: 14px; }
+        footer a { color: #1a73e8; }
+        table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+        th, td { border: 1px solid #ddd; padding: 8px 10px; text-align: left; font-size: 14px; }
+        th { background: #f8f9fa; color: #666; }
+    </style>
+</head>
+<body>
+    <h1>点呼端末の警告デバイス</h1>
+    <p>点呼キオスク (ブラウザ) の異常を音で知らせる据置ブザーの
+       ファームウェア書き込みツールです。
+       キオスクが 3 秒ごとに「正常」を送り、<strong>途切れたら端末が自分の判断で鳴ります</strong>。
+       CoreS3 統合ハブは <a href="index.html">こちら</a>、
+       AtomS3 印刷ブリッジは <a href="atoms3-print.html">こちら</a>、
+       NFC タイムカード端末は <a href="timecard.html">こちら</a>。</p>
+
+    <div class="card">
+        <h2>対応機器</h2>
+        <div class="device-info">
+            <div><strong>マイコン</strong>M5Stack Atom VoiceS3R (Atom EchoS3R / SKU C126-ECHO、8MB PSRAM)</div>
+            <div><strong>接続</strong>USB-C ケーブルで点呼キオスクの PC へ (給電も USB)</div>
+            <div><strong>停止ボタン</strong>本体ボタン (G41)</div>
+        </div>
+        <div class="warning">
+            <h3>PSRAM 非搭載の AtomS3 系には焼かないでください</h3>
+            <p>ここで配布しているのは <strong>Atom VoiceS3R 専用</strong>のビルドです。
+               PSRAM (Octal 8MB) を前提に sdkconfig を組んでいるため、
+               AtomS3 / AtomS3 Lite などの PSRAM 非搭載機に焼いても
+               <strong>PSRAM 無しのまま静かに起動します</strong> (エラーは出ません)。</p>
+        </div>
+        <div class="warning">
+            <h3>PC の電源が落ちるとブザーも止まります</h3>
+            <p>USB 給電なので、<strong>PC が完全に落ちたときは鳴りません</strong>。
+               これは承知の上の割り切りです (人が見れば分かる異常のため)。
+               ブラウザのクラッシュ・タブを閉じた・PC のフリーズ・USB を抜いた場合は、
+               いずれも「沈黙」として検知して鳴ります。</p>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>書き込み手順</h2>
+        <ol>
+            <li>本体を USB-C ケーブルで PC に接続</li>
+            <li><strong>箱出しの新品は本体ボタンを押しながら挿し直す</strong> —
+                工場出荷ファームは USB オーディオデバイスとして動いており、
+                そのままではシリアルポートが出てきません</li>
+            <li>下の「Install」ボタンをクリックし、シリアルポートを選択</li>
+            <li><strong>書き込みが終わったら、ボタンから指を離して USB を挿し直す</strong> —
+                押したままだと起動のたびにダウンロードモードに入り、
+                <strong>焼けているのにアプリが動きません</strong></li>
+            <li>起動から 30 秒たっても点呼キオスクを開いていなければ、
+                <strong>「沈黙」として鳴り始めます</strong> (これが正常動作です)。
+                本体ボタンを押すと止まります</li>
+        </ol>
+        <div class="warning">
+            <h3>「焼けたのに動かない」ときに見るところ</h3>
+            <p>シリアルに <code>waiting for download</code> や
+               <code>boot:0x30 (DOWNLOAD(USB/UART0))</code> が出ていたら、
+               <strong>ダウンロードモードに入ったままです</strong>。ボタンから指を離して挿し直してください
+               (書き込みは成功しています)。</p>
+            <p>コマンドラインで確認する場合、<code>espflash monitor</code> に
+               <strong><code>--no-reset</code> を付けないでください</strong> —
+               付けると端末がフラッシュスタブに留まってアプリが起動せず、
+               「反応が無い」ように見えます。</p>
+        </div>
+        <div class="warning">
+            <h3>デバイス登録は要りません</h3>
+            <p>この端末は<strong>ネットワークに出ません</strong>。サーバとの通信も
+               デバイス登録もなく、USB ケーブル 1 本で完結します。
+               焼いたらそのまま使えます。</p>
+        </div>
+    </div>
+
+    <div class="requirements">
+        <h3>動作要件</h3>
+        <ul>
+            <li>Chrome / Edge / Opera (Web Serial API 対応ブラウザ)</li>
+            <li>ESP32-S3 は USB Serial/JTAG 内蔵のため追加ドライバ不要</li>
+            <li>シリアルポートが出てこない場合は、<strong>本体ボタンを押したまま USB を挿し直す</strong>
+                (ROM ダウンロードモード)。工場出荷ファームや、書き込んだファームが
+                起動直後に落ちる状態では、これが唯一の入り口です</li>
+        </ul>
+    </div>
+
+    <div class="card install-section">
+        <h2>ファームウェアをインストール</h2>
+        <esp-web-install-button manifest="manifest-alarm.json">
+            <button slot="activate">Install alc-hub Alarm</button>
+            <span slot="unsupported">
+                お使いのブラウザは Web Serial API に対応していません。<br>
+                Chrome, Edge, または Opera をお使いください。
+            </span>
+            <span slot="not-allowed">シリアルポートへのアクセスが許可されていません。</span>
+        </esp-web-install-button>
+    </div>
+
+    <div class="card">
+        <h2>鳴り方と止め方</h2>
+        <table>
+            <tr><th>場面</th><th>音</th></tr>
+            <tr><td>警告 (鳴動中)</td><td>3000Hz 200ms を 3 連 — <strong>止まるまで 1.8 秒ごとに繰り返す</strong></td></tr>
+            <tr><td>異常が解消した</td><td>1200Hz 150ms を 1 発 (「直った」合図)</td></tr>
+            <tr><td>本体ボタンで止めた</td><td><strong>鳴らない</strong></td></tr>
+        </table>
+        <p>止めた合図を分けているのは運用上の識別のためです。
+           <strong>ボタンで黙らせたなら異常は続いている</strong>ので人が見に行く必要があり、
+           勝手に止まったなら解消しているので放置でよい。
+           同じ音だとこの区別が現場でつきません。</p>
+        <p>ボタンで黙らせたあとは、<strong>異常が解消するまで鳴りません</strong>
+           (人が認識済みなので蒸し返さない)。一度解消してから再発すると、また鳴ります。</p>
+    </div>
+
+    <div class="card">
+        <h2>鳴り出す条件</h2>
+        <table>
+            <tr><th>条件</th><th>しきい値</th></tr>
+            <tr><td>キオスクからの連絡が途切れた (沈黙)</td><td>最後の受信から <strong>10 秒</strong></td></tr>
+            <tr><td>電源を入れてから一度も連絡が来ない</td><td>起動から <strong>30 秒</strong></td></tr>
+            <tr><td>キオスクが異常を自覚している</td><td>即時 (<code>HB NG &lt;理由&gt;</code> 受信時)</td></tr>
+            <tr><td>点呼の呼び出しが来ている</td><td>即時 (<code>call=1</code> 受信時)</td></tr>
+        </table>
+        <p>キオスクは 3 秒ごとに送るので、10 秒は 3 回ぶんの取りこぼしを許す設定です
+           (ブラウザの <code>setInterval</code> は背面タブで 1 秒までしか
+           絞られないため、3 秒間隔なら背面でも間に合います)。</p>
+    </div>
+
+    <div class="card">
+        <h2>動作確認 (シリアル 115200bps)</h2>
+        <p>点呼キオスク側が自動で <code>HB</code> を送るので、通常は何も打つ必要はありません。
+           以下は現地での切り分け用です。</p>
+        <ul>
+            <li><code>STATUS</code> —
+                <code>STATUS alarm state=idle cause=none hb_age_ms=1200 VER=…</code>。
+                <strong><code>hb_age_ms</code> が 3000 前後で上下していれば</strong>キオスクからの
+                連絡が届いています (増え続けるなら届いていません)</li>
+            <li><code>HB OK</code> — 手で 1 回ぶんの「正常」を送る (鳴っていれば止まります)</li>
+            <li><code>HB NG serial</code> — 手で「異常」を送る (鳴り始めます)</li>
+            <li><code>PING</code> — <code>PONG</code> 応答</li>
+            <li><code>LOG DUMP</code> — 起動直後のログ (USB 接続前に流れた分も残ります)</li>
+        </ul>
+        <p>状態が変わるたび、および 5 秒ごとに
+           <code>EVT ALARM state=idle|alarming|muted cause=none|silence|ng:&lt;理由&gt;|call</code>
+           が出ます。キオスク側の画面表示はこの行を読んでいます。</p>
+        <div class="warning">
+            <h3>この端末は点灯で知らせません — 反応は音だけ</h3>
+            <p>Atom VoiceS3R には点灯表示がありません。
+               起動しても<strong>光りませんが異常ではありません</strong>。
+               生きているかどうかは、<strong>キオスクを閉じて 10 秒待てば鳴る</strong>ことで
+               確かめられます。音が全く出ない場合はシリアルに
+               <code>EVT SPEAKER_NG</code> が出ていないか確認してください。</p>
+        </div>
+    </div>
+
+    <footer>
+        <p><a href="https://github.com/ippoan/alc-app-s3" target="_blank">GitHub Repository</a> ·
+           <a href="index.html">CoreS3 統合ハブ</a> ·
+           <a href="atoms3-print.html">AtomS3 印刷ブリッジ</a> ·
+           <a href="timecard.html">NFC タイムカード端末</a></p>
+    </footer>
+</body>
+</html>

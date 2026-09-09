@@ -130,6 +130,14 @@ jobs:
           - { name: atoms3-timecard,
               cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard cargo check --release --locked -p alc-hub-atoms3-timecard",
               cache_key: build-timecard-s3r }
+          # 点呼端末の警告デバイス (#135)。同じ本番機 (Atom VoiceS3R) だが
+          # sdkconfig は timecard とも違う (W5500 と NFC の legacy 衝突回避を落とし、
+          # 音と PSRAM だけ残した) ため cache_key は**新規**。使い回すと
+          # esp-idf-sys が永遠に cold (Refs #63)。
+          # build の leg (下) と**同じキーにすること** — 別々だと同じ成果物を 2 回作る
+          - { name: atoms3-alarm,
+              cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-alarm cargo check --release --locked -p alc-hub-atoms3-alarm",
+              cache_key: build-alarm-s3r }
 
     steps:
       - name: Checkout
@@ -273,8 +281,9 @@ jobs:
 
   # ------------------------------------------------------------------
   # build: フルビルド + 書き込みイメージ (main のみ)。
-  # cores3 (CoreS3 統合ハブ) と atoms3-print (AtomS3 印刷ブリッジ) の
-  # 2 バイナリを並行ビルドする。sdkconfig が異なるため esp-idf-sys の
+  # cores3 (CoreS3 統合ハブ) / atoms3-print (AtomS3 印刷ブリッジ) /
+  # atoms3-timecard (NFC タイムカード端末) / atoms3-alarm (警告デバイス) を
+  # 並行ビルドする。sdkconfig が異なるため esp-idf-sys の
   # ビルドは共有できず、rust-cache は leg ごとに分離する (cache_key)。
   # Pages サイト組み立ては assemble-pages job (後述) に分離
   # ------------------------------------------------------------------
@@ -314,6 +323,17 @@ jobs:
             flash_size: 8mb
             partition_table: crates/atoms3-timecard/partitions.csv
             cache_key: build-timecard-s3r
+          # 点呼端末の警告デバイス (#135)。dev チャネルは出さない (dev の実体は
+          # mem-hud = 画面の HUD で、画面を持たない Atom 系には意味がない)。
+          # **ネットワークを持たない機**なので /device/setup のデバイス登録も
+          # 要らない — 配布は Pages インストーラ (docs/alarm.html) だけで完結する。
+          # check の leg (上) と**同じキーにすること**
+          - name: atoms3-alarm
+            bin: alc-hub-atoms3-alarm
+            build_env: 'ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-alarm'
+            flash_size: 8mb
+            partition_table: crates/atoms3-alarm/partitions.csv
+            cache_key: build-alarm-s3r
 
     steps:
       - name: Checkout
@@ -558,7 +578,8 @@ jobs:
   # assemble-pages: 各 build leg の成果物を集めて Pages サイトを組む。
   # CoreS3 (index.html + manifest.json) / AtomS3 印刷ブリッジ
   # (atoms3-print.html + manifest-atoms3-print.json) / NFC タイムカード端末
-  # (timecard.html + manifest-timecard.json) の 3 機種分。
+  # (timecard.html + manifest-timecard.json) / 点呼端末の警告デバイス
+  # (alarm.html + manifest-alarm.json) の 4 機種分。
   # manifest の version は auth-worker /device/setup の「最新版」照会
   # (機種別) が突き合わせるため、それぞれの crate version + SHA を刻む
   # ------------------------------------------------------------------
@@ -586,7 +607,9 @@ jobs:
           echo "atoms3_version=$ATOMS3_VERSION" >> "$GITHUB_OUTPUT"
           TIMECARD_VERSION=$(grep '^version' crates/atoms3-timecard/Cargo.toml | head -1 | sed 's/version *= *"\(.*\)"/\1/')
           echo "timecard_version=$TIMECARD_VERSION" >> "$GITHUB_OUTPUT"
-          echo "cores3: $VERSION / atoms3-print: $ATOMS3_VERSION / timecard: $TIMECARD_VERSION"
+          ALARM_VERSION=$(grep '^version' crates/atoms3-alarm/Cargo.toml | head -1 | sed 's/version *= *"\(.*\)"/\1/')
+          echo "alarm_version=$ALARM_VERSION" >> "$GITHUB_OUTPUT"
+          echo "cores3: $VERSION / atoms3-print: $ATOMS3_VERSION / timecard: $TIMECARD_VERSION / alarm: $ALARM_VERSION"
 
       - name: Assemble Pages site
         run: |
@@ -594,6 +617,7 @@ jobs:
           cp docs/index.html _site/
           cp docs/atoms3-print.html _site/
           cp docs/timecard.html _site/
+          cp docs/alarm.html _site/
           # boot/main = Web インストーラー用 (manifest の parts、NVS 温存 #48)。
           # merged = espflash/esptool で offset 0 に一括書き込みする CLI 用
           # (この経路は従来どおり NVS が消える)。app = OTA 用
@@ -613,6 +637,10 @@ jobs:
           cp alc-hub-atoms3-timecard-main.bin _site/firmware/
           cp alc-hub-atoms3-timecard-merged.bin _site/firmware/
           cp alc-hub-atoms3-timecard-app.bin _site/firmware/
+          cp alc-hub-atoms3-alarm-boot.bin _site/firmware/
+          cp alc-hub-atoms3-alarm-main.bin _site/firmware/
+          cp alc-hub-atoms3-alarm-merged.bin _site/firmware/
+          cp alc-hub-atoms3-alarm-app.bin _site/firmware/
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.version }}+$SHORT_SHA\"/" \
             docs/manifest.json > _site/manifest.json
@@ -629,7 +657,10 @@ jobs:
           # 実体は mem-hud (hub-ui の画面 HUD) で、画面を持たない Atom 系には意味がない
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.timecard_version }}+$SHORT_SHA\"/" \
             docs/manifest-timecard.json > _site/manifest-timecard.json
-          cat _site/manifest.json _site/manifest-dev.json _site/manifest-atoms3-print.json _site/manifest-timecard.json
+          # 点呼端末の警告デバイス (#135)。timecard と同じく **dev チャネルは出さない**
+          sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.alarm_version }}+$SHORT_SHA\"/" \
+            docs/manifest-alarm.json > _site/manifest-alarm.json
+          cat _site/manifest.json _site/manifest-dev.json _site/manifest-atoms3-print.json _site/manifest-timecard.json _site/manifest-alarm.json
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

@@ -185,6 +185,24 @@ ffmpeg / sox のコマンド列として残すこと)。CoreS3 用の既存 raw 
    (`Sound::Stop` を受けたら再生中のループを抜ける) が要る — 現状の
    `while let Ok(sound) = rx.recv()` は再生中に次を受け取れないので、
    `recv_timeout` ベースへ書き換える。
+
+   > **実装状況 (2026-09、#135)**: **`recv_timeout` への書き換えは不採用。**
+   > `start_player` は `rx.recv()` のまま残し、名前も
+   > `Sound::Alert` / `Sound::AlertResolved` にした (`AlertLoop` /
+   > `AlertStop` という「再生側がループを持つ」前提の名前にしていない)。
+   >
+   > **繰り返しは呼び出し側が刻む**: `crates/atoms3-alarm` の鳴動ループが
+   > `alarm::ALERT_PERIOD_MS` (1.8 秒) ごとに `Sound::Alert` を送り直す。
+   > 1 回ぶんの再生は 3000Hz 200ms ×3 = 1 秒未満なので、再生スレッドは毎周期
+   > 必ず空く。
+   >
+   > **書き換えなかった理由**: 再生スレッドの中でループを回すとスレッドを
+   > 長時間占有し、**ボタンで止めたのに鳴り続ける** (`recv` は再生中に次を
+   > 受け取れない)。`recv_timeout` + 中断フラグでも「今鳴っている 1 発」は
+   > 鳴り終わるまで止まらないので、結局遅れは残る。**周期を判定側 (hub-core の
+   > 状態機械) が持つ方が、閾値がテスト済みのロジック 1 か所に集まる** —
+   > 再生側は「1 回鳴らす」だけを知っていればよい。
+   > (§2.3 冒頭の「割らなかった理由」と同じ判断)
 3. ~~**`speaker` モジュールの feature ゲートを直す**~~ — **対応済み**。
    `hub-drivers/Cargo.toml` に独立した `speaker = []` feature があり、
    `hub-drivers/src/lib.rs:42` は `#[cfg(feature = "speaker")] pub mod speaker;`。
@@ -560,6 +578,24 @@ auth-worker が発行する URL-safe な短い文字列がそのまま入る。*
 | `alc-app` | `cf-alc-recorder/src/auth.ts:46` | `RECORDER_DEVICE_ROLES` に新 role を追加 (これが無いと WS が 403) |
 
 ## 4. (2) 点呼端末の警告デバイス
+
+> **実装状況 (2026-09、#135)**
+> **ネットワークなし・USB だけで完結する版 (§6 のマイルストーン 2) まで入った。**
+> 機は **Atom VoiceS3R** (機 (1) と同じ本番機)。
+>
+> - `crates/hub-core/src/alarm.rs` … 沈黙判定と状態機械 (ホストでテスト済みの純粋
+>   ロジック)。閾値もここ (`SILENCE_MS` 10 秒 / `BOOT_GRACE_MS` 30 秒 /
+>   `ALERT_PERIOD_MS` 1.8 秒 / `BANNER_MS` 5 秒)
+> - `crates/hub-core/src/protocol.rs` … `HB OK` / `HB NG <reason>` / 末尾 `call=0|1`
+> - `crates/hub-drivers/src/speaker.rs` … `Sound::Alert` / `Sound::AlertResolved`
+> - `crates/atoms3-alarm/` … 配線 (音の初期化・ボタン G41・50ms の鳴動ループ) と
+>   コンソール (`HB` / `STATUS alarm`)。CI leg (`build-alarm-s3r`) と
+>   Pages インストーラ (`docs/alarm.html`) も同時に入れた
+>
+> **残っているもの**: 案 A (Wi-Fi + WS 常時接続で点呼呼び出しを受ける、§4.2) と
+> **ビープ後の音声メッセージ** (§2.1)。呼び出しは当面 heartbeat 相乗り (案 B、
+> `call=1`) で受ける。§4.3 の DTR/RTS は**まだ実機で確かめていない**。
+> キオスク側 (`ippoan/alc-app`) の送信実装は別 issue で並行して入れた。
 
 点呼キオスク (ブラウザ) の異常を人に気付かせる据置ブザー。用途は 2 つ:
 

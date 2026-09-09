@@ -1,0 +1,61 @@
+# alc-hub-atoms3-alarm — 点呼端末の警告デバイス (issue #135)
+#
+# 対象は **Atom VoiceS3R** (M5Stack Atom EchoS3R, SKU C126-ECHO /
+# ESP32-S3-PICO-1-N8R8 = 8MB Flash + **8MB Octal PSRAM**)。
+# crates/atoms3-timecard と同じ本番機で、**音 (ES8311) だけを使う**構成:
+# ネットワーク (W5500 / Wi-Fi) も NFC も積まないので、あちらから
+# Ethernet と Unit NFC 由来の設定は落としてある。
+
+# ホストリンク (キオスクからの heartbeat / STATUS) は Atom ネイティブ USB-C の
+# USB Serial/JTAG コンソール経由。**この機の入出力はここだけ**
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
+CONFIG_FREERTOS_HZ=1000
+
+# ---- hub-drivers 由来 ----
+#
+# 本機は uplink も OTA も printer も使わないが、alc-hub-drivers は 1 クレートなので
+# ws_uplink / auth_link / printer / ota / heap もコンパイル対象に入る。
+# 使わなくても宣言だけは要る (atoms3-nfc と同じ 2 行)。
+
+# auth_link / printer / ws_uplink の esp_crt_bundle_attach
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+# heap.rs の uxTaskGetSystemState (HEAP DUMP のタスク別スタック余裕)
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+
+# ---- PSRAM (機種固有) ----
+#
+# ★★ **MODE は OCT。QUAD ではない。** ルート (CoreS3) の SPIRAM 設定を
+#    そのまま持ってくると QUAD になり、この機では PSRAM が初期化できず
+#    IGNORE_NOTFOUND により**黙って PSRAM なしで起動**する。
+#
+#    根拠は M5Stack 公式ファーム (m5stack/uiflow-micropython) のボード定義:
+#    `m5stack/boards/M5STACK_Atom_EchoS3R/mpconfigboard.cmake` の
+#    SDKCONFIG_DEFAULTS が `boards/sdkconfig.spiram_oct`
+#    (= `CONFIG_SPIRAM_MODE_OCT=y`) を読む。同じ M5 の CoreS3 は
+#    `sdkconfig.spiram_sx` で OCT を読まない — **両機の差は M5 自身の設定でも
+#    OCT/QUAD で分かれている** (詳細は crates/atoms3-timecard/sdkconfig.defaults)。
+#
+#    **起動ログの `EVT HEAP` で `free_psram` が 0 でないことを必ず確認すること。**
+#    ここを間違えても boot は通るので、コンパイルでは絶対に分からない。
+#
+#    本機で PSRAM が要るのは再生スレッドのスタック (`task::name_next_psram`) 程度で、
+#    無くても鳴る (PSRAM 非搭載なら内部RAM へ落ちる、task.rs 参照)。
+#    それでも設定を揃えるのは、**同じ本番機の 2 機種で PSRAM の扱いが違うと
+#    「どちらの機の実測か」で毎回混乱する**ため
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+# 4KB 未満の割当 (頻繁アクセスの小物・ドライバ周り) は内蔵 SRAM に残す。
+# 値は atoms3-timecard と同値 — 本機は TLS も NFC も無いので余裕はあるが、
+# 揃えておく方が「あちらで測った内部RAM の数字」がそのまま参考になる
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
+# DMA / 内蔵必須の割当 (I2S DMA を含む) が枯渇しないよう内蔵側に 64KB 予約
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+# PSRAM 初期化失敗時も abort せず PSRAM なしで boot 継続 (fail-safe)。
+# **警告デバイスは boot loop より「PSRAM 無しでも鳴る」方が上**。
+# 検出は上記 `free_psram` の目視に委ねる
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
