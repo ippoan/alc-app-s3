@@ -33,6 +33,12 @@
 //! 鳴動へ戻る。黙らせているあいだも [`MUTED_TICK_MS`] ごとに
 //! [`Action::PlayMutedTick`] を出す。**完全な無音にはしない** — 異常が続いて
 //! いることを忘れられるため (2026-09-09 の実機確認でのユーザー要望)。
+//!
+//! **意図した reload では鳴らさない** (issue #192) — ブラウザはページを再読み込みする
+//! 直前に `HB OK grace=45` を送る。`grace=<秒>` 付きの heartbeat は**その 1 回だけ**
+//! 次の沈黙判定の締切を `last_hb_at + grace 秒` に置き換える。次の heartbeat
+//! (grace 無し) が来れば通常の [`SILENCE_MS`] に戻り、猶予中に来なければ締切で
+//! 従来どおり `Cause::Silence`。音・周期・起動猶予 ([`BOOT_GRACE_MS`]) は変えない。
 
 use std::sync::{Arc, Mutex};
 
@@ -158,6 +164,10 @@ pub struct AlarmMonitor {
     /// 一度も heartbeat を受けていないときに沈黙とみなすまでの猶予。
     /// `None` = **初回 heartbeat を受けるまで沈黙警告を出さない** (武装方式)
     boot_grace_ms: Option<u64>,
+    /// `HB … grace=<秒>` で広げた**次の沈黙判定の締切** (絶対時刻 ms)。
+    /// `Some` のあいだは [`SILENCE_MS`] の代わりにこれで判定し、次の heartbeat
+    /// (grace 無し) で `None` に戻る (issue #192)
+    silence_deadline_override: Option<u64>,
     /// 画面タップ ([`AlarmMonitor::request_button`]) の予約。次の
     /// [`AlarmMonitor::tick`] が消費する
     button_pending: bool,
@@ -196,6 +206,7 @@ impl AlarmMonitor {
             state: State::Idle,
             last_hb_at: None,
             boot_grace_ms,
+            silence_deadline_override: None,
             button_pending: false,
             // 未受信のあいだは「正常」に倒しておく。この間の異常判定は
             // 起動猶予 (boot_grace_ms) の沈黙だけが担う
@@ -210,10 +221,29 @@ impl AlarmMonitor {
     /// heartbeat を 1 行受け取る (`HB OK` / `HB NG <reason>` / 末尾 `call=0|1`)。
     /// **状態遷移はここでは起こさない** — 次の [`Self::tick`] でまとめて判定する
     pub fn on_heartbeat(&mut self, now_ms: u64, ok: bool, reason: Option<&str>, call: bool) {
+        self.on_heartbeat_with_grace(now_ms, ok, reason, call, None);
+    }
+
+    /// [`Self::on_heartbeat`] の `grace=<秒>` つき (issue #192)。
+    ///
+    /// `grace` が `Some(秒)` なら**この 1 回だけ**次の沈黙判定の締切を
+    /// `now_ms + 秒` に置く (ブラウザが意図した reload の直前に送る。再接続まで
+    /// 鳴らさない)。`None` なら締切の上書きを消し、通常の [`SILENCE_MS`] に戻る。
+    /// 鳴動中 / 黙らせ中に来ても扱いは同じ — 「heartbeat が来た」ので次の
+    /// [`Self::tick`] で解消し、そのまま猶予に入る
+    pub fn on_heartbeat_with_grace(
+        &mut self,
+        now_ms: u64,
+        ok: bool,
+        reason: Option<&str>,
+        call: bool,
+        grace: Option<u16>,
+    ) {
         self.last_hb_at = Some(now_ms);
         self.hb_ok = ok;
         self.hb_reason = reason.map(|s| s.to_string());
         self.hb_call = call;
+        self.silence_deadline_override = grace.map(|secs| now_ms + u64::from(secs) * 1_000);
     }
 
     /// 本体ボタン (VoiceS3R は G41) が押された。**トグル** — 鳴動中なら黙らせ、
@@ -344,17 +374,25 @@ impl AlarmMonitor {
     /// 足して返すこと** (バージョンは hub-common 側にあり、このクレートからは見えない)。
     /// 先頭 2 トークン `STATUS alarm` は**ブラウザ側が機種を識別する目印**なので変えない
     /// — CoreS3 と VoiceS3R は USB の VID/PID が同一で記述子では見分けられない
+    ///
+    /// `HB … grace=<秒>` の猶予中だけ末尾に ` grace_left_ms=<残り>` が付く (issue #192)
     pub fn status_line(&self, now_ms: u64) -> String {
-        format!(
+        let mut line = format!(
             "STATUS alarm state={} cause={} hb_age_ms={}",
             self.state.label(),
             self.cause_at(now_ms).label(),
             self.hb_age_label(now_ms),
-        )
+        );
+        let grace_left = self.grace_left_ms(now_ms);
+        if grace_left > 0 {
+            line.push_str(&format!(" grace_left_ms={grace_left}"));
+        }
+        line
     }
 
     /// **自前の `STATUS` 行を持つ機 (CoreS3)** が行末に足す 1 トークン
-    /// (`ALARM=<state>/<cause>/<hb_age_ms>`)。
+    /// (`ALARM=<state>/<cause>/<hb_age_ms>/<grace_left_ms>`。4 番目は
+    /// `HB … grace=<秒>` の猶予の残り、猶予外は `0` — issue #192)。
     ///
     /// ★ CoreS3 は [`Self::status_line`] を使わないこと — ブラウザ側
     /// (`useCoreS3Serial` の `classify()`) は行頭 `STATUS alarm` と `EVT ALARM` を
@@ -363,11 +401,19 @@ impl AlarmMonitor {
     /// 触らずに鳴動状態を渡せる (issue #187)
     pub fn status_field(&self, now_ms: u64) -> String {
         format!(
-            "ALARM={}/{}/{}",
+            "ALARM={}/{}/{}/{}",
             self.state.label(),
             self.cause_at(now_ms).label(),
             self.hb_age_label(now_ms),
+            self.grace_left_ms(now_ms),
         )
+    }
+
+    /// `HB … grace=<秒>` で広げた締切までの残り ms。猶予外 (上書き無し / 締切を
+    /// 過ぎた) は `0`
+    fn grace_left_ms(&self, now_ms: u64) -> u64 {
+        self.silence_deadline_override
+            .map_or(0, |deadline| deadline.saturating_sub(now_ms))
     }
 
     /// 最後の heartbeat からの経過 ms。一度も受けていなければ `-`
@@ -404,7 +450,9 @@ impl AlarmMonitor {
                 Some(grace) => now_ms >= grace,
                 None => false,
             },
-            Some(t) => now_ms.saturating_sub(t) >= SILENCE_MS,
+            // 締切は通常 `last_hb_at + SILENCE_MS`。`HB … grace=<秒>` を受けた直後の
+            // 1 回だけ `last_hb_at + grace` に置き換わる (issue #192)
+            Some(t) => now_ms >= self.silence_deadline_override.unwrap_or(t + SILENCE_MS),
         };
         if silence {
             return Cause::Silence;
@@ -719,7 +767,7 @@ mod tests {
         assert_eq!(m.tick(BOOT_GRACE_MS), vec![emit("idle", "none")]);
         // 60 秒経っても出るのはバナーだけ (音は 1 度も鳴らない)
         assert_eq!(m.tick(60_000), vec![emit("idle", "none")]);
-        assert_eq!(m.status_field(60_000), "ALARM=idle/none/-");
+        assert_eq!(m.status_field(60_000), "ALARM=idle/none/-/0");
     }
 
     /// 武装後は VoiceS3R と同じ判定 — 初回 heartbeat から 10 秒の途絶で鳴る
@@ -736,7 +784,7 @@ mod tests {
         );
         assert_eq!(
             m.status_field(60_000 + SILENCE_MS),
-            "ALARM=alarming/silence/10000"
+            "ALARM=alarming/silence/10000/0"
         );
     }
 
@@ -754,7 +802,7 @@ mod tests {
             m.tick(SILENCE_MS + 500),
             vec![Action::PlayResolved, emit("idle", "none")]
         );
-        assert_eq!(m.status_field(SILENCE_MS + 500), "ALARM=idle/none/0");
+        assert_eq!(m.status_field(SILENCE_MS + 500), "ALARM=idle/none/0/0");
         // 一度武装したら解けない: また 10 秒途絶すれば鳴る
         assert_eq!(
             m.tick(SILENCE_MS + 500 + SILENCE_MS),
@@ -780,7 +828,7 @@ mod tests {
         assert!(m.request_button());
         let t = SILENCE_MS + 50;
         assert_eq!(m.tick(t), vec![emit("muted", "silence")]);
-        assert_eq!(m.status_field(t), "ALARM=muted/silence/10050");
+        assert_eq!(m.status_field(t), "ALARM=muted/silence/10050/0");
         // 黙らせている最中のタップは受け付けない (画面の通常操作へ素通し)。
         // 鳴動へは戻さず、Muted の短い合図もそのまま続く
         assert!(!m.request_button());
@@ -820,5 +868,89 @@ mod tests {
         assert_eq!(Cause::Silence.label(), "silence");
         assert_eq!(Cause::Call.label(), "call");
         assert_eq!(Cause::Ng("serial".into()).label(), "ng:serial");
+    }
+
+    #[test]
+    fn a_grace_heartbeat_widens_the_next_silence_deadline_once() {
+        let mut m = AlarmMonitor::new();
+        m.on_heartbeat(0, true, None, false);
+        // reload の直前にブラウザが送る `HB OK grace=45` (issue #192)
+        m.on_heartbeat_with_grace(1_000, true, None, false, Some(45));
+        assert_eq!(
+            m.status_line(1_000),
+            "STATUS alarm state=idle cause=none hb_age_ms=0 grace_left_ms=45000"
+        );
+        assert_eq!(m.status_field(21_000), "ALARM=idle/none/20000/25000");
+        // 通常なら 10 秒で鳴るところ、40 秒沈黙しても鳴らない (出るのはバナーだけ)
+        assert_eq!(m.tick(1_000 + SILENCE_MS), vec![emit("idle", "none")]);
+        assert_eq!(m.tick(41_000), vec![emit("idle", "none")]);
+        // 猶予 (45 秒) を過ぎても届かなければ従来どおり沈黙 = 異常
+        assert_eq!(m.tick(45_999), vec![]);
+        assert_eq!(
+            m.tick(46_000),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+        );
+        // 猶予を使い切ったあとは grace_left_ms を出さない (CoreS3 は 0)
+        assert_eq!(
+            m.status_line(51_000),
+            "STATUS alarm state=alarming cause=silence hb_age_ms=50000"
+        );
+        assert_eq!(m.status_field(51_000), "ALARM=alarming/silence/50000/0");
+    }
+
+    #[test]
+    fn a_plain_heartbeat_during_the_grace_restores_the_normal_deadline() {
+        let mut m = AlarmMonitor::new();
+        m.on_heartbeat_with_grace(0, true, None, false, Some(45));
+        // 再接続して通常の heartbeat が来た — 猶予はここで終わる
+        m.on_heartbeat(5_000, true, None, false);
+        assert_eq!(m.status_field(5_000), "ALARM=idle/none/0/0");
+        // 以後は通常どおり 10 秒で沈黙 (猶予の残りは引き継がない)
+        assert_eq!(m.tick(5_000 + SILENCE_MS - 1), vec![emit("idle", "none")]);
+        assert_eq!(
+            m.tick(5_000 + SILENCE_MS),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+        );
+    }
+
+    #[test]
+    fn a_grace_heartbeat_while_alarming_resolves_and_starts_the_grace() {
+        let mut m = AlarmMonitor::new();
+        m.on_heartbeat(0, true, None, false);
+        assert_eq!(
+            m.tick(SILENCE_MS),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+        );
+        // 鳴動中に grace 付きが来ても「heartbeat が来た」として解消し、そのまま猶予へ
+        m.on_heartbeat_with_grace(12_000, true, None, false, Some(30));
+        assert_eq!(
+            m.tick(12_000),
+            vec![Action::PlayResolved, emit("idle", "none")]
+        );
+        assert_eq!(
+            m.status_line(12_000),
+            "STATUS alarm state=idle cause=none hb_age_ms=0 grace_left_ms=30000"
+        );
+        // 猶予いっぱいまでは鳴らず、締切で沈黙
+        assert_eq!(m.tick(41_999), vec![emit("idle", "none")]);
+        assert_eq!(
+            m.tick(42_000),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+        );
+    }
+
+    #[test]
+    fn a_grace_heartbeat_while_muted_resolves_too() {
+        let mut m = AlarmMonitor::new();
+        m.on_heartbeat(0, true, None, false);
+        m.tick(SILENCE_MS);
+        // ボタンで黙らせているあいだに grace 付きが来た
+        m.on_button(11_000);
+        m.on_heartbeat_with_grace(12_000, true, None, false, Some(20));
+        assert_eq!(
+            m.tick(12_000),
+            vec![Action::PlayResolved, emit("idle", "none")]
+        );
+        assert_eq!(m.status_field(12_000), "ALARM=idle/none/0/20000");
     }
 }

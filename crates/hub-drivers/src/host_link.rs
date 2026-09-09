@@ -17,8 +17,8 @@
 //! | `ERROR <message>` | エラー画面を表示 |
 //! | `RESET` | 待機画面へ戻す |
 //! | `ROTATE <0\|90\|180\|270>` | 画面向きを変更 (NVS 保存、次回起動も維持) |
-//! | `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0 BOARD=cores3 ALARM=idle/none/-` を返す |
-//! | `HB OK` / `HB NG <reason>` | 運行者 PWA の heartbeat (3 秒ごと)。沈黙警告の判定器へ渡す。**応答しない** |
+//! | `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0 BOARD=cores3 ALARM=idle/none/-/0` を返す (`ALARM=` の 4 番目は `grace=` の猶予の残り ms、猶予外は 0) |
+//! | `HB OK` / `HB NG <reason>` | 運行者 PWA の heartbeat (3 秒ごと)。末尾に任意で `call=0\|1`、意図した reload の直前は `grace=<秒>` (#192)。沈黙警告の判定器へ渡す。**応答しない** |
 //! | `AUTH SET <id> <secret> <tenant>` | device credential を注入 (USB provisioning) |
 //! | `AUTH UNPAIR` | 保存済み device credential を破棄 (ローカルのみ) |
 //! | `AUTH STATUS` | `AUTH PAIRED <tenant> <id>` / `AUTH UNPAIRED` を返す |
@@ -219,8 +219,13 @@ fn handle_line(
         // 運行者 PWA からの heartbeat (`HB OK`、3 秒ごと)。**応答は返さない**。
         // 途切れたら鳴らすのは鳴動ループ (src/main.rs)、判定は alc_hub_core::alarm。
         // 初回のこの行が沈黙警告を**武装**する (それまでは鳴らない、#187)
-        HostCommand::Heartbeat { ok, reason, call } => {
-            crate::alarm::apply_heartbeat(alarm, ok, reason.as_deref(), call);
+        HostCommand::Heartbeat {
+            ok,
+            reason,
+            call,
+            grace,
+        } => {
+            crate::alarm::apply_heartbeat(alarm, ok, reason.as_deref(), call, grace);
         }
         // ★ 行頭 (`STATUS LAN=…`) は変えないこと。ブラウザ側 (`useCoreS3Serial` の
         //   `classify()`) は行頭 `STATUS alarm` を「警告デバイス = 別機種」と判定して

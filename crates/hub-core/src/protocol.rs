@@ -140,10 +140,13 @@ pub enum HostCommand {
     /// - `HB OK` … 正常
     /// - `HB NG <reason>` … キオスクが異常を自覚している (reason は表示用ラベル)
     /// - 末尾に任意で `call=1` / `call=0` … 点呼の呼び出し (plan §4.2 の案 B)
+    /// - 末尾に任意で `grace=<秒>` (1〜120) … **この 1 回だけ**沈黙の猶予を広げる
+    ///   (ブラウザが意図した reload の直前に送る、issue #192)。`call=` と順不同
     Heartbeat {
         ok: bool,
         reason: Option<String>,
         call: bool,
+        grace: Option<u16>,
     },
 }
 
@@ -324,12 +327,20 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
             };
             let mut reason: Option<String> = None;
             let mut call = false;
+            let mut grace: Option<u16> = None;
             for tok in it {
                 if let Some(v) = tok.strip_prefix("call=") {
                     match v {
                         "1" => call = true,
                         "0" => call = false,
                         _ => return Err("ERR HB: call= には 0|1 が必要です".into()),
+                    }
+                } else if let Some(v) = tok.strip_prefix("grace=") {
+                    // 意図した reload の猶予 (issue #192)。上限は reload → 再接続に
+                    // 現実的な範囲に絞る — 大きすぎると本当の沈黙を見逃す
+                    match v.parse::<u16>() {
+                        Ok(secs) if (1..=120).contains(&secs) => grace = Some(secs),
+                        _ => return Err("ERR HB: grace= には 1〜120 が必要です".into()),
                     }
                 } else if reason.is_some() {
                     return Err(format!("ERR HB: 余分なトークンです: {tok}"));
@@ -339,7 +350,12 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                     return Err("ERR HB: reason は [a-z0-9_]+ のみです".into());
                 }
             }
-            HostCommand::Heartbeat { ok, reason, call }
+            HostCommand::Heartbeat {
+                ok,
+                reason,
+                call,
+                grace,
+            }
         }
         // `PAIR` または `BLE PAIR`
         "PAIR" => HostCommand::BlePair,
@@ -802,10 +818,20 @@ mod tests {
     }
 
     fn hb(ok: bool, reason: Option<&str>, call: bool) -> Result<Option<HostCommand>, String> {
+        hb_grace(ok, reason, call, None)
+    }
+
+    fn hb_grace(
+        ok: bool,
+        reason: Option<&str>,
+        call: bool,
+        grace: Option<u16>,
+    ) -> Result<Option<HostCommand>, String> {
         Ok(Some(HostCommand::Heartbeat {
             ok,
             reason: reason.map(|s| s.to_string()),
             call,
+            grace,
         }))
     }
 
@@ -849,6 +875,51 @@ mod tests {
         assert!(parse_line("HB OK call=yes", T).is_err());
         // 理由は 1 つだけ
         assert!(parse_line("HB NG serial extra", T).is_err());
+    }
+
+    #[test]
+    fn heartbeat_grace() {
+        // 意図した reload の直前にブラウザが送る形 (issue #192)
+        assert_eq!(
+            parse_line("HB OK grace=45", T),
+            hb_grace(true, None, false, Some(45))
+        );
+        // 境界 (1〜120)
+        assert_eq!(
+            parse_line("HB OK grace=1", T),
+            hb_grace(true, None, false, Some(1))
+        );
+        assert_eq!(
+            parse_line("HB OK grace=120", T),
+            hb_grace(true, None, false, Some(120))
+        );
+        // call= と順不同、reason との組合せも可
+        assert_eq!(
+            parse_line("HB OK grace=30 call=1", T),
+            hb_grace(true, None, true, Some(30))
+        );
+        assert_eq!(
+            parse_line("HB NG nfc_bridge call=0 grace=60", T),
+            hb_grace(false, Some("nfc_bridge"), false, Some(60))
+        );
+        assert_eq!(
+            parse_line("HB NG grace=10 serial", T),
+            hb_grace(false, Some("serial"), false, Some(10))
+        );
+    }
+
+    #[test]
+    fn heartbeat_rejects_bad_grace() {
+        // grace= の値は 1〜120 の整数のみ
+        assert_eq!(
+            parse_line("HB OK grace=0", T),
+            Err("ERR HB: grace= には 1〜120 が必要です".into())
+        );
+        assert!(parse_line("HB OK grace=121", T).is_err());
+        assert!(parse_line("HB OK grace=999", T).is_err());
+        assert!(parse_line("HB OK grace=abc", T).is_err());
+        assert!(parse_line("HB OK grace=", T).is_err());
+        assert!(parse_line("HB OK grace=-5", T).is_err());
     }
 
     #[test]

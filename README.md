@@ -344,8 +344,8 @@ VOICEVOX の利用規約によりクレジット表記が必要 — 本製品を
 
 | 方向 | 行 | 説明 |
 |---|---|---|
-| 管理者のブラウザ → 端末 | `HB OK` / `HB NG <reason>` | heartbeat。3 秒ごと。末尾に任意で `call=0` / `call=1` (**着信** = 点呼の呼び出し)。reason は `[a-z0-9_]+` (例 `signaling`)。**返信しない** |
-| 管理者のブラウザ → 端末 | `STATUS` | `STATUS alarm state=<idle\|alarming\|muted> cause=<none\|silence\|ng:<reason>\|call> hb_age_ms=<n\|-> VER=…` |
+| 管理者のブラウザ → 端末 | `HB OK` / `HB NG <reason>` | heartbeat。3 秒ごと。末尾に任意で `call=0` / `call=1` (**着信** = 点呼の呼び出し)、意図した reload の直前は `grace=<秒>` (1〜120。**その 1 回だけ**沈黙の猶予を広げる、#192)。reason は `[a-z0-9_]+` (例 `signaling`)。**返信しない** |
+| 管理者のブラウザ → 端末 | `STATUS` | `STATUS alarm state=<idle\|alarming\|muted> cause=<none\|silence\|ng:<reason>\|call> hb_age_ms=<n\|-> [grace_left_ms=<n>] VER=…` (`grace_left_ms` は `grace=` の猶予中のみ。CoreS3 は `ALARM=<state>/<cause>/<hb_age_ms>/<grace_left_ms>`、猶予外は `0`) |
 | 端末 → 管理者のブラウザ | `EVT ALARM state=… cause=…` | 状態が変わるたび + 5 秒ごと (ブラウザのバナー用) |
 
 `PING` / `HEAP` / `LOG DUMP` は共通実装 (`hub-drivers/src/console.rs`)。

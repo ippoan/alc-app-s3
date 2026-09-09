@@ -35,12 +35,21 @@ pub fn with_monitor(monitor: &SharedMonitor, f: impl FnOnce(&mut AlarmMonitor, u
     }
 }
 
-/// `HB OK` / `HB NG <reason>` (末尾 `call=0|1`) を判定器へ渡す。
+/// `HB OK` / `HB NG <reason>` (末尾 `call=0|1` / `grace=<秒>`) を判定器へ渡す。
 ///
 /// **応答を返さない** — 3 秒ごとに来るので返すとホストのログが埋まる。
-/// 状態遷移もここでは起こさず、次の `tick` (鳴動ループ) がまとめて判定する
-pub fn apply_heartbeat(monitor: &SharedMonitor, ok: bool, reason: Option<&str>, call: bool) {
-    with_monitor(monitor, |m, now| m.on_heartbeat(now, ok, reason, call));
+/// 状態遷移もここでは起こさず、次の `tick` (鳴動ループ) がまとめて判定する。
+/// `grace` は意図した reload の直前にブラウザが付ける 1 回限りの猶予 (issue #192)
+pub fn apply_heartbeat(
+    monitor: &SharedMonitor,
+    ok: bool,
+    reason: Option<&str>,
+    call: bool,
+    grace: Option<u16>,
+) {
+    with_monitor(monitor, |m, now| {
+        m.on_heartbeat_with_grace(now, ok, reason, call, grace)
+    });
 }
 
 #[cfg(feature = "speaker")]
