@@ -233,10 +233,12 @@ pub fn run(
             if let Ok(mut st) = status.lock() {
                 st.usb_host = usb;
             }
-            // 切り替える瞬間だけ i2c を叩く (status のロックは手放してから)
+            // 切り替えるときだけ i2c を叩く (status のロックは手放してから)。
+            // 成功したときだけ Latch に確定させる — 失敗なら次の poll で再試行
             if let Some(desired) = usb5v.update(usb) {
                 match alc_hub_board::power::set_ext_5v_out(&mut i2c, desired) {
                     Ok(()) => {
+                        usb5v.commit(desired);
                         if let Ok(mut st) = status.lock() {
                             st.ext_5v_out = desired;
                         }
@@ -250,7 +252,7 @@ pub fn run(
                         // は hook を通らないため、再起動後の追跡はこちらが頼り)
                         log::info!("{line}");
                     }
-                    Err(e) => log::warn!("ui: M-Bus 5V 切り替えに失敗: {e:?}"),
+                    Err(e) => log::warn!("ui: M-Bus 5V 切り替えに失敗 (次の poll で再試行): {e:?}"),
                 }
             }
             last_usb = now;
