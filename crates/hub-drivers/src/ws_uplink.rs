@@ -464,7 +464,8 @@ fn flush_queue(conn: &mut Option<Conn>, queue: &mut UplinkQueue, unsent_only: bo
 /// 接続を切断状態へ遷移させる。**既に切断済みなら何もしない** —
 /// 呼び出し側 (WsEvent::Disconnected) はこの遷移が実際に起きたときだけ
 /// `EVT WS_DISCONNECTED` を積む (毎回積むと 10 秒ごとの再接続失敗が
-/// リング (当時 4 KB。#217 で PSRAM 256 KB) を約 95 秒で一周させ、切り分けに要る EVT を
+/// リング (当時 4 KB。#217 で CoreS3 では PSRAM 256 KB、それ以外の機種は 4 KB のまま)
+/// を約 95 秒で一周させ、切り分けに要る EVT を
 /// 押し出す。Refs #217)
 fn mark_disconnected(conn: &mut Option<Conn>, reason: &str, queue: &UplinkQueue) -> bool {
     let Some(c) = conn.as_mut() else {

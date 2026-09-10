@@ -162,8 +162,9 @@ pub fn tail_lines(text: &str, max_bytes: usize) -> (&str, bool) {
 /// 末尾から `offset` バイト遡った位置を終端とし、そこから前へ `max_bytes`
 /// バイト以内に収まる**行の並び**と、実際に使った offset (#217)。
 ///
-/// リング (CoreS3 は 256 KB) は 1 回の応答 ([`crate::uplink::LOG_MAX_BYTES`]) に
-/// 収まらないので、`get_log` command はこれで末尾以外の窓も返す。`offset = 0` は
+/// リング (CoreS3 では 256 KB、それ以外の機種は 4 KB) は 1 回の応答
+/// ([`crate::uplink::LOG_MAX_BYTES`]) に収まらないので、`get_log` command は
+/// これで末尾以外の窓も返す。`offset = 0` は
 /// [`tail_lines`] と同じ。終端が行の途中なら、その欠けた末尾行を捨てて手前の
 /// 行境界に寄せ、戻り値の offset もその分だけ大きくなる — 呼び側は
 /// `offset + 返したバイト数` を次の offset にすれば隙間なく遡れる (読むあいだに
@@ -183,8 +184,8 @@ pub fn window_lines(text: &str, offset: usize, max_bytes: usize) -> (&str, usize
 
 /// `get_log` command (#195) の command_result payload (JSON オブジェクト文字列)。
 /// `text` (リングの sanitize 済み全文) を末尾から `offset` バイト遡った位置から
-/// 前へ `max_bytes` 以内、行境界で切って返す ([`window_lines`])。リング (CoreS3 は
-/// 256 KB) は 1 回では取り切れない — `truncated` と `total_bytes` で伝え、実際に
+/// 前へ `max_bytes` 以内、行境界で切って返す ([`window_lines`])。リング (CoreS3 では
+/// 256 KB、それ以外の機種は 4 KB) は 1 回では取り切れない — `truncated` と `total_bytes` で伝え、実際に
 /// 使った `offset` を返す。呼び側は `offset + bytes` を次の offset にして遡る
 /// (#217)。文字列のエスケープは serde_json に任せる。
 ///
