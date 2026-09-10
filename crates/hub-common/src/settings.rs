@@ -40,6 +40,9 @@ const KEY_WS_SEQ: &str = "ws_seq";
 const KEY_BOOT_ID: &str = "boot_id";
 /// 直近 8 回の reset 理由の履歴 (u64 1 キーに詰める、Refs #211)
 const KEY_RESET_HIST: &str = "reset_hist";
+/// OTA 直後の image を前の image へ戻したときの証跡 (1 行の文字列、Refs #217)。
+/// 戻す直前に書き、戻った先の起動で ws_uplink::start が EVT に出して消す
+const KEY_OTA_ROLLBACK: &str = "ota_rollback";
 /// cf-alc-recorder WS URL の上書き (`WS URL` コマンド)
 const KEY_WS_URL: &str = "ws_url";
 /// プリンター宛先 host:port (印刷ブリッジ、`PRINTER ADDR` コマンド。#38)
@@ -287,6 +290,29 @@ impl Settings {
             log::warn!("settings: reset_hist 保存失敗: {e:?}");
         }
         next
+    }
+
+    /// OTA rollback の証跡を 1 行保存する (Refs #217)。lock が取れない /
+    /// 保存に失敗しても戻す動作は止めない (ログだけ出す)
+    pub fn set_ota_rollback_note(&self, note: &str) {
+        let Ok(nvs) = self.nvs.lock() else {
+            log::warn!("settings: ota_rollback lock 失敗");
+            return;
+        };
+        if let Err(e) = nvs.set_str(KEY_OTA_ROLLBACK, note) {
+            log::warn!("settings: ota_rollback 保存失敗: {e:?}");
+        }
+    }
+
+    /// OTA rollback の証跡を取り出して消す (Refs #217)。無ければ None
+    pub fn take_ota_rollback_note(&self) -> Option<String> {
+        let nvs = self.nvs.lock().ok()?;
+        let mut buf = [0u8; 128];
+        let note = nvs.get_str(KEY_OTA_ROLLBACK, &mut buf).ok()??.to_string();
+        if let Err(e) = nvs.remove(KEY_OTA_ROLLBACK) {
+            log::warn!("settings: ota_rollback 削除失敗: {e:?}");
+        }
+        (!note.is_empty()).then_some(note)
     }
 
     /// WS 送信の seq 採番カウンタ (未保存は 0)

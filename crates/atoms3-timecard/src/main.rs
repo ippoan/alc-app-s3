@@ -69,7 +69,7 @@
 //! # 起動順 (変えてはいけない)
 //!
 //! `crashlog::init` → `Settings::new` → `heap::start` → `console::start` →
-//! `ws_uplink::start` → LAN → `ota::mark_boot_valid`。**`crashlog::init` は
+//! `ws_uplink::start` → LAN (OTA の確定は ws_uplink が初回の WS 接続で行う)。**`crashlog::init` は
 //! `heap::start` より前**。配線漏れで `.noinit` のゴミ帳簿に書いて boot loop に
 //! なった実害が 2026-07-14 にある。
 
@@ -84,7 +84,7 @@ use alc_hub_common::{
 use alc_hub_drivers::nfc::NfcEvent;
 use alc_hub_drivers::speaker::Sound;
 use alc_hub_drivers::timecard::Punch;
-use alc_hub_drivers::{crashlog, es8311, eth_w5500, heap, nfc, ntp, ota, speaker, ws_uplink};
+use alc_hub_drivers::{crashlog, es8311, eth_w5500, heap, nfc, ntp, speaker, ws_uplink};
 use anyhow::Result;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::{
@@ -223,9 +223,6 @@ fn main() -> Result<()> {
         Arc::clone(&status),
         move |e: &NfcEvent| on_card(e, &ws_meas_tx, speaker_tx.as_ref()),
     )?;
-
-    // 起動完了 = OTA rollback 解除 (CoreS3 と同じ安全装置、ota.rs 参照)
-    ota::mark_boot_valid();
 
     // SNTP。**打刻端末では必須** — 起動しないとシステム時刻が 1970 のままで、
     // 打刻の `recorded_at_ms` が 1970 起点で送られる (範囲内なので DB 側で NULL
