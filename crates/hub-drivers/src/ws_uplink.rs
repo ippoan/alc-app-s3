@@ -31,7 +31,7 @@ use std::net::TcpStream;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
 use alc_hub_core::uplink::{
-    command_action, command_bus5v_mode, command_gw_url, command_log_max_bytes, command_ota_url,
+    command_action, command_gw_url, command_log_max_bytes, command_ota_url,
     command_print_chunk, command_print_url, command_result_frame, measurement_frame,
     parse_downlink, should_wait_for_clock, Downlink, DroppedEntry, UplinkQueue, PING_FRAME,
 };
@@ -767,46 +767,21 @@ fn handle_downlink(
                     );
                     send_command_result(conn, &id, &payload);
                 }
-                // M-Bus 5V 出力モードの遠隔設定 (auth-worker 端末一覧から。
-                // シリアルの `BUS5V AUTO|ON|OFF` と同じ NVS 保存先)。
-                // **その場では 5V を切り替えない** — AW9523 (BUS_EN) は起動時に
-                // しか触らないため、反映は次の起動から (`reboot` command と組)
-                Some("bus5v") => match command_bus5v_mode(&payload) {
-                    Some(mode) => match settings.set_bus5v(mode) {
-                        Ok(()) => {
-                            let payload = format!(
-                                r#"{{"ok":true,"mode":"{}","applies_after_reboot":true}}"#,
-                                mode.label(),
-                            );
-                            send_command_result(conn, &id, &payload);
-                        }
-                        Err(e) => {
-                            log::error!("ws_uplink: BUS5V 保存失敗: {e:?}");
-                            send_command_result(
-                                conn,
-                                &id,
-                                r#"{"ok":false,"message":"save failed"}"#,
-                            );
-                        }
-                    },
-                    None => {
-                        send_command_result(conn, &id, r#"{"ok":false,"message":"invalid mode"}"#)
-                    }
-                },
-                // M-Bus 5V の照会: 設定値 (NVS) と、起動時に実際に出したか。
-                // `Auto` の個体は電池の有無で決まるので battery_present も返す
+                // M-Bus 5V の照会 (設定は無い、#202): USB ホストの有無と、
+                // それに追随して hub-ui が実際に出しているか。`power_read` は
+                // AXP2101 を一度でも読めたか — 起動後 10 秒は false のままなので、
+                // UI は battery_present を「不明」と描き分けられる
                 Some("bus5v_status") => {
-                    let (battery_present, ext_5v_out) = status
+                    let (usb_host, ext_5v_out, battery_present, power_read) = status
                         .lock()
-                        .map(|st| (st.battery_present, st.ext_5v_out))
-                        .unwrap_or((false, false));
+                        .map(|st| (st.usb_host, st.ext_5v_out, st.battery_present, st.power_read))
+                        .unwrap_or((false, false, false, false));
                     let payload = format!(
-                        r#"{{"mode":"{}","battery_present":{battery_present},"ext_5v_out":{ext_5v_out}}}"#,
-                        settings.bus5v().label(),
+                        r#"{{"usb_host":{usb_host},"ext_5v_out":{ext_5v_out},"battery_present":{battery_present},"power_read":{power_read}}}"#
                     );
                     send_command_result(conn, &id, &payload);
                 }
-                // 遠隔再起動 (`bus5v` の反映用)。OTA 中と点呼中は断る —
+                // 遠隔再起動。OTA 中と点呼中は断る —
                 // OTA は書き込み途中で切ると起動不能になり、点呼中の再起動は
                 // 測定をやり直させる (点呼中の判定は src/main.rs の in_tenko と同じ)
                 Some("reboot") => {

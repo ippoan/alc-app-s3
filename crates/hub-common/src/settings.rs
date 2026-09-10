@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use alc_hub_core::cfg::{DeviceConfig, WifiConfig};
-use alc_hub_core::protocol::{valid_rotation, Bus5vMode};
+use alc_hub_core::protocol::valid_rotation;
 use anyhow::Result;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 
@@ -42,7 +42,6 @@ const KEY_PRINTER_ADDR: &str = "printer_addr";
 const KEY_GW_URL: &str = "gw_url";
 /// 点呼に血圧を含めるか (u8 0/1。未設定 = 0 = 保留、tenko.rs)
 const KEY_TENKO_BP: &str = "tenko_bp";
-const KEY_BUS5V: &str = "bus5v";
 
 #[derive(Clone)]
 pub struct Settings {
@@ -326,21 +325,6 @@ impl Settings {
     pub fn set_tenko_bp(&self, enabled: bool) -> Result<()> {
         let nvs = self.nvs.lock().expect("settings nvs lock");
         nvs.set_u8(KEY_TENKO_BP, u8::from(enabled))?;
-        Ok(())
-    }
-
-    /// M-Bus 5V を Core 側から出すか (`BUS5V AUTO|ON|OFF`)。未設定は Auto
-    pub fn bus5v(&self) -> Bus5vMode {
-        self.nvs
-            .lock()
-            .ok()
-            .and_then(|nvs| nvs.get_u8(KEY_BUS5V).ok().flatten())
-            .map_or(Bus5vMode::Auto, Bus5vMode::from_u8)
-    }
-
-    pub fn set_bus5v(&self, mode: Bus5vMode) -> Result<()> {
-        let nvs = self.nvs.lock().expect("settings nvs lock");
-        nvs.set_u8(KEY_BUS5V, mode.to_u8())?;
         Ok(())
     }
 

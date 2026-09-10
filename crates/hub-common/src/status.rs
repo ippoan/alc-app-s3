@@ -97,11 +97,15 @@ pub struct HubStatus {
     /// なので、残量/充電状態の表示はこれでゲートする
     pub battery_present: bool,
 
-    /// 起動時に M-Bus へ 5V を出したか (`Bus5vMode::resolve` の結果を
-    /// `src/main.rs` がそのまま入れる)。**起動後に再計算しない** — `Auto` の
-    /// 個体で起動後に電池を挿すと、`resolve()` の再評価と実際の出力
-    /// (AW9523 BUS_EN は起動時にしか触らない) が食い違うため。
-    /// WS 下り command `bus5v_status` の応答に載る
+    /// USB ホスト (PC) が列挙しているか (`usb_serial_jtag_is_connected`)。
+    /// hub-ui の i2c ループが 1 秒ごとに更新する。起動直後は driver install
+    /// 前で `true` 固定になるため、ui は 3 秒経つまでサンプルしない (#202)
+    pub usb_host: bool,
+
+    /// いま M-Bus へ 5V を出しているか (AW9523 BUS_EN)。**設定ではない** —
+    /// `usb_host` の有無に追随して hub-ui の i2c ループが更新する (#202)。
+    /// 起動時は false で、USB ホストが 2 サンプル続けて見えたら出す。
+    /// シリアル `BUS5V STATUS` と WS 下り command `bus5v_status` の応答に載る
     pub ext_5v_out: bool,
     /// バッテリー残量 [%] (AXP2101 フューエルゲージ 0xA4。255 = 未測定/電池なし)
     pub battery_percent: u8,

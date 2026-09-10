@@ -113,6 +113,15 @@ pub(crate) enum Screen {
 /// バッテリー/電源状態 (AXP2101) の取得間隔。診断用なので粗くてよい (Refs #50)。
 const BATT_INTERVAL_MS: u64 = 10_000;
 
+/// USB ホスト (PC) の列挙状態を読む間隔 (#202)。PC の再起動に数秒で追随したいので
+/// バッテリーより細かく見る。読み出し自体はレジスタ 1 本で i2c を使わない。
+const USB_POLL_MS: u64 = 1_000;
+/// USB のサンプルを始めるまでの猶予。`usb_serial_jtag_is_connected()` は
+/// connection monitor が `usb_serial_jtag_driver_install` (hub-drivers console.rs、
+/// 呼ぶのは host_link の別スレッド) の後でしか意味のある値を返さず、**起動直後は
+/// `true` 固定**。install は起動直後に済むので、それを待ってから読み始める。
+const USB_POLL_START_MS: u64 = 3_000;
+
 /// UI ループ (メインタスクを占有し、戻らない)。
 ///
 /// `alarm` は沈黙警告の判定器 (`alc_hub_core::alarm`)。**鳴らすのはここではない** —
@@ -151,6 +160,9 @@ pub fn run(
     let mut last_bar = 0u64;
     let mut last_spin = 0u64;
     let mut last_batt = 0u64;
+    let mut last_usb = 0u64;
+    // M-Bus 5V を USB ホストの有無に追随させるラッチ (#202)。起動時は出さない
+    let mut usb5v = alc_hub_core::usb5v::Latch::default();
     let mut spin_phase = 0u8;
     let mut last_touch: Option<touch::TouchPoint> = None;
     // BLE で取得中の機器 (点呼画面のラベル横スピナー表示)。
@@ -210,6 +222,38 @@ pub fn run(
                 Err(e) => log::warn!("ui: バッテリー状態取得に失敗: {e:?}"),
             }
             last_batt = now;
+        }
+
+        // M-Bus 5V (AW9523 BUS_EN) を USB ホストの有無に追随させる (#202)。
+        // 設定は持たない — 電池なしの CoreS3 では「USB だけ」と「PoE だけ」を
+        // 設定で両立できないため、**PC が居る間だけ Core が出す**を唯一の動作に
+        // している。i2c はこのループが所有しているのでここで書く。
+        if now >= USB_POLL_START_MS && now.saturating_sub(last_usb) >= USB_POLL_MS {
+            let usb = unsafe { esp_idf_svc::sys::usb_serial_jtag_is_connected() };
+            if let Ok(mut st) = status.lock() {
+                st.usb_host = usb;
+            }
+            // 切り替える瞬間だけ i2c を叩く (status のロックは手放してから)
+            if let Some(desired) = usb5v.update(usb) {
+                match alc_hub_board::power::set_ext_5v_out(&mut i2c, desired) {
+                    Ok(()) => {
+                        if let Ok(mut st) = status.lock() {
+                            st.ext_5v_out = desired;
+                        }
+                        let line = format!(
+                            "EVT BUS5V OUT={} usb_host={}",
+                            u8::from(desired),
+                            u8::from(usb)
+                        );
+                        println!("{line}");
+                        // crashlog のリングにも残す (vprintf hook 経由。println!
+                        // は hook を通らないため、再起動後の追跡はこちらが頼り)
+                        log::info!("{line}");
+                    }
+                    Err(e) => log::warn!("ui: M-Bus 5V 切り替えに失敗: {e:?}"),
+                }
+            }
+            last_usb = now;
         }
 
         // --- コマンド (ホスト / BLE) ---
