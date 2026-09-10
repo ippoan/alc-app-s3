@@ -28,6 +28,7 @@ use alc_hub_common::{
 use alc_hub_drivers::lan;
 use alc_hub_drivers::{crashlog, gw_link, heap, host_link, ntp, recorder, rs232, ws_uplink};
 use alc_hub_ui as ui;
+#[cfg(not(feature = "lan"))]
 use alc_hub_wifi::{improv, wifi};
 use anyhow::Result;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -170,23 +171,44 @@ fn main() -> Result<()> {
     let (tx, rx) = mpsc::channel(); // UiCommand: 各種 → UI ループ
     let (meas_tx, meas_rx) = mpsc::channel(); // Measurement: BLE → recorder
 
-    // Wi-Fi (Improv Wi-Fi Serial で設定。保存済みなら起動時に自動接続)
-    let wifi = wifi::Wifi::new(p.modem, sysloop.clone(), nvs_partition, Arc::clone(&status))?;
-    let coex = wifi.coex_handle();
-    let saved_credentials = settings.wifi_credentials();
-    let provisioned = saved_credentials.is_some();
-    if let Some((ssid, pass)) = saved_credentials {
-        // 起動時接続 + 切断検出時の自動再接続を常駐スレッドで維持する。
-        // (単発接続だと BLE との電波競合や AP 瞬断で一度切れると復帰しない)
-        let wifi = wifi.clone();
-        alc_hub_drivers::task::name_next(c"wifi_keepalive");
-        std::thread::Builder::new()
-            .name("wifi_keepalive".into())
-            .stack_size(8 * 1024)
-            .spawn(move || wifi.keepalive(ssid, pass))?;
-    }
-    let improv =
-        improv::Improv::new(settings.clone(), wifi.clone(), Arc::clone(&status), provisioned);
+    // Wi-Fi (Improv Wi-Fi Serial で設定。保存済みなら起動時に自動接続)。
+    // **`lan` ビルド (既定) では予備としても起こさない** (#217) — CoreS3 は
+    // Base LAN PoE 前提で、Wi-Fi ドライバのタスクと常駐バッファが内部 RAM を
+    // 取り、WS 接続のゲート (ws_uplink の空き 60 KB) の際まで削っていた。
+    // 起こさなければ sdkconfig の Wi-Fi バッファ設定の変動も内部 RAM に響かない
+    #[cfg(not(feature = "lan"))]
+    let (wifi, improv, coex) = {
+        let wifi = wifi::Wifi::new(p.modem, sysloop.clone(), nvs_partition, Arc::clone(&status))?;
+        let coex = wifi.coex_handle();
+        let saved_credentials = settings.wifi_credentials();
+        let provisioned = saved_credentials.is_some();
+        if let Some((ssid, pass)) = saved_credentials {
+            // 起動時接続 + 切断検出時の自動再接続を常駐スレッドで維持する。
+            // (単発接続だと BLE との電波競合や AP 瞬断で一度切れると復帰しない)
+            let wifi = wifi.clone();
+            alc_hub_drivers::task::name_next(c"wifi_keepalive");
+            std::thread::Builder::new()
+                .name("wifi_keepalive".into())
+                .stack_size(8 * 1024)
+                .spawn(move || wifi.keepalive(ssid, pass))?;
+        }
+        let improv =
+            improv::Improv::new(settings.clone(), wifi.clone(), Arc::clone(&status), provisioned);
+        (Some(wifi), Some(improv), coex)
+    };
+    #[cfg(feature = "lan")]
+    let (wifi, improv, coex) = {
+        // Wi-Fi の初期化が暗黙に立てていた esp_netif (lwIP の tcpip スレッド) を
+        // ここで立てる。無いと lan::start の EspEth::wrap より先に来るもの
+        // (host_link が受けた AUTH TOKEN / OTA、ntp::start) が `Invalid mbox` で
+        // panic する (起動ループ、ntp.rs の start_when_online 参照)。
+        // 後で EspEth::wrap → EspNetif::new が同じ初期化を通るが、IDF の
+        // esp_netif_init は tcpip が立っていれば何もせず ESP_OK を返す
+        esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_netif_init() })?;
+        alc_hub_common::evtlog::emit("EVT WIFI_DISABLED lan_build");
+        let coex = Arc::new(alc_hub_core::coex::RadioCoex::new());
+        (None, None, coex)
+    };
 
     // BLE 再ペアリング要求フラグ (host_link の PAIR → ble タスクがボンド消去)
     let pair_flag = alc_hub_common::control::new_pair_flag();

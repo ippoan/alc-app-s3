@@ -292,6 +292,12 @@ STATUS
 2.4GHz (11b/g/n) のみ・WPA/WPA2/WPA3-Personal 対応。主経路はあくまで
 LAN Module 13.2 (PoE) で、Wi-Fi は LAN 配線が無い拠点向けの代替経路。
 
+**既定ビルド (`lan` feature) は Wi-Fi を起こさない** (#217)。Wi-Fi ドライバの
+タスクと常駐バッファが内部 RAM を取り、WS 接続のゲートを際まで削るため。
+Improv フレームには `EVT IMPROV_UNAVAILABLE lan` (最初の 1 回だけ)、`WIFI TEST`
+には `EVT WIFI_TEST NG lan` を返し、起動時に `EVT WIFI_DISABLED lan_build` を出す。
+以下は `--no-default-features` で `lan` を外したビルドの動作。
+
 - **自動再接続 (keepalive)**: 切断を検出したら再接続。失敗が続く場合は段階的に
   バックオフ (15 秒→最大 5 分)、接続タイムアウトも短め (8 秒) にして、単一
   2.4GHz 無線を共有する BLE (医療機器・優先) への妨害を最小化する

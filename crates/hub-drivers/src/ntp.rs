@@ -23,8 +23,9 @@ pub fn start() -> Result<EspSntp<'static>> {
 /// (Invalid mbox)` で panic し、**起動ループになる**
 /// (2026-09-04 に AtomS3 Lite + Atomic PoE Base の実機で踏んだ)。
 ///
-/// CoreS3 が `lan::start` の直後に呼んでも通るのは、**Wi-Fi の初期化が先に
-/// esp_netif を立てている**から。Wi-Fi を持たない Atom 系では
+/// CoreS3 が `lan::start` の直後に呼んでも通るのは、**main.rs が先に
+/// esp_netif を立てている**から (`lan` ビルドは `esp_netif_init` を明示的に呼び、
+/// `lan` 無しビルドは Wi-Fi の初期化が暗黙に立てる、#217)。Atom 系では
 /// `eth_w5500::start` が W5500 の初期化をスレッドへ逃がして即戻るので、
 /// main の続きで呼ぶと必ず早すぎる。「CoreS3 で動いているから」で並びを
 /// 写さないこと。
