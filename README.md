@@ -68,7 +68,7 @@ Idle ─タップ→ Menu                                         自動/タッ�
 | `RESET` | 待機画面へ |
 | `ROTATE <0\|90\|180\|270>` | 画面向き変更 (NVS 保存、再起動後も維持) |
 | `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0 BOARD=cores3` 応答 (`BOARD` は起動時の I2C probe で `cores3` / `cores3se`) |
-| `LOG DUMP` | 直近ログのリング (CoreS3 は PSRAM の `.ext_ram_noinit` に 256 KB、それ以外の機種は `.noinit` に 4 KB、#217) を `LOGDUMP ...` で吸い出す。事象の後から原因を追う用。WS 下り command `{action:"get_log",max_bytes?,offset?}` (`max_bytes` は省略時 3000・上限 3800、`offset` は末尾から遡るバイト数で省略時 0 = 末尾) でも同じリングの窓を行境界で切って `command_result` `{text,bytes,total_bytes,truncated,offset,uptime_ms,pwa_log,pwa_log_error}` で遠隔から取れる (auth-worker MCP `get_device_log`)。1 回で取り切れないときは `offset + bytes` を次の `offset` にして遡る (`offset` は実際に使った値。`total_bytes` に達したら終わり)。reset 履歴を持つ機種 (CoreS3) は直近 8 回の `boot_history` `[{reset_reason,reset_code}]` (新しい順) も足す。リングは電源断以外の reset をまたいで残り、起動ごとに `--- BOOT reset=<name> (<code>) ---` が入る。CoreS3 に USB で運行者 PWA が繋がっていれば、PWA のシリアル診断ログ (`PWALOG`、最大 2 秒待ち・末尾 1200 バイト) を `pwa_log` に足す (`pwa_log_error`: `null` / `"timeout"` / `"no_host"`、#215) |
+| `LOG DUMP` | 直近ログ (`.noinit` リング) を `LOGDUMP ...` で吸い出す。事象の後から原因を追う用。WS 下り command `{action:"get_log",max_bytes?}` (省略時 3000、上限 3800) でも同じリングの末尾を `command_result` `{text,bytes,total_bytes,truncated,uptime_ms}` で遠隔から取れる (auth-worker MCP `get_device_log`)。リングは電源断以外の reset をまたいで残り、起動ごとに `--- BOOT reset=<name> (<code>) ---` が入る。CoreS3 に USB で運行者 PWA が繋がっていれば、PWA のシリアル診断ログ (`PWALOG`、最大 2 秒待ち・末尾 1200 バイト) を `pwa_log` に足す (`pwa_log_error`: `null` / `"timeout"` / `"no_host"`、#215) |
 | `CFG GET` | 現在の設定を 1 行 JSON でエクスポート |
 | `CFG SET <json>` | 設定 (画面向き + Wi-Fi) を検証して NVS へインポート |
 | `WIFI TEST` | 保存済み Wi-Fi 設定で接続テスト (失敗時は原因を切り分け) |

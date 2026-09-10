@@ -147,7 +147,7 @@ pub fn tail_str(s: &str, max_bytes: usize) -> &str {
 ///
 /// [`tail_str`] の結果を行境界にスナップする — 切った位置が行の途中なら、
 /// その欠けた先頭行を捨てる。全体が収まれば `(text, false)`。
-/// `get_log` command (#195) の窓 ([`window_lines`]) の先頭側を切るのに使う。
+/// `get_log` command (#195) がリングの末尾を返すのに使う。
 pub fn tail_lines(text: &str, max_bytes: usize) -> (&str, bool) {
     let tail = tail_str(text, max_bytes);
     let start = text.len() - tail.len();
@@ -159,35 +159,10 @@ pub fn tail_lines(text: &str, max_bytes: usize) -> (&str, bool) {
     (snapped, snapped.len() < text.len())
 }
 
-/// 末尾から `offset` バイト遡った位置を終端とし、そこから前へ `max_bytes`
-/// バイト以内に収まる**行の並び**と、実際に使った offset (#217)。
-///
-/// リング (CoreS3 では 256 KB、それ以外の機種は 4 KB) は 1 回の応答
-/// ([`crate::uplink::LOG_MAX_BYTES`]) に収まらないので、`get_log` command は
-/// これで末尾以外の窓も返す。`offset = 0` は
-/// [`tail_lines`] と同じ。終端が行の途中なら、その欠けた末尾行を捨てて手前の
-/// 行境界に寄せ、戻り値の offset もその分だけ大きくなる — 呼び側は
-/// `offset + 返したバイト数` を次の offset にすれば隙間なく遡れる (読むあいだに
-/// 追記された分だけ重なる)。`offset` が全体以上なら空。
-pub fn window_lines(text: &str, offset: usize, max_bytes: usize) -> (&str, usize) {
-    let end = text.len() - offset.min(text.len());
-    let end = if end == text.len() {
-        end
-    } else {
-        text.as_bytes()[..end]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |i| i + 1)
-    };
-    (tail_lines(&text[..end], max_bytes).0, text.len() - end)
-}
-
 /// `get_log` command (#195) の command_result payload (JSON オブジェクト文字列)。
-/// `text` (リングの sanitize 済み全文) を末尾から `offset` バイト遡った位置から
-/// 前へ `max_bytes` 以内、行境界で切って返す ([`window_lines`])。リング (CoreS3 では
-/// 256 KB、それ以外の機種は 4 KB) は 1 回では取り切れない — `truncated` と `total_bytes` で伝え、実際に
-/// 使った `offset` を返す。呼び側は `offset + bytes` を次の offset にして遡る
-/// (#217)。文字列のエスケープは serde_json に任せる。
+/// `text` (リングの sanitize 済み全文) の末尾 `max_bytes` を行境界で切って返す。
+/// リングは 4 KB なので `max_bytes` を最大にしても全体は取れないことがある —
+/// `truncated` と `total_bytes` で伝える。文字列のエスケープは serde_json に任せる。
 ///
 /// `reset_history` は直近 8 回の reset 理由の履歴 (Refs #211)。`Some` なら
 /// `boot_history` キーを新しい順 (先頭が現在の起動) で足す。履歴を持たない機種
@@ -201,20 +176,18 @@ pub fn window_lines(text: &str, offset: usize, max_bytes: usize) -> (&str, usize
 /// ([`crate::uplink::LOG_MAX_BYTES`]) は送信側の制約ではないため
 pub fn log_payload(
     text: &str,
-    offset: usize,
     max_bytes: usize,
     uptime_ms: u64,
     reset_history: Option<u64>,
     pwa: &PwaLog,
 ) -> String {
-    let (window, offset) = window_lines(text, offset, max_bytes);
+    let (tail, truncated) = tail_lines(text, max_bytes);
     let (pwa_log, pwa_log_error) = pwa.json_fields();
     let mut payload = serde_json::json!({
-        "text": window,
-        "bytes": window.len(),
+        "text": tail,
+        "bytes": tail.len(),
         "total_bytes": text.len(),
-        "truncated": window.len() < text.len(),
-        "offset": offset,
+        "truncated": truncated,
         "uptime_ms": uptime_ms,
         "pwa_log": pwa_log,
         "pwa_log_error": pwa_log_error,
@@ -411,56 +384,8 @@ mod tests {
     }
 
     #[test]
-    fn window_lines_offset_zero_is_tail_lines() {
-        let text = "a\nbb\nccc\n";
-        for max in [0, 3, 6, 7, 100] {
-            assert_eq!(window_lines(text, 0, max), (tail_lines(text, max).0, 0));
-        }
-        // 末尾行が書きかけ (改行前) でも offset 0 なら残す (tail_lines と同じ)
-        assert_eq!(window_lines("a\nbb", 0, 100), ("a\nbb", 0));
-    }
-
-    #[test]
-    fn window_lines_steps_back_on_line_boundaries() {
-        let text = "a\nbb\nccc\n"; // 9 バイト
-        // 終端がちょうど行境界 (末尾 4 バイト "ccc\n" を飛ばす)
-        assert_eq!(window_lines(text, 4, 100), ("a\nbb\n", 4));
-        // 終端が行の途中 → 欠けた "cc" を捨てて手前の行境界へ。offset もその分増える
-        assert_eq!(window_lines(text, 2, 100), ("a\nbb\n", 4));
-        // max_bytes は窓の先頭側を行境界で切る
-        assert_eq!(window_lines(text, 4, 3), ("bb\n", 4));
-        // offset + bytes を次の offset にすると隙間なく遡れる
-        assert_eq!(window_lines(text, 4 + 3, 3), ("a\n", 7));
-        // 終端より前に改行が無い → 空 (offset は全体)
-        assert_eq!(window_lines(text, 8, 100), ("", 9));
-    }
-
-    #[test]
-    fn window_lines_offset_beyond_text_is_empty() {
-        assert_eq!(window_lines("a\nbb\n", 5, 100), ("", 5));
-        assert_eq!(window_lines("a\nbb\n", 99, 100), ("", 5));
-        assert_eq!(window_lines("", 3, 100), ("", 0));
-    }
-
-    #[test]
-    fn log_payload_offset_returns_older_window() {
-        let p = log_payload("l1\nl2\nl3\n", 3, 100, 0, None, &PwaLog::NoHost);
-        let v: serde_json::Value = serde_json::from_str(&p).unwrap();
-        assert_eq!(v["text"], "l1\nl2\n");
-        assert_eq!(v["bytes"], 6);
-        assert_eq!(v["total_bytes"], 9);
-        assert_eq!(v["truncated"], true);
-        assert_eq!(v["offset"], 3);
-        // 既定 (offset 0) の応答にも offset キーが載る
-        let p = log_payload("l1\n", 0, 100, 0, None, &PwaLog::NoHost);
-        let v: serde_json::Value = serde_json::from_str(&p).unwrap();
-        assert_eq!(v["offset"], 0);
-        assert_eq!(v["truncated"], false);
-    }
-
-    #[test]
     fn log_payload_reports_sizes_and_truncation() {
-        let p = log_payload("l1\nl2 \"q\"\n", 0, 100, 4242, None, &PwaLog::NoHost);
+        let p = log_payload("l1\nl2 \"q\"\n", 100, 4242, None, &PwaLog::NoHost);
         let v: serde_json::Value = serde_json::from_str(&p).unwrap();
         assert_eq!(v["text"], "l1\nl2 \"q\"\n");
         assert_eq!(v["bytes"], 10);
@@ -468,7 +393,7 @@ mod tests {
         assert_eq!(v["truncated"], false);
         assert_eq!(v["uptime_ms"], 4242);
 
-        let p = log_payload("l1\nl2\nl3\n", 0, 4, 0, None, &PwaLog::NoHost);
+        let p = log_payload("l1\nl2\nl3\n", 4, 0, None, &PwaLog::NoHost);
         let v: serde_json::Value = serde_json::from_str(&p).unwrap();
         assert_eq!(v["text"], "l3\n");
         assert_eq!(v["bytes"], 3);
@@ -478,7 +403,7 @@ mod tests {
 
     #[test]
     fn log_payload_omits_boot_history_key_when_none() {
-        let p = log_payload("l1\n", 0, 100, 0, None, &PwaLog::NoHost);
+        let p = log_payload("l1\n", 100, 0, None, &PwaLog::NoHost);
         let v: serde_json::Value = serde_json::from_str(&p).unwrap();
         assert!(v.get("boot_history").is_none());
     }
@@ -488,7 +413,7 @@ mod tests {
         // code=11 (usb) が最新、9 (brownout) が 1 つ前
         let packed =
             crate::boot_history::push(crate::boot_history::push(crate::boot_history::EMPTY, 9), 11);
-        let p = log_payload("l1\n", 0, 100, 0, Some(packed), &PwaLog::NoHost);
+        let p = log_payload("l1\n", 100, 0, Some(packed), &PwaLog::NoHost);
         let v: serde_json::Value = serde_json::from_str(&p).unwrap();
         let hist = v["boot_history"].as_array().unwrap();
         assert_eq!(hist.len(), 2);
@@ -502,7 +427,6 @@ mod tests {
     fn log_payload_boot_history_empty_is_empty_array() {
         let p = log_payload(
             "l1\n",
-            0,
             100,
             0,
             Some(crate::boot_history::EMPTY),
@@ -513,7 +437,7 @@ mod tests {
     }
 
     fn payload_with(pwa: PwaLog) -> serde_json::Value {
-        let p = log_payload("l1\n", 0, 100, 0, None, &pwa);
+        let p = log_payload("l1\n", 100, 0, None, &pwa);
         serde_json::from_str(&p).unwrap()
     }
 
