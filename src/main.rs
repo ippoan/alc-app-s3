@@ -58,11 +58,22 @@ fn main() -> Result<()> {
     // NimBLE の INFO (5 秒ごとの scan の `GAP procedure initiated: discovery` 等) を
     // 止める。vprintf hook 経由で crashlog リング (4 KB) を数十秒で押し流し、
     // 切り分けに要る出来事が get_log に残らなかった (#215)。WARN 以上は残す
+    // WS 再接続の失敗も同じ理由で抑える — 10 秒ごとの再試行 (esp-tls /
+    // transport_base / transport_ws / websocket_client の INFO ログ) が
+    // リングを埋め、切り分けに要る EVT を押し出す (#217)。WARN 以上は残す
     unsafe {
-        esp_idf_svc::sys::esp_log_level_set(
-            c"NimBLE".as_ptr(),
-            esp_idf_svc::sys::esp_log_level_t_ESP_LOG_WARN,
-        );
+        for tag in [
+            c"NimBLE",
+            c"esp-tls",
+            c"transport_base",
+            c"transport_ws",
+            c"websocket_client",
+        ] {
+            esp_idf_svc::sys::esp_log_level_set(
+                tag.as_ptr(),
+                esp_idf_svc::sys::esp_log_level_t_ESP_LOG_WARN,
+            );
+        }
     }
     log::info!("alc-hub-cores3 v{} 起動", config::FIRMWARE_VERSION);
 
