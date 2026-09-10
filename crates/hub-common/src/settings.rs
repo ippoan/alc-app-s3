@@ -23,6 +23,10 @@ const MAX_LOG_LINES: usize = 20;
 const KEY_DEV_ID: &str = "dev_id";
 const KEY_DEV_SECRET: &str = "dev_secret";
 const KEY_DEV_TENANT: &str = "dev_tenant";
+/// 警告デバイス (VoiceS3R) の管理者認証用 ed25519 秘密鍵 (32 B の seed)。
+/// **この値を返す関数以外は作らない** — USB には公開鍵と署名しか出さない
+/// (Refs #205)
+const KEY_ALARM_SK: &str = "alarm_sk";
 /// auth-worker ベース URL の上書き (staging テスト用、`AUTH URL` コマンド)
 const KEY_AUTH_URL: &str = "auth_url";
 // WS 送信 (cf-alc-recorder、ippoan/alc-app-s3#21)
@@ -173,6 +177,24 @@ impl Settings {
         nvs.remove(KEY_DEV_ID)?;
         nvs.remove(KEY_DEV_SECRET)?;
         nvs.remove(KEY_DEV_TENANT)?;
+        Ok(())
+    }
+
+    /// 警告デバイスの ed25519 秘密鍵 (32 B の seed)。未生成は None。
+    /// **呼び出し側もこの値を USB に出さないこと** — `AUTH PUBKEY` / `AUTH SIG`
+    /// の応答は公開鍵と署名だけを含む (Refs #205)
+    pub fn alarm_sk(&self) -> Option<[u8; 32]> {
+        let nvs = self.nvs.lock().ok()?;
+        let mut buf = [0u8; 32];
+        let got = nvs.get_blob(KEY_ALARM_SK, &mut buf).ok()??;
+        (got.len() == 32).then_some(buf)
+    }
+
+    /// 警告デバイスの ed25519 秘密鍵 (32 B の seed) を保存する
+    /// (`AUTH KEYGEN`)。既存の有無は呼び出し側 (console.rs) が判定する
+    pub fn set_alarm_sk(&self, seed: &[u8; 32]) -> Result<()> {
+        let nvs = self.nvs.lock().expect("settings nvs lock");
+        nvs.set_blob(KEY_ALARM_SK, seed)?;
         Ok(())
     }
 

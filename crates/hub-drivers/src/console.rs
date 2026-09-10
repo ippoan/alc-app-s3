@@ -206,6 +206,35 @@ pub fn handle_common(
                 println!("ERR AUTH: URL の保存に失敗しました");
             }
         },
+        // 警告デバイス (VoiceS3R) 管理者認証用の ed25519 鍵対 (Refs #205)。
+        // 秘密鍵 (seed) は NVS alarm_sk のみに留まり、USB には公開鍵と署名
+        // しか出さない。**この口にそれ以外の応答を足さないこと**
+        HostCommand::AuthKeygen { force } => {
+            if !force && settings.alarm_sk().is_some() {
+                println!("ERR AUTH: key exists");
+            } else {
+                let mut seed = [0u8; 32];
+                unsafe { sys::esp_fill_random(seed.as_mut_ptr().cast(), seed.len()) };
+                match settings.set_alarm_sk(&seed) {
+                    Ok(()) => println!("{}", alc_hub_core::alarm_key::auth_pubkey_line(&seed)),
+                    Err(e) => {
+                        log::error!("console: alarm_sk 保存失敗: {e:?}");
+                        println!("ERR AUTH: 鍵の保存に失敗しました");
+                    }
+                }
+            }
+        }
+        HostCommand::AuthPubkey => match settings.alarm_sk() {
+            Some(seed) => println!("{}", alc_hub_core::alarm_key::auth_pubkey_line(&seed)),
+            None => println!("ERR AUTH: no key"),
+        },
+        HostCommand::AuthSign { nonce } => match settings.alarm_sk() {
+            Some(seed) => match alc_hub_core::alarm_key::auth_sig_line(&seed, &nonce) {
+                Ok(line) => println!("{line}"),
+                Err(_) => println!("ERR AUTH: bad nonce"),
+            },
+            None => println!("ERR AUTH: no key"),
+        },
         // cf-alc-recorder 常時接続 (ws_uplink.rs)
         HostCommand::WsUrl { url } => match settings.set_ws_url(&url) {
             Ok(()) => println!("OK WS URL"),
