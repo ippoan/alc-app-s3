@@ -85,40 +85,19 @@ fn main() -> Result<()> {
         probe.rtc_present,
         probe.imu_present
     );
-    // M-Bus 5V を Core 側から出すか (AW9523 BUS_EN)。判定は **AXP2101 の
-    // battery-present bit** で行う — **バッテリーが無い個体では出さない**。
+    // M-Bus 5V (AW9523 BUS_EN) は **起動時には出さない** (#202)。
     //
     // Base LAN PoE v1.2 のように自前で M-Bus 5V を供給するベースを履くと、Core も
     // 出していれば同じ 5V レールを両側から駆動することになる。電池があれば突入を
     // 吸収できるが、無い個体は PoE 単独給電で起動できずブラウンアウトを繰り返す
-    // (画面がぱちぱち点滅する)。USB を挿すと VBUS が支えるので気づけず、
-    // 「工場出荷ファームは PoE で動くのに焼いたファームだけ動かない」症状になる。
-    // M5Unified の CoreS3/CoreS3SE 初期化も BOOST_EN だけを on にし、BUS_EN は
-    // setExtOutput(true) を明示的に呼んだときだけ立てる。
+    // (画面がぱちぱち点滅する)。一方 USB 給電のベンチでは Core が出さないと
+    // スタックモジュール (RS232M / LAN 13.2) が無電源になる (Refs #76)。
     //
-    // ★board 種別 (rtc/imu の probe) では判定しない: 実機の CoreS3 SE が
-    // `BOARD=cores3` と出る個体があり (電池は無いのに RTC/IMU のどちらかが ack
-    // する)、SE 判定に賭けると本症状を踏み抜く。電池の有無こそが「Core が
-    // 5V を出せるか」の物理的な条件なので、そちらを直接見る。
-    // 読めなかったときは従来動作 (出す) にフォールバックする (Refs #76 — USB 給電の
-    // ベンチに積んだ RS232M/LAN 13.2 は Core からの 5V が無いと無電源になる)
-    // 既定は Auto (電池の有無で決める)。`BUS5V ON|OFF` で明示上書きできる
-    // — M5 の UIFlow も同じ考え方で `power_mode` (usb_in_bus_in / usb_in_bus_out …)
-    // を NVS に持ち、設定画面から切り替えさせている (uiflow-micropython board.cpp)
-    let bus5v = settings.bus5v();
-    let battery_present = match board::power::read_status(&mut i2c) {
-        Ok(s) => s.battery_present,
-        Err(e) => {
-            log::warn!("power: battery-present 読み出し失敗、電池ありとみなす: {e:#}");
-            true
-        }
-    };
-    let ext_5v_out = bus5v.resolve(battery_present);
-    log::info!(
-        "power: M-Bus 5V 出力={ext_5v_out} (mode={} battery_present={battery_present})",
-        bus5v.label()
-    );
-    board::power::set_ext_5v_out(&mut i2c, ext_5v_out)?;
+    // 設定で両立させようとしたが (#200/#201 の `BUS5V AUTO|ON|OFF`)、電池なしの
+    // CoreS3 では**どの設定値でも両立しない**ため設定ごと廃止した。代わりに
+    // **USB ホスト (PC) が列挙されている間だけ出す** — PC が居るなら VBUS が
+    // レールを支えられるし、PC が落ちれば Core は手を引いて PoE に任せられる。
+    // 追随は hub-ui の i2c ループ (1 秒ポーリング、`usb5v::Latch`) が担う。
     let rotation = settings.rotation();
     // 起動カウンタを 1 つ進める (点呼セッション ID の前置、Refs #112)。
     // **起動ごとに 1 回だけ** — 再起動をまたいだ session_id の再利用を防ぐ。
@@ -137,8 +116,6 @@ fn main() -> Result<()> {
 
     let status: SharedStatus = Arc::new(Mutex::new(HubStatus {
         board: board_kind,
-        // 起動時に実際に 5V を出したか (遠隔 `bus5v_status` の応答用)
-        ext_5v_out,
         // 点呼の構成 (血圧はオプション、既定 OFF)。`TENKO BP` で NVS ごと更新される
         tenko_bp: settings.tenko_bp(),
         ..HubStatus::default()

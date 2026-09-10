@@ -26,7 +26,7 @@
 //! | `AUTH TOKEN` | device JWT 取得の自己診断 (`EVT AUTH_TOKEN ...`) |
 //! | `WS URL <url>` | cf-alc-recorder WS URL を上書き (staging テスト用) |
 //! | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` を返す |
-//! | `BUS5V AUTO\|ON\|OFF` / `BUS5V STATUS` | M-Bus 5V を Core 側から出すか (NVS、既定 AUTO = 電池の有無で決める)。**再起動後に反映**。WS 下り command `{action:"bus5v",mode:"auto\|on\|off"}` / `{action:"bus5v_status"}` / `{action:"reboot"}` (auth-worker 端末一覧) でも遠隔で設定・照会・反映できる |
+//! | `BUS5V STATUS` | M-Bus 5V 出力の現況 `BUS5V USB=1 OUT=1 BATTERY=0` を返す。**設定は無い** — USB ホスト (PC) が列挙されている間だけ Core が 5V を出す固定動作で、hub-ui が 1 秒ごとに追随する (#202)。WS 下り command `{action:"bus5v_status"}` / `{action:"reboot"}` (auth-worker 端末一覧) でも遠隔で照会・再起動できる |
 //! | `TENKO BP ON\|OFF` / `TENKO STATUS` | 点呼に血圧を含めるか (NVS、既定 OFF) / `TENKO BP=0` を返す |
 //! | `HEAP` | `HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> TOTAL_INT=<n> TOTAL_PSRAM=<n>` を返す (Refs #27) |
 //! | `HEAP DUMP` | `HEAPDUMP ...` 複数行 (ヒープブロック概況 + タスク別スタック余裕) |
@@ -304,15 +304,20 @@ fn handle_line(
                 if discovered.is_empty() { "NONE".into() } else { discovered },
             );
         }
+        // M-Bus 5V の現況 (設定は無い — USB ホストの有無に hub-ui が追随する、#202)
+        HostCommand::Bus5vStatus => {
+            let (usb_host, ext_5v_out, battery_present) = status
+                .lock()
+                .map(|st| (st.usb_host, st.ext_5v_out, st.battery_present))
+                .unwrap_or((false, false, false));
+            println!(
+                "BUS5V USB={} OUT={} BATTERY={}",
+                u8::from(usb_host),
+                u8::from(ext_5v_out),
+                u8::from(battery_present),
+            );
+        }
         // 点呼の構成: 血圧はオプション (tenko.rs)。NVS に保存し、UI が次の点呼から読む
-        HostCommand::Bus5v { mode } => match settings.set_bus5v(mode) {
-            Ok(()) => println!("OK BUS5V MODE={} (再起動後に反映)", mode.label()),
-            Err(e) => {
-                log::error!("host_link: BUS5V 保存失敗: {e:?}");
-                println!("ERR BUS5V: 保存に失敗しました");
-            }
-        },
-        HostCommand::Bus5vStatus => println!("BUS5V MODE={}", settings.bus5v().label()),
         HostCommand::TenkoBp { enabled } => match settings.set_tenko_bp(enabled) {
             Ok(()) => {
                 if let Ok(mut st) = status.lock() {
