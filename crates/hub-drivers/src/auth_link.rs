@@ -20,9 +20,9 @@
 //! | `EVT AUTH_TOKEN NG <理由>` | 同 失敗 |
 
 use alc_hub_core::pairing::{
-    hub_token_request_body, introspect_request_body, parse_hub_token_response,
-    parse_introspect_response, parse_token_response, token_request_body, DeviceToken, HubToken,
-    IntrospectResult,
+    hub_token_request_body, introspect_request_body, parse_claim_ticket_response,
+    parse_hub_token_response, parse_introspect_response, parse_token_response, token_request_body,
+    DeviceToken, HubToken, IntrospectResult,
 };
 use anyhow::{Context, Result};
 use esp_idf_svc::hal::delay::FreeRtos;
@@ -137,6 +137,28 @@ pub fn introspect(
     .and_then(|(_, body)| parse_introspect_response(&body))
 }
 
+/// `AUTH TICKET`: 端末登録の一回券を取得する (ippoan/auth-worker#519、
+/// ippoan/alc-app-s3#204)。USB からの要求時にだけ、その場で HTTP を叩く
+/// (自発的には取りに行かない)。credential 未登録は `not paired` を返す。
+/// `mint_token` と同じ base で device JWT を mint し、その JWT を
+/// `Authorization: Bearer` に載せて body 無しで `POST /device/claim-ticket`
+/// する。**JWT も secret もホストへは出さない** — 返すのは券 (ticket) と
+/// 有効期限のみ。
+pub fn fetch_claim_ticket(settings: &Settings) -> Result<(String, u32), String> {
+    let (id, secret) = settings
+        .device_credential()
+        .ok_or_else(|| "not paired".to_string())?;
+    let base = settings.auth_url();
+    let jwt = mint_token(&base, &id, &secret)?;
+    let (status, body) = post_authed(&format!("{base}/device/claim-ticket"), &jwt.access_token)
+        .map_err(|e| e.to_string())?;
+    if status != 200 {
+        return Err(format!("http {status}"));
+    }
+    let ticket = parse_claim_ticket_response(&body)?;
+    Ok((ticket.ticket, ticket.expires_in_s))
+}
+
 /// JSON POST (blocking)。応答の (HTTP status, body) を返す。
 /// レスポンス解釈は純粋部 (pairing.rs) が行うため、非 2xx でも本文を返す
 /// (auth-worker はエラー時も `{"error":...}` を返す)。
@@ -160,7 +182,29 @@ fn post_json(url: &str, body: &str) -> Result<(u16, String)> {
     .context("リクエスト送信に失敗")?;
     conn.write_all(body.as_bytes()).context("本文送信に失敗")?;
     conn.initiate_response().context("応答受信に失敗")?;
+    read_response(conn)
+}
 
+/// 認証付き・body 無しの POST (blocking)。`fetch_claim_ticket` 専用
+/// (`/device/claim-ticket` は device JWT を Authorization ヘッダで渡すだけで
+/// リクエスト body を取らない)。
+fn post_authed(url: &str, bearer: &str) -> Result<(u16, String)> {
+    let mut conn = EspHttpConnection::new(&HttpConfiguration {
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        timeout: Some(core::time::Duration::from_secs(HTTP_TIMEOUT_S)),
+        ..Default::default()
+    })
+    .context("HTTP 接続の初期化に失敗")?;
+
+    let auth = format!("Bearer {bearer}");
+    conn.initiate_request(Method::Post, url, &[("Authorization", &auth)])
+        .context("リクエスト送信に失敗")?;
+    conn.initiate_response().context("応答受信に失敗")?;
+    read_response(conn)
+}
+
+/// 応答本文を読み切り、(HTTP status, body) を返す共通部。
+fn read_response(mut conn: EspHttpConnection) -> Result<(u16, String)> {
     let status = conn.status();
     let mut out: Vec<u8> = Vec::new();
     let mut buf = [0u8; 512];

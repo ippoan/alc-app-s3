@@ -117,11 +117,19 @@ pub fn spawn_reader(
 /// `STATUS` は機種ごとに項目が違うので**含めない**。`OTA` も、LAN 専用機は
 /// リンクアップを待つ必要がある一方で Wi-Fi 機はそうでないため含めない
 /// ([`handle_ota_lan_guarded`] 参照)。
+///
+/// `claim_ticket_supported` は `AUTH TICKET` (ippoan/alc-app-s3#204) だけの
+/// 例外 — この券は USB で繋がった**運行者 PWA ブラウザ**への受け渡しが前提
+/// (host_link.rs = CoreS3 のみ)。印刷ブリッジ・タイムカード端末・警告デバイス
+/// (VoiceS3R) に USB 越しの PWA は繋がらないため `false` を渡し、
+/// `ERR AUTH TICKET: unsupported` を返させる (VoiceS3R は元々ネットワーク自体
+/// を持たない)。
 #[must_use]
 pub fn handle_common(
     command: HostCommand,
     status: &SharedStatus,
     settings: &Settings,
+    claim_ticket_supported: bool,
 ) -> Option<HostCommand> {
     match command {
         HostCommand::Ping => println!("PONG"),
@@ -171,6 +179,25 @@ pub fn handle_common(
         HostCommand::AuthToken => {
             crate::auth_link::spawn_mint_test(settings.clone(), status.clone());
             println!("OK AUTH TOKEN");
+        }
+        // 端末登録の一回券 (ippoan/auth-worker#519、ippoan/alc-app-s3#204)。
+        // USB からの要求時だけ HTTP を叩き、その場で応答行を返す (AuthToken の
+        // 自己診断と違い EVT 経由の非同期にはしない — 運行者 PWA は応答行を
+        // 待って端末登録するため)。**JWT / secret はホストへ出さない**
+        HostCommand::AuthTicket => {
+            if !claim_ticket_supported {
+                println!("ERR AUTH TICKET: unsupported");
+            } else if settings.device_credential().is_none() {
+                println!("ERR AUTH TICKET: not paired");
+            } else {
+                match crate::auth_link::fetch_claim_ticket(settings) {
+                    Ok((ticket, expires_in)) => println!(
+                        "{}",
+                        alc_hub_core::pairing::auth_ticket_line(&ticket, expires_in)
+                    ),
+                    Err(e) => println!("ERR AUTH TICKET: {e}"),
+                }
+            }
         }
         HostCommand::AuthUrl { url } => match settings.set_auth_url(&url) {
             Ok(()) => println!("OK AUTH URL"),

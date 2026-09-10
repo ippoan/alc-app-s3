@@ -136,6 +136,37 @@ pub fn parse_introspect_response(body: &str) -> Result<IntrospectResult, String>
     })
 }
 
+/// `POST /device/claim-ticket` の応答 (端末登録の一回券、
+/// ippoan/auth-worker#519、ippoan/alc-app-s3#204)。運行者 PWA が USB 経由で
+/// 受け取り、管理者ログイン無しの端末登録に使う。券そのものは短命 (既定
+/// 300 秒) で 1 回しか引き換えられない — secret / device JWT はホストへ
+/// 出さない (`auth_link::fetch_claim_ticket` が mint する JWT は Authorization
+/// ヘッダで使うだけで、この構造体にも応答行にも載らない)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimTicket {
+    pub ticket: String,
+    pub expires_in_s: u32,
+}
+
+/// `POST /device/claim-ticket` の応答 (body 無しの POST。Authorization ヘッダ
+/// の device JWT だけで認証する) を解釈する。
+pub fn parse_claim_ticket_response(body: &str) -> Result<ClaimTicket, String> {
+    let obj = parse_object(body)?;
+    let ticket = str_field(&obj, "ticket")?;
+    let expires_in = u64_field(&obj, "expires_in")?;
+    let expires_in_s =
+        u32::try_from(expires_in).map_err(|_| "expires_in が大きすぎます".to_string())?;
+    Ok(ClaimTicket {
+        ticket,
+        expires_in_s,
+    })
+}
+
+/// ホストへ返す `AUTH TICKET` の成功応答行を組み立てる (`console.rs` から呼ぶ)。
+pub fn auth_ticket_line(ticket: &str, expires_in: u32) -> String {
+    format!("AUTH TICKET {ticket} EXPIRES={expires_in}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,5 +330,55 @@ mod tests {
             role: Some("device-gateway".into()),
         };
         assert!(!invalid.authorizes_gateway("dev-abc")); // valid:false は無条件で拒否
+    }
+
+    #[test]
+    fn claim_ticket_response_ok() {
+        let t = parse_claim_ticket_response(r#"{"ticket":"tkt_abc123","expires_in":300}"#).unwrap();
+        assert_eq!(
+            t,
+            ClaimTicket {
+                ticket: "tkt_abc123".into(),
+                expires_in_s: 300,
+            }
+        );
+    }
+
+    #[test]
+    fn claim_ticket_response_missing_fields() {
+        assert_eq!(
+            parse_claim_ticket_response(r#"{}"#),
+            Err("ticket (文字列) がありません".into())
+        );
+        assert_eq!(
+            parse_claim_ticket_response(r#"{"ticket":"tkt_abc123"}"#),
+            Err("expires_in (数値) がありません".into())
+        );
+    }
+
+    #[test]
+    fn claim_ticket_response_expires_in_overflow() {
+        // u32 に収まらない expires_in はエラーにする (秒数として非現実的な値の防御)
+        assert_eq!(
+            parse_claim_ticket_response(r#"{"ticket":"tkt_abc123","expires_in":5000000000}"#),
+            Err("expires_in が大きすぎます".into())
+        );
+    }
+
+    #[test]
+    fn claim_ticket_response_not_json() {
+        assert!(parse_claim_ticket_response("not json").is_err());
+        assert_eq!(
+            parse_claim_ticket_response(r#"{"error":"rate_limited"}"#),
+            Err("サーバエラー: rate_limited".into())
+        );
+    }
+
+    #[test]
+    fn claim_ticket_line() {
+        assert_eq!(
+            auth_ticket_line("tkt_abc123", 300),
+            "AUTH TICKET tkt_abc123 EXPIRES=300"
+        );
     }
 }

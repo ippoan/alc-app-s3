@@ -38,6 +38,10 @@ pub enum HostCommand {
     AuthUrl { url: String },
     /// 保存済み credential で device JWT を取得する自己診断
     AuthToken,
+    /// 端末登録の一回券を auth-worker から取得する (ippoan/auth-worker#519、
+    /// ippoan/alc-app-s3#204)。運行者 PWA が USB 経由で受け取り、管理者ログイン
+    /// 無しで端末登録に使う。secret / JWT はホストへ出さず、券だけを返す
+    AuthTicket,
     /// cf-alc-recorder WS URL の上書き (staging テスト用。NVS 保存)
     WsUrl { url: String },
     /// WS 送信の状態問い合わせ (`WS CONNECTED=1 QUEUE=3 SEQ=42` を応答)
@@ -322,6 +326,7 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
             Some("UNPAIR") => HostCommand::AuthUnpair,
             Some("STATUS") => HostCommand::AuthStatus,
             Some("TOKEN") => HostCommand::AuthToken,
+            Some("TICKET") => HostCommand::AuthTicket,
             Some("URL") => match it.next() {
                 Some(url) if url.starts_with("https://") || url.starts_with("http://") => {
                     HostCommand::AuthUrl {
@@ -330,7 +335,7 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                 }
                 _ => return Err("ERR AUTH: URL には http(s):// で始まる URL が必要です".into()),
             },
-            _ => return Err("ERR AUTH: SET|UNPAIR|STATUS|TOKEN|URL が必要です".into()),
+            _ => return Err("ERR AUTH: SET|UNPAIR|STATUS|TOKEN|TICKET|URL が必要です".into()),
         },
         _ => return Err(format!("ERR 不明なコマンド: {cmd}")),
     };
@@ -605,6 +610,14 @@ mod tests {
         assert_eq!(
             parse_line("AUTH TOKEN", T),
             Ok(Some(HostCommand::AuthToken))
+        );
+        assert_eq!(
+            parse_line("AUTH TICKET", T),
+            Ok(Some(HostCommand::AuthTicket))
+        );
+        assert_eq!(
+            parse_line("auth ticket", T),
+            Ok(Some(HostCommand::AuthTicket))
         );
     }
 
