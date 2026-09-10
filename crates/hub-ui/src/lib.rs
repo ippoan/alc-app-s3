@@ -163,6 +163,8 @@ pub fn run(
     let mut last_usb = 0u64;
     // M-Bus 5V を USB ホストの有無に追随させるラッチ (#202)。起動時は出さない
     let mut usb5v = alc_hub_core::usb5v::Latch::default();
+    // M-Bus 5V の i2c 書き込みの連続失敗回数。warn は連続失敗の初回だけ出す
+    let mut bus5v_fail_streak: u32 = 0;
     let mut spin_phase = 0u8;
     let mut last_touch: Option<touch::TouchPoint> = None;
     // BLE で取得中の機器 (点呼画面のラベル横スピナー表示)。
@@ -233,10 +235,12 @@ pub fn run(
             if let Ok(mut st) = status.lock() {
                 st.usb_host = usb;
             }
-            // 切り替える瞬間だけ i2c を叩く (status のロックは手放してから)
+            // 切り替えるときだけ i2c を叩く (status のロックは手放してから)。
+            // 成功したときだけ Latch に確定させる — 失敗なら次の poll で再試行
             if let Some(desired) = usb5v.update(usb) {
                 match alc_hub_board::power::set_ext_5v_out(&mut i2c, desired) {
                     Ok(()) => {
+                        usb5v.commit(desired);
                         if let Ok(mut st) = status.lock() {
                             st.ext_5v_out = desired;
                         }
@@ -249,8 +253,23 @@ pub fn run(
                         // crashlog のリングにも残す (vprintf hook 経由。println!
                         // は hook を通らないため、再起動後の追跡はこちらが頼り)
                         log::info!("{line}");
+                        if bus5v_fail_streak > 0 {
+                            log::info!(
+                                "ui: M-Bus 5V 切り替えが回復 (失敗 {bus5v_fail_streak} 回の後)"
+                            );
+                            bus5v_fail_streak = 0;
+                        }
                     }
-                    Err(e) => log::warn!("ui: M-Bus 5V 切り替えに失敗: {e:?}"),
+                    Err(e) => {
+                        // 恒常的に失敗すると 1 秒ごとの warn が crashlog のリング
+                        // (4 KB) を埋めるので、連続失敗の初回だけ出す
+                        if bus5v_fail_streak == 0 {
+                            log::warn!(
+                                "ui: M-Bus 5V 切り替えに失敗 (以後は回復まで黙って 1 秒ごとに再試行): {e:?}"
+                            );
+                        }
+                        bus5v_fail_streak = bus5v_fail_streak.saturating_add(1);
+                    }
                 }
             }
             last_usb = now;
