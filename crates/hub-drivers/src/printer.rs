@@ -117,8 +117,10 @@ fn fetch_and_send(url: &str, printer_addr: &str) -> Result<usize> {
         .unwrap_or(0);
 
     // レスポンスが取得できてから接続する (接続直後にすぐ書き込める状態にする)
-    let mut printer = TcpStream::connect(printer_addr)
-        .with_context(|| format!("プリンター {printer_addr} に接続できません"))?;
+    // 宛先は文言に入れない — `EVT PRINT NG {e:#}` は crashlog リングに入る
+    // (evtlog、#215)。宛先は設定で分かるので、失敗の種類だけ残す
+    let mut printer =
+        TcpStream::connect(printer_addr).context("プリンターに接続できません")?;
     printer
         .set_write_timeout(Some(Duration::from_secs(IO_TIMEOUT_S)))
         .context("送信タイムアウト設定失敗")?;
