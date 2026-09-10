@@ -2,9 +2,7 @@
 //!
 //! 「画面が切れた」時に何が起きていたかを後追いするための仕組み:
 //!
-//! 1. **panic 前ログの保持** — noinit 領域のリングバッファ (CoreS3 は PSRAM の
-//!    `.ext_ram_noinit` に 256 KB、AtomS3 系は DRAM の `.noinit` に 4 KB。
-//!    [`RING_CAP`]、#217) に
+//! 1. **panic 前ログの保持** — `.noinit` DRAM のリングバッファ (4KB) に
 //!    - C コンポーネント (Wi-Fi/BLE 等) の `esp_log` 出力
 //!      (`esp_log_set_vprintf` の tee hook)。**Rust `log` マクロはここを
 //!      通らない** — EspLogger は newlib stdout へ `fwrite` で直接書くため
@@ -43,21 +41,8 @@ use alc_hub_common::{
 use alc_hub_core::crashlog as pure;
 use esp_idf_svc::sys;
 
-/// リング容量。置き場は sdkconfig の `CONFIG_SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY`
-/// で切り替える (Refs #217):
-///
-/// - 有効な機 (CoreS3) — PSRAM (`.ext_ram_noinit`) に 256 KB (ログ 1 行 ~100
-///   バイトとして直近 ~2600 行相当)。WS 再接続の失敗が続いても数十分は残る
-/// - 無効な機 (AtomS3 系。PSRAM 非搭載・`IGNORE_NOTFOUND` 併用) — 内部 DRAM
-///   (`.noinit`) に 4 KB (直近 ~40 行相当)。静的 DRAM を常時消費するため控えめ
-///
-/// IDF のリンカスクリプトは `.ext_ram_noinit` をこの Kconfig が有効なときしか
-/// 定義しない。`#[link_section]` の直書きは C の `EXT_RAM_NOINIT_ATTR` と違って
-/// 無効時に内部 RAM へ黙って落ちてくれない (orphan section になる) ので、
-/// 置き場ごと cfg で分ける
-#[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
-const RING_CAP: usize = 256 * 1024;
-#[cfg(not(esp_idf_spiram_allow_noinit_seg_external_memory))]
+/// リング容量。`.noinit` は静的 DRAM を常時消費するため控えめにする
+/// (ログ 1 行 ~100 バイトとして直近 ~40 行相当)。
 const RING_CAP: usize = 4096;
 /// WS payload に載せるログの上限。送信キューは 1 件 1 キー (punchq、#142) に
 /// なったが、**1 行 (= 1 件) は NVS 文字列の上限 4000 バイト未満**である必要が
@@ -69,7 +54,7 @@ const MAGIC: u32 = 0x43524c47;
 /// 超過分は切り捨てる (hook は呼び出し元タスクのスタックで走るため控えめ)。
 const LINE_BUF: usize = 256;
 
-/// リング本体 (置き場は [`RING_CAP`] の doc)。ソフトリセットを跨いで内容が残る。
+/// `.noinit` に置くリング本体。ソフトリセットを跨いで内容が残る。
 #[repr(C)]
 struct Ring {
     magic: u32,
@@ -80,14 +65,7 @@ struct Ring {
     data: [u8; RING_CAP],
 }
 
-#[cfg_attr(
-    esp_idf_spiram_allow_noinit_seg_external_memory,
-    link_section = ".ext_ram_noinit"
-)]
-#[cfg_attr(
-    not(esp_idf_spiram_allow_noinit_seg_external_memory),
-    link_section = ".noinit"
-)]
+#[link_section = ".noinit"]
 static mut RING: MaybeUninit<Ring> = MaybeUninit::uninit();
 
 /// リングへの排他。vprintf hook は複数タスクから同時に呼ばれ得る。
