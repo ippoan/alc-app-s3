@@ -30,6 +30,13 @@ namespace {
 m5::unit::UnitUnified g_units;
 m5::unit::UnitNFC g_unit{};
 bool g_ready = false;
+// nfc_shim_init が begin() 失敗で抜けたあと、5秒後の再試行 (init_with_retry,
+// hub-drivers/src/nfc.rs:68) で bus/add をやり直さずに済ませるための持ち越し
+// state (issue #208)。UnitUnified::add() は同じ unit の重複登録を弾くので、
+// g_unit_added フラグ無しで「毎回 add」すると再試行が必ず失敗する。unit を
+// 外す remove API も無いので、add 済みの bus を i2c_del_master_bus で消す道も無い。
+static i2c_master_bus_handle_t g_bus = nullptr;
+static bool g_unit_added             = false;
 // NFCLayerF/A/B は動作確認済みの診断コード (atom_echo_nfc_test_B) と同じく
 // 起動時に1回だけ構築する (2026-07-20, issue #96 切り分け中: 従来は検出試行の
 // たびに新規構築していた。デストラクタは=defaultでレジスタは触らないと確認
@@ -182,12 +189,20 @@ extern "C" int nfc_shim_init(int i2c_port, int sda_gpio, int scl_gpio)
     bus_cfg.glitch_ignore_cnt            = 7;
     bus_cfg.flags.enable_internal_pullup = true;
 
-    i2c_master_bus_handle_t bus{};
-    if (i2c_new_master_bus(&bus_cfg, &bus) != ESP_OK) {
-        return -1;
+    // bus は在れば再利用 (初回失敗後の再試行で i2c_new_master_bus が「already
+    // acquired」で落ちないように)。add も同様に一度成功したら次回はやり直さない
+    // (UnitUnified::add() は重複登録を弾く)。begin() だけは毎回無条件で
+    // 呼び直せる (issue #208)
+    if (g_bus == nullptr) {
+        if (i2c_new_master_bus(&bus_cfg, &g_bus) != ESP_OK) {
+            return -1;
+        }
     }
-    if (!g_units.add(g_unit, bus)) {
-        return -2;
+    if (!g_unit_added) {
+        if (!g_units.add(g_unit, g_bus)) {
+            return -2;
+        }
+        g_unit_added = true;
     }
     if (!g_units.begin()) {
         return -3;
