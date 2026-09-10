@@ -77,8 +77,7 @@ fn init_with_retry(i2c_port: i32, sda_num: i32, scl_num: i32, status: &SharedSta
                 "NFC 初期化失敗 rc={rc} (配線/バス役割 port={i2c_port} sda={sda_num} scl={scl_num} を確認)"
             );
             log::error!("nfc: {msg} — {INIT_RETRY:?} ごとに再試行する");
-            println!("EVT NFC_INIT_NG rc={rc}");
-            crate::crashlog::note(&format!("EVT NFC_INIT_NG rc={rc}"));
+            alc_hub_common::evtlog::emit(&format!("EVT NFC_INIT_NG rc={rc}"));
             push_event(status, &msg);
             last_rc = rc;
         }
@@ -238,22 +237,23 @@ fn run(
     // ぶんが落ちるので、`EVT NFC_READY` は起動後でもコンソールから
     // `LOG DUMP` で拾える (crashlog リングに載る) ことに意味がある
     log::info!("nfc: 待受開始 port={i2c_port} sda={sda_num} scl={scl_num}");
-    println!("EVT NFC_READY port={i2c_port} sda={sda_num} scl={scl_num}");
-    crate::crashlog::note("EVT NFC_READY");
+    alc_hub_common::evtlog::emit(&format!(
+        "EVT NFC_READY port={i2c_port} sda={sda_num} scl={scl_num}"
+    ));
     push_event(&status, "NFC 待受開始 (存在検知ゲート + F→A→B 逐次ポーリング)");
     let license_first = order == PollOrder::LicenseFirst;
     if license_first {
         // 起動マーカー。**NFC_READY より前に置かない** — それより前のコンソール出力は
         // 取りこぼされる (起動直後と es8311 dump_regs 直後の約 200ms)
-        println!("EVT NFC_POLL_ORDER LicenseFirst");
+        alc_hub_common::evtlog::emit("EVT NFC_POLL_ORDER LicenseFirst");
         log::info!("nfc: B 先行 + B 粘着でポーリングする (PollOrder::LicenseFirst)");
         // step 4b: 「まだ載っている」(present) は RF の応答で決める (下の touch の直前)
-        println!("EVT NFC_PRESENT_SRC rf");
+        alc_hub_common::evtlog::emit("EVT NFC_PRESENT_SRC rf");
     }
     let always_poll = gate == PresenceGate::AlwaysPoll;
     if always_poll {
         // 起動マーカー (同じく NFC_READY より後)
-        println!("EVT NFC_PRESENCE_GATE AlwaysPoll");
+        alc_hub_common::evtlog::emit("EVT NFC_PRESENCE_GATE AlwaysPoll");
         log::info!("nfc: 存在検知をゲートに使わず常時ポーリングする (PresenceGate::AlwaysPoll)");
     }
 

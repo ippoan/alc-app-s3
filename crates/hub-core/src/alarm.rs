@@ -110,6 +110,68 @@ pub enum Action {
     Emit(String),
 }
 
+/// [`Action::Emit`] の行から、状態か理由が変わったときだけ crashlog リング用の
+/// 短い行 (`ALARM <state>/<cause>`) を返す (#215)。
+///
+/// `Emit` は遷移のたびに加えて [`BANNER_MS`] ごとにも同じ行が出るので、そのまま
+/// リングへ入れると 4 KB を押し流す。`EVT ` を付けないのは、CoreS3 がこの行を
+/// シリアルに出さない (ブラウザが `EVT ALARM` を見ると CoreS3 を別機種と判定する)
+/// 約束をリングの側でも崩さないため
+#[derive(Debug, Default)]
+pub struct TransitionLog {
+    last: Option<String>,
+}
+
+impl TransitionLog {
+    pub const fn new() -> Self {
+        Self { last: None }
+    }
+
+    /// `EVT ALARM state=<s> cause=<c>` を受け、前回と違えば `ALARM <s>/<c>`。
+    /// 形の違う行は `None`
+    pub fn on_emit(&mut self, line: &str) -> Option<String> {
+        let rest = line.strip_prefix("EVT ALARM state=")?;
+        let (state, cause) = rest.split_once(" cause=")?;
+        let note = format!("ALARM {state}/{cause}");
+        if self.last.as_deref() == Some(note.as_str()) {
+            return None;
+        }
+        self.last = Some(note.clone());
+        Some(note)
+    }
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+
+    #[test]
+    fn notes_only_changes() {
+        let mut t = TransitionLog::new();
+        assert_eq!(
+            t.on_emit("EVT ALARM state=idle cause=none").as_deref(),
+            Some("ALARM idle/none")
+        );
+        // BANNER_MS ごとの同じ行は入れない
+        assert_eq!(t.on_emit("EVT ALARM state=idle cause=none"), None);
+        assert_eq!(
+            t.on_emit("EVT ALARM state=alarming cause=silence").as_deref(),
+            Some("ALARM alarming/silence")
+        );
+        assert_eq!(
+            t.on_emit("EVT ALARM state=alarming cause=ng:offline").as_deref(),
+            Some("ALARM alarming/ng:offline")
+        );
+    }
+
+    #[test]
+    fn ignores_other_lines() {
+        let mut t = TransitionLog::default();
+        assert_eq!(t.on_emit("EVT BOOT reset=usb (11)"), None);
+        assert_eq!(t.on_emit("EVT ALARM state=idle"), None);
+    }
+}
+
 /// 鳴っている理由。**優先は silence > call > ng** — 沈黙はキオスク自身の申告が
 /// 当てにならない状態なので、同時に成立していたら沈黙を表に出す
 #[derive(Debug, Clone, PartialEq, Eq)]

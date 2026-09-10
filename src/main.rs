@@ -55,6 +55,15 @@ fn main() -> Result<()> {
     // ログ捕捉 hook (vprintf tee + Rust panic hook) の設置。他モジュールの
     // 初期化より先に呼び、起動中のログ・クラッシュも捕まえる (Refs #43)
     let (reset_code, crash) = crashlog::init();
+    // NimBLE の INFO (5 秒ごとの scan の `GAP procedure initiated: discovery` 等) を
+    // 止める。vprintf hook 経由で crashlog リング (4 KB) を数十秒で押し流し、
+    // 切り分けに要る出来事が get_log に残らなかった (#215)。WARN 以上は残す
+    unsafe {
+        esp_idf_svc::sys::esp_log_level_set(
+            c"NimBLE".as_ptr(),
+            esp_idf_svc::sys::esp_log_level_t_ESP_LOG_WARN,
+        );
+    }
     log::info!("alc-hub-cores3 v{} 起動", config::FIRMWARE_VERSION);
 
     let p = Peripherals::take()?;
@@ -223,7 +232,7 @@ fn main() -> Result<()> {
         if alc_hub_core::crashlog::is_usb_serial_reset(reset_code)
             && alc_hub_drivers::alarm::restore_armed_flag()
         {
-            println!("EVT ALARM_RESTORED reset={reset_code}");
+            alc_hub_common::evtlog::emit(&format!("EVT ALARM_RESTORED reset={reset_code}"));
             alc_hub_core::alarm::AlarmMonitor::with_boot_grace(Some(
                 alc_hub_core::alarm::SILENCE_MS,
             ))

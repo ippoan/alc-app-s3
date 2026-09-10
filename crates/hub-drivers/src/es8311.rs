@@ -93,12 +93,12 @@ pub fn probe_bus(i2c: &mut I2cDriver) {
         .collect::<Vec<_>>()
         .join(",");
     log::info!("es8311: I2C scan = [{list}]");
-    println!(
+    alc_hub_common::evtlog::emit(&format!(
         "EVT I2C_SCAN devices={} es8311={} lp5562={}",
         found.len(),
         u8::from(found.contains(&ES8311_ADDR)),
         u8::from(found.contains(&LP5562_ADDR)),
-    );
+    ));
 }
 
 /// ES8311 を I2S 入力・フル音量で有効化し、NS4150B アンプを有効にする。

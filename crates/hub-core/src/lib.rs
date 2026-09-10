@@ -25,6 +25,7 @@ pub mod nfca_uid;
 pub mod pairing;
 pub mod printer;
 pub mod protocol;
+pub mod pwalog;
 pub mod session;
 pub mod tenko;
 pub mod tenko_prompt;

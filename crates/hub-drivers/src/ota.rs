@@ -77,8 +77,7 @@ fn wait_for_heap() -> u32 {
     // BLE の scan 1 周期ぶん待って NimBLE に電波とヒープを手放させる
     FreeRtos::delay_ms(BLE_SETTLE_MS);
     let free = free_internal();
-    println!("EVT OTA_HEAP free_int={free}");
-    crate::crashlog::note(&format!("EVT OTA_HEAP free_int={free}"));
+    alc_hub_common::evtlog::emit(&format!("EVT OTA_HEAP free_int={free}"));
     free
 }
 /// 受信チャンク。8KB (>4KB) なので PSRAM に確保される
@@ -196,7 +195,9 @@ pub fn spawn_update(url: String, status: SharedStatus, progress: Option<Progress
                 // ここで落とさず明示的に失敗させる。以前はガードが無く、
                 // TLS ハンドシェイクの途中で無言のまま panic していた
                 set_ota_active(&status, false);
-                println!("EVT OTA NG 内部RAM 不足 ({free} bytes)");
+                alc_hub_common::evtlog::emit(&format!(
+                    "EVT OTA NG 内部RAM 不足 ({free} bytes)"
+                ));
                 if let Ok(mut st) = status.lock() {
                     st.push_event(now_ms(), "OTA 失敗 (内部RAM 不足)");
                 }
@@ -216,7 +217,7 @@ pub fn spawn_update(url: String, status: SharedStatus, progress: Option<Progress
             };
             match result {
                 Ok(bytes) => {
-                    println!("EVT OTA OK {bytes}");
+                    alc_hub_common::evtlog::emit(&format!("EVT OTA OK {bytes}"));
                     if let Ok(mut st) = status.lock() {
                         st.push_event(now_ms(), "OTA 完了 — 再起動");
                     }
@@ -231,7 +232,7 @@ pub fn spawn_update(url: String, status: SharedStatus, progress: Option<Progress
                 Err(e) => {
                     // WS / BLE を元に戻す (成功時は再起動するので不要)
                     set_ota_active(&status, false);
-                    println!("EVT OTA NG {e:#}");
+                    alc_hub_common::evtlog::emit(&format!("EVT OTA NG {e:#}"));
                     if let Ok(mut st) = status.lock() {
                         st.push_event(now_ms(), "OTA 失敗");
                     }
@@ -249,7 +250,7 @@ pub fn spawn_update(url: String, status: SharedStatus, progress: Option<Progress
         log::warn!("ota: スレッド設定を既定へ戻せませんでした: {e:?}");
     }
     if spawned.is_err() {
-        println!("EVT OTA NG スレッド起動失敗 (メモリ不足)");
+        alc_hub_common::evtlog::emit("EVT OTA NG スレッド起動失敗 (メモリ不足)");
         if let Ok(mut st) = status.lock() {
             st.push_event(now_ms(), "OTA 失敗 (メモリ不足)");
         }

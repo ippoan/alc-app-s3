@@ -13,6 +13,8 @@
 //! `.noinit` メモリの確保・`esp_log_set_vprintf` hook・`esp_reset_reason()`
 //! などの副作用は firmware 側 (hub-drivers/src/crashlog.rs) が担う。
 
+use crate::pwalog::PwaLog;
+
 /// `esp_reset_reason_t` の値 → 短い名前。ESP-IDF の安定 API 値
 /// (esp_system.h) をそのまま受ける — sys クレートに依存しない。
 pub fn reset_reason_name(code: i32) -> &'static str {
@@ -40,6 +42,12 @@ pub fn reset_reason_name(code: i32) -> &'static str {
 /// poweron / sw (esp_restart = OTA・RESET コマンド) / usb 等の正常系は除く。
 pub fn is_crash_reset(code: i32) -> bool {
     matches!(code, 4 | 5 | 6 | 7 | 9 | 14 | 15)
+}
+
+/// 起動ごとにリングへ入れる区切り行 (#215)。リングはソフトリセット (usb / sw /
+/// panic / WDT) をまたいで残るので、前の起動の行と今回の行の境目を示す。
+pub fn boot_separator(code: i32) -> String {
+    format!("--- BOOT reset={} ({code}) ---", reset_reason_name(code))
 }
 
 /// USB-Serial-JTAG 起因の reset (usb = 11 / jtag = 12) か。
@@ -160,19 +168,29 @@ pub fn tail_lines(text: &str, max_bytes: usize) -> (&str, bool) {
 /// `boot_history` キーを新しい順 (先頭が現在の起動) で足す。履歴を持たない機種
 /// (VoiceS3R 等、`HubStatus::reset_history` が既定の `None`) では `None` を渡し、
 /// キー自体を出さない。
+///
+/// `pwa` はキオスク PWA から中継した診断ログ (#215、[`crate::pwalog`])。
+/// `pwa_log` / `pwa_log_error` キーは常に出す ([`PwaLog::json_fields`])。
+/// `max_bytes` は `text` だけに掛かり、`pwa_log` (最大
+/// [`crate::pwalog::MAX_BYTES`]) はその外に足す — `max_bytes` の上限
+/// ([`crate::uplink::LOG_MAX_BYTES`]) は送信側の制約ではないため
 pub fn log_payload(
     text: &str,
     max_bytes: usize,
     uptime_ms: u64,
     reset_history: Option<u64>,
+    pwa: &PwaLog,
 ) -> String {
     let (tail, truncated) = tail_lines(text, max_bytes);
+    let (pwa_log, pwa_log_error) = pwa.json_fields();
     let mut payload = serde_json::json!({
         "text": tail,
         "bytes": tail.len(),
         "total_bytes": text.len(),
         "truncated": truncated,
         "uptime_ms": uptime_ms,
+        "pwa_log": pwa_log,
+        "pwa_log_error": pwa_log_error,
     });
     if let Some(packed) = reset_history {
         let boot_history: Vec<_> = crate::boot_history::codes(packed)
@@ -367,7 +385,7 @@ mod tests {
 
     #[test]
     fn log_payload_reports_sizes_and_truncation() {
-        let p = log_payload("l1\nl2 \"q\"\n", 100, 4242, None);
+        let p = log_payload("l1\nl2 \"q\"\n", 100, 4242, None, &PwaLog::NoHost);
         let v: serde_json::Value = serde_json::from_str(&p).unwrap();
         assert_eq!(v["text"], "l1\nl2 \"q\"\n");
         assert_eq!(v["bytes"], 10);
@@ -375,7 +393,7 @@ mod tests {
         assert_eq!(v["truncated"], false);
         assert_eq!(v["uptime_ms"], 4242);
 
-        let p = log_payload("l1\nl2\nl3\n", 4, 0, None);
+        let p = log_payload("l1\nl2\nl3\n", 4, 0, None, &PwaLog::NoHost);
         let v: serde_json::Value = serde_json::from_str(&p).unwrap();
         assert_eq!(v["text"], "l3\n");
         assert_eq!(v["bytes"], 3);
@@ -385,7 +403,7 @@ mod tests {
 
     #[test]
     fn log_payload_omits_boot_history_key_when_none() {
-        let p = log_payload("l1\n", 100, 0, None);
+        let p = log_payload("l1\n", 100, 0, None, &PwaLog::NoHost);
         let v: serde_json::Value = serde_json::from_str(&p).unwrap();
         assert!(v.get("boot_history").is_none());
     }
@@ -395,7 +413,7 @@ mod tests {
         // code=11 (usb) が最新、9 (brownout) が 1 つ前
         let packed =
             crate::boot_history::push(crate::boot_history::push(crate::boot_history::EMPTY, 9), 11);
-        let p = log_payload("l1\n", 100, 0, Some(packed));
+        let p = log_payload("l1\n", 100, 0, Some(packed), &PwaLog::NoHost);
         let v: serde_json::Value = serde_json::from_str(&p).unwrap();
         let hist = v["boot_history"].as_array().unwrap();
         assert_eq!(hist.len(), 2);
@@ -407,9 +425,68 @@ mod tests {
 
     #[test]
     fn log_payload_boot_history_empty_is_empty_array() {
-        let p = log_payload("l1\n", 100, 0, Some(crate::boot_history::EMPTY));
+        let p = log_payload(
+            "l1\n",
+            100,
+            0,
+            Some(crate::boot_history::EMPTY),
+            &PwaLog::NoHost,
+        );
         let v: serde_json::Value = serde_json::from_str(&p).unwrap();
         assert_eq!(v["boot_history"].as_array().unwrap().len(), 0);
+    }
+
+    fn payload_with(pwa: PwaLog) -> serde_json::Value {
+        let p = log_payload("l1\n", 100, 0, None, &pwa);
+        serde_json::from_str(&p).unwrap()
+    }
+
+    #[test]
+    fn log_payload_pwa_log_no_host() {
+        let v = payload_with(PwaLog::NoHost);
+        assert!(v["pwa_log"].is_null());
+        assert_eq!(v["pwa_log_error"], "no_host");
+        // 既存のキーは変わらない
+        assert_eq!(v["text"], "l1\n");
+    }
+
+    #[test]
+    fn log_payload_pwa_log_received() {
+        let v = payload_with(PwaLog::Received {
+            text: "a\n\"b\"".into(),
+            complete: true,
+        });
+        assert_eq!(v["pwa_log"], "a\n\"b\"");
+        assert!(v["pwa_log_error"].is_null());
+        // text の max_bytes は pwa_log に食われない
+        assert_eq!(v["bytes"], 3);
+    }
+
+    #[test]
+    fn log_payload_pwa_log_empty_answer() {
+        // PWA が 0 行で END を返した
+        let v = payload_with(PwaLog::Received {
+            text: String::new(),
+            complete: true,
+        });
+        assert_eq!(v["pwa_log"], "");
+        assert!(v["pwa_log_error"].is_null());
+    }
+
+    #[test]
+    fn log_payload_pwa_log_timeout_keeps_partial() {
+        let v = payload_with(PwaLog::Received {
+            text: "a".into(),
+            complete: false,
+        });
+        assert_eq!(v["pwa_log"], "a");
+        assert_eq!(v["pwa_log_error"], "timeout");
+    }
+
+    #[test]
+    fn boot_separator_names_the_reset() {
+        assert_eq!(boot_separator(11), "--- BOOT reset=usb (11) ---");
+        assert_eq!(boot_separator(4), "--- BOOT reset=panic (4) ---");
     }
 
     #[test]

@@ -169,7 +169,7 @@ pub fn open_store(settings: &Settings) -> (Box<dyn UplinkStore>, &'static str) {
             migrate_legacy(settings, &mut store);
             let count = store.seqs().len();
             log::info!("punchq: 専用パーティションを使用 (未送信 {count} 件)");
-            println!("EVT PUNCHQ nvs count={count}");
+            alc_hub_common::evtlog::emit(&format!("EVT PUNCHQ nvs count={count}"));
             (Box::new(store), "nvs")
         }
         Err(e) => {
@@ -180,7 +180,7 @@ pub fn open_store(settings: &Settings) -> (Box<dyn UplinkStore>, &'static str) {
                 settings: settings.clone(),
             };
             let count = store.seqs().len();
-            println!("EVT PUNCHQ legacy count={count}");
+            alc_hub_common::evtlog::emit(&format!("EVT PUNCHQ legacy count={count}"));
             (Box::new(store), "legacy")
         }
     }
@@ -205,5 +205,5 @@ fn migrate_legacy(settings: &Settings, store: &mut NvsKeyStore) {
     }
     settings.set_ws_queue("");
     log::info!("punchq: 旧キューから {moved} 件を移行");
-    println!("EVT PUNCHQ migrated {moved}");
+    alc_hub_common::evtlog::emit(&format!("EVT PUNCHQ migrated {moved}"));
 }

@@ -204,7 +204,7 @@ fn main() -> Result<()> {
         Ok((tx, en)) => (Some(tx), Some(en)),
         Err(e) => {
             log::warn!("speaker: 初期化失敗 — 打刻音なしで継続する: {e:#}");
-            println!("EVT SPEAKER_NG");
+            alc_hub_common::evtlog::emit("EVT SPEAKER_NG");
             (None, None)
         }
     };
@@ -275,7 +275,7 @@ fn on_card(
         // 「断った」ことを伝えるどころか誤解を増やす。
         // 読めなかったときの無反応は、**かざし直せば済む**ぶん 2 枚検知より軽い
         if let NfcEvent::MultipleCards = event {
-            println!("EVT NFC_MULTI_CARD");
+            alc_hub_common::evtlog::emit("EVT NFC_MULTI_CARD");
             if let Some(tx) = speaker {
                 let _ = tx.send(Sound::PunchNg);
             }

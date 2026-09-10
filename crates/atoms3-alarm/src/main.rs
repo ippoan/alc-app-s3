@@ -121,7 +121,7 @@ fn main() -> Result<()> {
         if alc_hub_core::crashlog::is_usb_serial_reset(reset_code)
             && alarm::restore_armed_flag()
         {
-            println!("EVT ALARM_RESTORED reset={reset_code}");
+            alc_hub_common::evtlog::emit(&format!("EVT ALARM_RESTORED reset={reset_code}"));
             AlarmMonitor::with_boot_grace(Some(alc_hub_core::alarm::SILENCE_MS))
         } else {
             AlarmMonitor::new()
@@ -166,7 +166,7 @@ fn main() -> Result<()> {
         Ok((tx, en)) => (Some(tx), Some(en)),
         Err(e) => {
             log::warn!("speaker: 初期化失敗 — 鳴らせない状態で継続する: {e:#}");
-            println!("EVT SPEAKER_NG");
+            alc_hub_common::evtlog::emit("EVT SPEAKER_NG");
             (None, None)
         }
     };

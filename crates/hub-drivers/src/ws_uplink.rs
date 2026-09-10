@@ -22,7 +22,7 @@
 //! | イベント | 意味 |
 //! |---|---|
 //! | `EVT WS_CONNECTED` / `EVT WS_DISCONNECTED` | WS 接続状態の変化 |
-//! | `EVT WS_COMMAND <id> <payload>` | 下り command を受信 |
+//! | `EVT WS_COMMAND <id> <payload>` | 下り command を受信。`get_log` のときはキオスク PWA が `PWALOG <id> …` を返す合図を兼ねる (#215、pwalog.rs) |
 //! | `EVT WS_DROPPED <seq> <kind>` | 保存先が一杯で最古の未送信測定を破棄 |
 //! | `EVT PUNCHQ <mode> count=<n>` | 送信キューの保存先と未送信件数 (punchq.rs) |
 
@@ -226,8 +226,7 @@ fn run(
                         c.disconnected_at = None;
                     }
                     connect_warned = false;
-                    println!("EVT WS_CONNECTED");
-                    crate::crashlog::note("EVT WS_CONNECTED");
+                    alc_hub_common::evtlog::emit("EVT WS_CONNECTED");
                     // 前の接続で送った分がサーバに届いたかは分からないので、
                     // 送信済みの印を落として窓の全件を送り直す
                     queue.reset_sent();
@@ -237,8 +236,7 @@ fn run(
                 WsEvent::Disconnected => {
                     if conn.is_some() {
                         mark_disconnected(&mut conn, "サーバ側から切断", &queue);
-                        println!("EVT WS_DISCONNECTED");
-                        crate::crashlog::note("EVT WS_DISCONNECTED");
+                        alc_hub_common::evtlog::emit("EVT WS_DISCONNECTED");
                     }
                     // 印刷中の切断は未完なので破棄 (drop で 9100 を閉じる)
                     print_session = None;
@@ -304,7 +302,7 @@ fn run(
                 );
                 log::warn!("{line}");
                 crate::crashlog::note(&line);
-                println!("EVT WS_STALE_RESTART");
+                alc_hub_common::evtlog::emit("EVT WS_STALE_RESTART");
                 settings.set_ws_last_seq(queue.last_seq());
                 std::thread::sleep(core::time::Duration::from_millis(300));
                 unsafe { esp_idf_svc::sys::esp_restart() };
@@ -346,7 +344,7 @@ fn run(
         let wait_clock = should_wait_for_clock(epoch_ms(), connected_for, queue.has_correctable(boot_id));
         if wait_clock && !clock_wait_logged {
             log::info!("ws_uplink: 時計未同期のため送信を待機 (NTP 同期後に時刻補正して送る)");
-            println!("EVT WS_CLOCK_WAIT");
+            alc_hub_common::evtlog::emit("EVT WS_CLOCK_WAIT");
             clock_wait_logged = true;
         }
         if !wait_clock {
@@ -363,7 +361,7 @@ fn run(
             let fixed = queue.fix_unsynced_times(epoch_ms(), now, boot_id);
             if fixed > 0 {
                 log::info!("ws_uplink: 未同期時刻の測定 {fixed} 件を実時刻へ補正");
-                println!("EVT WS_TIME_FIXED {fixed}");
+                alc_hub_common::evtlog::emit(&format!("EVT WS_TIME_FIXED {fixed}"));
                 persist(&settings, &queue);
             }
             send_unsent = false;
@@ -505,7 +503,7 @@ fn enqueue(queue: &mut UplinkQueue, settings: &Settings, rec: &UplinkRecord, boo
     if let Some(DroppedEntry { seq, kind }) = dropped {
         // 捨てられたのが打刻だと賃金計算のデータが欠けるので kind まで出す
         log::warn!("ws_uplink: 保存先が一杯で seq={seq} ({kind}) を破棄");
-        println!("EVT WS_DROPPED {seq} {kind}");
+        alc_hub_common::evtlog::emit(&format!("EVT WS_DROPPED {seq} {kind}"));
     }
     match result {
         Ok(_) => persist(settings, queue),
@@ -579,7 +577,9 @@ fn handle_downlink(
                         crate::ota::spawn_update(url, status.clone(), Some(sink));
                     }
                     None => {
-                        println!("EVT OTA NG 下り command に有効な url がありません");
+                        alc_hub_common::evtlog::emit(
+                            "EVT OTA NG 下り command に有効な url がありません",
+                        );
                         send_command_result(
                             conn,
                             &id,
@@ -757,15 +757,27 @@ fn handle_downlink(
                 // リングの末尾 (行境界) を command_result で返す。auth-worker の
                 // MCP get_device_log が読む。上限は payload の max_bytes
                 // (省略時 3000、1〜3800 にクランプ)。command_result は NVS
-                // キューを通らず socket 直書きなので MAX_LINE_BYTES には掛からない
+                // キューを通らず socket 直書きなので MAX_LINE_BYTES には掛からない。
+                // USB ホスト (運行者 PWA) が居れば、上の `EVT WS_COMMAND` を合図に
+                // PWA が返す `PWALOG` 行を最大 2 秒集めて `pwa_log` に足す (#215、
+                // pwalog.rs)。**待つあいだ status の lock を持たない**
                 Some("get_log") => {
                     let text = crate::crashlog::snapshot_text();
-                    let reset_history = status.lock().map(|st| st.reset_history).unwrap_or(None);
+                    let (reset_history, usb_host) = status
+                        .lock()
+                        .map(|st| (st.reset_history, st.usb_host))
+                        .unwrap_or((None, false));
+                    let pwa = if usb_host {
+                        crate::pwalog::collect(&id)
+                    } else {
+                        alc_hub_core::pwalog::PwaLog::NoHost
+                    };
                     let payload = alc_hub_core::crashlog::log_payload(
                         &text,
                         command_log_max_bytes(&payload),
                         now_ms(),
                         reset_history,
+                        &pwa,
                     );
                     send_command_result(conn, &id, &payload);
                 }
@@ -810,7 +822,7 @@ fn handle_downlink(
                         let line = "ws_uplink: 遠隔 reboot command により再起動します";
                         log::warn!("{line}");
                         crate::crashlog::note(line);
-                        println!("EVT WS_REBOOT_CMD");
+                        alc_hub_common::evtlog::emit("EVT WS_REBOOT_CMD");
                         settings.set_ws_last_seq(queue.last_seq());
                         std::thread::sleep(core::time::Duration::from_millis(300));
                         unsafe { esp_idf_svc::sys::esp_restart() };

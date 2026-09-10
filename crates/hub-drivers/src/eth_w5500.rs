@@ -95,11 +95,11 @@ pub fn start(
 
             let n = wait_for_w5500(spi, cs_num, &status);
             drop(rst_drv);
-            println!("EVT ETH_PROBE_OK n={n}");
+            alc_hub_common::evtlog::emit(&format!("EVT ETH_PROBE_OK n={n}"));
 
             match init(spi, cs, rst, sysloop) {
                 Ok(eth) => monitor_loop(eth, status),
-                Err(e) => println!("EVT ETH NG {e:#}"),
+                Err(e) => alc_hub_common::evtlog::emit(&format!("EVT ETH NG {e:#}")),
             }
         })
         .context("eth_w5500 スレッド起動失敗")?;
@@ -115,17 +115,19 @@ fn pulse_reset(num: PinId) -> Option<PinDriver<'static, esp_idf_svc::hal::gpio::
     let mut drv = match PinDriver::output(pin) {
         Ok(d) => d,
         Err(e) => {
-            println!("EVT ETH NG w5500 rst pin の取得に失敗 ({e})");
+            alc_hub_common::evtlog::emit(&format!(
+                "EVT ETH NG w5500 rst pin の取得に失敗 ({e})"
+            ));
             return None;
         }
     };
     if let Err(e) = drv.set_low() {
-        println!("EVT ETH NG w5500 rst の L 出力に失敗 ({e})");
+        alc_hub_common::evtlog::emit(&format!("EVT ETH NG w5500 rst の L 出力に失敗 ({e})"));
         return None;
     }
     FreeRtos::delay_ms(RST_LOW_MS);
     if let Err(e) = drv.set_high() {
-        println!("EVT ETH NG w5500 rst の H 出力に失敗 ({e})");
+        alc_hub_common::evtlog::emit(&format!("EVT ETH NG w5500 rst の H 出力に失敗 ({e})"));
         return None;
     }
     FreeRtos::delay_ms(RST_SETTLE_MS);
@@ -193,7 +195,7 @@ fn wait_for_w5500(
             log::warn!(
                 "eth_w5500: W5500 が応答しない ({reason}) — {ETH_PROBE_INTERVAL:?} ごとに probe する"
             );
-            println!("EVT ETH NG w5500 not responding {reason}");
+            alc_hub_common::evtlog::emit(&format!("EVT ETH NG w5500 not responding {reason}"));
             last = Some(reason);
         }
         FreeRtos::delay_ms(ETH_PROBE_INTERVAL.as_millis() as u32);
@@ -256,25 +258,26 @@ fn monitor_loop(
                     .as_ref()
                     .map(|i| i.ip.to_string())
                     .unwrap_or_default();
-                match &info {
-                    Ok(i) => println!("EVT ETH_CONNECTED {ip} subnet={:?}", i.subnet),
-                    Err(e) => println!("EVT ETH_CONNECTED {ip} (ip_info 取得失敗: {e})"),
-                }
-                // println! は vprintf hook を通らないためリングに残らない。
-                // 事後解析 (`LOG DUMP`) で「いつ繋がって いつ切れたか」を
-                // 追えるよう明示的に残す (crashlog.rs 参照)
-                crate::crashlog::note(&format!("EVT ETH_CONNECTED {ip} up_ms={}", now_ms()));
+                // 事後解析 (`LOG DUMP` / get_log) で「いつ繋がって いつ切れたか」を
+                // 追えるよう up_ms も付けてリングにも残す (evtlog、#215)
+                let detail = match &info {
+                    Ok(i) => format!("subnet={:?}", i.subnet),
+                    Err(e) => format!("(ip_info 取得失敗: {e})"),
+                };
+                alc_hub_common::evtlog::emit(&format!(
+                    "EVT ETH_CONNECTED {ip} {detail} up_ms={}",
+                    now_ms()
+                ));
                 if let Ok(mut st) = status.lock() {
                     st.lan_link = true;
                     st.lan_ip = ip.clone();
                     st.push_event(now_ms(), &format!("LAN 接続 {ip}"));
                 }
             } else {
-                println!("EVT ETH_DISCONNECTED");
                 // 切断時は「そのとき何が枯れていたか」まで残す。ヒープ不足と
-                // SPI 競合のどちらなのかを、後から `LOG DUMP` だけで切り分ける
+                // SPI 競合のどちらなのかを、後から `LOG DUMP` / get_log だけで切り分ける
                 let h = crate::heap::stats();
-                crate::crashlog::note(&format!(
+                alc_hub_common::evtlog::emit(&format!(
                     "EVT ETH_DISCONNECTED up_ms={} free_int={} min_int={} free_psram={}",
                     now_ms(),
                     h.free_int,
