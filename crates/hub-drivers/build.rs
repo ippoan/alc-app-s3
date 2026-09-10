@@ -8,4 +8,5 @@ fn main() {
     // embuild 0.33 は rustc-check-cfg を出さないため、sdkconfig 依存 cfg を
     // 未知条件として警告されないよう自前で宣言する
     println!("cargo::rustc-check-cfg=cfg(esp_idf_eth_spi_ethernet_w5500)");
+    println!("cargo::rustc-check-cfg=cfg(esp_idf_spiram_allow_noinit_seg_external_memory)");
 }
