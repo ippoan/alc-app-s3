@@ -137,6 +137,8 @@ fn main() -> Result<()> {
 
     let status: SharedStatus = Arc::new(Mutex::new(HubStatus {
         board: board_kind,
+        // 起動時に実際に 5V を出したか (遠隔 `bus5v_status` の応答用)
+        ext_5v_out,
         // 点呼の構成 (血圧はオプション、既定 OFF)。`TENKO BP` で NVS ごと更新される
         tenko_bp: settings.tenko_bp(),
         ..HubStatus::default()

@@ -26,6 +26,8 @@ use std::collections::{BTreeMap, VecDeque};
 
 use serde_json::{json, Map, Value};
 
+use crate::protocol::Bus5vMode;
+
 /// hibernation を起こさない keep-alive フレーム (完全一致でサーバが auto-response)
 pub const PING_FRAME: &str = r#"{"type":"ping"}"#;
 
@@ -203,6 +205,24 @@ pub fn command_gw_url(payload: &str) -> Option<String> {
     let v: Value = serde_json::from_str(payload).ok()?;
     let url = v.get("url")?.as_str()?;
     (url.starts_with("ws://") || url.starts_with("wss://")).then(|| url.to_string())
+}
+
+/// 下り command payload から M-Bus 5V 出力モードを取り出す
+/// (`{"action":"bus5v","mode":"auto|on|off"}`)。未知の値・欠落は None。
+/// auth-worker /device/setup からの遠隔設定用 (シリアルの `BUS5V` と同じ NVS
+/// 保存先)。**保存されるだけで、反映は次の起動から** — AW9523 (BUS_EN) は
+/// 起動時にしか触らないため、`reboot` command と組で使う。
+///
+/// シリアル側 (`protocol.rs` の `BUS5V`) が受ける `1` / `0` は受けない
+/// (web の UI は 3 値のラベルしか送らないため)。
+pub fn command_bus5v_mode(payload: &str) -> Option<Bus5vMode> {
+    let v: Value = serde_json::from_str(payload).ok()?;
+    match v.get("mode")?.as_str()?.to_ascii_lowercase().as_str() {
+        "auto" => Some(Bus5vMode::Auto),
+        "on" => Some(Bus5vMode::On),
+        "off" => Some(Bus5vMode::Off),
+        _ => None,
+    }
 }
 
 /// 下り command payload から印刷対象 PDF の URL を取り出す
@@ -958,6 +978,40 @@ mod tests {
         assert_eq!(command_gw_url(r#"{"action":"gw_url","url":1}"#), None);
         assert_eq!(command_gw_url(r#"{"action":"gw_url"}"#), None);
         assert_eq!(command_gw_url("{oops"), None);
+    }
+
+    #[test]
+    fn command_bus5v_mode_accepts_three_labels() {
+        assert_eq!(
+            command_bus5v_mode(r#"{"action":"bus5v","mode":"auto"}"#),
+            Some(Bus5vMode::Auto)
+        );
+        assert_eq!(
+            command_bus5v_mode(r#"{"action":"bus5v","mode":"on"}"#),
+            Some(Bus5vMode::On)
+        );
+        assert_eq!(
+            command_bus5v_mode(r#"{"action":"bus5v","mode":"off"}"#),
+            Some(Bus5vMode::Off)
+        );
+        // 大文字・混在も受ける (ASCII の大文字小文字は無視)
+        assert_eq!(
+            command_bus5v_mode(r#"{"action":"bus5v","mode":"ON"}"#),
+            Some(Bus5vMode::On)
+        );
+        assert_eq!(
+            command_bus5v_mode(r#"{"action":"bus5v","mode":"Auto"}"#),
+            Some(Bus5vMode::Auto)
+        );
+        // 未知の値・シリアル側の 1/0・型違い・欠落・非 JSON はすべて None
+        assert_eq!(
+            command_bus5v_mode(r#"{"action":"bus5v","mode":"status"}"#),
+            None
+        );
+        assert_eq!(command_bus5v_mode(r#"{"action":"bus5v","mode":"1"}"#), None);
+        assert_eq!(command_bus5v_mode(r#"{"action":"bus5v","mode":1}"#), None);
+        assert_eq!(command_bus5v_mode(r#"{"action":"bus5v"}"#), None);
+        assert_eq!(command_bus5v_mode("{oops"), None);
     }
 
     #[test]

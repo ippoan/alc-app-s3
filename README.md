@@ -79,6 +79,7 @@ Idle ─タップ→ Menu                                         自動/タッ�
 | `AUTH URL <url>` / `WS URL <url>` | auth-worker / cf-alc-recorder の URL 上書き (staging テスト用、NVS 保存) |
 | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` 応答 (測定データ WS 送信の状態) |
 | `TENKO BP ON\|OFF` / `TENKO STATUS` | 点呼に血圧を含めるか (NVS 保存、**既定 OFF** = 体温 + アルコールの 2 段)。`TENKO BP=0` 応答 |
+| `BUS5V AUTO\|ON\|OFF` / `BUS5V STATUS` | M-Bus 5V を Core 側から出すか (NVS 保存、既定 AUTO = 電池の有無で決める)。**再起動後に反映**。WS 下り command `{action:"bus5v",mode:"auto\|on\|off"}` (保存のみ、応答 `{ok,mode,applies_after_reboot}`) / `{action:"bus5v_status"}` (応答 `{mode,battery_present,ext_5v_out}`) / `{action:"reboot"}` (OTA 中・点呼中は `{ok:false,message:"busy"}`) で、auth-worker の端末一覧から遠隔で設定・照会・反映できる |
 | `GW URL <ws://...>` | Windows GW (alc-gw) ハブ URL の手動オーバーライド (NVS)。**通常は不要** — GW の UDP beacon (9001) を自動発見して接続する。WS 下り command `{action:"gw_url",url}` / `{action:"gw_status"}` (auth-worker /device/setup) でも遠隔で設定・確認できる |
 | `GW STATUS` | `GW CONNECTED=1 URL=UNSET DISCOVERED=ws://192.168.11.5:9000` 応答 |
 
