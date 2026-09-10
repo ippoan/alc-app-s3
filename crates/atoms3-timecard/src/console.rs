@@ -45,7 +45,7 @@ fn handle_line(line: &str, status: &SharedStatus, settings: &Settings) {
 
     // 機種に依らないコマンドは共通実装へ (hub-drivers/src/console.rs)。
     // 捌かれなかったものだけがここへ落ちてくる
-    let Some(command) = console::handle_common(command, status, settings) else {
+    let Some(command) = console::handle_common(command, status, settings, false) else {
         return;
     };
 

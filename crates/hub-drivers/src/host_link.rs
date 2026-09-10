@@ -24,6 +24,7 @@
 //! | `AUTH STATUS` | `AUTH PAIRED <tenant> <id>` / `AUTH UNPAIRED` を返す |
 //! | `AUTH URL <url>` | auth-worker ベース URL を上書き (staging テスト用) |
 //! | `AUTH TOKEN` | device JWT 取得の自己診断 (`EVT AUTH_TOKEN ...`) |
+//! | `AUTH TICKET` | 端末登録の一回券を auth-worker から取得し応答 (`AUTH TICKET <ticket> EXPIRES=<秒>` / `ERR AUTH TICKET: <理由>`)。運行者 PWA の端末登録用 (ippoan/auth-worker#519、ippoan/alc-app-s3#204)。**CoreS3 のみ**、他機は `unsupported` |
 //! | `WS URL <url>` | cf-alc-recorder WS URL を上書き (staging テスト用) |
 //! | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` を返す |
 //! | `BUS5V STATUS` | M-Bus 5V 出力の現況 `BUS5V USB=1 OUT=1 BATTERY=0` を返す。**設定は無い** — USB ホスト (PC) が列挙されている間だけ Core が 5V を出す固定動作で、hub-ui が 1 秒ごとに追随する (#202)。WS 下り command `{action:"bus5v_status"}` / `{action:"reboot"}` (auth-worker 端末一覧) でも遠隔で照会・再起動できる |
@@ -175,7 +176,7 @@ fn handle_line(
 
     // 機種に依らないコマンド (PING / HEAP / LOG / AUTH / WS) は共通実装へ。
     // 捌かれなかったものだけがここへ落ちてくる (console.rs 参照)
-    let Some(command) = console::handle_common(command, status, settings) else {
+    let Some(command) = console::handle_common(command, status, settings, true) else {
         return;
     };
 

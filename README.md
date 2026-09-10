@@ -76,6 +76,7 @@ Idle ─タップ→ Menu                                         自動/タッ�
 | `AUTH SET <id> <secret> <tenant>` | device credential を注入 (USB provisioning。ホストが auth-worker `/device/pair` 系で取得した値) |
 | `AUTH UNPAIR` / `AUTH STATUS` | credential の破棄 / 状態確認 (`AUTH PAIRED <tenant> <id>` or `AUTH UNPAIRED`) |
 | `AUTH TOKEN` | device JWT 取得の自己診断 (`EVT AUTH_TOKEN OK\|NG ...`) |
+| `AUTH TICKET` | 端末登録の一回券を auth-worker から取得 (`AUTH TICKET <ticket> EXPIRES=<秒>` / `ERR AUTH TICKET: <理由>`)。運行者 PWA の端末登録用、**CoreS3 のみ**対応 |
 | `AUTH URL <url>` / `WS URL <url>` | auth-worker / cf-alc-recorder の URL 上書き (staging テスト用、NVS 保存) |
 | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` 応答 (測定データ WS 送信の状態) |
 | `TENKO BP ON\|OFF` / `TENKO STATUS` | 点呼に血圧を含めるか (NVS 保存、**既定 OFF** = 体温 + アルコールの 2 段)。`TENKO BP=0` 応答 |
