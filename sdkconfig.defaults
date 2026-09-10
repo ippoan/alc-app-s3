@@ -10,6 +10,14 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
 CONFIG_FREERTOS_HZ=1000
 
+# esp_log のコンパイル上限を INFO に固定する (Refs #217)。crashlog のリングは C 側の
+# esp_log を全部拾い get_log で遠隔から読めるので、DEBUG に上げると
+# esp_http_client / websocket_client が Authorization ヘッダや URL 全文をリングに載せる。
+# LOG_MAXIMUM_LEVEL_INFO は DEFAULT が INFO 未満のときしか選べないため
+# (components/log/Kconfig.level)、「既定 = INFO / 上限 = 既定と同じ」で書く
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=y
+
 # LAN Module 13.2 (W5500) — SPI Ethernet (lan.rs → eth_w5500.rs、Refs #74)。
 # INT (G10) は配線済みだが esp-idf-svc は polling モードを使う (eth_w5500.rs)
 CONFIG_ETH_USE_SPI_ETHERNET=y
@@ -61,6 +69,13 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
+# .noinit を PSRAM に置けるようにする — crashlog のリング 256 KB を
+# `.ext_ram_noinit` に置き、ソフトリセットを跨いで残す (Refs #217)。
+# hub-drivers/src/crashlog.rs はこの Kconfig の cfg で置き場と容量を切り替える
+CONFIG_SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY=y
+# 上と排他 (Kconfig.spiram.common の depends) なので CONFIG_SPIRAM_IGNORE_NOTFOUND は外した。外したことで:
+# - PSRAM が見つからないと起動しなくなる (abort)。承知のうえで選んだ (#217)
+# - Wi-Fi / LWIP のバッファ既定が PSRAM プロファイルに切り替わり SPIRAM_TRY_ALLOCATE_WIFI_LWIP が実効になる (= 内部 RAM の空きは変わる)
 # 4KB 未満の割当 (頻繁アクセスの小物・ドライバ周り) は内蔵 SRAM に残す
 # (2048 も実機で試したが削減効果は ±2KB で誤差 — 残る内部RAM 消費はタスク
 # スタック / BT controller / Wi-Fi ドライバ本体で、この閾値では動かない)
@@ -72,8 +87,6 @@ CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
 # DMA / 内蔵必須の割当が枯渇しないよう内蔵側に 64KB 予約
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
-# PSRAM 初期化失敗時も abort せず PSRAM なしで boot 継続 (fail-safe)
-CONFIG_SPIRAM_IGNORE_NOTFOUND=y
 
 # auth-worker への HTTPS (device pairing / JWT mint、auth_link.rs)。
 # esp_crt_bundle_attach で公開 CA バンドルを使いサーバ証明書を検証する
