@@ -38,6 +38,8 @@ const KEY_WS_QUEUE: &str = "ws_queue";
 const KEY_WS_SEQ: &str = "ws_seq";
 /// 起動カウンタ (点呼セッション ID の前置に使う、Refs #112)
 const KEY_BOOT_ID: &str = "boot_id";
+/// 直近 8 回の reset 理由の履歴 (u64 1 キーに詰める、Refs #211)
+const KEY_RESET_HIST: &str = "reset_hist";
 /// cf-alc-recorder WS URL の上書き (`WS URL` コマンド)
 const KEY_WS_URL: &str = "ws_url";
 /// プリンター宛先 host:port (印刷ブリッジ、`PRINTER ADDR` コマンド。#38)
@@ -258,6 +260,31 @@ impl Settings {
         if let Err(e) = nvs.set_u32(KEY_BOOT_ID, next) {
             log::warn!("settings: boot_id 保存失敗: {e:?}");
             return 0;
+        }
+        next
+    }
+
+    /// 直近 8 回の reset 理由の履歴に今回の `code` を積んで NVS へ保存し、
+    /// 新しい詰め込み値を返す (Refs #211)。
+    ///
+    /// 本番機の再起動ループを後から切り分けるための計装 — 直近 1 回だけでは
+    /// ループを止めた操作 (USB 抜き) による reset で上書きされてしまうため、
+    /// 直近 8 回を持ち回す。lock が取れない / 保存に失敗しても、
+    /// **計算済みの値をそのまま返す** (`next_boot_id` と異なり 0 にフォールバック
+    /// しない — 保存できなくても get_log の応答には積みたいため)。
+    pub fn push_reset_history(&self, code: i32) -> u64 {
+        let Ok(nvs) = self.nvs.lock() else {
+            log::warn!("settings: reset_hist lock 失敗");
+            return alc_hub_core::boot_history::push(alc_hub_core::boot_history::EMPTY, code);
+        };
+        let packed = nvs
+            .get_u64(KEY_RESET_HIST)
+            .ok()
+            .flatten()
+            .unwrap_or(alc_hub_core::boot_history::EMPTY);
+        let next = alc_hub_core::boot_history::push(packed, code);
+        if let Err(e) = nvs.set_u64(KEY_RESET_HIST, next) {
+            log::warn!("settings: reset_hist 保存失敗: {e:?}");
         }
         next
     }

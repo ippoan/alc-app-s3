@@ -15,6 +15,10 @@ path = "crates/hub-core/src/board.rs"
 type = "unit"
 
 [[file]]
+path = "crates/hub-core/src/boot_history.rs"
+type = "unit"
+
+[[file]]
 path = "crates/hub-core/src/cfg.rs"
 type = "unit"
 

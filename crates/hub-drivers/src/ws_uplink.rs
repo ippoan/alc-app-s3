@@ -760,10 +760,12 @@ fn handle_downlink(
                 // キューを通らず socket 直書きなので MAX_LINE_BYTES には掛からない
                 Some("get_log") => {
                     let text = crate::crashlog::snapshot_text();
+                    let reset_history = status.lock().map(|st| st.reset_history).unwrap_or(None);
                     let payload = alc_hub_core::crashlog::log_payload(
                         &text,
                         command_log_max_bytes(&payload),
                         now_ms(),
+                        reset_history,
                     );
                     send_command_result(conn, &id, &payload);
                 }

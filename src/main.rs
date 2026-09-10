@@ -63,6 +63,10 @@ fn main() -> Result<()> {
     // NVS (BLE/Wi-Fi スタックも使用) と永続設定 (画面向き・Wi-Fi 認証情報)
     let nvs_partition = EspDefaultNvsPartition::take()?;
     let settings = Settings::new(nvs_partition.clone())?;
+    // 直近 8 回の reset 理由の履歴に今回分を積む (Refs #211)。**早い位置で
+    // 保存する** — 途中で落ちた起動 (この後の init で panic する等) も記録に
+    // 残すため、power::init より前に置く。
+    let reset_history = settings.push_reset_history(reset_code);
 
     // 内部 I2C (SDA=G12 / SCL=G11): AXP2101 / AW9523 / FT5x06 (タッチ)
     let i2c_cfg = I2cConfig::new().baudrate(Hertz(400_000));
@@ -118,6 +122,7 @@ fn main() -> Result<()> {
         board: board_kind,
         // 点呼の構成 (血圧はオプション、既定 OFF)。`TENKO BP` で NVS ごと更新される
         tenko_bp: settings.tenko_bp(),
+        reset_history: Some(reset_history),
         ..HubStatus::default()
     }));
     // ヒープ監視 (OOM 捕捉 + low-water 継続計測、Refs #27)。Wi-Fi/BLE/TLS の

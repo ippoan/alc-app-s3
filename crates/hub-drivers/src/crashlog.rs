@@ -3,9 +3,11 @@
 //! 「画面が切れた」時に何が起きていたかを後追いするための仕組み:
 //!
 //! 1. **panic 前ログの保持** — `.noinit` DRAM のリングバッファ (4KB) に
-//!    - `esp_log` 出力全部 (`esp_log_set_vprintf` の tee hook。Rust `log`
-//!      マクロは EspLogger → esp_log_write 経由でここを通る。Wi-Fi/BLE 等
-//!      C コンポーネントのログも同様)
+//!    - C コンポーネント (Wi-Fi/BLE 等) の `esp_log` 出力
+//!      (`esp_log_set_vprintf` の tee hook)。**Rust `log` マクロはここを
+//!      通らない** — EspLogger は newlib stdout へ `fwrite` で直接書くため
+//!      `esp_log_write` を経由せず、vprintf hook に乗らない
+//!      (esp-idf-svc 0.52.1 `src/log.rs:354-376`)
 //!    - Rust panic のメッセージ + 発生位置 (`std::panic::set_hook`。ESP の
 //!      abort ダンプは vprintf hook を通らないため、ここが唯一の捕捉点)
 //!    - `println!` 系の重要行 (vprintf hook を通らないため `note()` で明示追記。
@@ -223,10 +225,6 @@ pub fn init() -> (i32, Option<CrashSnapshot>) {
         sys::esp_log_set_vprintf(Some(vprintf_tee));
     }
 
-    log::info!(
-        "crashlog: reset_reason={} ({reset_code})",
-        pure::reset_reason_name(reset_code)
-    );
     (reset_code, snapshot)
 }
 
