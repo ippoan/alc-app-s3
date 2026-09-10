@@ -234,8 +234,7 @@ fn run(
                     dirty = true;
                 }
                 WsEvent::Disconnected => {
-                    if conn.is_some() {
-                        mark_disconnected(&mut conn, "サーバ側から切断", &queue);
+                    if mark_disconnected(&mut conn, "サーバ側から切断", &queue) {
                         alc_hub_common::evtlog::emit("EVT WS_DISCONNECTED");
                     }
                     // 印刷中の切断は未完なので破棄 (drop で 9100 を閉じる)
@@ -462,12 +461,17 @@ fn flush_queue(conn: &mut Option<Conn>, queue: &mut UplinkQueue, unsent_only: bo
 /// esp-idf 側は切断を検知すると `Reconnect after 10000 ms` と**自動再接続を
 /// 予定する**。こちらから client を捨てる必要はないので、フラグだけ倒して
 /// 再接続イベント (`WsEvent::Connected`) を待つ。
-fn mark_disconnected(conn: &mut Option<Conn>, reason: &str, queue: &UplinkQueue) {
+/// 接続を切断状態へ遷移させる。**既に切断済みなら何もしない** —
+/// 呼び出し側 (WsEvent::Disconnected) はこの遷移が実際に起きたときだけ
+/// `EVT WS_DISCONNECTED` を積む (毎回積むと 10 秒ごとの再接続失敗が
+/// `.noinit` リング 4 KB を約 95 秒で一周させ、切り分けに要る EVT を
+/// 押し出す。Refs #217)
+fn mark_disconnected(conn: &mut Option<Conn>, reason: &str, queue: &UplinkQueue) -> bool {
     let Some(c) = conn.as_mut() else {
-        return;
+        return false;
     };
     if !c.connected {
-        return;
+        return false;
     }
     let held = match c.connected_at {
         Some(at) => format!("{}s", now_ms().saturating_sub(at) / 1000),
@@ -483,6 +487,7 @@ fn mark_disconnected(conn: &mut Option<Conn>, reason: &str, queue: &UplinkQueue)
     c.connected = false;
     c.connected_at = None;
     c.disconnected_at = Some(now_ms());
+    true
 }
 
 /// 測定をキューへ積み NVS へ永続化する。記録時の稼働時間と boot_id も持たせ、
