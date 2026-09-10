@@ -8,6 +8,7 @@
 pub mod alarm;
 pub mod alarm_key;
 pub mod board;
+pub mod boot_history;
 pub mod cfg;
 pub mod clock;
 pub mod coex;

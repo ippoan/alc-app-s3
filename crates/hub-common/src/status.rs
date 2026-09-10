@@ -48,6 +48,12 @@ pub struct HubStatus {
     /// いるのは画面状態機械のため。
     pub session_id: Option<String>,
 
+    /// 直近 8 回の reset 理由の履歴 (NVS の詰め込み値そのまま、Refs #211)。
+    /// main.rs が起動時に `Settings::push_reset_history` の戻り値を入れる。
+    /// 既定 `None` は履歴を持たない機種 (VoiceS3R 等) 向け — get_log の応答に
+    /// `boot_history` キーを出さない目印になる。
+    pub reset_history: Option<u64>,
+
     /// LAN Module 13.2 (W5500) のリンク状態 (lan.rs — 未実装のため常に false)。
     /// AtomS3 印刷ブリッジでは eth_w5500.rs が更新する
     pub lan_link: bool,

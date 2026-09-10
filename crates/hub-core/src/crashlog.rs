@@ -155,16 +155,38 @@ pub fn tail_lines(text: &str, max_bytes: usize) -> (&str, bool) {
 /// `text` (リングの sanitize 済み全文) の末尾 `max_bytes` を行境界で切って返す。
 /// リングは 4 KB なので `max_bytes` を最大にしても全体は取れないことがある —
 /// `truncated` と `total_bytes` で伝える。文字列のエスケープは serde_json に任せる。
-pub fn log_payload(text: &str, max_bytes: usize, uptime_ms: u64) -> String {
+///
+/// `reset_history` は直近 8 回の reset 理由の履歴 (Refs #211)。`Some` なら
+/// `boot_history` キーを新しい順 (先頭が現在の起動) で足す。履歴を持たない機種
+/// (VoiceS3R 等、`HubStatus::reset_history` が既定の `None`) では `None` を渡し、
+/// キー自体を出さない。
+pub fn log_payload(
+    text: &str,
+    max_bytes: usize,
+    uptime_ms: u64,
+    reset_history: Option<u64>,
+) -> String {
     let (tail, truncated) = tail_lines(text, max_bytes);
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "text": tail,
         "bytes": tail.len(),
         "total_bytes": text.len(),
         "truncated": truncated,
         "uptime_ms": uptime_ms,
-    })
-    .to_string()
+    });
+    if let Some(packed) = reset_history {
+        let boot_history: Vec<_> = crate::boot_history::codes(packed)
+            .into_iter()
+            .map(|code| {
+                serde_json::json!({
+                    "reset_reason": reset_reason_name(code),
+                    "reset_code": code,
+                })
+            })
+            .collect();
+        payload["boot_history"] = serde_json::Value::Array(boot_history);
+    }
+    payload.to_string()
 }
 
 /// kind="crash_log" の WS payload (JSON オブジェクト文字列) を組み立てる。
@@ -345,7 +367,7 @@ mod tests {
 
     #[test]
     fn log_payload_reports_sizes_and_truncation() {
-        let p = log_payload("l1\nl2 \"q\"\n", 100, 4242);
+        let p = log_payload("l1\nl2 \"q\"\n", 100, 4242, None);
         let v: serde_json::Value = serde_json::from_str(&p).unwrap();
         assert_eq!(v["text"], "l1\nl2 \"q\"\n");
         assert_eq!(v["bytes"], 10);
@@ -353,12 +375,41 @@ mod tests {
         assert_eq!(v["truncated"], false);
         assert_eq!(v["uptime_ms"], 4242);
 
-        let p = log_payload("l1\nl2\nl3\n", 4, 0);
+        let p = log_payload("l1\nl2\nl3\n", 4, 0, None);
         let v: serde_json::Value = serde_json::from_str(&p).unwrap();
         assert_eq!(v["text"], "l3\n");
         assert_eq!(v["bytes"], 3);
         assert_eq!(v["total_bytes"], 9);
         assert_eq!(v["truncated"], true);
+    }
+
+    #[test]
+    fn log_payload_omits_boot_history_key_when_none() {
+        let p = log_payload("l1\n", 100, 0, None);
+        let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+        assert!(v.get("boot_history").is_none());
+    }
+
+    #[test]
+    fn log_payload_includes_boot_history_newest_first_when_some() {
+        // code=11 (usb) が最新、9 (brownout) が 1 つ前
+        let packed =
+            crate::boot_history::push(crate::boot_history::push(crate::boot_history::EMPTY, 9), 11);
+        let p = log_payload("l1\n", 100, 0, Some(packed));
+        let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+        let hist = v["boot_history"].as_array().unwrap();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0]["reset_reason"], "usb");
+        assert_eq!(hist[0]["reset_code"], 11);
+        assert_eq!(hist[1]["reset_reason"], "brownout");
+        assert_eq!(hist[1]["reset_code"], 9);
+    }
+
+    #[test]
+    fn log_payload_boot_history_empty_is_empty_array() {
+        let p = log_payload("l1\n", 100, 0, Some(crate::boot_history::EMPTY));
+        let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+        assert_eq!(v["boot_history"].as_array().unwrap().len(), 0);
     }
 
     #[test]
