@@ -7,6 +7,10 @@ path = "crates/hub-core/src/alarm.rs"
 type = "unit"
 
 [[file]]
+path = "crates/hub-core/src/alarm_key.rs"
+type = "unit"
+
+[[file]]
 path = "crates/hub-core/src/board.rs"
 type = "unit"
 

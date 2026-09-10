@@ -42,6 +42,13 @@ pub enum HostCommand {
     /// ippoan/alc-app-s3#204)。運行者 PWA が USB 経由で受け取り、管理者ログイン
     /// 無しで端末登録に使う。secret / JWT はホストへ出さず、券だけを返す
     AuthTicket,
+    /// ed25519 鍵対を機体内で生成 (`FORCE` で既存を上書き)。秘密鍵は NVS のみ
+    /// に留まり、USB には公開鍵しか出さない (Refs #205)
+    AuthKeygen { force: bool },
+    /// 生成済み公開鍵の提示 (`AUTH PUBKEY <base64url>` / 無ければエラー)
+    AuthPubkey,
+    /// サーバの nonce (小文字 hex 32 文字) に署名する
+    AuthSign { nonce: String },
     /// cf-alc-recorder WS URL の上書き (staging テスト用。NVS 保存)
     WsUrl { url: String },
     /// WS 送信の状態問い合わせ (`WS CONNECTED=1 QUEUE=3 SEQ=42` を応答)
@@ -335,7 +342,24 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                 }
                 _ => return Err("ERR AUTH: URL には http(s):// で始まる URL が必要です".into()),
             },
-            _ => return Err("ERR AUTH: SET|UNPAIR|STATUS|TOKEN|TICKET|URL が必要です".into()),
+            Some("KEYGEN") => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+                None => HostCommand::AuthKeygen { force: false },
+                Some("FORCE") => HostCommand::AuthKeygen { force: true },
+                _ => return Err("ERR AUTH: KEYGEN の引数は FORCE のみです".into()),
+            },
+            Some("PUBKEY") => HostCommand::AuthPubkey,
+            Some("SIGN") => match it.next() {
+                Some(nonce) => HostCommand::AuthSign {
+                    nonce: nonce.to_string(),
+                },
+                None => return Err("ERR AUTH: SIGN には nonce が必要です".into()),
+            },
+            _ => {
+                return Err(
+                    "ERR AUTH: SET|UNPAIR|STATUS|TOKEN|TICKET|URL|KEYGEN|PUBKEY|SIGN が必要です"
+                        .into(),
+                )
+            }
         },
         _ => return Err(format!("ERR 不明なコマンド: {cmd}")),
     };
@@ -661,6 +685,27 @@ mod tests {
         assert!(parse_line("AUTH URL", T).is_err());
         assert!(parse_line("AUTH URL ftp://x", T).is_err());
         assert!(parse_line("AUTH URL auth.ippoan.org", T).is_err());
+    }
+
+    #[test]
+    fn auth_keygen_pubkey_sign() {
+        assert_eq!(
+            parse_line("AUTH KEYGEN", T),
+            Ok(Some(HostCommand::AuthKeygen { force: false }))
+        );
+        assert_eq!(
+            parse_line("auth keygen force", T),
+            Ok(Some(HostCommand::AuthKeygen { force: true }))
+        );
+        assert!(parse_line("AUTH KEYGEN BOGUS", T).is_err());
+        assert_eq!(parse_line("AUTH PUBKEY", T), Ok(Some(HostCommand::AuthPubkey)));
+        assert_eq!(
+            parse_line("AUTH SIGN 0123456789abcdef0123456789abcdef", T),
+            Ok(Some(HostCommand::AuthSign {
+                nonce: "0123456789abcdef0123456789abcdef".into(),
+            }))
+        );
+        assert!(parse_line("AUTH SIGN", T).is_err());
     }
 
     #[test]

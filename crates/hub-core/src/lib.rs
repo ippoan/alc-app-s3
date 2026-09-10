@@ -6,6 +6,7 @@
 //! ラインカバレッジ 100% が強制される。
 
 pub mod alarm;
+pub mod alarm_key;
 pub mod board;
 pub mod cfg;
 pub mod clock;
