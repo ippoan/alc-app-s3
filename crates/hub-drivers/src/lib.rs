@@ -47,6 +47,8 @@ pub mod ota;
 pub mod printer;
 // オフライン送信キューの保存先 (専用 NVS パーティション punchq、#142)
 pub mod punchq;
+// キオスク PWA の診断ログ (`PWALOG`) を get_log の応答へ中継する口 (#215)
+pub mod pwalog;
 pub mod recorder;
 pub mod rs232;
 pub mod task;

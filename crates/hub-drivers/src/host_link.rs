@@ -35,6 +35,7 @@
 //! | `HEAP` | `HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> TOTAL_INT=<n> TOTAL_PSRAM=<n>` を返す (Refs #27) |
 //! | `HEAP DUMP` | `HEAPDUMP ...` 複数行 (ヒープブロック概況 + タスク別スタック余裕) |
 //! | `LOG DUMP` | `LOGDUMP ...` 複数行 (`.noinit` リングの直近ログ。事象の事後解析用) |
+//! | `PWALOG <id> <行>` / `PWALOG END <id> <n>` | キオスク PWA の診断ログ。WS 下り `get_log` で出す `EVT WS_COMMAND <id> …` への返事で、get_log の応答の `pwa_log` にだけ入る (最大 2 秒待つ、#215、pwalog.rs)。**応答しない**・リングには入れない |
 //!
 //! # 送信イベント (CoreS3 → ホスト)
 //!
@@ -168,6 +169,13 @@ fn handle_line(
     pair_flag: &PairFlag,
     alarm: &SharedMonitor,
 ) {
+    // キオスク PWA の診断ログの返事 (`PWALOG <id> …`、#215)。get_log の応答へ
+    // 中継するだけで、コマンドとしては解釈しない (ERR も返さない)。リング・
+    // crash_log にも入れない。信頼の境界は他のシリアルコマンドと同じ (pwalog.rs)
+    if alc_hub_core::pwalog::parse(line).is_some() {
+        crate::pwalog::offer(line);
+        return;
+    }
     let command = match parse_line(line, config::QR_DEFAULT_TIMEOUT_MS) {
         Ok(Some(command)) => command,
         Ok(None) => return, // 空行
@@ -271,16 +279,19 @@ fn handle_line(
         // 保存済み Wi-Fi 設定での接続テスト。失敗時は原因を切り分けて返す
         HostCommand::WifiTest => match settings.wifi_credentials() {
             Some((ssid, pass)) => match wifi.connect_with_diagnosis(&ssid, &pass) {
-                Ok(ip) => println!("EVT WIFI_TEST OK {ip}"),
+                Ok(ip) => alc_hub_common::evtlog::emit(&format!("EVT WIFI_TEST OK {ip}")),
                 Err(reason) => {
                     wifi.mark_disconnected();
                     if let Ok(mut st) = status.lock() {
                         st.push_event(now_ms(), "WiFi テスト失敗");
                     }
+                    // SSID を含むので println のまま (evtlog の例外、#215)
                     println!("EVT WIFI_TEST NG {reason}");
                 }
             },
-            None => println!("EVT WIFI_TEST NG 保存済み Wi-Fi 設定がありません"),
+            None => {
+                alc_hub_common::evtlog::emit("EVT WIFI_TEST NG 保存済み Wi-Fi 設定がありません")
+            }
         },
         // BLE 再ペアリング: ボンド消去を BLE スレッドへ依頼 (血圧計の暗号化復旧)。
         // 実際の消去と EVT PAIR_CLEARED 出力は ble タスク側で行う

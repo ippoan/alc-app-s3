@@ -116,14 +116,20 @@ pub fn apply_heartbeat(
 #[cfg(feature = "speaker")]
 mod player {
     use crate::speaker::Sound;
-    use alc_hub_core::alarm::Action;
+    use alc_hub_core::alarm::{Action, TransitionLog};
     use std::sync::mpsc::Sender;
+    use std::sync::Mutex;
+
+    /// `Action::Emit` の直前の状態 (リングへ遷移だけを残すため、#215)
+    static TRANSITIONS: Mutex<TransitionLog> = Mutex::new(TransitionLog::new());
 
     /// 判定器が返した [`Action`] を実行する (音を鳴らす / ホストへ行を出す)。
     ///
     /// `speaker` が `None` (初期化に失敗した個体) なら音は捨てる。
-    /// `emit_lines` が `false` なら `Action::Emit` の行も捨てる (CoreS3。
-    /// モジュール doc の「行を出すか出さないか」参照)
+    /// `emit_lines` が `false` なら `Action::Emit` の行をホストへは出さない (CoreS3。
+    /// モジュール doc の「行を出すか出さないか」参照)。どちらの機種でも、状態か
+    /// 理由が変わったときだけ `ALARM <state>/<cause>` を crashlog リングに残す
+    /// (`EVT ` を付けない — [`TransitionLog`] の doc)
     pub fn run_actions(
         actions: impl IntoIterator<Item = Action>,
         speaker: &Option<Sender<Sound>>,
@@ -143,6 +149,13 @@ mod player {
                 Action::PlaySilenceTick => send(speaker, Sound::SilenceTick),
                 // キオスクのバナー用。遷移のたび + BANNER_MS ごとに出る
                 Action::Emit(line) => {
+                    let note = TRANSITIONS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .on_emit(&line);
+                    if let Some(note) = note {
+                        crate::crashlog::note(&note);
+                    }
                     if emit_lines {
                         println!("{line}");
                     }

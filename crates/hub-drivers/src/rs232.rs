@@ -115,29 +115,31 @@ fn handle_event(
     // ホストは既知プレフィックス行のみ解釈する (README) — 状態遷移は EVT で流す
     match event {
         Event::Connected { model, variant } => {
-            println!("EVT FC1200 CONNECTED {model}{variant}");
+            alc_hub_common::evtlog::emit(&format!("EVT FC1200 CONNECTED {model}{variant}"));
             push_event(status, &format!("FC-1200 接続 ({model}{variant})"));
         }
         Event::WarmingUp {
             total_seconds,
             elapsed_days,
         } => {
-            println!("EVT FC1200 WARMING {total_seconds} {elapsed_days}");
+            alc_hub_common::evtlog::emit(&format!(
+                "EVT FC1200 WARMING {total_seconds} {elapsed_days}"
+            ));
             push_event(status, "FC-1200 ウォームアップ中");
             let _ = ui_tx.send(UiCommand::AlcoholStage(Some(AlcoholStage::Warming)));
         }
         Event::BlowWaiting => {
-            println!("EVT FC1200 BLOW_WAITING");
+            alc_hub_common::evtlog::emit("EVT FC1200 BLOW_WAITING");
             push_event(status, "FC-1200 吹込待ち");
             let _ = ui_tx.send(UiCommand::AlcoholStage(Some(AlcoholStage::BlowWaiting)));
         }
         Event::BlowTimeout => {
-            println!("EVT FC1200 BLOW_TIMEOUT");
+            alc_hub_common::evtlog::emit("EVT FC1200 BLOW_TIMEOUT");
             push_event(status, "FC-1200 吹込タイムアウト");
             let _ = ui_tx.send(UiCommand::AlcoholStage(None));
         }
         Event::Measuring => {
-            println!("EVT FC1200 MEASURING");
+            alc_hub_common::evtlog::emit("EVT FC1200 MEASURING");
             push_event(status, "FC-1200 測定中");
             let _ = ui_tx.send(UiCommand::AlcoholStage(Some(AlcoholStage::Measuring)));
         }

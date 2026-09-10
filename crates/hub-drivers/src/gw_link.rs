@@ -204,7 +204,7 @@ fn run(
                     connect_warned = false;
                     auth_state = AuthState::Open;
                     auth_queue.clear();
-                    println!("EVT GW_CONNECTED");
+                    alc_hub_common::evtlog::emit("EVT GW_CONNECTED");
                     // 自己紹介 (GW の readers 表示がデバイス名になる) と
                     // 現在の BLE 機器状態を送り直す
                     let device = settings
@@ -218,7 +218,7 @@ fn run(
                 }
                 WsEvent::Disconnected => {
                     if conn.take().is_some() {
-                        println!("EVT GW_DISCONNECTED");
+                        alc_hub_common::evtlog::emit("EVT GW_DISCONNECTED");
                     }
                     connected = false;
                     auth_state = AuthState::Open;
@@ -245,7 +245,7 @@ fn run(
         if let AuthState::AwaitingAuthOk { deadline_ms } = auth_state {
             if now >= deadline_ms {
                 log::warn!("gw_link: 認証タイムアウト — 切断");
-                println!("EVT GW_AUTH_FAIL timeout");
+                alc_hub_common::evtlog::emit("EVT GW_AUTH_FAIL timeout");
                 conn = None;
                 connected = false;
                 auth_state = AuthState::Open;
@@ -370,12 +370,12 @@ fn handle_downlink(
             }
             *auth_state = handle_auth_ok(&token, settings, conn, connected);
             if *connected && auth_state.allows_data() {
-                println!("EVT GW_AUTH_OK");
+                alc_hub_common::evtlog::emit("EVT GW_AUTH_OK");
                 while let Some(rec) = auth_queue.pop_front() {
                     relay(conn, connected, &rec);
                 }
             } else if !*connected {
-                println!("EVT GW_AUTH_FAIL introspect");
+                alc_hub_common::evtlog::emit("EVT GW_AUTH_FAIL introspect");
                 *backoff_until = now_ms() + RECONNECT_BACKOFF_MS;
             }
         }

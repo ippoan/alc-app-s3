@@ -29,6 +29,10 @@ use alc_hub_common::status::{now_ms, SharedStatus};
 /// 定期計測の間隔。TLS ハンドシェイク中の瞬間的な落ち込みは low-water mark
 /// (min_int) が拾うため、ログ量とのバランスでこの粒度にする (issue #27: 5〜10s)。
 const HEAP_LOG_INTERVAL_MS: u32 = 5_000;
+/// `EVT HEAP` を crashlog リングへ残す間隔 (println は上の 5 秒ごとのまま)。
+/// 5 秒ごとに残すと 4 KB のリングが数十秒で一周し、切り分けに要る出来事を
+/// 押し流す (#215)
+const HEAP_NOTE_INTERVAL_MS: u64 = 60_000;
 
 /// ヒープ計測値 [bytes]。
 #[derive(Debug, Clone, Copy)]
@@ -165,17 +169,23 @@ pub fn start(status: SharedStatus) -> Result<()> {
 
 fn monitor_loop(status: SharedStatus) -> ! {
     let mut last_min = usize::MAX;
+    let mut last_note: Option<u64> = None;
     loop {
         let s = stats();
         // ホスト/observability 向け (EVT プレフィックスで行解釈される)。
-        // println! は crashlog の vprintf hook を通らないため、クラッシュ前の
-        // ヒープ推移が crash_log に残るようリングにも明示追記する
+        // 周期的なので evtlog::emit ではなく println! (evtlog の例外)。クラッシュ前の
+        // ヒープ推移が crash_log に残るよう、リングへは HEAP_NOTE_INTERVAL_MS ごとに
+        // 明示追記する
         let line = format!(
             "EVT HEAP free_int={} min_int={} free_psram={}",
             s.free_int, s.min_int, s.free_psram
         );
         println!("{line}");
-        crate::crashlog::note(&line);
+        let now = now_ms();
+        if last_note.map_or(true, |at| now.saturating_sub(at) >= HEAP_NOTE_INTERVAL_MS) {
+            crate::crashlog::note(&line);
+            last_note = Some(now);
+        }
         if let Ok(mut st) = status.lock() {
             st.heap_free_int = s.free_int;
             st.heap_min_int = s.min_int;

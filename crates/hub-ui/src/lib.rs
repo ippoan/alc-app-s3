@@ -161,6 +161,8 @@ pub fn run(
     let mut last_spin = 0u64;
     let mut last_batt = 0u64;
     let mut last_usb = 0u64;
+    // 直前の USB ホストの有無。変わったときだけ `EVT USB_HOST` を出す (#215)
+    let mut prev_usb_host: Option<bool> = None;
     // M-Bus 5V を USB ホストの有無に追随させるラッチ (#202)。起動時は出さない
     let mut usb5v = alc_hub_core::usb5v::Latch::default();
     // M-Bus 5V の i2c 書き込みの連続失敗回数。warn は連続失敗の初回だけ出す
@@ -239,6 +241,11 @@ pub fn run(
         // #211、次の PR)。usb_host は判定に関わらず従来どおり毎回更新する。
         if now >= USB_POLL_START_MS && now.saturating_sub(last_usb) >= USB_POLL_MS {
             let usb = unsafe { esp_idf_svc::sys::usb_serial_jtag_is_connected() };
+            // USB ホスト (PC) の出入り。起動後の初回は今の状態を 1 行残す
+            if prev_usb_host != Some(usb) {
+                alc_hub_common::evtlog::emit(&format!("EVT USB_HOST={}", u8::from(usb)));
+                prev_usb_host = Some(usb);
+            }
             let bus_in = status
                 .lock()
                 .map(|mut st| {
@@ -258,15 +265,13 @@ pub fn run(
                             if let Ok(mut st) = status.lock() {
                                 st.ext_5v_out = desired;
                             }
-                            let line = format!(
+                            // println + crashlog リング (evtlog)。log::info! は
+                            // vprintf hook を通らずリングに残らない (#215)
+                            alc_hub_common::evtlog::emit(&format!(
                                 "EVT BUS5V OUT={} usb_host={}",
                                 u8::from(desired),
                                 u8::from(usb)
-                            );
-                            println!("{line}");
-                            // crashlog のリングにも残す (vprintf hook 経由。println!
-                            // は hook を通らないため、再起動後の追跡はこちらが頼り)
-                            log::info!("{line}");
+                            ));
                             if bus5v_fail_streak > 0 {
                                 log::info!(
                                     "ui: M-Bus 5V 切り替えが回復 (失敗 {bus5v_fail_streak} 回の後)"
@@ -468,11 +473,11 @@ pub fn run(
         let elapsed = now.saturating_sub(entered);
         let auto_close = match &screen {
             Screen::Qr { timeout_ms, .. } if elapsed > *timeout_ms => {
-                println!("EVT QR_TIMEOUT");
+                alc_hub_common::evtlog::emit("EVT QR_TIMEOUT");
                 true
             }
             Screen::Result { .. } if elapsed > config::RESULT_AUTO_CLOSE_MS => {
-                println!("EVT RESULT_CLOSED");
+                alc_hub_common::evtlog::emit("EVT RESULT_CLOSED");
                 true
             }
             // 点呼: 必須項目が揃ったら 5 秒表示して待機画面へ
@@ -480,12 +485,12 @@ pub fn run(
                 done_at: Some(done),
                 ..
             } if now.saturating_sub(*done) > config::TENKO_DONE_CLOSE_MS => {
-                println!("EVT TENKO_DONE");
+                alc_hub_common::evtlog::emit("EVT TENKO_DONE");
                 true
             }
             // 点呼: 測定が揃わないまま長時間経過したら待機画面へ (長め)
             Screen::Measuring { .. } if elapsed > config::TENKO_TIMEOUT_MS => {
-                println!("EVT TENKO_TIMEOUT");
+                alc_hub_common::evtlog::emit("EVT TENKO_TIMEOUT");
                 true
             }
             Screen::Temperature { .. } | Screen::BloodPressure { .. }
@@ -495,7 +500,7 @@ pub fn run(
             }
             // 点呼確認: かざしただけで立ち去ったら待機画面へ
             Screen::Confirm { .. } if elapsed > tenko_prompt::CONFIRM_TIMEOUT_MS => {
-                println!("EVT CONFIRM_TIMEOUT");
+                alc_hub_common::evtlog::emit("EVT CONFIRM_TIMEOUT");
                 true
             }
             _ => false,
@@ -561,7 +566,7 @@ pub fn run(
             match alc_hub_board::power::set_backlight(&mut i2c, 0) {
                 Ok(()) => {
                     backlight_dimmed = true;
-                    println!("EVT BACKLIGHT_DIM");
+                    alc_hub_common::evtlog::emit("EVT BACKLIGHT_DIM");
                 }
                 Err(e) => log::warn!("ui: バックライト減光失敗: {e:?}"),
             }
@@ -569,7 +574,7 @@ pub fn run(
             match alc_hub_board::power::set_backlight(&mut i2c, 100) {
                 Ok(()) => {
                     backlight_dimmed = false;
-                    println!("EVT BACKLIGHT_ON");
+                    alc_hub_common::evtlog::emit("EVT BACKLIGHT_ON");
                 }
                 Err(e) => log::warn!("ui: バックライト復帰失敗: {e:?}"),
             }
@@ -743,7 +748,7 @@ fn today_yyyymmdd() -> Option<String> {
 
 /// 点呼開始: ホストへ通知し、測定待ち画面を作る (構成は現在の設定で固定)
 fn start_tenko(items: TenkoItems) -> Screen {
-    println!("EVT TENKO_START");
+    alc_hub_common::evtlog::emit("EVT TENKO_START");
     new_tenko(items)
 }
 
@@ -768,7 +773,7 @@ fn on_click(
             match tenko_prompt::confirm_hit(y, screens::CONFIRM_BUTTONS_TOP, logical_h)? {
                 ConfirmChoice::Start => Some(start_tenko(items)),
                 ConfirmChoice::Cancel => {
-                    println!("EVT TENKO_CANCEL");
+                    alc_hub_common::evtlog::emit("EVT TENKO_CANCEL");
                     Some(Screen::Idle)
                 }
             }

@@ -156,11 +156,11 @@ async fn task(
                     if let Ok(mut st) = status.lock() {
                         st.push_event(now_ms(), "ペアリング情報を消去");
                     }
-                    println!("EVT PAIR_CLEARED");
+                    alc_hub_common::evtlog::emit("EVT PAIR_CLEARED");
                 }
                 Err(e) => {
                     log::warn!("ble: ボンド消去失敗: {e:?}");
-                    println!("EVT PAIR_ERR ボンド消去に失敗");
+                    alc_hub_common::evtlog::emit("EVT PAIR_ERR ボンド消去に失敗");
                 }
             }
         }

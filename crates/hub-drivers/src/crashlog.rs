@@ -11,9 +11,12 @@
 //!    - Rust panic のメッセージ + 発生位置 (`std::panic::set_hook`。ESP の
 //!      abort ダンプは vprintf hook を通らないため、ここが唯一の捕捉点)
 //!    - `println!` 系の重要行 (vprintf hook を通らないため `note()` で明示追記。
-//!      現状は heap.rs の `EVT HEAP` 行)
-//!    を蓄積する。`.noinit` はソフトリセット (panic / WDT / esp_restart) で
-//!    内容が保持され、電源断では失われる (magic + 帳簿検証で判定)。
+//!      `EVT ` 行は `alc_hub_common::evtlog::emit` 経由 (init が登録する)、
+//!      ほかに heap.rs の `EVT HEAP` (60 秒ごと) と起動の区切り行、#215)
+//!    を蓄積する。`.noinit` はソフトリセット (panic / WDT / esp_restart / USB
+//!    reset) で内容が保持され、電源断では失われる (magic + 帳簿検証で判定)。
+//!    保持されていれば**どの reset 理由でも引き継ぐ** — 起動ごとに
+//!    `--- BOOT reset=<name> (<code>) ---` を挟み、前の起動の行も読める (#215)。
 //! 2. **復帰後の自動送信** — 起動時に `esp_reset_reason()` を確認し、
 //!    クラッシュ由来ならリング内容 + reset reason + version/slot を
 //!    kind="crash_log" として既存の WS 送信キュー (NVS 永続・ack 冪等) に
@@ -105,7 +108,8 @@ fn ring_write(bytes: &[u8]) {
 }
 
 /// 任意の 1 行をリングに残す (`println!` 系は vprintf hook を通らないため、
-/// 残したい EVT 行は明示的にこれを呼ぶ)。
+/// 残したい行は明示的にこれを呼ぶ。`EVT ` 行は `alc_hub_common::evtlog::emit`
+/// が [`init`] で登録されたこれを呼ぶ)。
 pub fn note(line: &str) {
     ring_write(line.as_bytes());
     ring_write(b"\n");
@@ -171,7 +175,8 @@ extern "C" {
 
 /// 起動直後 (他モジュールの初期化より前) に呼ぶ。
 ///
-/// 前回リセットの解析 → リング初期化 → hook 設置の順。戻り値は
+/// 前回リセットの解析 → リングの引き継ぎ (壊れていれば初期化) → 区切り行 →
+/// `EVT ` 行の出口の登録 → `EVT BOOT` → hook 設置の順。戻り値は
 /// `(reset_code, snapshot)`:
 ///
 /// - `reset_code` — `esp_reset_reason()` の値 (`pure::reset_reason_name` /
@@ -181,15 +186,6 @@ extern "C" {
 ///   WS キュー起動後に `report()` へ渡すこと
 pub fn init() -> (i32, Option<CrashSnapshot>) {
     let reset_code = unsafe { sys::esp_reset_reason() } as i32;
-    // 起動時の reset 理由を EVT で出す (setup ページの KNOWN フィルタに乗せる #59)。
-    // usb/jtag/sw = シリアルポート open 等の無害なリセット (メール通知なし)、
-    // panic/int_wdt/task_wdt/wdt/brownout/pwr_glitch/cpu_lockup = 異常
-    // (is_crash_reset → crash_log 送信 + メール)。log::info! は "I (..)" 始まりで
-    // setup ページに出ないため println! で別途出す。
-    println!(
-        "EVT BOOT reset={} ({reset_code})",
-        pure::reset_reason_name(reset_code)
-    );
     let mut snapshot = None;
     unsafe {
         let r = ring_ptr();
@@ -205,11 +201,29 @@ pub fn init() -> (i32, Option<CrashSnapshot>) {
             };
             snapshot = Some(CrashSnapshot { reset_code, log });
         }
-        // 今回の稼働セッション用にリングを初期化する
-        (*r).magic = MAGIC;
-        (*r).pos = 0;
-        (*r).len = 0;
+        // 帳簿が有効なら**どの reset 理由でも**中身を残す (#215)。usb / sw の
+        // 起動のたびに消していると、reset の前に何が起きたかを遠隔 (get_log) で
+        // 読めない。電源断で壊れていれば今までどおり空から始める
+        if !preserved {
+            (*r).magic = MAGIC;
+            (*r).pos = 0;
+            (*r).len = 0;
+        }
     }
+    // 前の起動の行と今回の行の境目
+    note(&pure::boot_separator(reset_code));
+    // `EVT ` 行をリングにも残す口 (alc_hub_common::evtlog)。区切り行の後に
+    // 登録し、次の EVT BOOT が区切り行の直後に並ぶようにする
+    alc_hub_common::evtlog::set_sink(note);
+    // 起動時の reset 理由を EVT で出す (setup ページの KNOWN フィルタに乗せる #59)。
+    // usb/jtag/sw = シリアルポート open 等の無害なリセット (メール通知なし)、
+    // panic/int_wdt/task_wdt/wdt/brownout/pwr_glitch/cpu_lockup = 異常
+    // (is_crash_reset → crash_log 送信 + メール)。log::info! は "I (..)" 始まりで
+    // setup ページに出ないため EVT で別途出す。
+    alc_hub_common::evtlog::emit(&format!(
+        "EVT BOOT reset={} ({reset_code})",
+        pure::reset_reason_name(reset_code)
+    ));
 
     // Rust panic のメッセージ + 位置をリングへ。hook から戻った後は既定どおり
     // abort → ESP panic handler → リセットに進む
@@ -242,7 +256,7 @@ fn epoch_ms() -> u64 {
 /// 永続化され、圏外・未ペアリングでも接続回復後に送られる)。
 pub fn report(snap: &CrashSnapshot, ws_tx: &Sender<UplinkRecord>, status: &SharedStatus) {
     let reason = pure::reset_reason_name(snap.reset_code);
-    println!("EVT CRASH {reason} log_bytes={}", snap.log.len());
+    alc_hub_common::evtlog::emit(&format!("EVT CRASH {reason} log_bytes={}", snap.log.len()));
     if let Ok(mut st) = status.lock() {
         st.push_event(now_ms(), &format!("crash 復帰 ({reason})"));
     }

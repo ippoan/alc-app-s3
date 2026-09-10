@@ -6,6 +6,8 @@
 
 pub mod config;
 pub mod control;
+// `EVT ` 行の出口 (println + crashlog リング)。hub-ui / hub-ble も使う (#215)
+pub mod evtlog;
 pub mod measurement;
 pub mod settings;
 pub mod status;

@@ -50,7 +50,7 @@ pub fn spawn_print(url: String, printer_addr: String, status: SharedStatus) {
             // リンク negotiation 過渡期に PRINT が届くと lan_link=false で誤って
             // 失敗した (実機: 静かな再起動を挟むと boot 直後に PRINT が来る #59)。
             // lan_link が立つまで最大 20 秒待つ (auth_link と同じ待機を流用)。
-            println!("EVT PRINT_WAIT_LAN");
+            alc_hub_common::evtlog::emit("EVT PRINT_WAIT_LAN");
             if !crate::auth_link::wait_for_network(&status, 20_000) {
                 let diag = status
                     .lock()
@@ -61,7 +61,9 @@ pub fn spawn_print(url: String, printer_addr: String, status: SharedStatus) {
                         )
                     })
                     .unwrap_or_else(|_| "lock=poisoned".into());
-                println!("EVT PRINT NG LAN 未接続 (20秒待機後も未確立: {diag})");
+                alc_hub_common::evtlog::emit(&format!(
+                    "EVT PRINT NG LAN 未接続 (20秒待機後も未確立: {diag})"
+                ));
                 return;
             }
             println!("EVT PRINT_START url={url} printer={printer_addr}");
@@ -70,13 +72,13 @@ pub fn spawn_print(url: String, printer_addr: String, status: SharedStatus) {
             }
             match fetch_and_send(&url, &printer_addr) {
                 Ok(bytes) => {
-                    println!("EVT PRINT OK {bytes}");
+                    alc_hub_common::evtlog::emit(&format!("EVT PRINT OK {bytes}"));
                     if let Ok(mut st) = status.lock() {
                         st.push_event(now_ms(), &format!("印刷送信完了 {}KB", bytes / 1024));
                     }
                 }
                 Err(e) => {
-                    println!("EVT PRINT NG {e:#}");
+                    alc_hub_common::evtlog::emit(&format!("EVT PRINT NG {e:#}"));
                     if let Ok(mut st) = status.lock() {
                         st.push_event(now_ms(), "印刷失敗");
                     }
@@ -84,7 +86,7 @@ pub fn spawn_print(url: String, printer_addr: String, status: SharedStatus) {
             }
         });
     if spawned.is_err() {
-        println!("EVT PRINT NG スレッド起動失敗 (メモリ不足)");
+        alc_hub_common::evtlog::emit("EVT PRINT NG スレッド起動失敗 (メモリ不足)");
     }
 }
 
@@ -115,8 +117,10 @@ fn fetch_and_send(url: &str, printer_addr: &str) -> Result<usize> {
         .unwrap_or(0);
 
     // レスポンスが取得できてから接続する (接続直後にすぐ書き込める状態にする)
-    let mut printer = TcpStream::connect(printer_addr)
-        .with_context(|| format!("プリンター {printer_addr} に接続できません"))?;
+    // 宛先は文言に入れない — `EVT PRINT NG {e:#}` は crashlog リングに入る
+    // (evtlog、#215)。宛先は設定で分かるので、失敗の種類だけ残す
+    let mut printer =
+        TcpStream::connect(printer_addr).context("プリンターに接続できません")?;
     printer
         .set_write_timeout(Some(Duration::from_secs(IO_TIMEOUT_S)))
         .context("送信タイムアウト設定失敗")?;
