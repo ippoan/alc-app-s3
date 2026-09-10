@@ -30,7 +30,7 @@
 //! | `AUTH SIGN <nonce>` | nonce (小文字 hex 32 文字) にその 32 バイトそのもので署名し `AUTH SIG <pubkey base64url> <sig base64url>` を返す (鍵が無ければ `ERR AUTH: no key`、nonce の形式不正は `ERR AUTH: bad nonce`) |
 //! | `WS URL <url>` | cf-alc-recorder WS URL を上書き (staging テスト用) |
 //! | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` を返す |
-//! | `BUS5V STATUS` | M-Bus 5V 出力の現況 `BUS5V USB=1 OUT=1 BATTERY=0` を返す。**設定は無い** — USB ホスト (PC) が列挙されている間だけ Core が 5V を出す固定動作で、hub-ui が 1 秒ごとに追随する (#202)。WS 下り command `{action:"bus5v_status"}` / `{action:"reboot"}` (auth-worker 端末一覧) でも遠隔で照会・再起動できる |
+//! | `BUS5V STATUS` | M-Bus 5V 出力の現況 `BUS5V USB=1 OUT=1 BATTERY=0 BUS_IN=0` を返す。**設定は無い** — USB ホスト (PC) が列挙されていて、かつ M-Bus が外部給電でない (`BUS_IN=0`) 間だけ Core が 5V を出す固定動作で、hub-ui が 1 秒ごとに追随する (#202)。`BUS_IN` は起動時の W5500 probe で確定する M-Bus の外部給電判定 (`1`=PoE 等で外部給電中 `0`=無し `?`=未判定、Refs #211)。WS 下り command `{action:"bus5v_status"}` / `{action:"reboot"}` (auth-worker 端末一覧) でも遠隔で照会・再起動できる |
 //! | `TENKO BP ON\|OFF` / `TENKO STATUS` | 点呼に血圧を含めるか (NVS、既定 OFF) / `TENKO BP=0` を返す |
 //! | `HEAP` | `HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> TOTAL_INT=<n> TOTAL_PSRAM=<n>` を返す (Refs #27) |
 //! | `HEAP DUMP` | `HEAPDUMP ...` 複数行 (ヒープブロック概況 + タスク別スタック余裕) |
@@ -310,15 +310,21 @@ fn handle_line(
         }
         // M-Bus 5V の現況 (設定は無い — USB ホストの有無に hub-ui が追随する、#202)
         HostCommand::Bus5vStatus => {
-            let (usb_host, ext_5v_out, battery_present) = status
+            let (usb_host, ext_5v_out, battery_present, bus_in) = status
                 .lock()
-                .map(|st| (st.usb_host, st.ext_5v_out, st.battery_present))
-                .unwrap_or((false, false, false));
+                .map(|st| (st.usb_host, st.ext_5v_out, st.battery_present, st.bus_in))
+                .unwrap_or((false, false, false, None));
+            let bus_in_str = match bus_in {
+                Some(true) => "1",
+                Some(false) => "0",
+                None => "?",
+            };
             println!(
-                "BUS5V USB={} OUT={} BATTERY={}",
+                "BUS5V USB={} OUT={} BATTERY={} BUS_IN={}",
                 u8::from(usb_host),
                 u8::from(ext_5v_out),
                 u8::from(battery_present),
+                bus_in_str,
             );
         }
         // 点呼の構成: 血圧はオプション (tenko.rs)。NVS に保存し、UI が次の点呼から読む

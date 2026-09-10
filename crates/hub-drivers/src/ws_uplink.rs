@@ -774,12 +774,25 @@ fn handle_downlink(
                 // AXP2101 を一度でも読めたか — 起動後 10 秒は false のままなので、
                 // UI は battery_present を「不明」と描き分けられる
                 Some("bus5v_status") => {
-                    let (usb_host, ext_5v_out, battery_present, power_read) = status
+                    let (usb_host, ext_5v_out, battery_present, power_read, bus_in) = status
                         .lock()
-                        .map(|st| (st.usb_host, st.ext_5v_out, st.battery_present, st.power_read))
-                        .unwrap_or((false, false, false, false));
+                        .map(|st| {
+                            (
+                                st.usb_host,
+                                st.ext_5v_out,
+                                st.battery_present,
+                                st.power_read,
+                                st.bus_in,
+                            )
+                        })
+                        .unwrap_or((false, false, false, false, None));
+                    let bus_in_json = match bus_in {
+                        Some(true) => "true",
+                        Some(false) => "false",
+                        None => "null",
+                    };
                     let payload = format!(
-                        r#"{{"usb_host":{usb_host},"ext_5v_out":{ext_5v_out},"battery_present":{battery_present},"power_read":{power_read}}}"#
+                        r#"{{"usb_host":{usb_host},"ext_5v_out":{ext_5v_out},"battery_present":{battery_present},"power_read":{power_read},"bus_in":{bus_in_json}}}"#
                     );
                     send_command_result(conn, &id, &payload);
                 }

@@ -108,9 +108,22 @@ pub struct HubStatus {
     /// 前で `true` 固定になるため、ui は 3 秒経つまでサンプルしない (#202)
     pub usb_host: bool,
 
+    /// M-Bus に外から (ベースの自前給電、PoE) 5V が来ているか (Refs #211)。
+    /// 既定 `None` = 判定前。`eth_w5500::wait_for_w5500` が起動時の 1 回目の
+    /// probe 結果で確定し (`lan` feature 無効ビルドでは `Some(false)` を
+    /// main.rs が入れる)、以後は起動中 sticky で変えない。
+    /// `None` か `Some(true)` の間、hub-ui は `ext_5v_out` の切り替えそのもの
+    /// (usb5v::Latch への sampling) を起こさない — Some(true)/None は
+    /// 「外から来ているかもしれない」なので Core 側からは出さない。
+    /// シリアル `BUS5V STATUS` の `BUS_IN=` と WS 下り command `bus5v_status`
+    /// の `bus_in` に載る
+    pub bus_in: Option<bool>,
+
     /// いま M-Bus へ 5V を出しているか (AW9523 BUS_EN)。**設定ではない** —
     /// `usb_host` の有無に追随して hub-ui の i2c ループが更新する (#202)。
-    /// 起動時は false で、USB ホストが 2 サンプル続けて見えたら出す。
+    /// **`bus_in` が `Some(false)` (M-Bus が外部給電でない) のときだけ更新される**
+    /// — それ以外 (`None`/`Some(true)`) は切り替え自体が起きないので値は変わらない
+    /// (Refs #211)。起動時は false で、USB ホストが 2 サンプル続けて見えたら出す。
     /// シリアル `BUS5V STATUS` と WS 下り command `bus5v_status` の応答に載る
     pub ext_5v_out: bool,
     /// バッテリー残量 [%] (AXP2101 フューエルゲージ 0xA4。255 = 未測定/電池なし)

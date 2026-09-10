@@ -149,9 +149,12 @@ G5(=G1) / G15(=G13) の二択しかなく **内蔵スピーカー (I2S DOUT=G13 
   両側から駆動することになり、**バッテリーレスの CoreS3 SE は PoE 単独給電で
   起動できない** (USB を挿すと VBUS が支えるので気づけない。「工場出荷ファームは
   PoE で動くのに焼いたファームだけ動かない」の正体。画面がぱちぱち点滅する)。
-  `hub-board/src/power.rs` の `set_ext_5v_out()` を **AXP2101 の battery-present bit**
-  で切り替えており、電池が無い個体では立てない。USB 給電のベンチに RS232M/LAN 13.2 を
-  積む構成では逆に必須なので、電池付きの個体では従来どおり出す (Refs #76)。
+  `hub-board/src/power.rs` の `set_ext_5v_out()` は、**起動時の W5500 probe で
+  確定する `HubStatus::bus_in`** (M-Bus に外から 5V が来ているか) を hub-ui が
+  ゲートに使い、`bus_in == Some(false)` (外部給電でない) のときだけ USB ホスト
+  の有無に追随して立てる (Refs #211)。battery-present bit による切り替えは
+  過去の設計 (#129) で、実装は入っていない — 電池付きの個体でも USB 給電の
+  ベンチに RS232M/LAN 13.2 を積む構成では同じ規則で出す (Refs #76)。
   ★**board 種別 (rtc/imu probe) では判定しない** — 実機の CoreS3 SE で
   `BOARD=cores3` と出る個体を確認しており (電池は無いのに RTC/IMU のどちらかが ack
   する)、SE 判定に賭けると踏み抜く

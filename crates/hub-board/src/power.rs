@@ -74,10 +74,13 @@ pub fn init(i2c: &mut I2cDriver) -> Result<()> {
 ///   できなくなる。工場出荷ファームが PoE で動くのは BUS_EN を立てないため
 ///
 /// **呼ぶのは hub-ui の i2c ループだけ** (i2c の所有者)。起動時は出さず、
-/// **USB ホスト (PC) が列挙されている間だけ出す** (#202) ので、PoE 単独起動と
-/// 両立する — USB が居るなら VBUS がレールを支え、PC が落ちれば Core は手を
-/// 引いてベース側に任せる。設定は持たない (#200/#201 の `BUS5V AUTO|ON|OFF`
-/// は、電池なしの CoreS3 でどの値でも両立しなかったため廃止した)
+/// **USB ホスト (PC) が列挙されていて、かつ M-Bus が外部給電でない
+/// (`HubStatus::bus_in == Some(false)`) ときだけ出す** (#202, Refs #211)。
+/// M-Bus が外部給電中 (PoE 等) かどうかのゲートは呼び手 (hub-ui) が持つ —
+/// このモジュールの判定規則自体は変えていない。USB が居て M-Bus も外部給電で
+/// なければ VBUS がレールを支え、PC が落ちれば Core は手を引いてベース側に
+/// 任せる。設定は持たない (#200/#201 の `BUS5V AUTO|ON|OFF` は、電池なしの
+/// CoreS3 でどの値でも両立しなかったため廃止した)
 ///
 /// BOOST_EN (P1 bit7) は init() が常時 on にしたままにする (M5Unified と同じ)。
 pub fn set_ext_5v_out(i2c: &mut I2cDriver, enable: bool) -> Result<()> {
