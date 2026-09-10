@@ -5,6 +5,9 @@
 //! 2. Improv Wi-Fi Serial のバイナリフレーム (ESP Web Tools の Wi-Fi 設定)
 //!
 //! 受信バイト列は IMPROV マジックで振り分け、それ以外を行として解釈する。
+//! Wi-Fi を起こさないビルド (`lan` feature、#217) では `Wifi` / `Improv` が
+//! 無く、Improv フレームは読み捨てて `EVT IMPROV_UNAVAILABLE lan` を最初の
+//! 1 回だけ、`WIFI TEST` には `EVT WIFI_TEST NG lan` を返す。
 //!
 //! # 受信コマンド (ホスト → CoreS3)
 //!
@@ -52,6 +55,7 @@
 //! 既知プレフィックス (OK/ERR/PONG/STATUS/FC1200/EVT/`{`) の行のみ解釈すること。
 
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
 use alc_hub_core::cfg::DeviceConfig;
@@ -72,13 +76,17 @@ use alc_hub_wifi::{improv::Improv, wifi::Wifi};
 
 use crate::console;
 
+/// `EVT IMPROV_UNAVAILABLE` を出したか (Improv を持たないビルドで 1 回だけ出す)
+static IMPROV_UNAVAILABLE_SENT: AtomicBool = AtomicBool::new(false);
+
+/// `wifi` / `improv` は Wi-Fi を起こさないビルド (`lan`、#217) では `None`
 pub fn start(
     tx: Sender<UiCommand>,
     status: SharedStatus,
     settings: Settings,
-    wifi: Wifi,
+    wifi: Option<Wifi>,
     pair_flag: PairFlag,
-    mut improv: Improv,
+    mut improv: Option<Improv>,
     alarm: SharedMonitor,
 ) -> Result<()> {
     // stdin のブロッキング読み出しを可能にする (console.rs と同じ設置)。
@@ -103,7 +111,7 @@ pub fn start(
                             &tx,
                             &status,
                             &settings,
-                            &wifi,
+                            wifi.as_ref(),
                             &pair_flag,
                             &mut improv,
                             &alarm,
@@ -123,9 +131,9 @@ fn drain_buffer(
     tx: &Sender<UiCommand>,
     status: &SharedStatus,
     settings: &Settings,
-    wifi: &Wifi,
+    wifi: Option<&Wifi>,
     pair_flag: &PairFlag,
-    improv: &mut Improv,
+    improv: &mut Option<Improv>,
     alarm: &SharedMonitor,
 ) {
     loop {
@@ -138,7 +146,14 @@ fn drain_buffer(
                 data,
                 consumed,
             } => {
-                improv.handle_packet(ptype, &data);
+                match improv {
+                    Some(improv) => improv.handle_packet(ptype, &data),
+                    None => {
+                        if !IMPROV_UNAVAILABLE_SENT.swap(true, Ordering::Relaxed) {
+                            alc_hub_common::evtlog::emit("EVT IMPROV_UNAVAILABLE lan");
+                        }
+                    }
+                }
                 acc.drain(..consumed);
             }
             improv_proto::Frame::Corrupt { consumed } => {
@@ -165,7 +180,7 @@ fn handle_line(
     tx: &Sender<UiCommand>,
     status: &SharedStatus,
     settings: &Settings,
-    wifi: &Wifi,
+    wifi: Option<&Wifi>,
     pair_flag: &PairFlag,
     alarm: &SharedMonitor,
 ) {
@@ -277,22 +292,29 @@ fn handle_line(
             Err(msg) => println!("ERR CFG: {msg}"),
         },
         // 保存済み Wi-Fi 設定での接続テスト。失敗時は原因を切り分けて返す
-        HostCommand::WifiTest => match settings.wifi_credentials() {
-            Some((ssid, pass)) => match wifi.connect_with_diagnosis(&ssid, &pass) {
-                Ok(ip) => alc_hub_common::evtlog::emit(&format!("EVT WIFI_TEST OK {ip}")),
-                Err(reason) => {
-                    wifi.mark_disconnected();
-                    if let Ok(mut st) = status.lock() {
-                        st.push_event(now_ms(), "WiFi テスト失敗");
+        HostCommand::WifiTest => {
+            // Wi-Fi を起こさないビルド (`lan`、#217)
+            let Some(wifi) = wifi else {
+                alc_hub_common::evtlog::emit("EVT WIFI_TEST NG lan");
+                return;
+            };
+            match settings.wifi_credentials() {
+                Some((ssid, pass)) => match wifi.connect_with_diagnosis(&ssid, &pass) {
+                    Ok(ip) => alc_hub_common::evtlog::emit(&format!("EVT WIFI_TEST OK {ip}")),
+                    Err(reason) => {
+                        wifi.mark_disconnected();
+                        if let Ok(mut st) = status.lock() {
+                            st.push_event(now_ms(), "WiFi テスト失敗");
+                        }
+                        // SSID を含むので println のまま (evtlog の例外、#215)
+                        println!("EVT WIFI_TEST NG {reason}");
                     }
-                    // SSID を含むので println のまま (evtlog の例外、#215)
-                    println!("EVT WIFI_TEST NG {reason}");
-                }
-            },
-            None => {
-                alc_hub_common::evtlog::emit("EVT WIFI_TEST NG 保存済み Wi-Fi 設定がありません")
+                },
+                None => alc_hub_common::evtlog::emit(
+                    "EVT WIFI_TEST NG 保存済み Wi-Fi 設定がありません",
+                ),
             }
-        },
+        }
         // BLE 再ペアリング: ボンド消去を BLE スレッドへ依頼 (血圧計の暗号化復旧)。
         // 実際の消去と EVT PAIR_CLEARED 出力は ble タスク側で行う
         HostCommand::BlePair => {
