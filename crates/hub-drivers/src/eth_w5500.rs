@@ -93,7 +93,7 @@ pub fn start(
             // 同じ番号を reset_gpio_num で取り直すので、二重取得を避ける
             let rst_drv = rst_num.and_then(pulse_reset);
 
-            let n = wait_for_w5500(spi, cs_num);
+            let n = wait_for_w5500(spi, cs_num, &status);
             drop(rst_drv);
             println!("EVT ETH_PROBE_OK n={n}");
 
@@ -155,18 +155,40 @@ fn probe_versionr(spi: &'static SpiDriver<'static>, cs_num: PinId) -> Result<u8>
 /// esp-idf-svc が失敗時に MAC/PHY を解放せず、SPI ホストのデバイス枠
 /// (LCD と共有) が埋まって別の理由で永久に失敗するため。
 /// 失敗ログは理由が変わったときだけ出す (10 秒ごとに同じ行を吐き続けない)
-fn wait_for_w5500(spi: &'static SpiDriver<'static>, cs_num: PinId) -> u32 {
+///
+/// **1 回目の probe の結果で `HubStatus::bus_in` を確定する** (Refs #211)。
+/// 起動時の BUS_EN は L (`power::init`) なので、1 回目で応答があれば M-Bus に
+/// 外から 5V が来ている (PoE)。失敗した 1 回目でも `Some(false)` を入れる —
+/// この関数は成功するまで戻らないので、戻ってから入れると USB 単独起動が
+/// 判定待ちのまま止まる。2 回目以降の probe では触らない (起動中 sticky)。
+fn wait_for_w5500(
+    spi: &'static SpiDriver<'static>,
+    cs_num: PinId,
+    status: &SharedStatus,
+) -> u32 {
     let mut n: u32 = 0;
     let mut last: Option<String> = None;
     loop {
         n += 1;
         let reason = match probe_versionr(spi, cs_num) {
-            Ok(W5500_VERSION) => return n,
+            Ok(W5500_VERSION) => {
+                if n == 1 {
+                    if let Ok(mut st) = status.lock() {
+                        st.bus_in = Some(true);
+                    }
+                }
+                return n;
+            }
             // 0x00 / 0xFF はベースに 5V が無い (PoE 未接続) か未接続。
             // それ以外の値は配線か SPI モードを疑う
             Ok(v) => format!("versionr=0x{v:02X}"),
             Err(e) => format!("spi_err={e:#}"),
         };
+        if n == 1 {
+            if let Ok(mut st) = status.lock() {
+                st.bus_in = Some(false);
+            }
+        }
         if last.as_deref() != Some(reason.as_str()) {
             log::warn!(
                 "eth_w5500: W5500 が応答しない ({reason}) — {ETH_PROBE_INTERVAL:?} ごとに probe する"

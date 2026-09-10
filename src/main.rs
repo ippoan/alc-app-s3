@@ -99,9 +99,13 @@ fn main() -> Result<()> {
     //
     // 設定で両立させようとしたが (#200/#201 の `BUS5V AUTO|ON|OFF`)、電池なしの
     // CoreS3 では**どの設定値でも両立しない**ため設定ごと廃止した。代わりに
-    // **USB ホスト (PC) が列挙されている間だけ出す** — PC が居るなら VBUS が
-    // レールを支えられるし、PC が落ちれば Core は手を引いて PoE に任せられる。
-    // 追随は hub-ui の i2c ループ (1 秒ポーリング、`usb5v::Latch`) が担う。
+    // **USB ホスト (PC) が列挙されていて、かつ M-Bus が外部給電でない
+    // (`HubStatus::bus_in == Some(false)`) ときだけ出す** (Refs #211) —
+    // PoE 稼働中に USB を挿しても切り替え自体を起こさない (実機で電源断を確認
+    // 済み)。PC が居て M-Bus も外部給電でないなら VBUS がレールを支えられるし、
+    // PC が落ちれば Core は手を引いて PoE に任せられる。判定は起動時の W5500
+    // probe (`eth_w5500::wait_for_w5500`)、追随は hub-ui の i2c ループ
+    // (1 秒ポーリング、`usb5v::Latch`) が担う。
     let rotation = settings.rotation();
     // 起動カウンタを 1 つ進める (点呼セッション ID の前置、Refs #112)。
     // **起動ごとに 1 回だけ** — 再起動をまたいだ session_id の再利用を防ぐ。
@@ -125,6 +129,13 @@ fn main() -> Result<()> {
         reset_history: Some(reset_history),
         ..HubStatus::default()
     }));
+    // `lan` feature 無効ビルドは W5500 が無く `wait_for_w5500` が判定を入れない
+    // ので、起動時に確定させておく (Refs #211)。無いと `bus_in` が `None` の
+    // まま = hub-ui の 5V 切り替えがいつまでも判定待ちで止まる
+    #[cfg(not(feature = "lan"))]
+    if let Ok(mut st) = status.lock() {
+        st.bus_in = Some(false);
+    }
     // ヒープ監視 (OOM 捕捉 + low-water 継続計測、Refs #27)。Wi-Fi/BLE/TLS の
     // 重いアロケーションより先に登録し、初期化中の OOM も捕まえる
     heap::start(Arc::clone(&status))?;

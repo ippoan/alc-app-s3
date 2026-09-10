@@ -228,47 +228,62 @@ pub fn run(
 
         // M-Bus 5V (AW9523 BUS_EN) を USB ホストの有無に追随させる (#202)。
         // 設定は持たない — 電池なしの CoreS3 では「USB だけ」と「PoE だけ」を
-        // 設定で両立できないため、**PC が居る間だけ Core が出す**を唯一の動作に
-        // している。i2c はこのループが所有しているのでここで書く。
+        // 設定で両立できないため、**PC が居て、かつ M-Bus が外部給電でない間
+        // だけ Core が出す**を唯一の動作にしている。i2c はこのループが所有
+        // しているのでここで書く。
+        //
+        // `bus_in` が `None` (未判定) か `Some(true)` (PoE 等で外部給電中) の
+        // 間は、Latch へサンプルを渡すこと自体をしない — `set_ext_5v_out` を
+        // 呼ばなければ BUS_EN は 0 のままで、切り替えの過渡そのものが起きない。
+        // 稼働中に PoE が抜けて USB だけになるケースへの fallback は別途 (Refs
+        // #211、次の PR)。usb_host は判定に関わらず従来どおり毎回更新する。
         if now >= USB_POLL_START_MS && now.saturating_sub(last_usb) >= USB_POLL_MS {
             let usb = unsafe { esp_idf_svc::sys::usb_serial_jtag_is_connected() };
-            if let Ok(mut st) = status.lock() {
-                st.usb_host = usb;
-            }
-            // 切り替えるときだけ i2c を叩く (status のロックは手放してから)。
-            // 成功したときだけ Latch に確定させる — 失敗なら次の poll で再試行
-            if let Some(desired) = usb5v.update(usb) {
-                match alc_hub_board::power::set_ext_5v_out(&mut i2c, desired) {
-                    Ok(()) => {
-                        usb5v.commit(desired);
-                        if let Ok(mut st) = status.lock() {
-                            st.ext_5v_out = desired;
-                        }
-                        let line = format!(
-                            "EVT BUS5V OUT={} usb_host={}",
-                            u8::from(desired),
-                            u8::from(usb)
-                        );
-                        println!("{line}");
-                        // crashlog のリングにも残す (vprintf hook 経由。println!
-                        // は hook を通らないため、再起動後の追跡はこちらが頼り)
-                        log::info!("{line}");
-                        if bus5v_fail_streak > 0 {
-                            log::info!(
-                                "ui: M-Bus 5V 切り替えが回復 (失敗 {bus5v_fail_streak} 回の後)"
+            let bus_in = status
+                .lock()
+                .map(|mut st| {
+                    st.usb_host = usb;
+                    st.bus_in
+                })
+                .unwrap_or(None);
+            // M-Bus が外部給電でないと確定しているときだけ Latch にサンプルを
+            // 渡す。`None`/`Some(true)` は切り替え自体を起こさない (Refs #211)
+            if bus_in == Some(false) {
+                // 切り替えるときだけ i2c を叩く (status のロックは手放してから)。
+                // 成功したときだけ Latch に確定させる — 失敗なら次の poll で再試行
+                if let Some(desired) = usb5v.update(usb) {
+                    match alc_hub_board::power::set_ext_5v_out(&mut i2c, desired) {
+                        Ok(()) => {
+                            usb5v.commit(desired);
+                            if let Ok(mut st) = status.lock() {
+                                st.ext_5v_out = desired;
+                            }
+                            let line = format!(
+                                "EVT BUS5V OUT={} usb_host={}",
+                                u8::from(desired),
+                                u8::from(usb)
                             );
-                            bus5v_fail_streak = 0;
+                            println!("{line}");
+                            // crashlog のリングにも残す (vprintf hook 経由。println!
+                            // は hook を通らないため、再起動後の追跡はこちらが頼り)
+                            log::info!("{line}");
+                            if bus5v_fail_streak > 0 {
+                                log::info!(
+                                    "ui: M-Bus 5V 切り替えが回復 (失敗 {bus5v_fail_streak} 回の後)"
+                                );
+                                bus5v_fail_streak = 0;
+                            }
                         }
-                    }
-                    Err(e) => {
-                        // 恒常的に失敗すると 1 秒ごとの warn が crashlog のリング
-                        // (4 KB) を埋めるので、連続失敗の初回だけ出す
-                        if bus5v_fail_streak == 0 {
-                            log::warn!(
-                                "ui: M-Bus 5V 切り替えに失敗 (以後は回復まで黙って 1 秒ごとに再試行): {e:?}"
-                            );
+                        Err(e) => {
+                            // 恒常的に失敗すると 1 秒ごとの warn が crashlog のリング
+                            // (4 KB) を埋めるので、連続失敗の初回だけ出す
+                            if bus5v_fail_streak == 0 {
+                                log::warn!(
+                                    "ui: M-Bus 5V 切り替えに失敗 (以後は回復まで黙って 1 秒ごとに再試行): {e:?}"
+                                );
+                            }
+                            bus5v_fail_streak = bus5v_fail_streak.saturating_add(1);
                         }
-                        bus5v_fail_streak = bus5v_fail_streak.saturating_add(1);
                     }
                 }
             }
