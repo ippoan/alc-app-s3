@@ -804,7 +804,7 @@ GPIO を Web 検索の要約だけで書いて実機で無点灯になり、M5Un
   (nvs=0x9000 / otadata=0x10000 は build.yml の Split step と結合しているので動かさない)
 - 雛形は `crates/atoms3-print/src/main.rs` (144 行)。`crashlog::init` →
   `Settings::new` → `heap::start` → `console::start` → `ws_uplink::start` →
-  (LAN or Wi-Fi) → `ota::mark_boot_valid` の順番はそのまま守る
+  (LAN or Wi-Fi) の順番はそのまま守る (OTA の確定は ws_uplink が初回の WS 接続で行う、#217)
   (**`crashlog::init` は `heap::start` より前**。配線漏れで `.noinit` のゴミ帳簿に
   書いて boot loop になった実害が 2026-07-14 にある)
 
@@ -911,7 +911,7 @@ NVS キー (`dev_id` / `dev_secret` / `dev_tenant` / `auth_url` / `ws_url`) と
   `eth_w5500` / `ota` / `ws_uplink` / `crashlog` / `heap` を結線済み。**新バイナリの雛形**
 - `crates/hub-core/src/uplink.rs` — WS フレーム組立 + NVS 永続の送信キュー
   (seq 冪等、`push_record`)
-- `crates/hub-drivers/src/ota.rs` — OTA と `mark_boot_valid` の rollback 安全装置
+- `crates/hub-drivers/src/ota.rs` — OTA と `confirm_running_app_if_pending` の rollback 安全装置
 - `crates/hub-drivers/src/speaker.rs` — 音源・`Sound` enum・`start_player`
 - `docs/index.html` + `docs/manifest.json` / `docs/atoms3-print.html` +
   `docs/manifest-atoms3-print.json` / `.github/workflows/build.yml` の

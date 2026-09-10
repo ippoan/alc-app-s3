@@ -22,7 +22,7 @@ use alc_hub_common::{
     settings::Settings,
     status::{HubStatus, SharedStatus},
 };
-use alc_hub_drivers::{crashlog, eth_w5500, heap, ntp, ota, ws_uplink};
+use alc_hub_drivers::{crashlog, eth_w5500, heap, ntp, ws_uplink};
 use anyhow::Result;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::{
@@ -108,9 +108,6 @@ fn main() -> Result<()> {
             None
         }
     };
-
-    // 起動完了 = OTA rollback 解除 (CoreS3 と同じ安全装置、ota.rs 参照)
-    ota::mark_boot_valid();
 
     // SNTP。起動しないとシステム時刻が 1970 のままで、送信キューに積んだ測定の
     // `recorded_at_ms` が 1970 起点になる。**即起動は panic する** — 理由は

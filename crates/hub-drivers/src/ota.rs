@@ -10,9 +10,11 @@
 //! CI が GitHub Pages の `firmware/alc-hub-cores3-app.bin` に公開する。
 //!
 //! 安全装置:
-//! - `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` + 起動完了時の
-//!   `mark_running_slot_valid` (main.rs) — 新 FW が起動途中で死ぬと
-//!   ブートローダが自動で旧スロットへ戻す
+//! - `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` + 初回の WS 接続での
+//!   [`confirm_running_app_if_pending`] (ws_uplink.rs、Refs #217) — 新 FW が
+//!   起動途中で死ぬとブートローダが自動で旧スロットへ戻す。登録済みの機が
+//!   IP を持ったまま 10 分 WS に繋がらなければ ws_uplink が旧スロットへ戻す
+//!   (`EVT OTA_ROLLED_BACK` は戻った先の起動で出る)
 //! - ダウンロード/書き込み失敗時は update を破棄して現行 FW のまま続行
 //!
 //! # ホストへのイベント出力
@@ -23,6 +25,7 @@
 //! | `EVT OTA_PROGRESS <received>/<total>` | 進捗 (64KB 毎。total は不明なら 0) |
 //! | `EVT OTA OK <bytes>` | 書き込み完了 — 直後に再起動する |
 //! | `EVT OTA NG <理由>` | 失敗 (現行 FW のまま続行) |
+//! | `EVT OTA_CONFIRMED slot=<label>` | OTA 直後の image を確定した (rollback 解除) |
 
 use anyhow::{bail, Context, Result};
 use esp_idf_svc::hal::delay::FreeRtos;
@@ -286,6 +289,11 @@ fn download_and_write(url: &str, progress: Option<&ProgressSink>) -> Result<usiz
         .unwrap_or(0);
 
     let mut ota = EspOta::new().context("OTA 初期化に失敗 (パーティション構成を確認)")?;
+    // OTA 直後の未確定 (PENDING_VERIFY) のままだと esp_ota_begin が
+    // ESP_ERR_OTA_ROLLBACK_INVALID_STATE で失敗する。WS 経路は接続時に確定済みだが、
+    // シリアルの `OTA <url>` は WS が繋がる前にも来るのでここで確定する
+    // (スレッド起動失敗・URL 誤り・HTTP 失敗では確定しない位置)
+    confirm_running_app_if_pending();
     let mut update = ota.initiate_update().context("OTA スロットの準備に失敗")?;
 
     // 8KB チャンク (PSRAM) でストリーミング。失敗時は update を drop = 破棄
@@ -327,11 +335,35 @@ fn download_and_write(url: &str, progress: Option<&ProgressSink>) -> Result<usiz
     Ok(received)
 }
 
-/// 起動が正常に完了したことをブートローダへ確定する (rollback 解除)。
-/// OTA 直後の初回起動でここまで到達できなければ、次のリセットで
-/// ブートローダが旧スロットへ自動で戻す。
-pub fn mark_boot_valid() {
-    if let Ok(mut ota) = EspOta::new() {
-        let _ = ota.mark_running_slot_valid();
+/// 実行中の app が OTA 直後の初回起動 (`ESP_OTA_IMG_PENDING_VERIFY`) か。
+/// USB で焼いた機は otadata に状態が無い (NOT_FOUND) ので false。
+///
+/// sys を直に呼ぶ: `EspOta::new()` は 1 プロセス 1 個で OTA スレッドと衝突し、
+/// esp-idf-svc 0.52.1 の `SlotState::Unverified` は NEW と PENDING_VERIFY を
+/// 区別しない
+pub fn running_app_pending() -> bool {
+    let mut state: sys::esp_ota_img_states_t = 0;
+    let err = unsafe {
+        sys::esp_ota_get_state_partition(sys::esp_ota_get_running_partition(), &mut state)
+    };
+    err == sys::ESP_OK && state == sys::esp_ota_img_states_t_ESP_OTA_IMG_PENDING_VERIFY
+}
+
+/// OTA 直後の初回起動 (PENDING_VERIFY) のときだけ、この image を確定して
+/// rollback を解除する (Refs #217。ippoan/alc-gw-p4 の
+/// `ota_link_confirm_running_app` と同じ判定)。確定後は VALID になるので、
+/// 2 回目以降の呼び出しは何もしない。
+///
+/// 呼ぶのは 3 か所: 初回の WS 接続・判定できない機の確定 (どちらも ws_uplink)・
+/// シリアル OTA の書き込み前 (`download_and_write`)
+pub fn confirm_running_app_if_pending() {
+    if !running_app_pending() {
+        return;
+    }
+    let err = unsafe { sys::esp_ota_mark_app_valid_cancel_rollback() };
+    if err == sys::ESP_OK {
+        alc_hub_common::evtlog::emit(&format!("EVT OTA_CONFIRMED slot={}", running_slot()));
+    } else {
+        log::warn!("ota: image の確定に失敗 (err={err})");
     }
 }

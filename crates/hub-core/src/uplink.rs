@@ -66,6 +66,53 @@ pub fn should_wait_for_clock(now_epoch_ms: u64, connected_for_ms: u64, has_corre
     now_epoch_ms < MIN_SYNCED_MS && has_correctable && connected_for_ms < CLOCK_WAIT_MS
 }
 
+/// OTA 直後の image が WS に繋がらないまま、この時間が経ったら前の image に戻す
+/// (Refs #217)。起動からの稼働時間で測る
+pub const OTA_VERIFY_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+
+/// OTA 直後の初回起動 (PENDING_VERIFY) の image をどうするか (Refs #217)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtaGuard {
+    /// まだ決めない (または決める必要が無い)
+    Nothing,
+    /// この image を確定して rollback を解除する
+    Confirm,
+    /// この image を無効にして前の image で再起動する
+    Rollback,
+}
+
+/// OTA 直後の image を確定するか、前の image に戻すかを決める (Refs #217)。
+///
+/// 健康の判定は「認証付きの WS に繋がったか」で、繋がった時点の確定は呼び側が
+/// 接続イベントで行う (ここは `ws_ever_connected` なら何もしない)。
+///
+/// - 未登録 (`!paired`) の機は WS で判定できないので、すぐ確定する (今までどおり)
+/// - 登録済みで [`OTA_VERIFY_TIMEOUT_MS`] 経っても繋がらない: IP があれば戻す。
+///   IP が無い (ネットワークが無い) なら image のせいか判定できないので確定する
+///   — 判定できない image を黙って捨てない
+pub fn ota_guard(
+    pending: bool,
+    paired: bool,
+    has_ip: bool,
+    ws_ever_connected: bool,
+    uptime_ms: u64,
+) -> OtaGuard {
+    if !pending || ws_ever_connected {
+        return OtaGuard::Nothing;
+    }
+    if !paired {
+        return OtaGuard::Confirm;
+    }
+    if uptime_ms < OTA_VERIFY_TIMEOUT_MS {
+        return OtaGuard::Nothing;
+    }
+    if has_ip {
+        OtaGuard::Rollback
+    } else {
+        OtaGuard::Confirm
+    }
+}
+
 /// NTP 未同期で記録されたエントリの recorded_at_ms を、現在の壁時計と稼働時間の
 /// 差から実時刻に直す。補正できるのは
 ///
@@ -1567,5 +1614,42 @@ mod tests {
         assert_eq!(s.lines(), vec!["B".to_string()]);
         s.remove(2);
         assert!(s.seqs().is_empty());
+    }
+
+    #[test]
+    fn ota_guard_does_nothing_unless_pending_and_never_connected() {
+        // USB で焼いた機 / 確定済みの機
+        assert_eq!(
+            ota_guard(false, true, true, false, OTA_VERIFY_TIMEOUT_MS),
+            OtaGuard::Nothing
+        );
+        // 一度でも WS が繋がった (確定は接続イベントで済んでいる)
+        assert_eq!(
+            ota_guard(true, true, true, true, OTA_VERIFY_TIMEOUT_MS),
+            OtaGuard::Nothing
+        );
+    }
+
+    #[test]
+    fn ota_guard_confirms_unpaired_device_at_once() {
+        // 未登録の機は WS で判定できないので起動直後に確定する
+        assert_eq!(ota_guard(true, false, false, false, 0), OtaGuard::Confirm);
+    }
+
+    #[test]
+    fn ota_guard_waits_until_timeout_then_rolls_back_only_with_ip() {
+        let before = OTA_VERIFY_TIMEOUT_MS - 1;
+        assert_eq!(ota_guard(true, true, true, false, before), OtaGuard::Nothing);
+        assert_eq!(ota_guard(true, true, false, false, before), OtaGuard::Nothing);
+        // IP があるのに繋がらない = image のせいとみなして戻す
+        assert_eq!(
+            ota_guard(true, true, true, false, OTA_VERIFY_TIMEOUT_MS),
+            OtaGuard::Rollback
+        );
+        // IP が無い = 判定できないので捨てずに確定する
+        assert_eq!(
+            ota_guard(true, true, false, false, OTA_VERIFY_TIMEOUT_MS),
+            OtaGuard::Confirm
+        );
     }
 }

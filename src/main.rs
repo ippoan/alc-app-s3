@@ -479,11 +479,6 @@ fn main() -> Result<()> {
     let ui_meas_tx = meas_tx.clone();
     ble::start(Arc::clone(&status), meas_tx, tx, coex, pair_flag)?;
 
-    // 全サービスの起動に成功 = 正常起動として rollback を確定解除する
-    // (OTA 直後の初回起動でここまで来られなければ、ブートローダが次の
-    // リセットで旧スロットへ自動で戻す。ota.rs 参照)
-    alc_hub_drivers::ota::mark_boot_valid();
-
     // UI ループ (メインタスクを占有, 戻らない)。alarm_monitor は**鳴動中の**
     // 画面タップで黙らせるためだけに渡す — 鳴らすのは上の専用スレッド
     ui::run(
