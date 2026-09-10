@@ -26,7 +26,7 @@
 //! | `AUTH TOKEN` | device JWT 取得の自己診断 (`EVT AUTH_TOKEN ...`) |
 //! | `WS URL <url>` | cf-alc-recorder WS URL を上書き (staging テスト用) |
 //! | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` を返す |
-//! | `BUS5V AUTO\|ON\|OFF` / `BUS5V STATUS` | M-Bus 5V を Core 側から出すか (NVS、既定 AUTO = 電池の有無で決める)。**再起動後に反映** |
+//! | `BUS5V AUTO\|ON\|OFF` / `BUS5V STATUS` | M-Bus 5V を Core 側から出すか (NVS、既定 AUTO = 電池の有無で決める)。**再起動後に反映**。WS 下り command `{action:"bus5v",mode:"auto\|on\|off"}` / `{action:"bus5v_status"}` / `{action:"reboot"}` (auth-worker 端末一覧) でも遠隔で設定・照会・反映できる |
 //! | `TENKO BP ON\|OFF` / `TENKO STATUS` | 点呼に血圧を含めるか (NVS、既定 OFF) / `TENKO BP=0` を返す |
 //! | `HEAP` | `HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> TOTAL_INT=<n> TOTAL_PSRAM=<n>` を返す (Refs #27) |
 //! | `HEAP DUMP` | `HEAPDUMP ...` 複数行 (ヒープブロック概況 + タスク別スタック余裕) |

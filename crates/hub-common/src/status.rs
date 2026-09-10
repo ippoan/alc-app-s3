@@ -96,6 +96,13 @@ pub struct HubStatus {
     /// バッテリーが接続されているか (AXP2101 0x00 bit3)。CoreS3 SE は常に false
     /// なので、残量/充電状態の表示はこれでゲートする
     pub battery_present: bool,
+
+    /// 起動時に M-Bus へ 5V を出したか (`Bus5vMode::resolve` の結果を
+    /// `src/main.rs` がそのまま入れる)。**起動後に再計算しない** — `Auto` の
+    /// 個体で起動後に電池を挿すと、`resolve()` の再評価と実際の出力
+    /// (AW9523 BUS_EN は起動時にしか触らない) が食い違うため。
+    /// WS 下り command `bus5v_status` の応答に載る
+    pub ext_5v_out: bool,
     /// バッテリー残量 [%] (AXP2101 フューエルゲージ 0xA4。255 = 未測定/電池なし)
     pub battery_percent: u8,
     /// バッテリー電圧 [mV] (AXP2101 ADC。0 = 未計測)
