@@ -123,19 +123,32 @@ mod cache_msync {
     }
 }
 
-/// [`ring_write`] が書いた範囲と帳簿を PSRAM へ書き戻す (#226)。
-/// **順番はデータ → 帳簿** — 逆だと、間でリセットが入ったとき新しい帳簿が
-/// まだ書き戻っていない古いバイトを有効として指してしまう。
+/// [`ring_write`] が書いたデータ区間を PSRAM へ書き戻す。**帳簿 (pos/len) を
+/// store する前に呼ぶこと** ([`writeback_ledger`] の doc)。
 /// `esp_cache_msync` のエラーは握りつぶす (ここでログを出すとリングへ再入する)。
+/// ヒープ確保を避けるため区間は固定長配列で受け取る (vprintf hook から
+/// RING_LOCK を握ったまま呼ばれるため、#226)。
 #[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
-unsafe fn writeback(r: *mut Ring, pos_before: u32, write_len: usize) {
+unsafe fn writeback_data(r: *mut Ring, pos_before: u32, write_len: usize) {
     use cache_msync::{esp_cache_msync, DIR_C2M, UNALIGNED};
     let flags = DIR_C2M | UNALIGNED;
     let data_base = core::ptr::addr_of_mut!((*r).data) as *mut u8;
-    for (offset, len) in pure::ring_write_ranges(RING_CAP, pos_before, write_len) {
+    let (ranges, n) = pure::ring_write_ranges(RING_CAP, pos_before, write_len);
+    for &(offset, len) in &ranges[..n] {
         let _ = esp_cache_msync(data_base.add(offset) as *mut c_void, len, flags);
     }
-    // 帳簿 (magic/pos/len、#[repr(C)] で連続する先頭 3 x u32) はデータの後
+}
+
+/// 帳簿 (magic/pos/len、`#[repr(C)]` で連続する先頭 3 x u32) を PSRAM へ
+/// 書き戻す。**[`writeback_data`] とその区間の `(*r).pos`/`(*r).len` への
+/// store が完全に終わった後に呼ぶこと** (#226) — 先に呼ぶ・データの store と
+/// 順番を崩すと、帳簿を含む cache line が (この msync を待たず) 自然に
+/// 追い出された場合に、帳簿だけが先に PSRAM へ届き得る。その状態でリセットが
+/// 入ると、新しい帳簿がまだ書き戻っていない古いバイトを有効として指してしまう。
+#[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
+unsafe fn writeback_ledger(r: *mut Ring) {
+    use cache_msync::{esp_cache_msync, DIR_C2M, UNALIGNED};
+    let flags = DIR_C2M | UNALIGNED;
     let ledger = core::ptr::addr_of_mut!((*r).magic) as *mut c_void;
     let ledger_len = 3 * core::mem::size_of::<u32>();
     let _ = esp_cache_msync(ledger, ledger_len, flags);
@@ -172,13 +185,22 @@ fn ring_write(bytes: &[u8]) {
         let mut pos = pos_before;
         let mut len = (*r).len;
         pure::ring_append(&mut (*r).data, &mut pos, &mut len, bytes);
-        (*r).pos = pos;
-        (*r).len = len;
-        // PSRAM 版だけ、書いた範囲と帳簿を明示的に書き戻す (#226 doc、モジュール
-        // doc 冒頭)。DRAM 版 (AtomS3 系) はソフトリセットで自然に保持されるため
-        // 不要 — cache を介さない内部 RAM で、そもそも disable/enable の対象外
+        // PSRAM 版だけ、データの store → 書き戻し → 帳簿の store → 書き戻し、
+        // の順を厳密に守る (#226、[`writeback_ledger`] の doc)。DRAM 版
+        // (AtomS3 系) はソフトリセットで自然に保持されるため不要 — cache を
+        // 介さない内部 RAM で、そもそも disable/enable の対象外
         #[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
-        writeback(r, pos_before, bytes.len());
+        {
+            writeback_data(r, pos_before, bytes.len());
+            (*r).pos = pos;
+            (*r).len = len;
+            writeback_ledger(r);
+        }
+        #[cfg(not(esp_idf_spiram_allow_noinit_seg_external_memory))]
+        {
+            (*r).pos = pos;
+            (*r).len = len;
+        }
     }
 }
 
