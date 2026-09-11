@@ -12,6 +12,9 @@ pub enum HostCommand {
     Result { ok: bool, value: String },
     ShowError { message: String },
     Reset,
+    /// PC (運行者タブ) の点呼の今の段 (`OK STAGE <label>` を応答)。点呼画面の
+    /// どの欄を強調するか・PC だけで進む段かを切り替える。結果は従来の `RESULT`
+    Stage(HostStage),
     Rotate(u16),
     Status,
     /// 設定のエクスポート (`CFG <json>` を応答)
@@ -104,6 +107,32 @@ pub enum HostCommand {
         call: bool,
         grace: Option<u16>,
     },
+}
+
+/// PC (運行者タブ) の点呼の段 (`STAGE NFC|TEMP|ALCOHOL|PC`)。
+/// CoreS3 の点呼画面を PC の流れに合わせるためだけに使う
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostStage {
+    /// 免許証待ち → 待機画面
+    Nfc,
+    /// 体温
+    Temp,
+    /// アルコール (FC-1200)
+    Alcohol,
+    /// PC の画面だけで進む段 (顔認証・自己申告・日常点検など)
+    Pc,
+}
+
+impl HostStage {
+    /// `OK STAGE <label>` に載せる機械可読ラベル
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Nfc => "nfc",
+            Self::Temp => "temp",
+            Self::Alcohol => "alcohol",
+            Self::Pc => "pc",
+        }
+    }
 }
 
 /// heartbeat の理由ラベルとして許す形か (`[a-z0-9_]+`)。
@@ -270,6 +299,14 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                 _ => return Err("ERR TENKO: BP には ON|OFF が必要です".into()),
             },
             _ => return Err("ERR TENKO: BP|STATUS が必要です".into()),
+        },
+        // PC (運行者タブ) の点呼の段。点呼画面を PC の流れに合わせる (hub-ui)
+        "STAGE" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+            Some("NFC") => HostCommand::Stage(HostStage::Nfc),
+            Some("TEMP") => HostCommand::Stage(HostStage::Temp),
+            Some("ALCOHOL") => HostCommand::Stage(HostStage::Alcohol),
+            Some("PC") => HostCommand::Stage(HostStage::Pc),
+            _ => return Err("ERR STAGE: NFC|TEMP|ALCOHOL|PC が必要です".into()),
         },
         // 点呼キオスクからの heartbeat (警告デバイス、issue #135)。返信はしない
         "HB" => {
@@ -780,6 +817,50 @@ mod tests {
         assert!(parse_line("TENKO TEMP ON", T).is_err());
         assert!(parse_line("TENKO BP", T).is_err());
         assert!(parse_line("TENKO BP MAYBE", T).is_err());
+    }
+
+    #[test]
+    fn stage_subcommands() {
+        assert_eq!(
+            parse_line("STAGE NFC", T),
+            Ok(Some(HostCommand::Stage(HostStage::Nfc)))
+        );
+        assert_eq!(
+            parse_line("STAGE TEMP", T),
+            Ok(Some(HostCommand::Stage(HostStage::Temp)))
+        );
+        assert_eq!(
+            parse_line("STAGE ALCOHOL", T),
+            Ok(Some(HostCommand::Stage(HostStage::Alcohol)))
+        );
+        assert_eq!(
+            parse_line("STAGE PC", T),
+            Ok(Some(HostCommand::Stage(HostStage::Pc)))
+        );
+        // 小文字でも通る (他コマンドと同じ大文字小文字非依存)
+        assert_eq!(
+            parse_line("stage temp", T),
+            Ok(Some(HostCommand::Stage(HostStage::Temp)))
+        );
+    }
+
+    #[test]
+    fn stage_errors() {
+        assert_eq!(
+            parse_line("STAGE", T),
+            Err("ERR STAGE: NFC|TEMP|ALCOHOL|PC が必要です".into())
+        );
+        // 結果は RESULT で送る (STAGE RESULT は無い)
+        assert!(parse_line("STAGE RESULT", T).is_err());
+        assert!(parse_line("STAGE 1", T).is_err());
+    }
+
+    #[test]
+    fn stage_labels_are_the_wire_values() {
+        assert_eq!(HostStage::Nfc.label(), "nfc");
+        assert_eq!(HostStage::Temp.label(), "temp");
+        assert_eq!(HostStage::Alcohol.label(), "alcohol");
+        assert_eq!(HostStage::Pc.label(), "pc");
     }
 
     #[test]
