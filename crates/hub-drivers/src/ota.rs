@@ -11,8 +11,10 @@
 //!
 //! 安全装置:
 //! - `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` + 初回の WS 接続での
-//!   [`confirm_running_app_if_pending`] (ws_uplink.rs、Refs #217) — 新 FW が
-//!   起動途中で死ぬとブートローダが自動で旧スロットへ戻す。登録済みの機が
+//!   [`confirm_running_app_if_pending`] (ws_uplink.rs、Refs #217)。web
+//!   インストーラの boot.bin は espflash 同梱の bootloader (rollback 無し) な
+//!   ので、この設定は bootloader 自体には効かず、app 側の API (NEW を書く)
+//!   にだけ効く — 確定と戻しは app (このモジュール) が行う。登録済みの機が
 //!   IP を持ったまま 10 分 WS に繋がらなければ ws_uplink が旧スロットへ戻す
 //!   (`EVT OTA_ROLLED_BACK` は戻った先の起動で出る)
 //! - ダウンロード/書き込み失敗時は update を破棄して現行 FW のまま続行
@@ -335,8 +337,23 @@ fn download_and_write(url: &str, progress: Option<&ProgressSink>) -> Result<usiz
     Ok(received)
 }
 
-/// 実行中の app が OTA 直後の初回起動 (`ESP_OTA_IMG_PENDING_VERIFY`) か。
-/// USB で焼いた機は otadata に状態が無い (NOT_FOUND) ので false。
+/// 実行中の app が OTA 直後の未確定状態 (`PENDING_VERIFY` または `NEW`) か。
+/// web インストーラで入れた機は空の otadata から起動し、bootloader が VALID を
+/// 書く (`bootloader_utility.c:491-506`)。`espflash flash` は otadata を触らない
+/// ので、以前 OTA した機を USB で焼き直すと active entry が NEW のまま残り、
+/// pending 扱いになりうる (登録済みで IP あり・WS 無しなら 10 分後に別の slot へ
+/// 戻る。未登録なら ws_uplink.rs の分岐で即確定)。
+///
+/// NEW を含める理由: web インストーラの boot.bin (espflash 4.5.0 同梱、IDF
+/// release/v5.5 既定設定) は rollback を持たず、OTA 書き込み後も otadata を
+/// NEW → PENDING_VERIFY に書き換えない (`bootloader_utility.c` の遷移は
+/// `#ifdef CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` の中)。NEW のままだと確定も
+/// 戻しも一切走らず #217 の安全網が丸ごと機能しない。NEW を pending として
+/// 扱っても安全なのは、確定 (`esp_ota_mark_app_valid_cancel_rollback`) が NEW
+/// からでも VALID を書き (IDF v5.5.3 `esp_ota_ops.c:912-923`)、戻し
+/// (`esp_ota_mark_app_invalid_rollback_and_reboot`) も状態を検査せず前の slot の
+/// 検査が通れば自分の entry に INVALID を書いて restart するため
+/// (`esp_ota_ops.c:924-936,848-900`)。
 ///
 /// sys を直に呼ぶ: `EspOta::new()` は 1 プロセス 1 個で OTA スレッドと衝突し、
 /// esp-idf-svc 0.52.1 の `SlotState::Unverified` は NEW と PENDING_VERIFY を
@@ -346,13 +363,17 @@ pub fn running_app_pending() -> bool {
     let err = unsafe {
         sys::esp_ota_get_state_partition(sys::esp_ota_get_running_partition(), &mut state)
     };
-    err == sys::ESP_OK && state == sys::esp_ota_img_states_t_ESP_OTA_IMG_PENDING_VERIFY
+    err == sys::ESP_OK
+        && (state == sys::esp_ota_img_states_t_ESP_OTA_IMG_PENDING_VERIFY
+            || state == sys::esp_ota_img_states_t_ESP_OTA_IMG_NEW)
 }
 
-/// OTA 直後の初回起動 (PENDING_VERIFY) のときだけ、この image を確定して
-/// rollback を解除する (Refs #217。ippoan/alc-gw-p4 の
-/// `ota_link_confirm_running_app` と同じ判定)。確定後は VALID になるので、
-/// 2 回目以降の呼び出しは何もしない。
+/// OTA 直後の未確定状態 (PENDING_VERIFY または NEW) のときだけ、この image を
+/// 確定して rollback を解除する (Refs #217)。ippoan/alc-gw-p4 の
+/// `ota_link_confirm_running_app` は PENDING_VERIFY だけを見る — あちらは IDF で
+/// build した bootloader (rollback 有効) を使うため NEW のまま残ることが無く、
+/// こことは判定が分かれる。確定後は VALID になるので、2 回目以降の呼び出しは
+/// 何もしない。
 ///
 /// 呼ぶのは 3 か所: 初回の WS 接続・判定できない機の確定 (どちらも ws_uplink)・
 /// シリアル OTA の書き込み前 (`download_and_write`)

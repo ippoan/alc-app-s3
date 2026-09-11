@@ -15,7 +15,9 @@ CONFIG_FREERTOS_HZ=1000
 # HEAP DUMP (タスク別スタック余裕の列挙 = uxTaskGetSystemState) に必要
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 
-# OTA (ota.rs): 新 FW が起動完了前に死んだらブートローダが旧スロットへ戻す
+# OTA (ota.rs): web インストーラの boot.bin は espflash 同梱の bootloader で
+# rollback を持たないため、この設定は bootloader 自体には効かず、app 側の
+# API (NEW を書く) にだけ効く。確定と戻しは app が行う (ota.rs running_app_pending)
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # auth-worker への HTTPS / cf-alc-recorder への WSS (公開 CA バンドル検証)

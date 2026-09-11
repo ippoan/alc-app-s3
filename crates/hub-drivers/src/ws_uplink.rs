@@ -204,7 +204,8 @@ fn run(
     let mut connect_warned = false;
     // ヒープ不足ログの最終出力時刻
     let mut heap_log_at: u64 = 0;
-    // OTA 直後の初回起動 (PENDING_VERIFY) か。確定するか戻すまで true (Refs #217)
+    // OTA 直後の未確定状態 (PENDING_VERIFY または NEW) か。確定するか戻すまで
+    // true (Refs #217)
     let mut ota_pending = crate::ota::running_app_pending();
     // この起動で一度でも WS が繋がったか
     let mut ws_ever_connected = false;

@@ -70,7 +70,8 @@ pub fn should_wait_for_clock(now_epoch_ms: u64, connected_for_ms: u64, has_corre
 /// (Refs #217)。起動からの稼働時間で測る
 pub const OTA_VERIFY_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 
-/// OTA 直後の初回起動 (PENDING_VERIFY) の image をどうするか (Refs #217)
+/// OTA 直後の未確定状態 (PENDING_VERIFY または NEW) の image をどうするか
+/// (Refs #217)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OtaGuard {
     /// まだ決めない (または決める必要が無い)

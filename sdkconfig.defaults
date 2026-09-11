@@ -17,8 +17,9 @@ CONFIG_ETH_SPI_ETHERNET_W5500=y
 # HEAP DUMP (タスク別スタック余裕の列挙 = uxTaskGetSystemState) に必要 (Refs #27)
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 
-# OTA (ota.rs): 新 FW が起動完了 (mark_running_slot_valid) 前に死んだら
-# ブートローダが旧スロットへ自動で戻す
+# OTA (ota.rs): web インストーラの boot.bin は espflash 同梱の bootloader で
+# rollback を持たないため、この設定は bootloader 自体には効かず、app 側の
+# API (NEW を書く) にだけ効く。確定と戻しは app が行う (ota.rs running_app_pending)
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # C++ 例外 (nfc-verify feature, components/nfc_shim 経由の M5UnitUnified 統合、issue #84):
