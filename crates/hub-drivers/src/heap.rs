@@ -170,6 +170,8 @@ pub fn start(status: SharedStatus) -> Result<()> {
 fn monitor_loop(status: SharedStatus) -> ! {
     let mut last_min = usize::MAX;
     let mut last_note: Option<u64> = None;
+    // 最後に `EVT RING_MSYNC` を出したときの失敗回数 (#226)
+    let mut last_msync_fail = 0u32;
     loop {
         let s = stats();
         // ホスト/observability 向け (EVT プレフィックスで行解釈される)。
@@ -185,6 +187,17 @@ fn monitor_loop(status: SharedStatus) -> ! {
         if last_note.map_or(true, |at| now.saturating_sub(at) >= HEAP_NOTE_INTERVAL_MS) {
             crate::crashlog::note(&line);
             last_note = Some(now);
+            // PSRAM 版リングの書き戻し (esp_cache_msync) の失敗が前回より増えて
+            // いたら別の 1 行で出す (#226 の切り分け。失敗したその場では log hook
+            // へ再入するので出せない)。DRAM 版の機種は常に None で何も出ない
+            if let Some((fail, err)) = crate::crashlog::msync_failures() {
+                if fail > last_msync_fail {
+                    alc_hub_common::evtlog::emit(&alc_hub_core::crashlog::ring_msync_line(
+                        fail, err,
+                    ));
+                    last_msync_fail = fail;
+                }
+            }
         }
         if let Ok(mut st) = status.lock() {
             st.heap_free_int = s.free_int;
