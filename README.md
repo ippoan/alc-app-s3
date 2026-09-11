@@ -232,7 +232,7 @@ cargo build --release             # 初回は ESP-IDF v5.5.3 を自動取得 (�
 
 ### ローカル書き込み (Windows)
 
-編集 → ビルド → 実機書き込みは [local/flash.ps1](local/README.md) で一発:
+編集 → ビルド → 実機書き込みは手元に用意する `local/flash.ps1` で一発:
 
 ```powershell
 .\local\flash.ps1            # ビルド + COM4 の CoreS3 へ書き込み
@@ -242,7 +242,8 @@ cargo build --release             # 初回は ESP-IDF v5.5.3 を自動取得 (�
 ESP-IDF は出力パスが長いと "Too long output directory" で失敗するため、
 `flash.ps1` は `CARGO_TARGET_DIR=C:\t\alcs3` (短いパス) と
 `ESP_IDF_SDKCONFIG_DEFAULTS` の絶対指定でこれを回避している (詳細は
-[local/README.md](local/README.md))。CoreS3 は USB Serial/JTAG のため、Pages の
+手元の `local/README.md` に控える想定、秘匿情報を含むため repo には含まれない)。
+CoreS3 は USB Serial/JTAG のため、Pages の
 タブや他のシリアルモニタが COM を掴んでいると書き込みに失敗する (先に閉じる)。
 
 動作確認 (シリアルモニタから):
@@ -396,7 +397,7 @@ VOICEVOX の利用規約によりクレジット表記が必要 — 本製品を
 画面向きと Wi-Fi 設定を JSON で一括バックアップ/復元できる
 (`CFG GET` / `CFG SET`、Pages の「設定のエクスポート/インポート」カード)。
 複数台への同一設定配布や、接続不良の切り分けに使う。ローカルからは
-[local/device-config.json](local/README.md) を `CFG SET` に流し込む。
+手元に用意する `local/device-config.json` を `CFG SET` に流し込む。
 
 ## TODO
 
