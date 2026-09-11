@@ -190,9 +190,9 @@ pub fn run(
     // 残り秒数表示は 1 秒刻みの部分更新で追従させる (last_lock_secs)
     let mut log_lock = LogLock::new();
     let mut last_lock_secs = 0u64;
-    // 点呼確認画面の「点呼を開始」で始めた点呼の札。session_id を発番した直後に
-    // Measurement::License として recorder へ渡す (同じ session_id が付く、#125)
-    let mut pending_license: Option<LicenseCard> = None;
+    // 確認画面に出ている札。確認画面から点呼画面へ進んだ点呼 (タッチの「点呼を
+    // 開始」/ PC の STAGE / MEASURE のどれでも) の session_id 発番時に送る
+    let mut confirm_card: Option<LicenseCard> = None;
 
     loop {
         let now = now_ms();
@@ -459,6 +459,7 @@ pub fn run(
                         if expiry == ExpiryState::Expired {
                             println!("EVT LICENSE_EXPIRED {}", card.expiry);
                         }
+                        confirm_card = Some(card.clone());
                         screen = Screen::Confirm { card, expiry };
                         entered = now;
                         dirty = true;
@@ -573,10 +574,6 @@ pub fn run(
                 log_lock.is_locked(now),
                 current_items(&status),
             ) {
-                // 免許証から始めた点呼: 札を控えておき、session_id 発番時に送る
-                if let (Screen::Confirm { card, .. }, Screen::Measuring { .. }) = (&screen, &next) {
-                    pending_license = Some(card.clone());
-                }
                 screen = next;
                 entered = now;
                 dirty = true;
@@ -674,7 +671,7 @@ pub fn run(
             }
             // session_id を status に載せた後で送る (recorder はそれを読んで付ける)。
             // メニューから始めた点呼では札が無いので何も送らない
-            if let Some(card) = pending_license.take() {
+            if let Some(card) = confirm_card.take() {
                 if now_in_session {
                     if let (Ok(issue), Ok(expiry)) = (card.issue.parse::<u32>(), card.expiry.parse::<u32>()) {
                         let _ = meas_tx.send(Measurement::License {
@@ -685,6 +682,13 @@ pub fn run(
                     }
                 }
             }
+        }
+
+        // 確認画面を離れた札は捨てる (キャンセル・タイムアウトで待機へ戻った後の
+        // 点呼に載せない)。確認画面から点呼画面へ進んだ周は、上で take 済み。
+        // かざした札が PC で未登録でも、確認画面のうちに PC が進めればその札が付く
+        if !matches!(screen, Screen::Confirm { .. }) {
+            confirm_card = None;
         }
 
         FreeRtos::delay_ms(20);

@@ -20,6 +20,10 @@
 //!   URL や SSID を含む行 等) — リングは get_device_log で遠隔から読まれ、そこから
 //!   issue / PR の本文へ転記されうる。その経路を作らない
 //! - **CoreS3 の `EVT ALARM`** — シリアルにも出さない (hub-drivers/src/alarm.rs)
+//!
+//! 画面を変えるホストのコマンドへの `OK` 応答 (host_link.rs の QR / MEASURE /
+//! RESULT / ERROR / RESET / STAGE) も emit にする (PC 主導の点呼の進みを
+//! get_log で後から読むため、Refs #135)
 
 use std::sync::OnceLock;
 
