@@ -19,7 +19,7 @@
 //! | `RESULT OK\|NG [value]` | 測定結果画面を表示 (value 例: `0.000`) |
 //! | `ERROR <message>` | エラー画面を表示 |
 //! | `RESET` | 待機画面へ戻す |
-//! | `STAGE NFC\|TEMP\|ALCOHOL\|PC` | PC (運行者タブ) の点呼の段に点呼画面を合わせる (`OK STAGE <label>`)。NFC = 待機画面、TEMP / ALCOHOL = その欄を強調、PC = PC の画面だけで進む段。結果は `RESULT` |
+//! | `STAGE NFC\|TEMP\|ALCOHOL\|PC` | PC (運行者タブ) の点呼の段に点呼画面を合わせる (`OK STAGE <label>`。応答はリングにも残る、get_log で読める)。NFC = 待機画面、TEMP / ALCOHOL = その欄を強調、PC = PC の画面だけで進む段。結果は `RESULT` |
 //! | `ROTATE <0\|90\|180\|270>` | 画面向きを変更 (NVS 保存、次回起動も維持) |
 //! | `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0 BOARD=cores3 ALARM=idle/none/-/0` を返す (`ALARM=` の 4 番目は `grace=` の猶予の残り ms、猶予外は 0) |
 //! | `HB OK` / `HB NG <reason>` | 運行者 PWA の heartbeat (3 秒ごと)。末尾に任意で `call=0\|1`、意図した reload の直前は `grace=<秒>` (#192)。沈黙警告の判定器へ渡す。**応答しない** |
@@ -216,27 +216,27 @@ fn handle_line(
                 payload,
                 timeout_ms,
             });
-            println!("OK QR");
+            alc_hub_common::evtlog::emit("OK QR");
         }
         HostCommand::Measure => {
             let _ = tx.send(UiCommand::Measure);
-            println!("OK MEASURE");
+            alc_hub_common::evtlog::emit("OK MEASURE");
         }
         HostCommand::Result { ok, value } => {
             let _ = tx.send(UiCommand::Result { ok, value });
-            println!("OK RESULT");
+            alc_hub_common::evtlog::emit("OK RESULT");
         }
         HostCommand::ShowError { message } => {
             let _ = tx.send(UiCommand::Error { message });
-            println!("OK ERROR");
+            alc_hub_common::evtlog::emit("OK ERROR");
         }
         HostCommand::Reset => {
             let _ = tx.send(UiCommand::Reset);
-            println!("OK RESET");
+            alc_hub_common::evtlog::emit("OK RESET");
         }
         HostCommand::Stage(stage) => {
             let _ = tx.send(UiCommand::Stage(stage));
-            println!("OK STAGE {}", stage.label());
+            alc_hub_common::evtlog::emit(&format!("OK STAGE {}", stage.label()));
         }
         HostCommand::Rotate(deg) => match settings.set_rotation(deg) {
             Ok(()) => {
