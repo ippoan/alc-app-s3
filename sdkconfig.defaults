@@ -76,7 +76,12 @@ CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY=y
 # 上と排他 (Kconfig.spiram.common の depends) なので CONFIG_SPIRAM_IGNORE_NOTFOUND は外した。外したことで:
 # - PSRAM が見つからないと起動しなくなる (abort)。承知のうえで選んだ (#217)
-# - Wi-Fi / LWIP のバッファ既定が PSRAM プロファイルに切り替わり SPIRAM_TRY_ALLOCATE_WIFI_LWIP が実効になる (= 内部 RAM の空きは変わる)
+# - CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP は IGNORE_NOTFOUND に関係なく効いている
+#   (lwipopts.h:1708、wifi_init.c:296/332)。IGNORE_NOTFOUND を外すと変わるのは
+#   (a) esp_wifi/Kconfig:82 の depends で Wi-Fi の TX が STATIC に固定される
+#   (b) Kconfig の既定値 (STATIC_RX 10→16 は下で 6 を明示、CACHE_TX_BUFFER_NUM 32 が
+#       有効化、lwip OOSEQ 4→0 は下で 4 を明示) (c) wifi_netif.c:72 の tx_by_ref。
+#   PSRAM が見つからない CoreS3 は起動時に abort する
 # 4KB 未満の割当 (頻繁アクセスの小物・ドライバ周り) は内蔵 SRAM に残す
 # (2048 も実機で試したが削減効果は ±2KB で誤差 — 残る内部RAM 消費はタスク
 # スタック / BT controller / Wi-Fi ドライバ本体で、この閾値では動かない)
@@ -110,7 +115,13 @@ CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 # ヒープ優先 — 実測で定常空きヒープ 41KB しかなく TLS (WSS) が入らないため
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
-CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+# `lan` を外して build した CoreS3 (ベンチ等) で、STATIC_TX 16 本 × 1600 B = 25.6 KB
+# の DMA 内部 RAM が常駐するのを防ぐ (#219 の障害の原因)。LAN ビルドは Wi-Fi を
+# 初期化しないので効かない。既定 16、範囲 1-64 (esp_wifi/Kconfig:90-94)
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=4
+# IGNORE_NOTFOUND を外すと lwip/Kconfig:739-740 の既定が 4→0 (無制限) に変わる
+# ため、今の値を明示で保つ
+CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS=4
 # Wi-Fi/LWIP のバッファを可能な範囲で PSRAM に置く (内部RAM 使用率 77%→60% 台
 # を狙う削減の主レバー)
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
