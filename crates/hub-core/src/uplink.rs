@@ -282,6 +282,17 @@ pub fn command_log_max_bytes(payload: &str) -> usize {
         })
 }
 
+/// 下り `get_log` command payload の `offset` (末尾から遡るバイト数、#217) を
+/// 取り出す。省略・整数でない値・負値・`usize` に収まらない値は 0 (= 末尾)。
+/// 全体を越える値はそのまま返す — 切り詰めは [`crate::crashlog::window_lines`]
+pub fn command_log_offset(payload: &str) -> usize {
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|v| v.get("offset")?.as_u64())
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0)
+}
+
 /// WS push 印刷 (#38) の 1 チャンク。`print_data` command payload
 /// (`{"action":"print_data","seq":N,"chunk":"<base64>","last":bool}`) を
 /// デコードした結果。`data` は base64 デコード済みの生バイト列。
@@ -1041,6 +1052,25 @@ mod tests {
             LOG_DEFAULT_BYTES
         );
         assert_eq!(command_log_max_bytes("{oops"), LOG_DEFAULT_BYTES);
+    }
+
+    #[test]
+    fn command_log_offset_defaults_to_zero() {
+        assert_eq!(command_log_offset(r#"{"action":"get_log"}"#), 0);
+        assert_eq!(
+            command_log_offset(r#"{"action":"get_log","offset":7600}"#),
+            7600
+        );
+        // 全体を越える値はここでは切らない (window_lines が空を返す)
+        assert_eq!(
+            command_log_offset(r#"{"action":"get_log","offset":9999999}"#),
+            9_999_999
+        );
+        // 負値・整数でない指定・壊れた JSON は 0 (= 末尾)
+        assert_eq!(command_log_offset(r#"{"action":"get_log","offset":-1}"#), 0);
+        assert_eq!(command_log_offset(r#"{"action":"get_log","offset":"3"}"#), 0);
+        assert_eq!(command_log_offset(r#"{"action":"get_log","offset":1.5}"#), 0);
+        assert_eq!(command_log_offset("{oops"), 0);
     }
 
     #[test]

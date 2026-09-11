@@ -33,7 +33,7 @@ use std::net::TcpStream;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
 use alc_hub_core::uplink::{
-    command_action, command_gw_url, command_log_max_bytes, command_ota_url,
+    command_action, command_gw_url, command_log_max_bytes, command_log_offset, command_ota_url,
     command_print_chunk, command_print_url, command_result_frame, measurement_frame, ota_guard,
     parse_downlink, should_wait_for_clock, Downlink, DroppedEntry, OtaGuard, UplinkQueue,
     OTA_VERIFY_TIMEOUT_MS, PING_FRAME,
@@ -550,7 +550,8 @@ fn flush_queue(conn: &mut Option<Conn>, queue: &mut UplinkQueue, unsent_only: bo
 /// 接続を切断状態へ遷移させる。**既に切断済みなら何もしない** —
 /// 呼び出し側 (WsEvent::Disconnected) はこの遷移が実際に起きたときだけ
 /// `EVT WS_DISCONNECTED` を積む (毎回積むと 10 秒ごとの再接続失敗が
-/// `.noinit` リング 4 KB を約 95 秒で一周させ、切り分けに要る EVT を
+/// リング (当時 4 KB。#217 で CoreS3 では PSRAM 256 KB、それ以外の機種は 4 KB のまま)
+/// を約 95 秒で一周させ、切り分けに要る EVT を
 /// 押し出す。Refs #217)
 fn mark_disconnected(conn: &mut Option<Conn>, reason: &str, queue: &UplinkQueue) -> bool {
     let Some(c) = conn.as_mut() else {
@@ -844,10 +845,11 @@ fn handle_downlink(
                         .unwrap_or_else(|_| r#"{"read":false}"#.to_string());
                     send_command_result(conn, &id, &payload);
                 }
-                // 直近ログの取得 (#195): crash_log / `LOG DUMP` と同じ `.noinit`
-                // リングの末尾 (行境界) を command_result で返す。auth-worker の
-                // MCP get_device_log が読む。上限は payload の max_bytes
-                // (省略時 3000、1〜3800 にクランプ)。command_result は NVS
+                // 直近ログの取得 (#195): crash_log / `LOG DUMP` と同じリングを
+                // 行境界で切って command_result で返す。auth-worker の MCP
+                // get_device_log が読む。上限は payload の max_bytes (省略時 3000、
+                // 1〜3800 にクランプ)。payload の offset を渡すと末尾からその
+                // バイト数だけ遡った窓を返す (省略時 0 = 末尾、#217)。command_result は NVS
                 // キューを通らず socket 直書きなので MAX_LINE_BYTES には掛からない。
                 // USB ホスト (運行者 PWA) が居れば、上の `EVT WS_COMMAND` を合図に
                 // PWA が返す `PWALOG` 行を最大 2 秒集めて `pwa_log` に足す (#215、
@@ -865,6 +867,7 @@ fn handle_downlink(
                     };
                     let payload = alc_hub_core::crashlog::log_payload(
                         &text,
+                        command_log_offset(&payload),
                         command_log_max_bytes(&payload),
                         now_ms(),
                         reset_history,
