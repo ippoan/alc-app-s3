@@ -50,6 +50,33 @@ pub fn boot_separator(code: i32) -> String {
     format!("--- BOOT reset={} ({code}) ---", reset_reason_name(code))
 }
 
+/// 起動時の PSRAM 版リングの生の帳簿と置き場 (`EVT RING_BOOT`、#226)。
+///
+/// 再起動をまたいでリングが消えた件の切り分け用 — firmware の `init()` が
+/// `preserved` を決める前に読んだ帳簿の値そのもの (`raw_*`) と、その判定結果、
+/// リング本体の番地 (`ring_addr`)、リンカの `.ext_ram_noinit` 区間の先頭
+/// (`noinit_addr`) を 1 行に並べる。番地は 16 進 8 桁のゼロ埋め
+pub fn ring_boot_line(
+    raw_magic: u32,
+    raw_pos: u32,
+    raw_len: u32,
+    preserved: bool,
+    ring_addr: u32,
+    noinit_addr: u32,
+) -> String {
+    format!(
+        "EVT RING_BOOT raw_magic=0x{raw_magic:08x} raw_pos={raw_pos} raw_len={raw_len} \
+         preserved={} ring=0x{ring_addr:08x} noinit=0x{noinit_addr:08x}",
+        u8::from(preserved)
+    )
+}
+
+/// PSRAM 版リングの書き戻し (`esp_cache_msync`) が失敗した累計回数と、最後の
+/// エラー (`esp_err_t` の値を 10 進で) (`EVT RING_MSYNC`、#226)。
+pub fn ring_msync_line(fail: u32, err: i32) -> String {
+    format!("EVT RING_MSYNC fail={fail} err={err}")
+}
+
 /// USB-Serial-JTAG 起因の reset (usb = 11 / jtag = 12) か。
 ///
 /// 運行者 PC の PWA タブを閉じると Windows の driver がハンドル解放で
@@ -644,6 +671,52 @@ mod tests {
     fn boot_separator_names_the_reset() {
         assert_eq!(boot_separator(11), "--- BOOT reset=usb (11) ---");
         assert_eq!(boot_separator(4), "--- BOOT reset=panic (4) ---");
+    }
+
+    #[test]
+    fn ring_boot_line_formats_all_fields() {
+        assert_eq!(
+            ring_boot_line(0x4352_4c47, 1234, 262_144, true, 0x3c0a_1000, 0x3c0a_0000),
+            "EVT RING_BOOT raw_magic=0x43524c47 raw_pos=1234 raw_len=262144 preserved=1 \
+             ring=0x3c0a1000 noinit=0x3c0a0000"
+        );
+    }
+
+    #[test]
+    fn ring_boot_line_zero_pads_hex() {
+        assert_eq!(
+            ring_boot_line(0, 0, 0, false, 0, 0),
+            "EVT RING_BOOT raw_magic=0x00000000 raw_pos=0 raw_len=0 preserved=0 \
+             ring=0x00000000 noinit=0x00000000"
+        );
+        assert_eq!(
+            ring_boot_line(0x1f, 7, 8, false, 0x100, 0xabc),
+            "EVT RING_BOOT raw_magic=0x0000001f raw_pos=7 raw_len=8 preserved=0 \
+             ring=0x00000100 noinit=0x00000abc"
+        );
+    }
+
+    #[test]
+    fn ring_boot_line_max_values() {
+        assert_eq!(
+            ring_boot_line(u32::MAX, u32::MAX, u32::MAX, true, u32::MAX, u32::MAX),
+            "EVT RING_BOOT raw_magic=0xffffffff raw_pos=4294967295 raw_len=4294967295 \
+             preserved=1 ring=0xffffffff noinit=0xffffffff"
+        );
+    }
+
+    #[test]
+    fn ring_msync_line_formats() {
+        assert_eq!(ring_msync_line(0, 0), "EVT RING_MSYNC fail=0 err=0");
+        assert_eq!(ring_msync_line(3, 258), "EVT RING_MSYNC fail=3 err=258");
+        assert_eq!(
+            ring_msync_line(u32::MAX, i32::MIN),
+            "EVT RING_MSYNC fail=4294967295 err=-2147483648"
+        );
+        assert_eq!(
+            ring_msync_line(1, i32::MAX),
+            "EVT RING_MSYNC fail=1 err=2147483647"
+        );
     }
 
     #[test]

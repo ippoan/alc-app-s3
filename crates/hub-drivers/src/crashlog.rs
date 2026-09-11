@@ -33,6 +33,8 @@ use core::ffi::{c_char, c_int};
 #[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
 use core::ffi::c_void;
 use core::mem::MaybeUninit;
+#[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::io::Write as _;
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
@@ -123,9 +125,51 @@ mod cache_msync {
     }
 }
 
+/// リンカの `.ext_ram_noinit` 区間の先頭 (IDF v5.5.3
+/// `esp_system/ld/esp32s3/sections.ld.in`)。`EVT RING_BOOT` にリングの番地と
+/// 並べて出す (#226)。この Kconfig が無効な機ではシンボル自体が定義されないので、
+/// 宣言ごと cfg で分ける
+#[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
+extern "C" {
+    static _ext_ram_noinit_start: u8;
+}
+
+/// `esp_cache_msync` が失敗した累計回数と、最後のエラー (`esp_err_t`)。#226 の
+/// 切り分け用で、[`msync_failures`] が読み、heap.rs が `EVT RING_MSYNC` に出す。
+/// 失敗したその場で出さないのは、RING_LOCK を握った log hook の中からリングへ
+/// 再入するため
+#[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
+static MSYNC_FAILS: AtomicU32 = AtomicU32::new(0);
+#[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
+static MSYNC_LAST_ERR: AtomicI32 = AtomicI32::new(0);
+
+/// `esp_cache_msync` の戻り値が ESP_OK でなければ [`MSYNC_FAILS`] /
+/// [`MSYNC_LAST_ERR`] に数える。ログは出さない ([`MSYNC_FAILS`] の doc)
+#[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
+fn count_msync(err: c_int) {
+    if err != sys::ESP_OK as c_int {
+        MSYNC_LAST_ERR.store(err, Ordering::Relaxed);
+        MSYNC_FAILS.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// PSRAM 版リングの書き戻し (`esp_cache_msync`) の失敗の `(累計回数, 最後の
+/// エラー)` (#226)。書き戻しをしない DRAM 版の機種は常に `None`
+pub fn msync_failures() -> Option<(u32, i32)> {
+    #[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
+    let failures = Some((
+        MSYNC_FAILS.load(Ordering::Acquire),
+        MSYNC_LAST_ERR.load(Ordering::Relaxed),
+    ));
+    #[cfg(not(esp_idf_spiram_allow_noinit_seg_external_memory))]
+    let failures = None;
+    failures
+}
+
 /// [`ring_write`] が書いたデータ区間を PSRAM へ書き戻す。**帳簿 (pos/len) を
 /// store する前に呼ぶこと** ([`writeback_ledger`] の doc)。
-/// `esp_cache_msync` のエラーは握りつぶす (ここでログを出すとリングへ再入する)。
+/// `esp_cache_msync` のエラーは [`count_msync`] で数えるだけで、ここでログは
+/// 出さない (出すとリングへ再入する)。
 /// ヒープ確保を避けるため区間は固定長配列で受け取る (vprintf hook から
 /// RING_LOCK を握ったまま呼ばれるため、#226)。
 #[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
@@ -135,7 +179,7 @@ unsafe fn writeback_data(r: *mut Ring, pos_before: u32, write_len: usize) {
     let data_base = core::ptr::addr_of_mut!((*r).data) as *mut u8;
     let (ranges, n) = pure::ring_write_ranges(RING_CAP, pos_before, write_len);
     for &(offset, len) in &ranges[..n] {
-        let _ = esp_cache_msync(data_base.add(offset) as *mut c_void, len, flags);
+        count_msync(esp_cache_msync(data_base.add(offset) as *mut c_void, len, flags));
     }
 }
 
@@ -151,7 +195,7 @@ unsafe fn writeback_ledger(r: *mut Ring) {
     let flags = DIR_C2M | UNALIGNED;
     let ledger = core::ptr::addr_of_mut!((*r).magic) as *mut c_void;
     let ledger_len = 3 * core::mem::size_of::<u32>();
-    let _ = esp_cache_msync(ledger, ledger_len, flags);
+    count_msync(esp_cache_msync(ledger, ledger_len, flags));
 }
 
 /// 前回リセットがクラッシュ由来だった時の持ち越し情報。
@@ -284,10 +328,27 @@ extern "C" {
 pub fn init() -> (i32, Option<CrashSnapshot>) {
     let reset_code = unsafe { sys::esp_reset_reason() } as i32;
     let mut snapshot = None;
+    // #226 の切り分け (PSRAM 版だけ): preserved を決める前の生の帳簿と、リング・
+    // noinit 区間の番地を、EVT BOOT の後に `EVT RING_BOOT` として出す
+    #[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
+    let ring_boot;
     unsafe {
         let r = ring_ptr();
+        #[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
+        let (raw_magic, raw_pos, raw_len) = ((*r).magic, (*r).pos, (*r).len);
         let preserved =
             (*r).magic == MAGIC && pure::ring_valid(RING_CAP, (*r).pos, (*r).len);
+        #[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
+        {
+            ring_boot = pure::ring_boot_line(
+                raw_magic,
+                raw_pos,
+                raw_len,
+                preserved,
+                r as usize as u32,
+                core::ptr::addr_of!(_ext_ram_noinit_start) as usize as u32,
+            );
+        }
         if pure::is_crash_reset(reset_code) {
             let log = if preserved {
                 let raw = pure::ring_snapshot(&(*r).data, (*r).pos, (*r).len);
@@ -321,6 +382,8 @@ pub fn init() -> (i32, Option<CrashSnapshot>) {
         "EVT BOOT reset={} ({reset_code})",
         pure::reset_reason_name(reset_code)
     ));
+    #[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
+    alc_hub_common::evtlog::emit(&ring_boot);
 
     // Rust panic のメッセージ + 位置をリングへ。hook から戻った後は既定どおり
     // abort → ESP panic handler → リセットに進む
