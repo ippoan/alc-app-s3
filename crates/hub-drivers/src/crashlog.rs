@@ -76,6 +76,12 @@ const LINE_BUF: usize = 256;
 /// リング本体 (置き場は [`RING_CAP`] の doc)。ソフトリセットを跨いで内容が残る。
 #[repr(C)]
 struct Ring {
+    /// ESP-IDF は起動時の PSRAM 検出で PSRAM の番地 0 に 4 バイトを書いて
+    /// 読み戻す (`esp_psram_impl_ap_quad.c` の `s_check_psram_connected`。
+    /// octal 版 `esp_psram_impl_octal.c` も同じ、Refs #226)。`.ext_ram_noinit`
+    /// は PSRAM 写像の先頭に置かれるので、帳簿 (magic/pos/len) をそこから
+    /// 退かす。32 は書き込まれる 4 バイトに対する余裕。
+    _psram_probe_scratch: [u8; 32],
     magic: u32,
     /// 次の書き込み位置 (< RING_CAP)
     pos: u32,
@@ -83,6 +89,10 @@ struct Ring {
     len: u32,
     data: [u8; RING_CAP],
 }
+
+/// [`Ring::_psram_probe_scratch`] が縮んで帳簿が PSRAM 検出の書き込み先に
+/// 戻ってしまう変更をビルドで検出する (#226)。
+const _: () = assert!(core::mem::offset_of!(Ring, magic) >= 32);
 
 #[cfg_attr(
     esp_idf_spiram_allow_noinit_seg_external_memory,
@@ -183,8 +193,9 @@ unsafe fn writeback_data(r: *mut Ring, pos_before: u32, write_len: usize) {
     }
 }
 
-/// 帳簿 (magic/pos/len、`#[repr(C)]` で連続する先頭 3 x u32) を PSRAM へ
-/// 書き戻す。**[`writeback_data`] とその区間の `(*r).pos`/`(*r).len` への
+/// 帳簿 (magic/pos/len、`#[repr(C)]` で `_psram_probe_scratch` の後に続く
+/// 3 x u32) を PSRAM へ書き戻す。**[`writeback_data`] とその区間の
+/// `(*r).pos`/`(*r).len` への
 /// store が完全に終わった後に呼ぶこと** (#226) — 先に呼ぶ・データの store と
 /// 順番を崩すと、帳簿を含む cache line が (この msync を待たず) 自然に
 /// 追い出された場合に、帳簿だけが先に PSRAM へ届き得る。その状態でリセットが
