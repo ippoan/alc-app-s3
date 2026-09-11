@@ -14,7 +14,7 @@
 CoreS3
   ├─ LCD (ILI9342C 320x240) + タッチ (FT5x06) ← 画面処理 (hub-ui)
   ├─ ネイティブ USB-C (USB Serial/JTAG)       ← ホストリンク + Improv (hub-drivers)
-  ├─ M-Bus: RS232M Module → DB9 → FC-1200     ← UART1 パススルー (実装済み)
+  ├─ M-Bus: RS232M Module → DB9 → FC-1200     ← UART1 (fc1200-wasm 移植、実装済み)
   ├─ 内蔵 BLE → NT-100B / NBP-1BLE            ← 実装済み (hub-ble,
   │                                             ble-medical-gateway 移植)
   ├─ 内蔵 Wi-Fi (2.4GHz)                       ← Improv 設定 + 自動再接続 (hub-wifi)
@@ -122,7 +122,7 @@ ESP-IDF のログが同じコンソールに混在するため、ホスト側は
 |---|---|---|
 | LCD SPI2 | SCLK=G36 / MOSI=G37 / CS=G3 / DC=G35 | M5GFX CoreS3 定義準拠。RST=AW9523 P1_1, BL=AXP2101 DLDO1 |
 | タッチ I2C | SDA=G12 / SCL=G11 (0x38) | AXP2101(0x34) / AW9523(0x58) と共用 |
-| RS232M | TX=G17 / RX=G18 | DIP スイッチ候補。**シルク番号≠GPIO 番号の実例あり (Community #5581)、実機で要確認** |
+| RS232M | TX=G17 / RX=G18 | DIP: RXD2 (シルク16)→ホスト RX, TXD2 (シルク17)→ホスト TX、他 OFF。実機確認済み (**シルク番号≠GPIO 番号**、Community #5581) |
 | Base LAN PoE v1.2 | CS=G9 / RST=G7 / INT=G14 | `lan` feature。INT は未使用 (polling)。本体 DB9 (RX=G13 / TX=G1) は使わない |
 | Unit NFC (I2C1) | SDA=G2 / SCL=G1 (Port A) | `nfc-verify` feature (既定 on)。ack しなければ SDA/SCL 入替 |
 
@@ -402,10 +402,8 @@ VOICEVOX の利用規約によりクレジット表記が必要 — 本製品を
 
 - [ ] 実機での LCD 初期化確認 (色順 `ColorOrder` / 回転は要調整の可能性)
 - [ ] 90/270 回転時のタッチ座標変換の実機確認 (layout::map_touch)
-- [ ] RS232M Module の DIP スイッチ実配置確認 (G17/G18 想定)
 - [ ] BLE と Wi-Fi 同時使用 (コエグジスト) 時のメモリ・安定性の実機確認
 - [ ] LAN Module 13.2 (W5500) リンク監視・クラウド接続 (src/lan.rs)
-- [ ] FC-1200 プロトコル解釈: `fc1200-wasm` の UART 直結移植 (現状は hex パススルー)
 - [ ] NFC (Unit NFC / ST25R3916 CE モード) — alc-app#100 の調査メモ参照、当面スコープ外。
       読み取れたら gw_link の `nfc_read` (alc-gw README 参照) で GW へ送る
 - [x] Windows GW (alc-gw) 連携 — 測定の生中継 + 下り測定開始 (`GW URL` で有効化、gw_link.rs)
