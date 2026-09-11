@@ -93,6 +93,40 @@ pub fn ring_append(data: &mut [u8], pos: &mut u32, len: &mut u32, bytes: &[u8]) 
     }
 }
 
+/// リングに `write_len` バイトを `pos_before` から書き込んだときに、実際に
+/// 触られた領域 (`(offset, len)` の並び、1〜2 区間) と区間数。
+///
+/// PSRAM 版のリング (`.ext_ram_noinit`、#217) は書き込みのたびにこの区間を
+/// `esp_cache_msync` で書き戻す (#226) — USB のようなハードリセットは
+/// ソフトの shutdown 処理を経ないため、書いた直後に書き戻すのがリセットを
+/// またいで残す唯一の方法 (firmware 側 `hub-drivers::crashlog` の doc 冒頭)。
+/// `pos_before` は書き込み前の帳簿の `pos` (`< cap` である前提、[`ring_valid`])。
+/// `write_len >= cap` (1 周以上書いた) ときは全域が触られたとみなし 1 区間を返す。
+///
+/// 戻り値は固定長配列 + 区間数 (`ranges[..count]` が有効) — 呼び出し元
+/// (`ring_write`) は vprintf hook から `RING_LOCK` を握ったまま呼ぶため、
+/// ログ 1 行ごとのヒープ確保を避ける (`Vec` を返さない、#226)。
+pub fn ring_write_ranges(cap: usize, pos_before: u32, write_len: usize) -> ([(usize, usize); 2], usize) {
+    let mut ranges = [(0, 0); 2];
+    if cap == 0 || write_len == 0 {
+        return (ranges, 0);
+    }
+    if write_len >= cap {
+        ranges[0] = (0, cap);
+        return (ranges, 1);
+    }
+    let pos_before = pos_before as usize % cap;
+    let end = pos_before + write_len;
+    if end <= cap {
+        ranges[0] = (pos_before, write_len);
+        (ranges, 1)
+    } else {
+        ranges[0] = (pos_before, cap - pos_before);
+        ranges[1] = (0, end - cap);
+        (ranges, 2)
+    }
+}
+
 /// リング内容を古い順に取り出す。帳簿が不正なら空を返す (fail-safe)。
 pub fn ring_snapshot(data: &[u8], pos: u32, len: u32) -> Vec<u8> {
     if !ring_valid(data.len(), pos, len) {
@@ -360,6 +394,53 @@ mod tests {
         let data = [0u8; 8];
         assert!(ring_snapshot(&data, 99, 4).is_empty());
         assert!(ring_snapshot(&data, 0, 99).is_empty());
+    }
+
+    #[test]
+    fn ring_write_ranges_no_wrap() {
+        let (ranges, n) = ring_write_ranges(8, 2, 3);
+        assert_eq!((&ranges[..n], n), (&[(2, 3)][..], 1));
+    }
+
+    #[test]
+    fn ring_write_ranges_exact_tail() {
+        // pos_before + write_len がちょうど cap (折り返さない)
+        let (ranges, n) = ring_write_ranges(8, 5, 3);
+        assert_eq!((&ranges[..n], n), (&[(5, 3)][..], 1));
+    }
+
+    #[test]
+    fn ring_write_ranges_wraps() {
+        let (ranges, n) = ring_write_ranges(8, 6, 4);
+        assert_eq!((&ranges[..n], n), (&[(6, 2), (0, 2)][..], 2));
+    }
+
+    #[test]
+    fn ring_write_ranges_fills_capacity_exactly() {
+        // pos_before=0 かつ write_len==cap もちょうど末尾 (折り返さない) の一種
+        let (ranges, n) = ring_write_ranges(8, 0, 8);
+        assert_eq!((&ranges[..n], n), (&[(0, 8)][..], 1));
+    }
+
+    #[test]
+    fn ring_write_ranges_more_than_capacity_covers_whole_ring() {
+        // 1 周以上書いた (vsnprintf の巨大出力など) → 全域が触られたとみなす
+        let (ranges, n) = ring_write_ranges(8, 3, 20);
+        assert_eq!((&ranges[..n], n), (&[(0, 8)][..], 1));
+    }
+
+    #[test]
+    fn ring_write_ranges_zero_cap_or_len_is_empty() {
+        assert_eq!(ring_write_ranges(0, 0, 5).1, 0);
+        assert_eq!(ring_write_ranges(8, 3, 0).1, 0);
+    }
+
+    #[test]
+    fn ring_write_ranges_normalizes_out_of_range_pos() {
+        // pos_before は呼び出し元で ring_valid 済みの想定だが、範囲外でも
+        // panic せず折りたたむ (ring_append と同じ fail-safe の流儀)
+        let (ranges, n) = ring_write_ranges(8, 10, 2);
+        assert_eq!((&ranges[..n], n), (&[(2, 2)][..], 1));
     }
 
     #[test]

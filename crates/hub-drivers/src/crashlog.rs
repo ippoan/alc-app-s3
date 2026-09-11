@@ -30,6 +30,8 @@
 //! (純粋・テスト済み)。
 
 use core::ffi::{c_char, c_int};
+#[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
+use core::ffi::c_void;
 use core::mem::MaybeUninit;
 use std::io::Write as _;
 use std::sync::mpsc::Sender;
@@ -94,6 +96,64 @@ static mut RING: MaybeUninit<Ring> = MaybeUninit::uninit();
 /// panic 中の再入で毒化しても書き込みは続行する (into_inner)。
 static RING_LOCK: Mutex<()> = Mutex::new(());
 
+/// `esp_cache_msync` — PSRAM 版リング (`.ext_ram_noinit`) の書き込みを
+/// data cache から明示的に書き戻すための宣言 (#226)。
+///
+/// IDF v5.5.3 の `esp_restart_noos` は書き戻さずに `Cache_Disable_DCache()`
+/// するため (`esp_system/port/soc/esp32s3/system_internal.c:120-122`)、USB の
+/// ようなハードリセットでは書き戻す機会が無い。**書き込みのたびに** ここで
+/// 明示的に書き戻すのが、リセットをまたいで内容を残す唯一の方法
+/// (モジュール doc 冒頭)。関数シグネチャとフラグの値は
+/// `esp_mm/include/esp_cache.h` (IDF v5.5.3) から写す — `esp-idf-sys` 0.37.2
+/// の bindgen 出力に出ていないため自前宣言する (2026-09、実機の
+/// `target/*/esp-idf-sys-*/out/bindings.rs` に `esp_cache_msync` 無しを確認済み)。
+#[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
+mod cache_msync {
+    use super::c_void;
+    use core::ffi::c_int;
+
+    /// cache → memory 方向 (書き戻し)。esp_cache.h: `ESP_CACHE_MSYNC_FLAG_DIR_C2M`
+    pub const DIR_C2M: c_int = 1 << 2;
+    /// アドレス/サイズがキャッシュラインに未整列でもよい。
+    /// esp_cache.h: `ESP_CACHE_MSYNC_FLAG_UNALIGNED`
+    pub const UNALIGNED: c_int = 1 << 1;
+
+    extern "C" {
+        pub fn esp_cache_msync(addr: *mut c_void, size: usize, flags: c_int) -> c_int;
+    }
+}
+
+/// [`ring_write`] が書いたデータ区間を PSRAM へ書き戻す。**帳簿 (pos/len) を
+/// store する前に呼ぶこと** ([`writeback_ledger`] の doc)。
+/// `esp_cache_msync` のエラーは握りつぶす (ここでログを出すとリングへ再入する)。
+/// ヒープ確保を避けるため区間は固定長配列で受け取る (vprintf hook から
+/// RING_LOCK を握ったまま呼ばれるため、#226)。
+#[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
+unsafe fn writeback_data(r: *mut Ring, pos_before: u32, write_len: usize) {
+    use cache_msync::{esp_cache_msync, DIR_C2M, UNALIGNED};
+    let flags = DIR_C2M | UNALIGNED;
+    let data_base = core::ptr::addr_of_mut!((*r).data) as *mut u8;
+    let (ranges, n) = pure::ring_write_ranges(RING_CAP, pos_before, write_len);
+    for &(offset, len) in &ranges[..n] {
+        let _ = esp_cache_msync(data_base.add(offset) as *mut c_void, len, flags);
+    }
+}
+
+/// 帳簿 (magic/pos/len、`#[repr(C)]` で連続する先頭 3 x u32) を PSRAM へ
+/// 書き戻す。**[`writeback_data`] とその区間の `(*r).pos`/`(*r).len` への
+/// store が完全に終わった後に呼ぶこと** (#226) — 先に呼ぶ・データの store と
+/// 順番を崩すと、帳簿を含む cache line が (この msync を待たず) 自然に
+/// 追い出された場合に、帳簿だけが先に PSRAM へ届き得る。その状態でリセットが
+/// 入ると、新しい帳簿がまだ書き戻っていない古いバイトを有効として指してしまう。
+#[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
+unsafe fn writeback_ledger(r: *mut Ring) {
+    use cache_msync::{esp_cache_msync, DIR_C2M, UNALIGNED};
+    let flags = DIR_C2M | UNALIGNED;
+    let ledger = core::ptr::addr_of_mut!((*r).magic) as *mut c_void;
+    let ledger_len = 3 * core::mem::size_of::<u32>();
+    let _ = esp_cache_msync(ledger, ledger_len, flags);
+}
+
 /// 前回リセットがクラッシュ由来だった時の持ち越し情報。
 pub struct CrashSnapshot {
     /// esp_reset_reason() の値
@@ -121,11 +181,26 @@ fn ring_write(bytes: &[u8]) {
             (*r).pos = 0;
             (*r).len = 0;
         }
-        let mut pos = (*r).pos;
+        let pos_before = (*r).pos;
+        let mut pos = pos_before;
         let mut len = (*r).len;
         pure::ring_append(&mut (*r).data, &mut pos, &mut len, bytes);
-        (*r).pos = pos;
-        (*r).len = len;
+        // PSRAM 版だけ、データの store → 書き戻し → 帳簿の store → 書き戻し、
+        // の順を厳密に守る (#226、[`writeback_ledger`] の doc)。DRAM 版
+        // (AtomS3 系) はソフトリセットで自然に保持されるため不要 — cache を
+        // 介さない内部 RAM で、そもそも disable/enable の対象外
+        #[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
+        {
+            writeback_data(r, pos_before, bytes.len());
+            (*r).pos = pos;
+            (*r).len = len;
+            writeback_ledger(r);
+        }
+        #[cfg(not(esp_idf_spiram_allow_noinit_seg_external_memory))]
+        {
+            (*r).pos = pos;
+            (*r).len = len;
+        }
     }
 }
 
