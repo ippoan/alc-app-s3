@@ -29,7 +29,11 @@ use u8g2_fonts::{
 
 use super::Screen;
 use alc_hub_board::display::Cs3Display;
-use alc_hub_common::{config, status::HubStatus, ui_api::AlcoholStage};
+use alc_hub_common::{
+    config,
+    status::HubStatus,
+    ui_api::{AlcoholStage, HostStage},
+};
 
 pub(crate) const BAR_H: i32 = 18;
 
@@ -278,8 +282,9 @@ pub fn draw_full(
             bp,
             alcohol,
             alc_stage,
+            host,
             ..
-        } => draw_tenko(d, *items, *temp, *bp, alcohol, *alc_stage),
+        } => draw_tenko(d, *items, *temp, *bp, alcohol, *alc_stage, *host),
         Screen::Result { ok, value } => draw_result(d, *ok, value),
         Screen::Error { message } => draw_error(d, message),
         Screen::Temperature { celsius } => draw_temperature(d, *celsius),
@@ -511,9 +516,21 @@ fn tenko_waiting(d: &mut Cs3Display, row_y: i32, row_h: i32) {
     jp2x_left(d, "計測待ち", w - 136, tenko_label_y(row_y, row_h), C_MUTED, C_BG);
 }
 
+/// 段のラベル色。PC が段を送っている間 (host) は今の段だけを強調色にする。
+/// `row` はその段に当たる STAGE (血圧は当たる段が無いので None)
+fn tenko_label_color(host: Option<HostStage>, row: Option<HostStage>) -> Rgb565 {
+    if host.is_none() || host == row {
+        C_ACCENT
+    } else {
+        C_MUTED
+    }
+}
+
 /// 点呼画面: 体温 / (血圧) / アルコールを同一画面で計測・確認する。
 /// 未計測の欄は「計測待ち」。取得中スピナーは draw_tenko_spinner (部分更新)。
-/// アルコール欄は FC-1200 の進行状態 (準備中/吹込待ち/判定中) をライブ表示する
+/// アルコール欄は FC-1200 の進行状態 (準備中/吹込待ち/判定中) をライブ表示する。
+/// `host` は PC (運行者タブ) の今の段 (`STAGE`)。PC の画面だけで進む段では
+/// 最下行にその旨を出す
 fn draw_tenko(
     d: &mut Cs3Display,
     items: TenkoItems,
@@ -521,8 +538,9 @@ fn draw_tenko(
     bp: Option<(f32, f32, Option<f32>)>,
     alcohol: &Option<(bool, String)>,
     alc_stage: Option<AlcoholStage>,
+    host: Option<HostStage>,
 ) {
-    let (w, _) = dims(d);
+    let (w, h) = dims(d);
     clear(d);
 
     // 段の区切り線 (2 段目以降の上端)
@@ -534,7 +552,8 @@ fn draw_tenko(
     // --- 体温 ---
     let (ty, th) = tenko_row(d, items, TenkoRow::Temp);
     let label_y = tenko_label_y(ty, th);
-    jp2x_left(d, "体温", TENKO_LABEL_X, label_y, C_ACCENT, C_BG);
+    let color = tenko_label_color(host, Some(HostStage::Temp));
+    jp2x_left(d, "体温", TENKO_LABEL_X, label_y, color, C_BG);
     match temp {
         Some(celsius) => {
             // ℃ の幅の分だけ左に寄せて右端を揃える。BIG42 (42px) を段の縦中央に
@@ -560,7 +579,8 @@ fn draw_tenko(
     if items.bp {
         let (by, bh) = tenko_row(d, items, TenkoRow::Bp);
         // ラベルは少し上 (脈拍をその下に出す)
-        jp2x_left(d, "血圧", TENKO_LABEL_X, by + bh / 2 - 29, C_ACCENT, C_BG);
+        let color = tenko_label_color(host, None);
+        jp2x_left(d, "血圧", TENKO_LABEL_X, by + bh / 2 - 29, color, C_BG);
         match bp {
             Some((systolic, diastolic, pulse)) => {
                 // 収縮期 / 拡張期 は別々に描き '/' は線で手描き (draw_blood_pressure
@@ -610,7 +630,8 @@ fn draw_tenko(
     // --- アルコール (ホストの RESULT / FC-1200 で更新。点呼完了の必須項目) ---
     let (ay, ah) = tenko_row(d, items, TenkoRow::Alcohol);
     let label_y = tenko_label_y(ay, ah);
-    jp2x_left(d, "アルコール", TENKO_LABEL_X, label_y, C_ACCENT, C_BG);
+    let color = tenko_label_color(host, Some(HostStage::Alcohol));
+    jp2x_left(d, "アルコール", TENKO_LABEL_X, label_y, color, C_BG);
     match alcohol {
         Some((ok, value)) => {
             let color = if *ok { C_OK } else { C_NG };
@@ -645,6 +666,12 @@ fn draw_tenko(
             }
             None => tenko_waiting(d, ay, ah),
         },
+    }
+
+    // PC の画面だけで進む段 (顔認証・自己申告など)。最後に描く — jp2x の
+    // ラベルは背景色で行を塗るので、先に描くと 3 段のときに下端が欠ける
+    if host == Some(HostStage::Pc) {
+        jp_center(d, "PC の画面で操作してください", h - 24, C_MUTED);
     }
 }
 

@@ -4,6 +4,7 @@
 //! この enum を送るだけ。UI 側の Screen 遷移規則は src/ui/mod.rs を参照。
 
 use alc_hub_core::device::DeviceKind;
+pub use alc_hub_core::protocol::HostStage;
 pub use alc_hub_core::tenko_prompt::LicenseCard;
 
 /// FC-1200 (RS232) の測定進行状態。点呼画面のアルコール欄に
@@ -33,6 +34,9 @@ pub enum UiCommand {
         message: String,
     },
     Reset,
+    /// PC (運行者タブ) の点呼の今の段 (`STAGE`、host_link)。点呼画面の強調する
+    /// 欄を切り替える。NFC は待機画面へ
+    Stage(HostStage),
     /// 画面向き変更 (0/90/180/270 度)。NVS への保存は host_link 側で実施済み
     Rotate(u16),
     /// BLE 体温計の測定値 (℃)

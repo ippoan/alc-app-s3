@@ -27,6 +27,11 @@
 //! を表示し、どちらを取得中かを示す。必須項目 (体温 + アルコール、血圧 ON なら
 //! 血圧も) が揃ってから TENKO_DONE_CLOSE_MS (5秒) で待機画面へ戻る。無操作時は
 //! TENKO_TIMEOUT_MS (長め) で待機画面へ戻る。
+//!
+//! PC (運行者タブ) が `STAGE` で点呼の段を送ってきたら、点呼画面をその流れに
+//! 合わせる (Measuring の `host`)。今の段の欄を強調し、PC の画面だけで進む段では
+//! その旨を出す。この点呼では RESULT で結果画面へ移り、誤タップでは抜けない。
+//! 段を受けるたびに TENKO_TIMEOUT_MS を数え直す (PC が居なくなれば待機画面へ)。
 //! ```
 //!
 //! コマンドは host_link (USB CDC) と ble から mpsc 経由で届く。描画は状態
@@ -55,6 +60,7 @@ use alc_hub_common::{
 use esp_idf_svc::hal::{delay::FreeRtos, i2c::I2cDriver};
 
 // コマンド定義は I/O 層 (host_link / ble が送信側) と共有
+use alc_hub_common::ui_api::HostStage;
 pub use alc_hub_common::ui_api::UiCommand;
 
 pub(crate) enum Screen {
@@ -82,6 +88,9 @@ pub(crate) enum Screen {
         alc_stage: Option<alc_hub_common::ui_api::AlcoholStage>,
         /// 必須項目が揃った時刻 [ms] (items.complete)。TENKO_DONE_CLOSE_MS 経過で待機画面へ
         done_at: Option<u64>,
+        /// PC (運行者タブ) が `STAGE` で送ってきた今の段。None = CoreS3 単体の点呼
+        /// (メニュー / 免許証 / MEASURE から)
+        host: Option<HostStage>,
     },
     Result {
         ok: bool,
@@ -393,7 +402,7 @@ pub fn run(
                     }
                 }
                 // 点呼中の RESULT はアルコール欄の更新のみ (画面遷移しない)。
-                // それ以外は従来どおり結果画面へ
+                // PC が段を送っている点呼 (host) とそれ以外は結果画面へ
                 UiCommand::Result { ok, value } => {
                     if let Screen::Measuring {
                         items,
@@ -402,6 +411,7 @@ pub fn run(
                         alcohol,
                         alc_stage,
                         done_at,
+                        host: None,
                     } = &mut screen
                     {
                         *alcohol = Some((ok, value));
@@ -413,6 +423,20 @@ pub fn run(
                         entered = now;
                         dirty = true;
                     }
+                }
+                // PC の点呼の段: 点呼中なら段だけ差し替える (値・session は保つ)。
+                // それ以外の画面なら点呼画面を開く。NFC は待機画面。どれも
+                // entered を今に戻し、TENKO_TIMEOUT_MS を段ごとに数え直す
+                UiCommand::Stage(stage) => {
+                    if stage == HostStage::Nfc {
+                        screen = Screen::Idle;
+                    } else if let Screen::Measuring { host, .. } = &mut screen {
+                        *host = Some(stage);
+                    } else {
+                        screen = new_tenko(current_items(&status), Some(stage));
+                    }
+                    entered = now;
+                    dirty = true;
                 }
                 // FC-1200 の進行状態: 点呼画面のアルコール欄のみ更新。
                 // 他画面では無視 (測定フローは FC-1200 側が勝手に進むため)
@@ -451,7 +475,7 @@ pub fn run(
                             payload,
                             timeout_ms,
                         },
-                        UiCommand::Measure => new_tenko(current_items(&status)),
+                        UiCommand::Measure => new_tenko(current_items(&status), None),
                         UiCommand::Error { message } => Screen::Error { message },
                         UiCommand::Reset => Screen::Idle,
                         UiCommand::Rotate(_)
@@ -461,6 +485,7 @@ pub fn run(
                         | UiCommand::BleIdle
                         | UiCommand::AlcoholStage(_)
                         | UiCommand::License(_)
+                        | UiCommand::Stage(_)
                         | UiCommand::Result { .. } => unreachable!(),
                     };
                     entered = now;
@@ -689,8 +714,8 @@ fn current_items(status: &SharedStatus) -> TenkoItems {
     }
 }
 
-/// 点呼画面の初期状態
-fn new_tenko(items: TenkoItems) -> Screen {
+/// 点呼画面の初期状態。`host` は PC の段 (`STAGE`) から開いたとき、単体の点呼は None
+fn new_tenko(items: TenkoItems, host: Option<HostStage>) -> Screen {
     Screen::Measuring {
         items,
         temp: None,
@@ -698,6 +723,7 @@ fn new_tenko(items: TenkoItems) -> Screen {
         alcohol: None,
         alc_stage: None,
         done_at: None,
+        host,
     }
 }
 
@@ -749,7 +775,7 @@ fn today_yyyymmdd() -> Option<String> {
 /// 点呼開始: ホストへ通知し、測定待ち画面を作る (構成は現在の設定で固定)
 fn start_tenko(items: TenkoItems) -> Screen {
     alc_hub_common::evtlog::emit("EVT TENKO_START");
-    new_tenko(items)
+    new_tenko(items, None)
 }
 
 /// タップ時の画面遷移先 (None = 変化なし)。y は回転補正済みの論理座標。
@@ -778,6 +804,9 @@ fn on_click(
                 }
             }
         }
+        // PC が段を送っている点呼は誤タップで抜けない (RESET / STAGE NFC /
+        // RESULT / タイムアウトのみ)
+        Screen::Measuring { host: Some(_), .. } => None,
         Screen::Log
         | Screen::Measuring { .. }
         | Screen::Result { .. }
