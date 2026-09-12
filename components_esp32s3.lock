@@ -2,23 +2,23 @@ dependencies:
   M5HAL:
     dependencies: []
     source:
-      path: /tmp/claude-1001/-home-claude-claude260730-alc-app-s3--claude-worktrees-youthful-pike-f490a4/a816ab4c-5f38-45da-a17e-b012c9e3cc63/scratchpad/wt-110/components/M5HAL
+      path: C:\Users\mtama\claude\alc-app-s3\components\M5HAL
       type: local
     version: 0.1.2
   M5UnitUnified:
     dependencies: []
     source:
-      path: /tmp/claude-1001/-home-claude-claude260730-alc-app-s3--claude-worktrees-youthful-pike-f490a4/a816ab4c-5f38-45da-a17e-b012c9e3cc63/scratchpad/wt-110/components/M5UnitUnified
+      path: C:\Users\mtama\claude\alc-app-s3\components\M5UnitUnified
       type: local
     version: 0.5.5
   M5Utility:
     dependencies: []
     source:
-      path: /tmp/claude-1001/-home-claude-claude260730-alc-app-s3--claude-worktrees-youthful-pike-f490a4/a816ab4c-5f38-45da-a17e-b012c9e3cc63/scratchpad/wt-110/components/M5Utility
+      path: C:\Users\mtama\claude\alc-app-s3\components\M5Utility
       type: local
     version: 0.2.0
   espressif/esp_websocket_client:
-    component_hash: dc00233af846f3a744ada283a300e0d586040aadc3ee67361645ecdce4523672
+    component_hash: 3fb288702517ef4d75bf933a115f1056ee0c2540d964f9e1d856e0bb67e1dfeb
     dependencies:
     - name: idf
       require: private
@@ -26,17 +26,17 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 1.8.0
+    version: 1.7.0
   idf:
     source:
       type: idf
-    version: 5.5.3
+    version: 5.4.2
 direct_dependencies:
 - espressif/esp_websocket_client
 - idf
 - m5stack/M5HAL
 - m5stack/M5UnitUnified
 - m5stack/M5Utility
-manifest_hash: 0e7ec97f9bb97f779f1af4a3fda528ddb716a261ade1e4ea3e253477755d1d1e
+manifest_hash: 70d6abf8d3c4f12e8de7d80d4635d63c3f55b4671eccd85f7b03b2740860688b
 target: esp32s3
 version: 2.0.0
