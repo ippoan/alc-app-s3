@@ -32,7 +32,9 @@ use anyhow::{bail, Result};
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::gpio::{AnyIOPin, Pin};
 
+use alc_hub_common::evtlog;
 use alc_hub_common::status::{now_ms, SharedStatus};
+use alc_hub_core::desfire;
 use alc_hub_core::nfc_sticky::{self, Sticky};
 use alc_hub_core::nfc_tap::{TapGate, TapOutcome, DEFAULT_COMMIT_WINDOW_MS};
 
@@ -55,6 +57,14 @@ extern "C" {
         out: *mut u8,
         out_cap: i32,
     ) -> i32;
+    fn nfc_shim_isodep_a_open(out_ats: *mut u8, ats_cap: i32) -> i32;
+    fn nfc_shim_isodep_a_transceive(
+        cmd: *const u8,
+        cmd_len: i32,
+        out: *mut u8,
+        out_cap: i32,
+    ) -> i32;
+    fn nfc_shim_isodep_a_close() -> i32;
 }
 
 /// 初期化の再試行間隔。Unit の電源投入直後や活線挿抜では ack しないことがあり、
@@ -289,6 +299,9 @@ fn run(
     // -2 (カード無し) は定常状態なのでログしない。未実行センチネルは i32::MIN。
     // **これは失敗ログの抑止専用** — 成功時の発火判定は license_gate が持つ
     let mut last_license_rc = i32::MIN;
+    // 直近に構造 probe を打った車検証の UID と時刻 (issue #110)。同じカードを
+    // 置きっぱなしにしても 10 秒に 1 回しか probe しない
+    let mut last_carins: Option<(String, u64)> = None;
 
     // 存在検知のベースライン (-1 = 未較正、初回測定値で初期化)。
     // 振幅はカード系、位相はスマホ系 (モバイルSuica 等、振幅に出にくい) を拾う
@@ -519,6 +532,9 @@ fn run(
                         // コストが乗るが、非対応カードは RATS 非対応で即座に弾かれる
                         // ため実害は小さい
                         let event = if detect_car_inspection_a() {
+                            // 車検証と判定できた回だけ、カードの構造を実機で測る
+                            // (issue #110)。管理番号のパースと通知は実測が出てからの別 PR
+                            probe_carins_if_due(&uid, &mut last_carins, &status);
                             NfcEvent::CarInspection { uid: uid.clone() }
                         } else {
                             NfcEvent::NfcaUid { uid: uid.clone() }
@@ -640,6 +656,305 @@ fn detect_car_inspection_a() -> bool {
     }
     let n = n as usize;
     out[n - 2] == 0x90 && out[n - 1] == 0x00
+}
+
+// ===== 電子車検証 (DESFire) の構造 probe (issue #110) =====
+//
+// PIN 不要で読める「電子車検証管理番号」を取るのが最終目的だが、カードの構造を
+// まだ誰も実機で測っていない。測りたい未知数は 3 つだけ:
+//   1. AID は F33011 (登録車) / F33018 (軽) か、GetApplicationIDs が返す別の値か
+//   2. File 03 が実在し、通信モードが平文・アクセス権の Read が free か
+//   3. ReadData が返す中身の形 (`車両ID / 管理番号` の UTF-8 `/` 区切りか)
+//
+// **測定結果の出口**は 3 つに分ける。実機はオフラインで、戻ってきたら OTA して
+// 遠隔ログで読む段取りなので、EVT 行が主の出口になる:
+//   - evtlog::emit  … 識別子を含まない行だけ (crashlog のリングに残る = 遠隔で読める)
+//   - log::info!    … 生の応答 hex (シリアルのみ。リングには載らない)
+//   - push_event    … 1 行だけの要約 (値は出さない)
+//
+// ⚠ log::info! の生 hex には**実在する車両の管理番号が入る**。この repo は public
+// なので、その出力を issue / PR の本文やコメントに貼らないこと。実機の話を書く
+// 必要があるなら EVT 行 (識別子を含まない側) だけを引用する。
+
+/// 同じ車検証に probe を打ち直す間隔。置きっぱなしのカードで毎周 12 往復させない
+const CARINS_PROBE_INTERVAL_MS: u64 = 10_000;
+/// probe 全体の上限。1 往復の上限 (shim 側 1500ms) は 1 回ぶんの値でしかなく、
+/// 手順は最大 12 往復あるので全体にも上限が要る — 無いと最悪 18 秒かかり、
+/// その間 TapGate の touch/poll が止まって watchdog にも効く
+const CARINS_PROBE_DEADLINE_MS: u64 = 2_000;
+/// GetFileSettings を掛けるファイル数の上限
+const CARINS_MAX_FILES: usize = 8;
+/// 1 フレームの受信バッファ。NFC スレッドは 8KB なので大きくしない
+const CARINS_RX_CAP: usize = 264;
+
+/// Type-A ISO-DEP セッションの RAII ガード。`Drop` で必ず閉じる —
+/// DESFire の「選択中アプリ」は活性化セッションに紐づくので、probe の途中で
+/// 抜けてもカードを ACTIVE のまま残さない
+struct IsoDepA;
+
+impl IsoDepA {
+    /// セッションを開く。`Ok((guard, ATS のバイト数))` / `Err(shim の rc)`
+    fn open(ats: &mut [u8]) -> Result<(Self, usize), i32> {
+        let n = unsafe { nfc_shim_isodep_a_open(ats.as_mut_ptr(), ats.len() as i32) };
+        if n < 0 {
+            return Err(n);
+        }
+        Ok((IsoDepA, n as usize))
+    }
+
+    /// APDU を 1 往復。`Ok(受信バイト数)` / `Err(shim の rc)`
+    fn transceive(&self, cmd: &[u8], out: &mut [u8]) -> Result<usize, i32> {
+        let n = unsafe {
+            nfc_shim_isodep_a_transceive(
+                cmd.as_ptr(),
+                cmd.len() as i32,
+                out.as_mut_ptr(),
+                out.len() as i32,
+            )
+        };
+        if n < 0 {
+            return Err(n);
+        }
+        Ok(n as usize)
+    }
+}
+
+impl Drop for IsoDepA {
+    fn drop(&mut self) {
+        unsafe { nfc_shim_isodep_a_close() };
+    }
+}
+
+/// EVT 行に出す rc トークン (DESFire の `91 xx` の xx、または shim の rc)
+fn carins_rc(st: desfire::Status) -> String {
+    match st {
+        desfire::Status::Ok => "00".to_string(),
+        desfire::Status::MoreFrames => "AF".to_string(),
+        desfire::Status::Error(x) => format!("{x:02X}"),
+        desfire::Status::NotDesfire([a, b]) => format!("nd{a:02X}{b:02X}"),
+        desfire::Status::TooShort => "short".to_string(),
+    }
+}
+
+/// 1 コマンドを送り、`91 AF` で切れていれば `90 AF` を送って継ぎ足す
+/// (`IsoDEP::transceiveAPDU` は `61xx`/`6Cxx` しか追従しない)。
+/// `Ok((データ部, フレーム数))` / `Err(rc トークン)`
+fn carins_exchange(
+    session: &IsoDepA,
+    cmd: &[u8],
+    deadline: u64,
+    step: &str,
+) -> Result<(Vec<u8>, u32), String> {
+    let mut out = [0u8; CARINS_RX_CAP];
+    let mut acc: Vec<u8> = Vec::new();
+    let mut frames = 0u32;
+    let mut next = cmd.to_vec();
+    loop {
+        if now_ms() > deadline {
+            evtlog::emit(&format!("EVT CARINS_DEADLINE step={step}"));
+            return Err("deadline".to_string());
+        }
+        let n = match session.transceive(&next, &mut out) {
+            Ok(n) => n,
+            Err(rc) => return Err(format!("s{rc}")),
+        };
+        frames += 1;
+        // 生ダンプはシリアルのみ (リングには載らない)。⚠ 本文に貼らないこと
+        log::info!("carins probe: {step} rx={}", desfire::hex_upper(&out[..n]));
+        match desfire::accumulate(&mut acc, &out[..n]) {
+            desfire::ReadStep::Done(data) => return Ok((data, frames)),
+            desfire::ReadStep::NeedMore => next = desfire::additional_frame(),
+            desfire::ReadStep::Failed(st) => return Err(carins_rc(st)),
+        }
+    }
+}
+
+/// `ReadData` の中身を**値を出さずに**形だけ書く。UTF-8 として読めたら
+/// `/` 区切りの各フィールドを「文字クラス (d=数字 / a=英数 / x=その他) + 長さ」で、
+/// 読めなければ非 0 バイト数だけを返す (先頭バイトも出さない)
+fn carins_shape(data: &[u8]) -> String {
+    let end = data
+        .iter()
+        .rposition(|&b| b != 0x00 && b != 0xFF)
+        .map_or(0, |i| i + 1);
+    match core::str::from_utf8(&data[..end]) {
+        Ok(s) => {
+            let fields: Vec<String> = s
+                .split('/')
+                .map(|f| {
+                    let f = f.trim();
+                    let class = if f.chars().all(|c| c.is_ascii_digit()) {
+                        'd'
+                    } else if f.chars().all(|c| c.is_ascii_alphanumeric()) {
+                        'a'
+                    } else {
+                        'x'
+                    };
+                    format!("{class}{}", f.chars().count())
+                })
+                .collect();
+            format!("utf8=1 fields={}", fields.join("/"))
+        }
+        Err(_) => format!(
+            "utf8=0 nonzero={}",
+            data.iter().filter(|&&b| b != 0).count()
+        ),
+    }
+}
+
+/// 同じ UID には [`CARINS_PROBE_INTERVAL_MS`] に 1 回だけ probe を打つ
+fn probe_carins_if_due(uid: &str, last: &mut Option<(String, u64)>, status: &SharedStatus) {
+    let now = now_ms();
+    if let Some((prev_uid, at)) = last.as_ref() {
+        if prev_uid == uid && now.saturating_sub(*at) < CARINS_PROBE_INTERVAL_MS {
+            return;
+        }
+    }
+    *last = Some((uid.to_string(), now));
+    probe_carins(status);
+}
+
+/// 構造 probe 本体。手順の分岐 (AID の候補 / ファイルの探索) は実測が出れば
+/// 定数に畳まれて消えるものなので、純粋関数へ切り出さず直線で書く
+fn probe_carins(status: &SharedStatus) {
+    let deadline = now_ms() + CARINS_PROBE_DEADLINE_MS;
+
+    let mut ats = [0u8; 64];
+    let (session, ats_len) = match IsoDepA::open(&mut ats) {
+        Ok(v) => v,
+        Err(rc) => {
+            evtlog::emit(&format!("EVT CARINS_PROBE rc=s{rc}"));
+            return;
+        }
+    };
+    evtlog::emit(&format!(
+        "EVT CARINS_PROBE ats={}",
+        desfire::hex_upper(&ats[..ats_len])
+    ));
+    push_event(status, "電子車検証 構造 probe");
+
+    // 1) AID 一覧。取れなければ候補 2 つを順に試す
+    let aids = match carins_exchange(&session, &desfire::get_application_ids(), deadline, "apps") {
+        Ok((data, _)) => match desfire::parse_application_ids(&data) {
+            Ok(v) => {
+                let list: Vec<String> = v.iter().map(|a| desfire::hex_upper(a)).collect();
+                evtlog::emit(&format!("EVT CARINS_APPS rc=00 aids={}", list.join(",")));
+                v
+            }
+            Err(e) => {
+                evtlog::emit(&format!("EVT CARINS_APPS rc=00 aids=err{e:?}"));
+                Vec::new()
+            }
+        },
+        Err(rc) => {
+            evtlog::emit(&format!("EVT CARINS_APPS rc={rc}"));
+            Vec::new()
+        }
+    };
+    if now_ms() > deadline {
+        return;
+    }
+
+    // 2) 選ぶ AID。一覧に既知の候補があればそれ、無ければ一覧の先頭、
+    //    一覧が取れていなければ F33011 → F33018 の順に試す
+    let candidates: Vec<[u8; 3]> = if aids.contains(&desfire::AID_REGISTERED) {
+        vec![desfire::AID_REGISTERED]
+    } else if aids.contains(&desfire::AID_KEI) {
+        vec![desfire::AID_KEI]
+    } else if let Some(first) = aids.first() {
+        vec![*first]
+    } else {
+        vec![desfire::AID_REGISTERED, desfire::AID_KEI]
+    };
+
+    let mut selected = false;
+    for aid in candidates {
+        let hex = desfire::hex_upper(&aid);
+        match carins_exchange(&session, &desfire::select_application(aid), deadline, "select") {
+            Ok(_) => {
+                evtlog::emit(&format!("EVT CARINS_SELECT aid={hex} rc=00"));
+                selected = true;
+                break;
+            }
+            Err(rc) => evtlog::emit(&format!("EVT CARINS_SELECT aid={hex} rc={rc}")),
+        }
+        if now_ms() > deadline {
+            return;
+        }
+    }
+    if !selected {
+        return;
+    }
+
+    // 3) ファイル一覧
+    let files = match carins_exchange(&session, &desfire::get_file_ids(), deadline, "files") {
+        Ok((data, _)) => {
+            let ids = desfire::parse_file_ids(&data);
+            let list: Vec<String> = ids.iter().map(|f| format!("{f:02X}")).collect();
+            evtlog::emit(&format!("EVT CARINS_FILES rc=00 ids={}", list.join(",")));
+            ids
+        }
+        Err(rc) => {
+            evtlog::emit(&format!("EVT CARINS_FILES rc={rc}"));
+            return;
+        }
+    };
+
+    // 4) 各ファイルの設定。平文かつ free read の最初のものを控えておく
+    let mut plain_free: Option<u8> = None;
+    for &f in files.iter().take(CARINS_MAX_FILES) {
+        if now_ms() > deadline {
+            evtlog::emit("EVT CARINS_DEADLINE step=settings");
+            return;
+        }
+        match carins_exchange(&session, &desfire::get_file_settings(f), deadline, "settings") {
+            Ok((data, _)) => match desfire::parse_file_settings(&data) {
+                Ok(fs) => {
+                    evtlog::emit(&format!(
+                        "EVT CARINS_FILE file={f:02X} rc=00 type={:02X} comm={:02X} rights={:04X} size={}",
+                        fs.file_type,
+                        fs.comm_mode(),
+                        fs.access_rights,
+                        fs.file_size
+                    ));
+                    if plain_free.is_none() && fs.is_plain() && fs.is_free_read() {
+                        plain_free = Some(f);
+                    }
+                }
+                Err(e) => evtlog::emit(&format!("EVT CARINS_FILE file={f:02X} rc=00 parse={e:?}")),
+            },
+            Err(rc) => evtlog::emit(&format!("EVT CARINS_FILE file={f:02X} rc={rc}")),
+        }
+    }
+
+    // 5) 03 があればそれ、無ければ平文 free read の最初のファイルを読む
+    let target = if files.contains(&desfire::FILE_NO_MGMT) {
+        Some(desfire::FILE_NO_MGMT)
+    } else {
+        plain_free
+    };
+    let Some(file_no) = target else {
+        return;
+    };
+    if now_ms() > deadline {
+        evtlog::emit("EVT CARINS_DEADLINE step=read");
+        return;
+    }
+    match carins_exchange(&session, &desfire::read_data(file_no, 0, 0), deadline, "read") {
+        Ok((data, frames)) => {
+            // ⚠ この 1 行に実在する車両の管理番号が入る。シリアルのみ・本文に貼らない
+            log::info!(
+                "carins probe: read file={file_no:02X} hex={}",
+                desfire::hex_upper(&data)
+            );
+            evtlog::emit(&format!(
+                "EVT CARINS_READ file={file_no:02X} rc=00 len={} frames={frames} {}",
+                data.len(),
+                carins_shape(&data)
+            ));
+        }
+        Err(rc) => evtlog::emit(&format!("EVT CARINS_READ file={file_no:02X} rc={rc}")),
+    }
 }
 
 /// B (免許証) を 1 回読み、読めたら gate に載せる。戻り値は shim の rc (0 = 読了)。

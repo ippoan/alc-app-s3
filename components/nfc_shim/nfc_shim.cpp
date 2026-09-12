@@ -44,6 +44,14 @@ static bool g_unit_added             = false;
 std::unique_ptr<m5::nfc::NFCLayerF> g_nfc_f;
 std::unique_ptr<m5::nfc::NFCLayerA> g_nfc_a;
 std::unique_ptr<m5::nfc::NFCLayerB> g_nfc_b;
+// Type-A ISO-DEP セッション (issue #110)。open 中は活性化 (ACTIVE) を維持し、
+// 複数 APDU を同じセッションで往復させる — DESFire の「選択中アプリ」は
+// 活性化セッションに紐づくため、SelectApplication と後続を別セッションに
+// 分けると後者が必ず失敗する
+bool g_a_session          = false;
+uint32_t g_a_session_opened_ms = 0;
+// open しっぱなしの上限。これを超えた transceive はセッションを閉じて -7 を返す
+constexpr uint32_t kASessionMaxMs = 1500;
 // 直近に configureNFCMode() で実際にチップへ反映したモード。呼ぶたびに
 // CMD_STOP_ALL_ACTIVITIES + nfc_initial_field_on() (RFフィールドの一旦停止/
 // 再始動) が走るため、モードが変わらない限り呼び直さない (2026-07-20,
@@ -130,6 +138,22 @@ void reset_rf_field()
     g_unit.configureNFCMode(mode);
     g_configured_mode = mode;
     boost_rf_power();
+}
+
+// 開いている Type-A ISO-DEP セッションを閉じる (冪等)。開いていなければ何もしない。
+// 各 extern 入口の先頭で呼び、前の呼び出しが閉じ忘れたセッション (Rust 側の
+// panic 等) を掃除する — NFC スレッドは 1 本 (hub-drivers/src/nfc.rs) なので、
+// 1 周 (数百 ms) 以内に必ずここを通る
+void close_a_session()
+{
+    if (!g_a_session) {
+        return;
+    }
+    g_a_session = false;
+    if (g_nfc_a) {
+        g_nfc_a->deactivate();  // DESELECT/HLTA
+    }
+    reset_rf_field();
 }
 
 // EF 2F01 (共通データ要素) の READ BINARY レスポンス内オフセット。
@@ -221,6 +245,7 @@ extern "C" int nfc_shim_poll_felica_idm(char* out_hex, int out_cap)
     if (!g_ready || out_cap < 17) {
         return -1;
     }
+    close_a_session();  // 前周の open が残っていたら掃除する (#110)
     // UnitUnified::update() を呼ばずに detect() だけ叩くと常に未検出になる実機
     // 事象を確認 (2026-07-20)。M5 公式サンプル (examples/UnitUnified/NFCF/Detect)
     // も loop() 毎回 Units.update() を呼んでおり、内部状態機械の駆動に必須
@@ -248,6 +273,7 @@ extern "C" int nfc_shim_poll_nfca_uid(char* out_hex, int out_cap)
     if (!g_ready || out_cap < 21) {
         return -1;
     }
+    close_a_session();  // 前周の open が残っていたら掃除する (#110)
     g_units.update();
     ensure_mode(m5::nfc::NFC::A);
     m5::nfc::a::PICC picc{};
@@ -364,6 +390,58 @@ int try_read_license_once(char* out_issue, char* out_expiry)
 // → deactivate (HLTA)。免許証 (Type-B) の try_read_license_once と違い
 // APDU の中身 (どの AID を SELECT するか等) はここに持たず呼び出し元
 // (Rust) から受け取る — 車検証以外の AID/APDU にも使い回せる汎用プリミティブ
+// RATS 応答 (ATS) を生バイト列に戻して out へ写す。ATS 構造体 (M5Unit-NFC の
+// nfc/a/nfca.hpp) は TL/T0 と条件付きの TA/TB/TC、historical を別々に持つので、
+// T0 の存在ビットを見てワイヤ上の並びを組み直す。戻り値は写したバイト数
+int copy_ats(const m5::nfc::a::ATS& ats, uint8_t* out, int cap)
+{
+    if (out == nullptr || cap <= 0) {
+        return 0;
+    }
+    uint8_t buf[5 + 32];
+    int n    = 0;
+    buf[n++] = ats.TL;
+    buf[n++] = ats.T0;
+    if (ats.validTA()) {
+        buf[n++] = ats.TA;
+    }
+    if (ats.validTB()) {
+        buf[n++] = ats.TB;
+    }
+    if (ats.validTC()) {
+        buf[n++] = ats.TC;
+    }
+    const int hist = std::min<int>(static_cast<int>(ats.historical_len), static_cast<int>(ats.historical.size()));
+    for (int i = 0; i < hist; ++i) {
+        buf[n++] = ats.historical[static_cast<size_t>(i)];
+    }
+    const int copied = std::min(n, cap);
+    std::memcpy(out, buf, static_cast<size_t>(copied));
+    return copied;
+}
+
+// 1 セッション活性化試行 (issue #110)。try_transceive_apdu_a_once の
+// 活性化部分 (WUPA → select (RATS 込み) → ISO14443-4 判定) と同一で、
+// deactivate せずに ACTIVE のまま抜けるところだけが違う
+int try_open_a_session_once(uint8_t* out_ats, int ats_cap)
+{
+    uint16_t atqa = 0;
+    if (!g_nfc_a->wakeup(atqa)) {
+        return -2;  // カード無し
+    }
+    m5::nfc::a::PICC picc{};
+    if (!g_nfc_a->select(picc)) {
+        return -3;  // anti-collision/SELECT (RATS 含む) 失敗
+    }
+    if (!picc.isISO14443_4()) {
+        g_nfc_a->deactivate();
+        return -4;  // ISO14443-4 非対応 (単純メモリタグ等)
+    }
+    g_a_session           = true;
+    g_a_session_opened_ms = m5::utility::millis();
+    return copy_ats(picc.ats, out_ats, ats_cap);
+}
+
 int try_transceive_apdu_a_once(const uint8_t* cmd, uint16_t cmd_len, uint8_t* rx, uint16_t& rx_len)
 {
     uint16_t atqa = 0;
@@ -423,6 +501,7 @@ extern "C" void nfc_shim_prepare_mode_b(void)
     if (!g_ready) {
         return;
     }
+    close_a_session();  // 前周の open が残っていたら掃除する (#110)
     ensure_mode(m5::nfc::NFC::B);
 }
 
@@ -445,6 +524,7 @@ extern "C" int nfc_shim_read_license_expiry(char* out_issue, int issue_cap, char
     if (!g_ready || issue_cap < 9 || expiry_cap < 9) {
         return -1;
     }
+    close_a_session();  // 前周の open が残っていたら掃除する (#110)
     g_units.update();  // 理由は nfc_shim_poll_felica_idm のコメント参照
     ensure_mode(m5::nfc::NFC::B);
 
@@ -512,6 +592,7 @@ extern "C" int nfc_shim_transceive_apdu_a(const uint8_t* cmd, int cmd_len, uint8
     if (!g_ready || cmd == nullptr || cmd_len <= 0 || out == nullptr || out_cap < 2) {
         return -1;
     }
+    close_a_session();  // 前周の open が残っていたら掃除する (#110)
     g_units.update();  // 理由は nfc_shim_poll_felica_idm のコメント参照
     ensure_mode(m5::nfc::NFC::A);
 
@@ -533,4 +614,71 @@ extern "C" int nfc_shim_transceive_apdu_a(const uint8_t* cmd, int cmd_len, uint8
         }
     }
     return last_rc;
+}
+
+// ===== Type-A ISO-DEP セッション API (issue #110) =====
+// 電子車検証 (DESFire) は SelectApplication で選んだアプリが**活性化セッションに
+// 紐づく**ため、1 セッション 1 APDU の nfc_shim_transceive_apdu_a では
+// SelectApplication → GetFileIDs が成立しない。セッションを跨いで使う口を分けて用意する。
+// プロトコル固有のバイト列は一切ここに置かない (呼び出し元 = Rust が組む)
+
+extern "C" int nfc_shim_isodep_a_open(uint8_t* out_ats, int ats_cap)
+{
+    if (!g_ready || (out_ats != nullptr && ats_cap <= 0)) {
+        return -1;
+    }
+    close_a_session();  // 二重 open を作らない (前の open は必ず閉じてから開く)
+    g_units.update();   // 理由は nfc_shim_poll_felica_idm のコメント参照
+    ensure_mode(m5::nfc::NFC::A);
+
+    // リトライ方針は nfc_shim_transceive_apdu_a と同じ (予算 100ms、カード無し
+    // (-2) ではリセットせずフィールドを維持、途中死はリセット + 60ms 後に再試行)
+    constexpr uint32_t kBudgetMs = 100;
+    const auto budget_end        = m5::utility::millis() + kBudgetMs;
+    int last_rc                  = -2;
+
+    while (m5::utility::millis() <= budget_end) {
+        const int rc = try_open_a_session_once(out_ats, ats_cap);
+        if (rc >= 0) {
+            return rc;  // 写した ATS のバイト数
+        }
+        if (rc != -2) {
+            last_rc = rc;
+            reset_rf_field();
+            m5::utility::delay(60);
+        }
+    }
+    return last_rc;
+}
+
+extern "C" int nfc_shim_isodep_a_transceive(const uint8_t* cmd, int cmd_len, uint8_t* out, int out_cap)
+{
+    if (!g_ready || cmd == nullptr || cmd_len <= 0 || out == nullptr || out_cap < 2) {
+        return -1;
+    }
+    if (!g_a_session) {
+        return -7;  // セッション無し
+    }
+    // 開きっぱなしの保険。カードを外されたまま往復を続けると 1 周が伸び、
+    // TapGate の確定窓と watchdog に効いてくる
+    if (m5::utility::millis() - g_a_session_opened_ms > kASessionMaxMs) {
+        close_a_session();
+        return -7;
+    }
+
+    auto* dep = g_nfc_a->isoDEP();
+    // FWT/WTX の方針は try_transceive_apdu_a_once と同じ
+    const m5::nfc::isodep::policy_t fast_policy{/*fwt_ms=*/50U, /*wtx_max_ms=*/2000U, /*max_retries=*/0};
+    uint16_t rx_len = static_cast<uint16_t>(std::min(out_cap, 0xFFFF));
+    if (!dep->transceiveAPDU(out, rx_len, cmd, static_cast<uint16_t>(cmd_len), &fast_policy)) {
+        close_a_session();  // 途中死したカードは ACTIVE で固まるので必ず落とす
+        return -5;
+    }
+    return static_cast<int>(rx_len);
+}
+
+extern "C" int nfc_shim_isodep_a_close(void)
+{
+    close_a_session();
+    return 0;
 }

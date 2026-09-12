@@ -13,6 +13,7 @@ pub mod cfg;
 pub mod clock;
 pub mod coex;
 pub mod crashlog;
+pub mod desfire;
 pub mod device;
 pub mod fc1200;
 pub mod gw;

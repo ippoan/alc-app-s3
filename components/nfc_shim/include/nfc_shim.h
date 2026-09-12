@@ -63,6 +63,34 @@ int nfc_shim_read_license_expiry(char* out_issue, int issue_cap, char* out_expir
 int nfc_shim_transceive_apdu_a(const uint8_t* cmd, int cmd_len, uint8_t* out, int out_cap);
 
 /**
+ * Type-A ISO-DEP セッションを開く: WUPA → SELECT (anti-collision + RATS) → ACTIVE のまま返す。
+ * `nfc_shim_transceive_apdu_a` が 1 セッション 1 APDU で毎回カードを落とすのに対し、
+ * こちらはセッションを開いたまま複数 APDU を往復させる (issue #110)。DESFire の
+ * 「選択中アプリ」のような**活性化セッションに紐づく状態**を跨いで使うために必要。
+ * 活性化のリトライ方針は nfc_shim_transceive_apdu_a と同じ (予算 100ms、途中死は
+ * reset_rf_field + 60ms 後に再試行)。
+ * out_ats/ats_cap: 省略可 (NULL/0)。RATS 応答 (ATS) の生バイトを写す。
+ * 戻り値: >=0 成功 (写した ATS のバイト数。out_ats が NULL なら 0)
+ *   -1 未初期化 / 引数不正, -2 カード無し, -3 SELECT/RATS 失敗,
+ *   -4 ISO14443-4 非対応 (HLTA 済み)
+ */
+int nfc_shim_isodep_a_open(uint8_t* out_ats, int ats_cap);
+
+/**
+ * open 中のセッションで APDU を 1 往復。cmd の中身は呼び出し元 (Rust) が組む
+ * (AID 等プロトコル固有のバイト列を C++ 側に置かない方針は上と同じ)。
+ * 戻り値: >=0 受信バイト数 (SW1SW2 込み), -1 引数不正 / 未初期化,
+ *   -5 送受信失敗 (セッションは内部で close 済み), -7 セッション無し
+ *   (未 open、または open から 1500ms を超えたので閉じた)
+ */
+int nfc_shim_isodep_a_transceive(const uint8_t* cmd, int cmd_len, uint8_t* out, int out_cap);
+
+/**
+ * DESELECT/HLTA → reset_rf_field。open していなければ何もしない。戻り値: 0 (常に。冪等)
+ */
+int nfc_shim_isodep_a_close(void);
+
+/**
  * B モードへ戻す (電界 ON のまま。既に B なら何もしない)。Rust 側の
  * PollOrder::LicenseFirst が F/A の後に呼び、待機中のモードを B に揃える (#155 step 4)
  */
