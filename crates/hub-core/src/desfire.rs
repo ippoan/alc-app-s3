@@ -1,10 +1,10 @@
 //! DESFire native APDU のコーデック (Refs ippoan/alc-app-s3#110)。
 //!
 //! 電子車検証の IC は DESFire で、PIN 不要で読める「電子車検証管理番号」を
-//! 取るのが最終目的。ただし**カードの構造をまだ実機で測っていない**ため、
-//! このモジュールは「実機で構造を測るため」のコマンド組み立てと応答の
-//! 読み解きだけを持つ。手順 (どの AID を選び、どのファイルを読むか) は
-//! 実測が出るまで固まらないので `hub-drivers` 側の直線コードに置く。
+//! File 03 から取る。手順 (アプリを選び、File 03 を読む) は `hub-drivers` の
+//! `nfc.rs` (`read_carins_mgmt`) にあり、ここはコマンドの組み立てと応答の
+//! 読み解きだけを持つ。構造 (AID・File 03 が平文で読めること・中身の形) は
+//! #234 の計器で実機を測って確かめた。
 //!
 //! # なぜ vendor の `DESFireFileSystem` を使わないか
 //!
@@ -20,18 +20,15 @@
 //! ISO7816-4 の APDU に包んで送る。応答の末尾 2 バイトは `91 <status>` で、
 //! `91 00` = 成功、`91 AF` = 続きあり (`90 AF` を送って継ぎ足す)。
 
-/// 登録車 (普通車) の電子車検証アプリの AID。実機未検証の候補
+/// 登録車 (普通車) の電子車検証アプリの AID。実機で SELECT → File 03 の読みを確認済み
 pub const AID_REGISTERED: [u8; 3] = [0xF3, 0x30, 0x11];
-/// 軽自動車の電子車検証アプリの AID。実機未検証の候補
+/// 軽自動車の電子車検証アプリの AID (登録車で選べなかったときに試す)。実機は未確認
 pub const AID_KEI: [u8; 3] = [0xF3, 0x30, 0x18];
-/// 管理番号が入っていると想定しているファイル番号。実機未検証の候補
+/// 車両 ID と電子車検証管理番号が入っているファイル番号 (平文・鍵なしで読める)
 pub const FILE_NO_MGMT: u8 = 0x03;
 
 const CLA_NATIVE: u8 = 0x90;
-const INS_GET_APPLICATION_IDS: u8 = 0x6A;
 const INS_SELECT_APPLICATION: u8 = 0x5A;
-const INS_GET_FILE_IDS: u8 = 0x6F;
-const INS_GET_FILE_SETTINGS: u8 = 0xF5;
 const INS_READ_DATA: u8 = 0xAD;
 const INS_ADDITIONAL_FRAME: u8 = 0xAF;
 
@@ -48,25 +45,10 @@ pub fn wrap_native(ins: u8, data: &[u8]) -> Vec<u8> {
     v
 }
 
-/// `GetApplicationIDs` — カード上のアプリ (AID) の一覧を返させる
-pub fn get_application_ids() -> Vec<u8> {
-    wrap_native(INS_GET_APPLICATION_IDS, &[])
-}
-
 /// `SelectApplication` — 以後のコマンドの対象アプリを選ぶ。
 /// **選択はセッション (活性化) に紐づく**ので、後続と同じセッションで送ること
 pub fn select_application(aid: [u8; 3]) -> Vec<u8> {
     wrap_native(INS_SELECT_APPLICATION, &aid)
-}
-
-/// `GetFileIDs` — 選択中アプリのファイル番号の一覧
-pub fn get_file_ids() -> Vec<u8> {
-    wrap_native(INS_GET_FILE_IDS, &[])
-}
-
-/// `GetFileSettings` — 1 ファイルの型・通信モード・アクセス権・サイズ
-pub fn get_file_settings(file_no: u8) -> Vec<u8> {
-    wrap_native(INS_GET_FILE_SETTINGS, &[file_no])
 }
 
 /// `ReadData` — `len` = 0 でファイル全体
@@ -85,10 +67,6 @@ pub fn additional_frame() -> Vec<u8> {
 
 fn le24(v: u32) -> [u8; 3] {
     [v as u8, (v >> 8) as u8, (v >> 16) as u8]
-}
-
-fn unpack_le24(b: &[u8]) -> u32 {
-    u32::from(b[0]) | (u32::from(b[1]) << 8) | (u32::from(b[2]) << 16)
 }
 
 /// 応答末尾 2 バイト (`91 xx`) の読み解き
@@ -131,10 +109,10 @@ pub fn payload(rx: &[u8]) -> &[u8] {
     &rx[..rx.len() - 2]
 }
 
-/// コーデックの解釈失敗。**どれも仮説の検証が目的**なので細かく分けて返す
+/// [`parse_mgmt_record`] の失敗の理由 (`EVT NFC_CARINS rc=` に載る)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseError {
-    /// 長さが想定と合わない (値は実際の長さ)
+    /// パディングを落とすと空 (値は落とした後の長さ = 0)
     Length(usize),
     /// UTF-8 として読めない
     NotUtf8,
@@ -142,80 +120,6 @@ pub enum ParseError {
     NoSeparator,
     /// 区切りの片側が空
     EmptyField,
-}
-
-/// `GetApplicationIDs` の応答データを 3 バイトずつの AID に割る
-pub fn parse_application_ids(payload: &[u8]) -> Result<Vec<[u8; 3]>, ParseError> {
-    if payload.len() % 3 != 0 {
-        return Err(ParseError::Length(payload.len()));
-    }
-    Ok(payload.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect())
-}
-
-/// `GetFileIDs` の応答データ (ファイル番号がそのまま並ぶ)
-pub fn parse_file_ids(payload: &[u8]) -> Vec<u8> {
-    payload.to_vec()
-}
-
-/// `GetFileSettings` の応答
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileSettings {
-    /// ファイル型 (00=Standard Data, 01=Backup, 02=Value, 03/04=Record, 05=TransactionMAC)
-    pub file_type: u8,
-    /// 通信モードのバイト (下位 2 bit が意味を持つ)
-    pub comm_mode_raw: u8,
-    /// アクセス権 (LE u16。上位ニブルから Read / Write / ReadWrite / Change)
-    pub access_rights: u16,
-    /// ファイルサイズ (TransactionMAC では 0)
-    pub file_size: u32,
-}
-
-impl FileSettings {
-    /// 0 = 平文 / 1 = MAC / 3 = 暗号
-    pub fn comm_mode(&self) -> u8 {
-        self.comm_mode_raw & 0x03
-    }
-
-    /// 平文で読めるか
-    pub fn is_plain(&self) -> bool {
-        self.comm_mode() == 0
-    }
-
-    /// アクセス権の Read ニブル (最上位)。`0xE` = free (鍵不要)
-    pub fn read_key(&self) -> u8 {
-        ((self.access_rights >> 12) & 0x0F) as u8
-    }
-
-    /// 鍵無しで読めるか
-    pub fn is_free_read(&self) -> bool {
-        self.read_key() == 0x0E
-    }
-}
-
-/// `GetFileSettings` の応答データを読む。
-/// wire 形式は vendor の `desfire_file_system.cpp` (`getFileSettings`) と同じ解釈:
-/// `[type][option][rights LE u16][size le24]`。type 0x05 (TransactionMAC) は
-/// 4 バイトで終わり、それ以外は 7 バイト以上
-pub fn parse_file_settings(payload: &[u8]) -> Result<FileSettings, ParseError> {
-    if payload.len() < 4 {
-        return Err(ParseError::Length(payload.len()));
-    }
-    let file_type = payload[0];
-    let comm_mode_raw = payload[1];
-    let access_rights = u16::from(payload[2]) | (u16::from(payload[3]) << 8);
-    if file_type == 0x05 {
-        // TransactionMAC file: サイズを持たない
-        return Ok(FileSettings { file_type, comm_mode_raw, access_rights, file_size: 0 });
-    }
-    if payload.len() < 7 {
-        return Err(ParseError::Length(payload.len()));
-    }
-    Ok(FileSettings {
-        file_type,
-        comm_mode_raw,
-        access_rights,
-        file_size: unpack_le24(&payload[4..7]),
-    })
 }
 
 /// `91 AF` の継ぎ足し 1 回ぶんの結果
@@ -245,16 +149,18 @@ pub fn accumulate(acc: &mut Vec<u8>, rx: &[u8]) -> ReadStep {
     }
 }
 
-/// 管理番号レコードの仮説: UTF-8 の `車両ID / 電子車検証管理番号` を `/` で区切ったもの
+/// File 03 の中身。実機の形 (#234 の計器): UTF-8 の `車両ID/電子車検証管理番号` を
+/// `/` で区切り、残りを 0 で埋めたもの。車両 ID は英数 14 桁、管理番号は数字 12 桁
+/// (軽は 13 桁)。**値の妥当性 (桁・文字種) はここでは見ない** — 受け取るサーバが検査する
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MgmtRecord {
-    /// `/` の前
+    /// `/` の前 (車両 ID)
     pub vehicle_id: String,
-    /// `/` の後
+    /// `/` の後 (電子車検証管理番号)
     pub cert_no: String,
 }
 
-/// [`MgmtRecord`] の仮説で読んでみる。**未検証の仮説**なので失敗の理由を細かく返す。
+/// File 03 の中身を [`MgmtRecord`] に読む。
 /// 末尾の 0x00 / 0xFF パディングを落とし、UTF-8 として読み、最初の `/` で 2 分割する
 pub fn parse_mgmt_record(payload: &[u8]) -> Result<MgmtRecord, ParseError> {
     let end = payload
@@ -273,15 +179,6 @@ pub fn parse_mgmt_record(payload: &[u8]) -> Result<MgmtRecord, ParseError> {
         return Err(ParseError::EmptyField);
     }
     Ok(MgmtRecord { vehicle_id: vehicle_id.to_string(), cert_no: cert_no.to_string() })
-}
-
-/// 大文字 hex 文字列 (区切り無し)
-pub fn hex_upper(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02X}"));
-    }
-    s
 }
 
 #[cfg(test)]
@@ -303,17 +200,11 @@ mod tests {
 
     #[test]
     fn command_builders() {
-        assert_eq!(get_application_ids(), vec![0x90, 0x6A, 0x00, 0x00, 0x00]);
         assert_eq!(
             select_application(AID_REGISTERED),
             vec![0x90, 0x5A, 0x00, 0x00, 0x03, 0xF3, 0x30, 0x11, 0x00]
         );
         assert_eq!(select_application(AID_KEI)[7], 0x18);
-        assert_eq!(get_file_ids(), vec![0x90, 0x6F, 0x00, 0x00, 0x00]);
-        assert_eq!(
-            get_file_settings(FILE_NO_MGMT),
-            vec![0x90, 0xF5, 0x00, 0x00, 0x01, 0x03, 0x00]
-        );
         assert_eq!(additional_frame(), vec![0x90, 0xAF, 0x00, 0x00, 0x00]);
     }
 
@@ -321,7 +212,7 @@ mod tests {
     fn read_data_encodes_le24_offset_and_len() {
         // file 03 / offset 0 / len 0 (= 全体)
         assert_eq!(
-            read_data(0x03, 0, 0),
+            read_data(FILE_NO_MGMT, 0, 0),
             vec![0x90, 0xAD, 0x00, 0x00, 0x07, 0x03, 0, 0, 0, 0, 0, 0, 0x00]
         );
         // le24 の 3 バイトが並ぶこと (0x010203 -> 03 02 01)
@@ -348,66 +239,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_application_ids_splits_by_three() {
-        assert_eq!(
-            parse_application_ids(&[0xF3, 0x30, 0x11, 0xF3, 0x30, 0x18]),
-            Ok(vec![AID_REGISTERED, AID_KEI])
-        );
-        assert_eq!(parse_application_ids(&[]), Ok(vec![]));
-        assert_eq!(parse_application_ids(&[0x01, 0x02]), Err(ParseError::Length(2)));
-    }
-
-    #[test]
-    fn parse_file_ids_passes_through() {
-        assert_eq!(parse_file_ids(&[0x01, 0x02, 0x03]), vec![0x01, 0x02, 0x03]);
-        assert_eq!(parse_file_ids(&[]), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn parse_file_settings_standard_file() {
-        // type=00 / option=00 (平文) / rights=EEEE / size=0x000020
-        let fs = parse_file_settings(&[0x00, 0x00, 0xEE, 0xEE, 0x20, 0x00, 0x00]).unwrap();
-        assert_eq!(fs.file_type, 0x00);
-        assert_eq!(fs.comm_mode(), 0);
-        assert!(fs.is_plain());
-        assert_eq!(fs.access_rights, 0xEEEE);
-        assert_eq!(fs.read_key(), 0x0E);
-        assert!(fs.is_free_read());
-        assert_eq!(fs.file_size, 0x20);
-    }
-
-    #[test]
-    fn parse_file_settings_encrypted_and_keyed() {
-        // option=03 (暗号) / rights=0x1234 → Read ニブルは 0x1
-        let fs = parse_file_settings(&[0x00, 0x03, 0x34, 0x12, 0x01, 0x00, 0x00]).unwrap();
-        assert_eq!(fs.comm_mode(), 3);
-        assert!(!fs.is_plain());
-        assert_eq!(fs.read_key(), 0x1);
-        assert!(!fs.is_free_read());
-        // MAC (1) も平文ではない
-        let mac = parse_file_settings(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]).unwrap();
-        assert_eq!(mac.comm_mode(), 1);
-        assert!(!mac.is_plain());
-    }
-
-    #[test]
-    fn parse_file_settings_transaction_mac_is_four_bytes() {
-        let fs = parse_file_settings(&[0x05, 0x00, 0xEE, 0xEE]).unwrap();
-        assert_eq!(fs.file_type, 0x05);
-        assert_eq!(fs.file_size, 0);
-    }
-
-    #[test]
-    fn parse_file_settings_rejects_short() {
-        assert_eq!(parse_file_settings(&[0x00, 0x00, 0x00]), Err(ParseError::Length(3)));
-        // TransactionMAC 以外で 4..7 バイト
-        assert_eq!(
-            parse_file_settings(&[0x00, 0x00, 0xEE, 0xEE, 0x20]),
-            Err(ParseError::Length(5))
-        );
-    }
-
-    #[test]
     fn accumulate_joins_frames_until_ok() {
         let mut acc = Vec::new();
         assert_eq!(accumulate(&mut acc, &[0x01, 0x02, 0x91, 0xAF]), ReadStep::NeedMore);
@@ -427,30 +258,63 @@ mod tests {
         assert!(acc.is_empty());
     }
 
-    #[test]
-    fn parse_mgmt_record_splits_on_first_slash() {
-        let rec = parse_mgmt_record(b"1234567/890123456789").unwrap();
-        assert_eq!(rec.vehicle_id, "1234567");
-        assert_eq!(rec.cert_no, "890123456789");
-        // 末尾パディングと両側の空白は落とす
-        let rec = parse_mgmt_record(b" 12 / 34 \x00\x00\xFF").unwrap();
-        assert_eq!(rec.vehicle_id, "12");
-        assert_eq!(rec.cert_no, "34");
+    // 値はすべて合成値 (実在の車両 ID・管理番号を書かない)
+    const SYNTH: &[u8] = b"TESTCARID00001/000000000001";
+
+    fn padded(fill: u8, len: usize) -> Vec<u8> {
+        let mut v = SYNTH.to_vec();
+        v.resize(len, fill);
+        v
+    }
+
+    fn synth_record() -> MgmtRecord {
+        MgmtRecord { vehicle_id: "TESTCARID00001".into(), cert_no: "000000000001".into() }
     }
 
     #[test]
-    fn parse_mgmt_record_error_arms() {
+    fn parse_mgmt_record_zero_padded() {
+        assert_eq!(parse_mgmt_record(&padded(0x00, 64)), Ok(synth_record()));
+    }
+
+    #[test]
+    fn parse_mgmt_record_ff_padded() {
+        assert_eq!(parse_mgmt_record(&padded(0xFF, 64)), Ok(synth_record()));
+    }
+
+    #[test]
+    fn parse_mgmt_record_unpadded_and_kei_length() {
+        assert_eq!(parse_mgmt_record(SYNTH), Ok(synth_record()));
+        let kei = parse_mgmt_record(b"TESTCARID00001/0000000000001\x00\x00").unwrap();
+        assert_eq!(kei.cert_no, "0000000000001");
+    }
+
+    #[test]
+    fn parse_mgmt_record_splits_on_first_slash_and_trims() {
+        let rec = parse_mgmt_record(b" TESTCARID00001 / 000000000001 \x00\xFF").unwrap();
+        assert_eq!(rec, synth_record());
+        let rec = parse_mgmt_record(b"TESTCARID00001/000000000001/X").unwrap();
+        assert_eq!(rec.cert_no, "000000000001/X");
+    }
+
+    #[test]
+    fn parse_mgmt_record_without_slash() {
+        assert_eq!(
+            parse_mgmt_record(b"TESTCARID00001000000000001\x00"),
+            Err(ParseError::NoSeparator)
+        );
+    }
+
+    #[test]
+    fn parse_mgmt_record_empty_fields() {
+        assert_eq!(parse_mgmt_record(b"/000000000001\x00"), Err(ParseError::EmptyField));
+        assert_eq!(parse_mgmt_record(b"TESTCARID00001/ \x00"), Err(ParseError::EmptyField));
+    }
+
+    #[test]
+    fn parse_mgmt_record_blank_or_broken() {
         assert_eq!(parse_mgmt_record(&[]), Err(ParseError::Length(0)));
-        assert_eq!(parse_mgmt_record(&[0x00, 0xFF]), Err(ParseError::Length(0)));
+        assert_eq!(parse_mgmt_record(&[0x00; 32]), Err(ParseError::Length(0)));
+        assert_eq!(parse_mgmt_record(&[0xFF, 0x00, 0xFF]), Err(ParseError::Length(0)));
         assert_eq!(parse_mgmt_record(&[0xC3, 0x28]), Err(ParseError::NotUtf8));
-        assert_eq!(parse_mgmt_record(b"noslash"), Err(ParseError::NoSeparator));
-        assert_eq!(parse_mgmt_record(b"/12"), Err(ParseError::EmptyField));
-        assert_eq!(parse_mgmt_record(b"12/ "), Err(ParseError::EmptyField));
-    }
-
-    #[test]
-    fn hex_upper_formats_uppercase() {
-        assert_eq!(hex_upper(&[0x0A, 0xF3, 0x00]), "0AF300");
-        assert_eq!(hex_upper(&[]), "");
     }
 }
