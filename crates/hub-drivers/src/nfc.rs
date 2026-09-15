@@ -665,6 +665,7 @@ fn detect_car_inspection_a() -> bool {
 //   1. AID は F33011 (登録車) / F33018 (軽) か、GetApplicationIDs が返す別の値か
 //   2. File 03 が実在し、通信モードが平文・アクセス権の Read が free か
 //   3. ReadData が返す中身の形 (`車両ID / 管理番号` の UTF-8 `/` 区切りか)
+// 実機 (2026-09-15): AID は F33011、GetFileIDs は 0xAE。一覧が拒否されたら 03 を直接測る
 //
 // **測定結果の出口**は 3 つに分ける。実機はオフラインで、戻ってきたら OTA して
 // 遠隔ログで読む段取りなので、EVT 行が主の出口になる:
@@ -896,7 +897,9 @@ fn probe_carins(status: &SharedStatus) {
         }
         Err(rc) => {
             evtlog::emit(&format!("EVT CARINS_FILES rc={rc}"));
-            return;
+            // 一覧は認証を要求しても、File 03 自体は free read のことがある (一覧と
+            // ファイルの権限は別)。一覧が取れなければ 03 だけを候補にして測る
+            vec![desfire::FILE_NO_MGMT]
         }
     };
 
