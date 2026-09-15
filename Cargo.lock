@@ -74,6 +74,7 @@ dependencies = [
  "alc-hub-common",
  "alc-hub-core",
  "anyhow",
+ "embuild",
  "esp-idf-svc",
  "esp32-nimble",
  "log",

@@ -55,6 +55,9 @@ use alc_hub_common::status::{now_ms, SharedStatus};
 use alc_hub_common::ui_api::UiCommand;
 use alc_hub_core::coex::RadioCoex;
 
+#[cfg(feature = "probe")]
+mod probe;
+
 /// on_notify クロージャ (Send + Sync 要求) から使うため Mutex で包む。
 /// notify コールバックは nimble_host タスク上で走りスタックが小さいため、
 /// ここでは「パースして Measurement を送るだけ」に留める (重い処理は recorder)。
@@ -187,6 +190,8 @@ async fn task(
             .interval(100)
             .window(99)
             .start(device, SCAN_DURATION_MS, |dev, data| {
+                #[cfg(feature = "probe")]
+                probe::log_adv(dev, &data);
                 // 直近の接続がデータなしだった機器はバックオフ中 — 接続しない
                 if empty_backoff.iter().any(|(a, _)| *a == dev.addr()) {
                     return None;
@@ -248,6 +253,11 @@ fn match_target(dev: &BLEAdvertisedDevice, data: &BLEAdvertisedData<&[u8]>) -> O
     }
 
     if let Some(name) = data.name() {
+        // 測定モードでは Omron の機器 (独自名) も拾う。hub-core の名前判定は変えない
+        #[cfg(feature = "probe")]
+        if probe::match_name(&String::from_utf8_lossy(name)) {
+            return Some(DeviceKind::BloodPressure);
+        }
         // name() は生バイト列 (&[u8]) を返す
         return match_device_name(&String::from_utf8_lossy(name));
     }
@@ -287,6 +297,13 @@ async fn handle_device(
             }
             Err(e) => return Err(e).context("接続失敗 (リトライ上限)"),
         }
+    }
+
+    // 測定モード: 以下の本番経路 (固定サービスの購読) より前に抜け、GATT と bond を出す
+    #[cfg(feature = "probe")]
+    {
+        let _ = (kind, status, meas_tx);
+        return probe::inspect(client).await;
     }
 
     // 明示的な secure_connection は行わない。血圧計 (NBP-1BLE) は
