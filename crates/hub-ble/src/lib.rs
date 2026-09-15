@@ -349,6 +349,13 @@ async fn handle_device(
         }
     });
 
+    // ペアリング待ちの Omron 機は、保存済みのその機器の bond を先に消す。残っていると
+    // secure_connection が新しいペアリングにならず古い鍵での暗号化で終わる (Linux の成功例は
+    // 毎回消していた)。delete_bond (ble_gap_unpair) は接続中だと切断するので接続の前に行う
+    if omron == Some(OmronAdv::Pairing) {
+        omron_unbond(&adv.addr());
+    }
+
     // Arduino 版と同様に最大 3 回リトライ
     let mut attempt = 0;
     loop {
@@ -665,6 +672,30 @@ async fn omron_pair(client: &mut BLEClient, disconnected: &Disconnected) -> Resu
         FreeRtos::delay_ms(100);
     }
     Ok(())
+}
+
+/// その機器の bond だけを消し、`EVT OMRON_PAIR unbond ok|err|none` を出す
+/// (全消去はニプロ機の bond を巻き込むので使わない)
+fn omron_unbond(addr: &BLEAddress) {
+    let device = BLEDevice::take();
+    // BLEAddress の == は 6 byte だけを比べる。消すときは保存側のアドレス (型付き) を渡す
+    let result = match device.bonded_addresses() {
+        Ok(addrs) => match addrs.iter().find(|a| *a == addr) {
+            Some(bonded) => match device.delete_bond(bonded) {
+                Ok(()) => "ok",
+                Err(e) => {
+                    log::warn!("ble: Omron bond 消去失敗: {e:?}");
+                    "err"
+                }
+            },
+            None => "none",
+        },
+        Err(e) => {
+            log::warn!("ble: bond 一覧の取得失敗: {e:?}");
+            "err"
+        }
+    };
+    alc_hub_common::evtlog::emit(&format!("EVT OMRON_PAIR unbond {result}"));
 }
 
 /// `EVT OMRON_DESC bonded=.. encrypted=.. authenticated=..` を出す
