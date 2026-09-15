@@ -421,7 +421,12 @@ async fn handle_device(
         // パースしてバッファに積むだけに留める — println!/format!/NVS 等の
         // 重い処理は recorder スレッドで行う (以前ここで直接やって血圧受信時に
         // スタックオーバーフロー→再起動していた)。
+        // Omron 機だけは届いた中身を serial に 1 行出す (println と hex 化のみ)
+        let trace_uuid = omron.map(|_| measurement_uuid(kind));
         characteristic.on_notify(move |raw| {
+            if let Some(uuid) = trace_uuid {
+                log_omron_rx(uuid, raw);
+            }
             let now = now_ms();
             if let Some(pair) = parse_measurement(kind, raw, now) {
                 if let Ok(mut buf) = buffer.lock() {
@@ -681,13 +686,21 @@ async fn omron_subscribe_all(client: &mut BLEClient, disconnected: &Disconnected
                         continue;
                     }
                 };
+                let bpm_uuid = BleUuid::from_uuid16(BLOOD_PRESSURE_MEASUREMENT);
                 for chr in chars {
+                    if !(chr.can_indicate() || chr.can_notify()) {
+                        continue;
+                    }
+                    // on_notify は後から付けた閉包で置き換わるので、0x2A35 には付けない
+                    // (handle_device が付けた受信コールバックを残す)
+                    let chr_uuid = chr.uuid();
+                    if chr_uuid != bpm_uuid {
+                        chr.on_notify(move |raw| log_omron_rx(chr_uuid, raw));
+                    }
                     let res = if chr.can_indicate() {
                         chr.subscribe_indicate(true).await
-                    } else if chr.can_notify() {
-                        chr.subscribe_notify(true).await
                     } else {
-                        continue;
+                        chr.subscribe_notify(true).await
                     };
                     match res {
                         Ok(()) => n += 1,
@@ -698,6 +711,21 @@ async fn omron_subscribe_all(client: &mut BLEClient, disconnected: &Disconnected
             anyhow::Ok(n)
         })
         .await?
+}
+
+/// Omron 機から届いた notify / indicate を serial に 1 行出す。nimble_host タスク上で
+/// 呼ばれるので println と hex 化だけにする (evtlog はサーバーへ流れるので使わない)
+fn log_omron_rx(uuid: BleUuid, raw: &[u8]) {
+    println!("OMRON RX chr={uuid} len={} hex={}", raw.len(), hex(raw));
+}
+
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// on_disconnect で立つ印。立ったら待っている future を起こす。
