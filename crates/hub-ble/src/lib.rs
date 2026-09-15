@@ -105,6 +105,8 @@ const OMRON_SET_KEY_WAIT_MS: u64 = 3_000;
 /// Omron 機への secure_connection の上限。保存済みの鍵で暗号化を始めて機器が応じないと、
 /// ENC_CHANGE も切断も来ずに止まる (S3R で実測)
 const OMRON_SECURE_TIMEOUT_MS: u64 = 10_000;
+/// early start のあと、この時間暗号化されなければ暗号化を始め直す
+const OMRON_ENC_RESTART_MS: u64 = 3_000;
 /// early start 後のサービス探索で、見つかった数がこの時間変わらなければ完了とみなす
 const OMRON_SERVICES_SETTLE_MS: u64 = 400;
 /// 鍵登録の後始末 (CCCD を 0 に) のあと、切断までに置く時間 (Linux の手順と同じ)
@@ -413,8 +415,6 @@ async fn handle_device(
             Err(e) => return Err(e).context("接続失敗 (リトライ上限)"),
         }
     }
-    // 接続確立の時刻 (EVT の t= の基準)。early start なら接続を見つけた時刻
-    let connected_at = early_enc.map_or_else(now_ms, |e| e.connected_at);
 
     match omron {
         Some(OmronAdv::Pairing) => {
@@ -432,12 +432,12 @@ async fn handle_device(
             // 別 characteristic に移る
             // early start が通っていれば secure_connection は呼ばない: 暗号化が済んだリンクで
             // 呼ぶと NimBLE は 2 回目の暗号化を始める (EALREADY になるのは手順の進行中だけ)
-            let early = early_enc.filter(|e| e.rc == 0);
-            let res = if let Some(e) = early {
+            let mut early = early_enc.filter(|e| e.rc == 0);
+            let res = if let Some(e) = early.as_mut() {
                 // 暗号化の完了時刻 (connect の間に見えていればその時刻) から、接続確立からの ms を出す
                 let done = match e.encrypted_at {
                     Some(at) => Ok(at),
-                    None => wait_encrypted(client, &disconnected, OMRON_SECURE_TIMEOUT_MS),
+                    None => wait_encrypted(client, &disconnected, OMRON_SECURE_TIMEOUT_MS, e),
                 };
                 done.map(|at| Ok(Some(at.saturating_sub(e.connected_at))))
             } else {
@@ -446,10 +446,12 @@ async fn handle_device(
                     .await
                     .map(|r| r.map(|()| None))
             };
+            // early start を張り直した回数 (0x3e などで接続が張り直されたとき)
+            let retry = early.map_or(String::new(), |e| format!(" retry={}", e.retry));
             match res {
                 Ok(Ok(t)) => {
                     let line = match t {
-                        Some(t) => format!("EVT OMRON_ENC ok t={t}"),
+                        Some(t) => format!("EVT OMRON_ENC ok t={t}{retry}"),
                         None => "EVT OMRON_ENC ok".to_string(),
                     };
                     alc_hub_common::evtlog::emit(&line);
@@ -461,7 +463,7 @@ async fn handle_device(
                 }
                 // 切断・時間切れ: 暗号化の途中なので打ち切って切断する
                 Err(e) => {
-                    alc_hub_common::evtlog::emit("EVT OMRON_ENC err");
+                    alc_hub_common::evtlog::emit(&format!("EVT OMRON_ENC err{retry}"));
                     let _ = client.disconnect();
                     return Err(e.context("Omron 暗号化の打ち切り"));
                 }
@@ -469,6 +471,8 @@ async fn handle_device(
             if early.is_some() {
                 omron_settle_services(client, &disconnected).await?;
             }
+            // 張り直しがあれば、EVT の t= は張り直した接続を基準にする
+            early_enc = early.or(early_enc);
         }
         None => {}
     }
@@ -530,6 +534,8 @@ async fn handle_device(
         // Omron 機は 0x2A35 だけの購読では記録を送らない。Linux で記録が届いた回と同じく、
         // 全 service の notify / indicate を GATT の並び順に全部購読する
         // (0x2A35 には上の受信コールバックが付いている)
+        // 接続確立の時刻 (EVT の t= の基準)。early start なら接続を見つけた時刻
+        let connected_at = early_enc.map_or_else(now_ms, |e| e.connected_at);
         let n = omron_subscribe_all(client, &disconnected, connected_at).await?;
         let t = now_ms().saturating_sub(connected_at);
         alc_hub_common::evtlog::emit(&format!("EVT OMRON_SUB n={n} t={t}"));
@@ -779,7 +785,9 @@ fn omron_find_bond(addr: &BLEAddress) -> Result<Option<BLEAddress>> {
 /// Linux で記録が届いた接続は、接続から約 50 ms で暗号化を始めていた)。esp32-nimble の
 /// on_connect は MTU 交換の完了後に呼ばれるので使えない。connect が client を借りているので、
 /// 接続の有無と conn_handle は NimBLE の conn desc をアドレスで引いて見る (5 ms おき)。
-/// 暗号化を始めたら `EVT OMRON_ENC start rc=<n>` を出し、その結果を返す
+/// 暗号化を始めたら `EVT OMRON_ENC start rc=<n> retry=<k>` を出し、その結果を返す。
+/// 暗号化の完了前に接続が消えたら (NimBLE が 0x3e で接続を張り直す。S3R で実測)、
+/// 張り直された接続が見えた時点で暗号化を始め直す (retry を 1 増やす)
 async fn connect_encrypting<F: Future>(
     connect: F,
     addr: BLEAddress,
@@ -797,12 +805,31 @@ async fn connect_encrypting<F: Future>(
                 None if found => {
                     let rc =
                         unsafe { esp_idf_svc::sys::ble_gap_security_initiate(desc.conn_handle) };
-                    alc_hub_common::evtlog::emit(&format!("EVT OMRON_ENC start rc={rc}"));
+                    alc_hub_common::evtlog::emit(&format!("EVT OMRON_ENC start rc={rc} retry=0"));
                     early = Some(EarlyEnc {
                         rc,
                         connected_at: now_ms(),
                         encrypted_at: None,
+                        retry: 0,
+                        lost: false,
                     });
+                }
+                // 暗号化の完了前に接続が消えた
+                Some(e) if !found && e.encrypted_at.is_none() => {
+                    e.lost = true;
+                }
+                // 張り直された接続が見えたので、暗号化を始め直す
+                Some(e) if found && e.lost => {
+                    let rc =
+                        unsafe { esp_idf_svc::sys::ble_gap_security_initiate(desc.conn_handle) };
+                    e.retry += 1;
+                    alc_hub_common::evtlog::emit(&format!(
+                        "EVT OMRON_ENC start rc={rc} retry={}",
+                        e.retry
+                    ));
+                    e.rc = rc;
+                    e.connected_at = now_ms();
+                    e.lost = false;
                 }
                 // 暗号化が connect (MTU 待ち) の間に終わったら、その時刻を控える
                 Some(e)
@@ -819,8 +846,8 @@ async fn connect_encrypting<F: Future>(
         if let Poll::Ready(out) = connect.as_mut().poll(cx) {
             return Poll::Ready((out, early));
         }
-        // 接続の検出と暗号化の完了を 5 ms おきに見る
-        if encrypt && early.map_or(true, |e| e.rc == 0 && e.encrypted_at.is_none()) {
+        // 接続の検出・消失と暗号化の完了を 5 ms おきに見る
+        if encrypt && early.map_or(true, |e| e.encrypted_at.is_none()) {
             FreeRtos::delay_ms(5);
             cx.waker().wake_by_ref();
         }
@@ -838,15 +865,36 @@ struct EarlyEnc {
     connected_at: u64,
     /// connect の間に暗号化の完了が見えた時刻 (now_ms)
     encrypted_at: Option<u64>,
+    /// 暗号化を始め直した回数
+    retry: u32,
+    /// 暗号化の完了前に接続が消え、張り直しを待っている
+    lost: bool,
 }
 
 /// リンクが暗号化されるまで最大 `timeout_ms` 待ち、暗号化が見えた時刻 (now_ms) を返す
-/// (切断されたら Err)
-fn wait_encrypted(client: &BLEClient, disconnected: &Disconnected, timeout_ms: u64) -> Result<u64> {
+/// (切断されたら Err)。OMRON_ENC_RESTART_MS の間暗号化されなければ、暗号化の手順が接続の
+/// 張り直しで失われた場合に備えて始め直す (手順が進行中なら NimBLE は EALREADY を返すだけ)
+fn wait_encrypted(
+    client: &BLEClient,
+    disconnected: &Disconnected,
+    timeout_ms: u64,
+    early: &mut EarlyEnc,
+) -> Result<u64> {
     let start = now_ms();
+    let mut last_start = start;
     loop {
-        if client.desc().is_ok_and(|d| d.encrypted()) {
-            return Ok(now_ms());
+        match client.desc() {
+            Ok(d) if d.encrypted() => return Ok(now_ms()),
+            Ok(d) if now_ms().saturating_sub(last_start) >= OMRON_ENC_RESTART_MS => {
+                let rc = unsafe { esp_idf_svc::sys::ble_gap_security_initiate(d.conn_handle()) };
+                early.retry += 1;
+                alc_hub_common::evtlog::emit(&format!(
+                    "EVT OMRON_ENC start rc={rc} retry={}",
+                    early.retry
+                ));
+                last_start = now_ms();
+            }
+            _ => {}
         }
         if disconnected.is_set() {
             anyhow::bail!("切断された");
