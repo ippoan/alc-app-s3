@@ -12,7 +12,11 @@ fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    let status = Arc::new(Mutex::new(HubStatus::default()));
+    // Omron を拾う前提の測定用 probe (issue #237)
+    let status = Arc::new(Mutex::new(HubStatus {
+        omron_bp: true,
+        ..HubStatus::default()
+    }));
     let coex = Arc::new(alc_hub_core::coex::RadioCoex::new());
     // 起動時に bond は消さない (消すと、ペアリング後の再接続で暗号化できない)
     let pair_flag = alc_hub_common::control::new_pair_flag();

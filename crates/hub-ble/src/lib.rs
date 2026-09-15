@@ -231,6 +231,10 @@ async fn task(
         empty_backoff.retain(|(_, at)| now_ms().saturating_sub(*at) < EMPTY_BACKOFF_MS);
         paired_backoff.retain(|(_, at)| now_ms().saturating_sub(*at) < OMRON_PAIRED_BACKOFF_MS);
 
+        // Omron 血圧計を拾うか (NVS、既定 OFF)。ループ 1 周に 1 回だけ読む —
+        // スキャンの callback は広告 1 件ごとに呼ばれるため、その中で lock しない
+        let omron_enabled = status.lock().map(|st| st.omron_bp).unwrap_or(false);
+
         // ニプロ機器は測定時にアドバタイズを開始するため、短いスキャンを
         // 繰り返して発見次第すぐ接続する (Arduino 版 loop() と同じ運用)。
         // 送信済み機器の広告にも接続する — 一度届いた測定は再送されず
@@ -247,6 +251,7 @@ async fn task(
                     return None;
                 }
                 match match_target(dev, &data) {
+                    Some((_, Some(_))) if !omron_enabled => None,
                     Some((_, Some(OmronAdv::Pairing)))
                         if paired_backoff.iter().any(|(a, _)| *a == dev.addr()) =>
                     {

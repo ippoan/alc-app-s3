@@ -42,6 +42,11 @@ pub struct HubStatus {
     /// host_link が `TENKO BP` で更新する)。UI は点呼画面に入るたびに読む
     pub tenko_bp: bool,
 
+    /// Omron 血圧計 (HEM-6231T) を拾うか (Settings::omron_bp の写し。main.rs が
+    /// 起動時に入れ、host_link が `OMRON BP` で更新する)。hub-ble がスキャンの
+    /// たびに読む
+    pub omron_bp: bool,
+
     /// 進行中の点呼セッションの識別子 (Refs #112)。点呼画面 (Measuring) に
     /// いる間だけ Some で、待機画面へ戻ると None に戻る。**発番と更新は UI
     /// スレッドだけが行い、recorder は読むだけ** — 点呼の開始/終了を知って

@@ -51,6 +51,8 @@ const KEY_PRINTER_ADDR: &str = "printer_addr";
 const KEY_GW_URL: &str = "gw_url";
 /// 点呼に血圧を含めるか (u8 0/1。未設定 = 0 = 保留、tenko.rs)
 const KEY_TENKO_BP: &str = "tenko_bp";
+/// Omron 血圧計 (HEM-6231T) を拾うか (`OMRON BP ON|OFF`)。未設定は false
+const KEY_OMRON_BP: &str = "omron_bp";
 
 #[derive(Clone)]
 pub struct Settings {
@@ -400,6 +402,21 @@ impl Settings {
     pub fn set_tenko_bp(&self, enabled: bool) -> Result<()> {
         let nvs = self.nvs.lock().expect("settings nvs lock");
         nvs.set_u8(KEY_TENKO_BP, u8::from(enabled))?;
+        Ok(())
+    }
+
+    /// Omron 血圧計 (HEM-6231T) を拾うか (`OMRON BP ON|OFF`)。未設定は false
+    pub fn omron_bp(&self) -> bool {
+        self.nvs
+            .lock()
+            .ok()
+            .and_then(|nvs| nvs.get_u8(KEY_OMRON_BP).ok().flatten())
+            .map_or(false, |v| v != 0)
+    }
+
+    pub fn set_omron_bp(&self, enabled: bool) -> Result<()> {
+        let nvs = self.nvs.lock().expect("settings nvs lock");
+        nvs.set_u8(KEY_OMRON_BP, u8::from(enabled))?;
         Ok(())
     }
 
