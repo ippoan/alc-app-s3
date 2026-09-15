@@ -76,11 +76,21 @@ fn main() -> Result<()> {
     // (_pin_table_other0, "//RGBLED" コメント付き) を確認したところ実際は
     // GPIO35 だった (2026-07-20)。legacy RMT ドライバで直接ビットバンギング
     // (ws2812-esp32-rmt-driver crate は esp-idf-hal 0.46 と links 衝突するため不使用)
-    let tx = TxRmtDriver::new(
-        p.rmt.channel0,
-        p.pins.gpio35,
-        &TransmitConfig::new().clock_divider(1),
-    )?;
+    //
+    // `ATOMS3_NFC_NO_LED` を付けて build すると LED を出さない (値は問わない)。
+    // Atom VoiceS3R を測定台に使うとき用: あちらは Octal PSRAM が GPIO35〜37 を
+    // 内部で使い (uiflow-micropython の M5STACK_Atom_EchoS3R が sdkconfig.spiram_oct)、
+    // WS2812 も載っていない。Grove は同じ SDA=G2 / SCL=G1 なので他は変えない
+    let tx = if option_env!("ATOMS3_NFC_NO_LED").is_some() {
+        log::info!("LED 無効 (ATOMS3_NFC_NO_LED)");
+        None
+    } else {
+        Some(TxRmtDriver::new(
+            p.rmt.channel0,
+            p.pins.gpio35,
+            &TransmitConfig::new().clock_divider(1),
+        )?)
+    };
     let led = Arc::new(Mutex::new(Led::new(tx)));
 
     // 本機は画面もホストリンクも持たないので、push_event の行き先は捨て場。
@@ -133,14 +143,15 @@ fn paint_event(led: &Mutex<Led>, event: &NfcEvent) {
 /// 共有相手はもう居ない (#151 で向こうの led.rs は消えた)。ここは AtomS3 Lite
 /// (G35) 専用のベンチ用目視デバッグ
 struct Led {
-    tx: TxRmtDriver<'static>,
+    /// `None` = LED を出さない build (`ATOMS3_NFC_NO_LED`)
+    tx: Option<TxRmtDriver<'static>>,
     /// 現在出している色 (同色の再送出を避ける)
     shown: (u8, u8, u8),
     since: Instant,
 }
 
 impl Led {
-    fn new(tx: TxRmtDriver<'static>) -> Self {
+    fn new(tx: Option<TxRmtDriver<'static>>) -> Self {
         let mut led = Self {
             tx,
             // 待機色以外にしておき、初回 paint で必ず 1 回描かせる
@@ -157,7 +168,10 @@ impl Led {
             return;
         }
         self.shown = color;
-        if let Err(e) = write_ws2812(&mut self.tx, color) {
+        let Some(tx) = self.tx.as_mut() else {
+            return;
+        };
+        if let Err(e) = write_ws2812(tx, color) {
             log::warn!("led: write failed: {e:#}");
         }
     }
