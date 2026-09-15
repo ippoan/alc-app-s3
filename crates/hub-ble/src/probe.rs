@@ -198,10 +198,12 @@ pub async fn inspect(client: &mut BLEClient) -> Result<bool> {
                             }
                         });
                     }
+                    // CCCD は応答ありの書き込みで設定する。応答なし (false) だと
+                    // HEM-6231T は購読を無視し、ペアリング完了の通知も記録も送らない (Refs #237)
                     let (kind, res) = if chr.can_indicate() {
-                        ("indicate", chr.subscribe_indicate(false).await)
+                        ("indicate", chr.subscribe_indicate(true).await)
                     } else {
-                        ("notify", chr.subscribe_notify(false).await)
+                        ("notify", chr.subscribe_notify(true).await)
                     };
                     println!("PROBE SUB chr={chr_uuid} kind={kind} result={res:?}");
                 }
