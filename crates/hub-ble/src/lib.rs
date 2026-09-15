@@ -140,8 +140,10 @@ const OMRON_PAIRED_BACKOFF_MS: u64 = 30_000;
 /// 控える時間。機器は送信を終えても送信広告を出し続け、約 20 秒おきに接続し続けて機器が
 /// 終了しなかった (ユーザー指摘)。ペアリング待ちの広告は対象外
 const OMRON_TRANSFER_BACKOFF_MS: u64 = 5 * 60_000;
-/// Omron 機の全購読が終わってからデータを待つ時間。ニプロ機の DATA_WAIT_TIMEOUT_MS より長い
-const OMRON_DATA_WAIT_TIMEOUT_MS: u64 = 10_000;
+/// Omron 機の送信接続で、機器が自分で切断するのを待つ上限。機器は自分で切断するまで
+/// つながっていないと記録を送信済みにせず、S3R から切った回は次の接続で同じ記録を再送した
+/// (Linux で記録が届いた接続は、indication のあと約 8 秒で機器が切断していた)
+const OMRON_SESSION_TIMEOUT_MS: u64 = 20_000;
 
 fn service_uuid(kind: DeviceKind) -> BleUuid {
     match kind {
@@ -558,13 +560,30 @@ async fn handle_device(
     // - 受信あり: 続報 (血圧計の過去分ダンプ) が静穏時間途切れたら切断して転送
     // - 機器の自発切断: 受信済み分を転送して終了
     // - 無データのままタイムアウト: 張り付き防止のためこちらから切断
+    // Omron 機は受信しても S3R から切らず、機器が切断するまで (上限 OMRON_SESSION_TIMEOUT_MS) 待つ
     let wait_start = now_ms();
-    let data_wait_ms = if omron.is_some() {
-        OMRON_DATA_WAIT_TIMEOUT_MS
-    } else {
-        DATA_WAIT_TIMEOUT_MS
-    };
     loop {
+        if omron.is_some() {
+            let by = if disconnected.is_set() {
+                "peer"
+            } else if now_ms().saturating_sub(wait_start) > OMRON_SESSION_TIMEOUT_MS {
+                let _ = client.disconnect();
+                "timeout"
+            } else {
+                FreeRtos::delay_ms(100);
+                continue;
+            };
+            let n = buffer.lock().map(|b| b.len()).unwrap_or(0);
+            if by == "timeout" && n == 0 {
+                alc_hub_common::evtlog::emit("EVT OMRON_RX timeout");
+            }
+            alc_hub_common::evtlog::emit(&format!("EVT OMRON_END by={by} n={n}"));
+            println!(
+                "{{\"type\":\"disconnected\",\"device\":\"{}\"}}",
+                kind.json_name()
+            );
+            break;
+        }
         if disconnected.is_set() {
             println!(
                 "{{\"type\":\"disconnected\",\"device\":\"{}\"}}",
@@ -579,11 +598,8 @@ async fn handle_device(
                 let _ = client.disconnect();
                 break;
             }
-        } else if now_ms().saturating_sub(wait_start) > data_wait_ms {
+        } else if now_ms().saturating_sub(wait_start) > DATA_WAIT_TIMEOUT_MS {
             let _ = client.disconnect();
-            if omron.is_some() {
-                alc_hub_common::evtlog::emit("EVT OMRON_RX timeout");
-            }
             println!(
                 "{{\"type\":\"disconnected\",\"device\":\"{}\",\"reason\":\"timeout\"}}",
                 kind.json_name()
