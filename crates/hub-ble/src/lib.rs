@@ -403,6 +403,9 @@ async fn handle_device(
         omron_unbond(&adv.addr());
     }
 
+    // 送信接続の間に NimBLE が受けた notify / indication を数え、抜けるときに出す (計測用)
+    let _omron_trace = (omron == Some(OmronAdv::Transfer)).then(OmronTrace::start);
+
     // Arduino 版と同様に最大 3 回リトライ
     let mut attempt = 0;
     // Omron の送信広告への接続では、接続ができた瞬間に暗号化を始める
@@ -1289,6 +1292,14 @@ static OMRON_RX: Mutex<Option<OmronRx>> = Mutex::new(None);
 
 /// 受信の振り分け先を設定する (GAP の listener は初回に 1 度だけ登録する)
 fn omron_rx_install(rx: OmronRx) {
+    omron_listener_register();
+    if let Ok(mut slot) = OMRON_RX.lock() {
+        *slot = Some(rx);
+    }
+}
+
+/// GAP の listener を初回に 1 度だけ登録する
+fn omron_listener_register() {
     static REGISTER: std::sync::Once = std::sync::Once::new();
     REGISTER.call_once(|| {
         let listener: &'static mut esp_idf_svc::sys::ble_gap_event_listener =
@@ -1304,8 +1315,44 @@ fn omron_rx_install(rx: OmronRx) {
             log::warn!("ble: GAP listener の登録失敗 rc={rc}");
         }
     });
-    if let Ok(mut slot) = OMRON_RX.lock() {
-        *slot = Some(rx);
+}
+
+/// 計測中 (Omron の送信接続の間) か
+static OMRON_TRACE: AtomicBool = AtomicBool::new(false);
+/// 計測中に GAP の listener が受けた indication / notification の数
+static OMRON_IND_RX: AtomicU32 = AtomicU32::new(0);
+static OMRON_NTF_RX: AtomicU32 = AtomicU32::new(0);
+
+/// Omron の送信接続の間、NimBLE が受けた notify / indication を数える (計測用)。
+/// NimBLE の ble_att_stats は esp-idf のポートでは STATS_INC が空マクロ
+/// (porting/nimble/include/stats/stats.h:46) で 0 のままなので使えない。代わりに
+/// GAP の listener で NOTIFY_RX を indication フラグ別に数える: ATT 層は受けた indication を
+/// ble_att_svr_rx_indicate (ble_att_svr.c:3257) で、notification を ble_att_svr_rx_notify
+/// (ble_att_svr.c:3060) で ble_gap_notify_rx_event に渡し、そこで listener を必ず呼ぶ
+/// (ble_gap.c:9329)。届かないのは、PDU が壊れている・ハンドルが 0・Confirmation 用の mbuf が
+/// 取れない・sm_sec_lvl >= 2 で未暗号化、のときだけ。抜けるときに
+/// `EVT OMRON_ATT ind_rx=<n> ind_rsp_tx=na ntf_rx=<n>` を出す
+/// (Confirmation の送信数は stats 無しでは数えられないので na)
+struct OmronTrace;
+
+impl OmronTrace {
+    fn start() -> Self {
+        omron_listener_register();
+        OMRON_IND_RX.store(0, Ordering::SeqCst);
+        OMRON_NTF_RX.store(0, Ordering::SeqCst);
+        OMRON_TRACE.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for OmronTrace {
+    fn drop(&mut self) {
+        OMRON_TRACE.store(false, Ordering::SeqCst);
+        alc_hub_common::evtlog::emit(&format!(
+            "EVT OMRON_ATT ind_rx={} ind_rsp_tx=na ntf_rx={}",
+            OMRON_IND_RX.load(Ordering::SeqCst),
+            OMRON_NTF_RX.load(Ordering::SeqCst)
+        ));
     }
 }
 
@@ -1331,6 +1378,20 @@ unsafe extern "C" fn omron_gap_listener(
         return 0;
     }
     let rx = unsafe { &event.__bindgen_anon_1.notify_rx };
+    let is_indication = rx.indication() != 0;
+    if OMRON_TRACE.load(Ordering::SeqCst) {
+        if is_indication {
+            OMRON_IND_RX.fetch_add(1, Ordering::SeqCst);
+        } else {
+            OMRON_NTF_RX.fetch_add(1, Ordering::SeqCst);
+        }
+        let len = unsafe { esp_idf_svc::sys::os_mbuf_len(rx.om) };
+        alc_hub_common::evtlog::emit(&format!(
+            "EVT OMRON_NTF handle=0x{:04x} ind={} len={len}",
+            rx.attr_handle,
+            u8::from(is_indication)
+        ));
+    }
     let Ok(mut slot) = OMRON_RX.lock() else {
         return 0;
     };
