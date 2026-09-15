@@ -1,0 +1,58 @@
+# alc-hub-ble-probe — hub-ble の BLE central を Atom VoiceS3R で試す測定用 build (issue #237)
+#
+# `ESP_IDF_SYS_ROOT_CRATE=alc-hub-ble cargo build --release -p alc-hub-ble --features probe`
+# のときだけ使われる。最終的な載せ先は CoreS3 (root) なので、**BT 節は root の
+# sdkconfig.defaults と同じ値**にして本番と同じ条件で測る。PSRAM 節と基本設定は
+# 同じ VoiceS3R の crates/atoms3-alarm/sdkconfig.defaults に合わせる。
+# Wi-Fi・ネットワークは使わない。OTA も不要なので partition は IDF 既定の single app large。
+
+# 入出力は Atom ネイティブ USB-C の USB Serial/JTAG コンソールだけ
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
+CONFIG_FREERTOS_HZ=1000
+
+# VoiceS3R は 8MB flash (atoms3-alarm の build と同じ)
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# ---- PSRAM (機種固有、crates/atoms3-alarm/sdkconfig.defaults と同値) ----
+#
+# ★★ MODE は OCT。QUAD ではない。root (CoreS3) の SPIRAM 設定を持ってくると
+#    QUAD になり、この機では PSRAM が初期化できず IGNORE_NOTFOUND により
+#    黙って PSRAM なしで起動する (根拠と経緯は atoms3-alarm 側のコメント)。
+#    下の BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL は PSRAM に host ヒープを置くので、
+#    PSRAM が無いと本番と違う条件の測定になる
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+
+# ---- BT (root の sdkconfig.defaults と同値) ----
+
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+# root の同じ節にある Task WDT 設定も揃える (probe は WDT に登録するタスクを持たない
+# ので実質は idle 監視を切るだけ)
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+CONFIG_BT_NIMBLE_SM_SC=y
+CONFIG_BT_NIMBLE_SM_LEGACY=y
+CONFIG_BT_NIMBLE_MAX_BONDS=8
+
+# notify コールバックが nimble_host タスク上で println! するため既定 4KB では足りない
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192

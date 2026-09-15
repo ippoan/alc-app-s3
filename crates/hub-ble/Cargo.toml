@@ -4,6 +4,19 @@ version = "0.1.0"
 edition = "2021"
 description = "BLE central: ニプロ体温計 NT-100B / 血圧計 NBP-1BLE の読み取り (ble-medical-gateway 移植)"
 
+# 通常の lib (CoreS3 root の依存) では bin を作らない。`probe` feature を付けたときだけ
+# 測定用の bin (src/bin/probe.rs) が build される (issue #237)
+[[bin]]
+name = "alc-hub-ble-probe"
+path = "src/bin/probe.rs"
+harness = false
+required-features = ["probe"]
+
+[features]
+# Atom VoiceS3R で未対応の BLE 機器 (Omron HEM-6231T) の広告・GATT・bond を
+# `PROBE ` 行で serial に出す測定モード。既定 off — off のときの挙動は変えない
+probe = []
+
 [dependencies]
 alc-hub-core = { path = "../hub-core" }
 alc-hub-common = { path = "../hub-common" }
@@ -16,3 +29,12 @@ esp-idf-svc = { version = "0.52", default-features = false, features = [
     "binstart",
 ] }
 esp32-nimble = "0.12"
+
+[build-dependencies]
+embuild = "0.33"
+
+# probe bin を VoiceS3R 向けに build するときは `ESP_IDF_SYS_ROOT_CRATE=alc-hub-ble` を
+# 付けて本 crate の metadata を使わせる (付けなければ root = CoreS3 の sdkconfig)。
+[package.metadata.esp-idf-sys]
+# 相対パスはワークスペースルート基準で解決される (atoms3-nfc と同じ仕様)
+esp_idf_sdkconfig_defaults = "crates/hub-ble/sdkconfig.probe.defaults"
