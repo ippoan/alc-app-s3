@@ -234,6 +234,24 @@ mod tests {
     }
 
     #[test]
+    fn blood_pressure_omron_hem6231t() {
+        // Omron HEM-6231T が 0x2A35 に送った実機の値 (S3R で受信、Refs #237)。
+        // flags 0x1E = timestamp + pulse + user id + measurement status。
+        // user id (1 byte) と status (2 byte) は pulse の後ろにあり、読まない
+        let data = [
+            0x1E, 0x78, 0x00, 0x48, 0x00, 0x58, 0x00, // 120 / 72 / MAP 88
+            0xEA, 0x07, 0x09, 0x0F, 0x16, 0x17, 0x33, // 2026-09-15 22:23:51
+            0x3D, 0x00, // pulse 61
+            0x01, 0x00, 0x00, // user id 1, status 0
+        ];
+        let bp = parse_blood_pressure(&data).unwrap();
+        assert_eq!(bp.systolic, 120.0);
+        assert_eq!(bp.diastolic, 72.0);
+        assert_eq!(bp.pulse, Some(61.0));
+        assert_eq!(bp.timestamp, Some(20_260_915_222_351));
+    }
+
+    #[test]
     fn blood_pressure_pulse_flag_but_truncated() {
         // pulse フラグは立っているがデータが足りない → None
         let bp = parse_blood_pressure(&[0x04, 120, 0, 80, 0, 0, 0]).unwrap();

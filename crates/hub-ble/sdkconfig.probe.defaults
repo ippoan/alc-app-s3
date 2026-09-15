@@ -39,7 +39,14 @@ CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
-CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
+# Omron HEM-6231T は CCCD を書くと、ホスト (この機) に ATT Find By Type Value Request
+# (Current Time Service の検索) を送り、その応答が無いと記録 (0x2A35 indication) を送らないと読める
+# (Linux の btmon で確認、Refs #237)。NimBLE は GATT サーバが無効だと ATT の要求に何も
+# 応答しない (host/src/ble_att.c の dispatch と未知要求へのエラー応答が BLE_GATTS の中) ので、
+# peripheral role と GATT サーバを有効にする (サービスは登録せず、Attribute Not Found を返す)。
+# advertising はしない
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_GATT_SERVER=y
 CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
 # root の同じ節にある Task WDT 設定も揃える (probe は WDT に登録するタスクを持たない

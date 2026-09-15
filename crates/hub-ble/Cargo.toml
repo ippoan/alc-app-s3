@@ -13,8 +13,8 @@ harness = false
 required-features = ["probe"]
 
 [features]
-# Atom VoiceS3R で未対応の BLE 機器 (Omron HEM-6231T) の広告・GATT・bond を
-# `PROBE ` 行で serial に出す測定モード。既定 off — off のときの挙動は変えない
+# Atom VoiceS3R で hub-ble の BLE central (Omron HEM-6231T 対応を含む) を動かし、広告を
+# `PROBE ADV` 行で serial に出す測定モード。既定 off — off のときの挙動は変えない
 probe = []
 
 [dependencies]
