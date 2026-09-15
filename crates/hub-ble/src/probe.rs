@@ -11,6 +11,7 @@
 //! 出力は全部 `PROBE ` で始まる 1 行 (grep で拾う):
 //!
 //! ```text
+//! PROBE SEC auth=bond|sc io=none our_key=enc|id their_key=enc|id
 //! PROBE BOND stage=pre_subscribe result=Ok|Err(..)
 //! PROBE BOND stage=pre_subscribe bonded=.. encrypted=.. authenticated=..
 //! PROBE ADV addr=.. type=.. rssi=.. name=.. svc=[..] mfg=<hex>
@@ -30,8 +31,9 @@ use std::sync::{Arc, Mutex};
 use alc_hub_common::status::now_ms;
 use anyhow::Result;
 use esp32_nimble::{
-    enums::AdvType, utilities::BleUuid, BLEAddress, BLEAdvertisedData, BLEAdvertisedDevice,
-    BLEClient,
+    enums::{AdvType, AuthReq, PairKeyDist, SecurityIOCap},
+    utilities::BleUuid,
+    BLEAddress, BLEAdvertisedData, BLEAdvertisedDevice, BLEClient, BLEDevice,
 };
 use esp_idf_svc::hal::delay::FreeRtos;
 
@@ -136,6 +138,17 @@ pub async fn inspect(client: &mut BLEClient) -> Result<bool> {
             (v & 0x80 == 0).then_some(s as u8)
         });
     };
+
+    // bond の前に、SMP を「Bond + Secure Connections、鍵配布は双方 ENC|ID」に上書きする。
+    // 本番 (lib.rs) は Bond だけ = LE Legacy で、自分の IRK を配らない。Omron 機はそれだと
+    // bond しても完了扱いにならない疑い (#c237-4)。probe のときだけ走るので本番は変わらない
+    BLEDevice::take()
+        .security()
+        .set_auth(AuthReq::Bond | AuthReq::Sc)
+        .set_io_cap(SecurityIOCap::NoInputNoOutput)
+        .set_security_init_key(PairKeyDist::ENC | PairKeyDist::ID)
+        .set_security_resp_key(PairKeyDist::ENC | PairKeyDist::ID);
+    println!("PROBE SEC auth=bond|sc io=none our_key=enc|id their_key=enc|id");
 
     // 1. GATT 列挙より前に、先に bond する (購読だけでは暗号化されない機器がいる)
     let res = client.secure_connection().await;
