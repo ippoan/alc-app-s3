@@ -68,6 +68,9 @@ const BLOOD_PRESSURE_SERVICE: u16 = 0x1810;
 const TEMPERATURE_MEASUREMENT: u16 = 0x2A1C;
 const BLOOD_PRESSURE_MEASUREMENT: u16 = 0x2A35;
 
+/// Omron の company id (Bluetooth SIG)。本体の広告のメーカーデータに載る
+const OMRON_COMPANY_ID: u16 = 0x020E;
+
 // Omron 独自 service のペアリング (unlock 鍵の登録)。UUID と電文は omblepy
 // (https://github.com/userx14/omblepy) の LEGACY_* / writeNewUnlockKey と同じ (Refs #237)
 const OMRON_SERVICE: BleUuid = uuid128!("ecbe3980-c9a2-11e1-b1bd-0002a5d5c51b");
@@ -266,6 +269,17 @@ fn match_target(
 ) -> Option<(DeviceKind, Option<OmronAdv>)> {
     if dev.rssi() < MIN_RSSI {
         return None;
+    }
+
+    // Omron 機の本体の広告は名前が無く 0x1810 を広告し、名前は別パケットの scan response
+    // にだけ載る (S3R の PROBE ADV で実測)。本体の広告を 0x1810 で当てると Omron と
+    // 分からずニプロ経路で接続するので無視し、scan response の名前で判定させる
+    if data
+        .manufacture_data()
+        .is_some_and(|m| m.company_identifier == OMRON_COMPANY_ID)
+    {
+        let name = String::from_utf8_lossy(data.name()?);
+        return omron_adv(&name).map(|adv| (DeviceKind::BloodPressure, Some(adv)));
     }
 
     if data.is_advertising_service(&BleUuid::from_uuid16(HEALTH_THERMOMETER_SERVICE)) {
