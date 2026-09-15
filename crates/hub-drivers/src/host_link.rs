@@ -36,6 +36,7 @@
 //! | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` を返す |
 //! | `BUS5V STATUS` | M-Bus 5V 出力の現況 `BUS5V USB=1 OUT=1 BATTERY=0 BUS_IN=0` を返す。**設定は無い** — USB ホスト (PC) が列挙されていて、かつ M-Bus が外部給電でない (`BUS_IN=0`) 間だけ Core が 5V を出す固定動作で、hub-ui が 1 秒ごとに追随する (#202)。`BUS_IN` は起動時の W5500 probe で確定する M-Bus の外部給電判定 (`1`=PoE 等で外部給電中 `0`=無し `?`=未判定、Refs #211)。WS 下り command `{action:"bus5v_status"}` / `{action:"reboot"}` (auth-worker 端末一覧) でも遠隔で照会・再起動できる |
 //! | `TENKO BP ON\|OFF` / `TENKO STATUS` | 点呼に血圧を含めるか (NVS、既定 OFF) / `TENKO BP=0` を返す |
+//! | `OMRON BP ON\|OFF` / `OMRON STATUS` | Omron 血圧計を拾うか (NVS、既定 OFF) / `OMRON BP=0` を返す |
 //! | `HEAP` | `HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> TOTAL_INT=<n> TOTAL_PSRAM=<n>` を返す (Refs #27) |
 //! | `HEAP DUMP` | `HEAPDUMP ...` 複数行 (ヒープブロック概況 + タスク別スタック余裕) |
 //! | `LOG DUMP` | `LOGDUMP ...` 複数行 (`.noinit` リングの直近ログ。事象の事後解析用) |
@@ -379,6 +380,21 @@ fn handle_line(
             }
         },
         HostCommand::TenkoStatus => println!("TENKO BP={}", u8::from(settings.tenko_bp())),
+        // Omron 血圧計 (HEM-6231T) を拾うか。NVS に保存し、hub-ble がスキャンの
+        // たびに読む
+        HostCommand::OmronBp { enabled } => match settings.set_omron_bp(enabled) {
+            Ok(()) => {
+                if let Ok(mut st) = status.lock() {
+                    st.omron_bp = enabled;
+                }
+                println!("OK OMRON BP={}", u8::from(enabled));
+            }
+            Err(e) => {
+                log::error!("host_link: OMRON BP 保存失敗: {e:?}");
+                println!("ERR OMRON: 保存に失敗しました");
+            }
+        },
+        HostCommand::OmronStatus => println!("OMRON BP={}", u8::from(settings.omron_bp())),
         // OTA 更新 (進捗・結果は EVT OTA_* で届く。シリアル経路は WS 進捗 sink
         // 無し = None。ota.rs 参照)
         HostCommand::Ota { url } => {

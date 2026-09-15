@@ -148,6 +148,8 @@ fn main() -> Result<()> {
         board: board_kind,
         // 点呼の構成 (血圧はオプション、既定 OFF)。`TENKO BP` で NVS ごと更新される
         tenko_bp: settings.tenko_bp(),
+        // Omron 血圧計を拾うか (既定 OFF)。`OMRON BP` で NVS ごと更新される
+        omron_bp: settings.omron_bp(),
         reset_history: Some(reset_history),
         ..HubStatus::default()
     }));

@@ -67,6 +67,10 @@ pub enum HostCommand {
     TenkoBp { enabled: bool },
     /// 点呼構成の問い合わせ (`TENKO BP=0` を応答)
     TenkoStatus,
+    /// Omron 血圧計 (HEM-6231T) を拾うか (`OMRON BP ON|OFF`。NVS 保存、既定 OFF)
+    OmronBp { enabled: bool },
+    /// Omron 構成の問い合わせ (`OMRON BP=0` を応答)
+    OmronStatus,
     /// ヒープ状態の問い合わせ
     /// (`HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> ...` を応答、Refs #27)
     Heap,
@@ -302,6 +306,16 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                 _ => return Err("ERR TENKO: BP には ON|OFF が必要です".into()),
             },
             _ => return Err("ERR TENKO: BP|STATUS が必要です".into()),
+        },
+        // Omron 血圧計 (HEM-6231T) を拾うか (hub-ble)
+        "OMRON" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+            Some("STATUS") => HostCommand::OmronStatus,
+            Some("BP") => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+                Some("ON") | Some("1") => HostCommand::OmronBp { enabled: true },
+                Some("OFF") | Some("0") => HostCommand::OmronBp { enabled: false },
+                _ => return Err("ERR OMRON: BP には ON|OFF が必要です".into()),
+            },
+            _ => return Err("ERR OMRON: BP|STATUS が必要です".into()),
         },
         // PC (運行者タブ) の点呼の段。点呼画面を PC の流れに合わせる (hub-ui)
         "STAGE" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
@@ -821,6 +835,35 @@ mod tests {
         assert!(parse_line("TENKO TEMP ON", T).is_err());
         assert!(parse_line("TENKO BP", T).is_err());
         assert!(parse_line("TENKO BP MAYBE", T).is_err());
+    }
+
+    #[test]
+    fn omron_subcommands() {
+        assert_eq!(parse_line("OMRON STATUS", T), Ok(Some(HostCommand::OmronStatus)));
+        assert_eq!(
+            parse_line("omron bp on", T),
+            Ok(Some(HostCommand::OmronBp { enabled: true }))
+        );
+        assert_eq!(
+            parse_line("OMRON BP 1", T),
+            Ok(Some(HostCommand::OmronBp { enabled: true }))
+        );
+        assert_eq!(
+            parse_line("OMRON BP OFF", T),
+            Ok(Some(HostCommand::OmronBp { enabled: false }))
+        );
+        assert_eq!(
+            parse_line("OMRON BP 0", T),
+            Ok(Some(HostCommand::OmronBp { enabled: false }))
+        );
+    }
+
+    #[test]
+    fn omron_errors() {
+        assert!(parse_line("OMRON", T).is_err());
+        assert!(parse_line("OMRON TEMP ON", T).is_err());
+        assert!(parse_line("OMRON BP", T).is_err());
+        assert!(parse_line("OMRON BP MAYBE", T).is_err());
     }
 
     #[test]
