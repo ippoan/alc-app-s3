@@ -22,6 +22,8 @@
 //! が出す `NFC IDm=…` / `免許証 交付 …`) を監視してビープを鳴らす方式に加え、
 //! 本体 LED (WS2812) でもカード検知時に色を変える。待受中は暗い青 (生存確認)、
 //! 検知成功 (IDm/免許証) は緑、読み取り失敗とカード 2 枚 (#143) は赤。
+//! Atom VoiceS3R を測定台に使う build (`ATOMS3_NFC_VOICES3R`) は LED の代わりに
+//! 内蔵スピーカーで、読めたときに短いビープを鳴らす (`VOICES3R` の doc)。
 //!
 //! **打刻は送らない。** WS/HTTP の uplink を持たないベンチ専用機なので、
 //! ここでカードを読んでもサーバには何も届かない。
@@ -35,17 +37,21 @@
 // check_rmt_legacy_driver_conflict で abort する (sdkconfig.defaults 参照)
 #![allow(deprecated)]
 
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use alc_hub_common::status::{HubStatus, SharedStatus};
 use alc_hub_drivers::nfc::{self, NfcEvent};
+use alc_hub_drivers::speaker::Sound;
+use alc_hub_drivers::{es8311, speaker};
 use anyhow::Result;
 use esp_idf_svc::hal::delay::FreeRtos;
+use esp_idf_svc::hal::i2c::{config::Config as I2cConfig, I2cDriver};
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::rmt::{
     config::TransmitConfig, FixedLengthSignal, PinState, Pulse, TxRmtDriver,
 };
+use esp_idf_svc::hal::units::Hertz;
 
 /// nfc_shim (C++ 側) に立てさせる I2C ポート。本機は他に I2C を使わないので
 /// I2C_NUM_0 (実機確認済み 2026-07-21)。CoreS3 は内部バスが I2C_NUM_0 を
@@ -59,6 +65,13 @@ const I2C_PORT_NFC: i32 = 0;
 const LED_IDLE: (u8, u8, u8) = (0, 0, 255);
 const LED_OK: (u8, u8, u8) = (0, 255, 0);
 const LED_ERR: (u8, u8, u8) = (255, 0, 0);
+
+/// Atom VoiceS3R を測定台に使う build の印 (`ATOMS3_NFC_VOICES3R`、値は問わない)。
+/// あちらは Octal PSRAM が GPIO35〜37 を内部で使い (uiflow-micropython の
+/// M5STACK_Atom_EchoS3R が sdkconfig.spiram_oct)、WS2812 も載っていないので
+/// LED を出さず、代わりに内蔵の ES8311 で読めたときに短いビープを鳴らす。
+/// Grove は同じ SDA=G2 / SCL=G1 なので NFC 側は変えない。既定 (AtomS3 Lite) は従来どおり
+const VOICES3R: bool = option_env!("ATOMS3_NFC_VOICES3R").is_some();
 
 /// 検知色を維持する時間。RF リンクは per-exchange で確率的に落ちるため、
 /// 成功直後の一時的な失敗で表示を戻すと「不安定」に見える (issue #96)
@@ -76,12 +89,53 @@ fn main() -> Result<()> {
     // (_pin_table_other0, "//RGBLED" コメント付き) を確認したところ実際は
     // GPIO35 だった (2026-07-20)。legacy RMT ドライバで直接ビットバンギング
     // (ws2812-esp32-rmt-driver crate は esp-idf-hal 0.46 と links 衝突するため不使用)
-    let tx = TxRmtDriver::new(
-        p.rmt.channel0,
-        p.pins.gpio35,
-        &TransmitConfig::new().clock_divider(1),
-    )?;
+    // VoiceS3R の測定台では GPIO35 に出さない (VOICES3R の doc)
+    let tx = if VOICES3R {
+        None
+    } else {
+        Some(TxRmtDriver::new(
+            p.rmt.channel0,
+            p.pins.gpio35,
+            &TransmitConfig::new().clock_divider(1),
+        )?)
+    };
     let led = Arc::new(Mutex::new(Led::new(tx)));
+
+    // VoiceS3R の測定台だけ: 内蔵オーディオ (ES8311 + NS4150B)。つなぎは
+    // atoms3-timecard と同じ形で、初期化と再生は hub-drivers の es8311 / speaker。
+    // I2C は内蔵バス (SDA=G45 / SCL=G0) を i2c1 で — Grove の Unit NFC は
+    // nfc_shim が I2C_NUM_0 を握るので取り合わない。
+    // 音は失敗しても致命にしない (NFC の測定は続ける)。`amp_en` は NS4150B の
+    // 有効化ピン (G18) で、drop すると出力が落ちるので main が持ち続ける
+    let (speaker_tx, amp_en) = if VOICES3R {
+        match (|| -> Result<_> {
+            let mut audio_i2c = I2cDriver::new(
+                p.i2c1,
+                p.pins.gpio45,
+                p.pins.gpio0,
+                &I2cConfig::new().baudrate(Hertz(400_000)),
+            )?;
+            es8311::probe_bus(&mut audio_i2c);
+            // 順番が命 (Refs #102): I2S で BCK/WS を流してからコーデックを起こす
+            let mut spk = speaker::Speaker::new(
+                p.i2s1,
+                p.pins.gpio17.into(), // BCLK
+                p.pins.gpio3.into(),  // WS (LRCK)
+                p.pins.gpio48.into(), // DOUT
+            )?;
+            spk.feed_silence(300)?;
+            let en = es8311::init_amp(&mut audio_i2c, p.pins.gpio18.into())?;
+            Ok((speaker::start_player(spk)?, en))
+        })() {
+            Ok((tx, en)) => (Some(tx), Some(en)),
+            Err(e) => {
+                log::warn!("speaker: 初期化失敗 — 音なしで継続する: {e:#}");
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
 
     // 本機は画面もホストリンクも持たないので、push_event の行き先は捨て場。
     // それでも `nfc::start` はボード非依存の口として status を要求する
@@ -100,8 +154,19 @@ fn main() -> Result<()> {
         // 存在検知ゲートも従来どおり (#175 の AlwaysPoll は本番機 atoms3-timecard だけ)
         nfc::PresenceGate::Adaptive,
         Arc::clone(&status),
-        move |e: &NfcEvent| paint_event(&led_for_nfc, e),
+        move |e: &NfcEvent| notify_event(&led_for_nfc, speaker_tx.as_ref(), e),
     )?;
+    // 起動直後のログは取りこぼすことがあるので、音の有無は NFC の起動後に出す
+    if VOICES3R {
+        log::info!(
+            "測定台 (Atom VoiceS3R): LED なし / 読めたらビープ = {}",
+            if amp_en.is_some() {
+                "有効"
+            } else {
+                "無効 (初期化失敗)"
+            }
+        );
+    }
 
     // メインループは LED のラッチ戻しだけ。検知そのもののログは nfc.rs が出す
     loop {
@@ -113,8 +178,9 @@ fn main() -> Result<()> {
 }
 
 /// 検知結果を LED の色にする。**2 枚見え (#143) と読み取り失敗は赤** —
-/// どちらも「かざしたのに登録されなかった」ことを目視で分ける必要がある
-fn paint_event(led: &Mutex<Led>, event: &NfcEvent) {
+/// どちらも「かざしたのに登録されなかった」ことを目視で分ける必要がある。
+/// 音を持つ build (VoiceS3R の測定台) では、読めたとき (緑) だけ短いビープを鳴らす
+fn notify_event(led: &Mutex<Led>, speaker: Option<&mpsc::Sender<Sound>>, event: &NfcEvent) {
     let color = match event {
         NfcEvent::ReadFailed { .. } | NfcEvent::MultipleCards => LED_ERR,
         NfcEvent::Felica { .. }
@@ -122,6 +188,12 @@ fn paint_event(led: &Mutex<Led>, event: &NfcEvent) {
         | NfcEvent::CarInspection { .. }
         | NfcEvent::License { .. } => LED_OK,
     };
+    if color == LED_OK {
+        if let Some(tx) = speaker {
+            // 再生は speaker スレッド。ここはキューに積むだけで NFC を止めない
+            let _ = tx.send(Sound::BeepOk);
+        }
+    }
     if let Ok(mut led) = led.lock() {
         led.paint(color);
     }
@@ -133,14 +205,15 @@ fn paint_event(led: &Mutex<Led>, event: &NfcEvent) {
 /// 共有相手はもう居ない (#151 で向こうの led.rs は消えた)。ここは AtomS3 Lite
 /// (G35) 専用のベンチ用目視デバッグ
 struct Led {
-    tx: TxRmtDriver<'static>,
+    /// `None` = LED を出さない build (`VOICES3R`)
+    tx: Option<TxRmtDriver<'static>>,
     /// 現在出している色 (同色の再送出を避ける)
     shown: (u8, u8, u8),
     since: Instant,
 }
 
 impl Led {
-    fn new(tx: TxRmtDriver<'static>) -> Self {
+    fn new(tx: Option<TxRmtDriver<'static>>) -> Self {
         let mut led = Self {
             tx,
             // 待機色以外にしておき、初回 paint で必ず 1 回描かせる
@@ -157,7 +230,10 @@ impl Led {
             return;
         }
         self.shown = color;
-        if let Err(e) = write_ws2812(&mut self.tx, color) {
+        let Some(tx) = self.tx.as_mut() else {
+            return;
+        };
+        if let Err(e) = write_ws2812(tx, color) {
             log::warn!("led: write failed: {e:#}");
         }
     }

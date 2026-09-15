@@ -27,7 +27,9 @@ harness = false
 # 検証機と本番機 (atoms3-timecard) で重複抑止が違うと、ここで測った挙動が
 # 本番と食い違う (issue #103 のエッジ判定がまさにそれだった)
 alc-hub-common = { path = "../hub-common" }
-alc-hub-drivers = { path = "../hub-drivers", features = ["nfc"] }
+# "speaker" は Atom VoiceS3R を測定台に使う build (ATOMS3_NFC_VOICES3R) の読めたらビープ用。
+# 既定 (AtomS3 Lite) の build では初期化しない (src/main.rs の VOICES3R)
+alc-hub-drivers = { path = "../hub-drivers", features = ["nfc", "speaker"] }
 anyhow = "1"
 log = "0.4"
 esp-idf-svc = { version = "0.52", default-features = false, features = [
