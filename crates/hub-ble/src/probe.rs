@@ -10,6 +10,7 @@
 //! PROBE ADV addr=.. type=.. rssi=.. name=.. svc=[..] mfg=<hex>
 //! ```
 
+use std::fmt::Write as _;
 use std::sync::Mutex;
 
 use alc_hub_common::status::now_ms;
@@ -51,7 +52,7 @@ pub fn log_adv(dev: &BLEAdvertisedDevice, data: &BLEAdvertisedData<&[u8]>) {
         .manufacture_data()
         .map(|m| {
             let mut s = format!("{:04x}", m.company_identifier);
-            s.push_str(&crate::hex(m.payload));
+            s.push_str(&hex(m.payload));
             s
         })
         .unwrap_or_default();
@@ -60,4 +61,12 @@ pub fn log_adv(dev: &BLEAdvertisedDevice, data: &BLEAdvertisedData<&[u8]>) {
         dev.adv_type(),
         dev.rssi()
     );
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }

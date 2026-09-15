@@ -72,14 +72,8 @@ const HEALTH_THERMOMETER_SERVICE: u16 = 0x1809;
 const BLOOD_PRESSURE_SERVICE: u16 = 0x1810;
 const TEMPERATURE_MEASUREMENT: u16 = 0x2A1C;
 const BLOOD_PRESSURE_MEASUREMENT: u16 = 0x2A35;
+const CURRENT_TIME_SERVICE: u16 = 0x1805;
 const CURRENT_TIME: u16 = 0x2A2B;
-// GATT の属性型 (Find Information で見える UUID)
-const GATT_PRIMARY_SERVICE: u16 = 0x2800;
-const GATT_SECONDARY_SERVICE: u16 = 0x2801;
-const GATT_CHARACTERISTIC: u16 = 0x2803;
-const GATT_CCCD: u16 = 0x2902;
-/// NimBLE の GATT 手順 (探索・CCCD 書き込み) 1 本の待ちの上限
-const OMRON_GATT_OP_TIMEOUT_MS: u64 = 5_000;
 
 /// Omron の company id (Bluetooth SIG)。本体の広告のメーカーデータに載る
 const OMRON_COMPANY_ID: u16 = 0x020E;
@@ -107,6 +101,8 @@ const OMRON_SET_KEY_WAIT_MS: u64 = 3_000;
 const OMRON_SECURE_TIMEOUT_MS: u64 = 10_000;
 /// early start のあと、この時間暗号化されなければ暗号化を始め直す
 const OMRON_ENC_RESTART_MS: u64 = 3_000;
+/// early start 後のサービス探索で、見つかった数がこの時間変わらなければ完了とみなす
+const OMRON_SERVICES_SETTLE_MS: u64 = 400;
 /// 鍵登録の後始末 (CCCD を 0 に) のあと、切断までに置く時間 (Linux の手順と同じ)
 const OMRON_PAIR_LINGER_MS: u64 = 3_000;
 
@@ -140,10 +136,10 @@ const EMPTY_BACKOFF_MS: u64 = 10_000;
 /// ペアリングを終えた Omron 機へペアリング接続を控える時間。鍵登録の直後も
 /// ペアリング待ちの広告が数秒残り、そこへ再接続すると機器に切られる (S3R で実測)
 const OMRON_PAIRED_BACKOFF_MS: u64 = 30_000;
-/// Omron 機の送信接続が終わったら (成功・失敗・機器からの切断を問わず) 同じ機器へ送信接続を
-/// 控える時間。機器は記録を送り終えても送信広告を出し続け、S3R が約 20 秒おきに接続し続けて
-/// 機器が終了しなかった (ユーザー指摘)。ペアリング待ちの広告は対象外
-const OMRON_TRANSFER_COOLDOWN_MS: u64 = 5 * 60_000;
+/// Omron 機の送信接続が終わったら (成功・失敗・機器からの切断を問わず) 同じ機器へ接続を
+/// 控える時間。機器は送信を終えても送信広告を出し続け、約 20 秒おきに接続し続けて機器が
+/// 終了しなかった (ユーザー指摘)。ペアリング待ちの広告は対象外
+const OMRON_TRANSFER_BACKOFF_MS: u64 = 5 * 60_000;
 /// Omron 機の全購読が終わってからデータを待つ時間。ニプロ機の DATA_WAIT_TIMEOUT_MS より長い
 const OMRON_DATA_WAIT_TIMEOUT_MS: u64 = 10_000;
 
@@ -198,15 +194,13 @@ async fn task(
         .set_io_cap(SecurityIOCap::NoInputNoOutput);
 
     let mut scan = BLEScan::new();
-    // データなしで終わった機器 (アドレス, 終了時刻)。EMPTY_BACKOFF_MS の間は
-    // 再接続せず、機器を空けて測り直しを受け付けやすくする
+    // データなしで終わった機器 (アドレス, 期限)。期限までは再接続せず、機器を空けて
+    // 測り直しを受け付けやすくする (EMPTY_BACKOFF_MS。Omron の送信接続のあとは
+    // OMRON_TRANSFER_BACKOFF_MS。Omron のペアリング待ちの広告は対象外)
     let mut empty_backoff: Vec<(BLEAddress, u64)> = Vec::new();
     // ペアリングを終えた Omron 機 (アドレス, 終了時刻)。OMRON_PAIRED_BACKOFF_MS の間は
     // ペアリング待ちの広告に接続しない (送信広告には接続する)
     let mut paired_backoff: Vec<(BLEAddress, u64)> = Vec::new();
-    // 送信接続を終えた Omron 機 (アドレス, 終了時刻)。OMRON_TRANSFER_COOLDOWN_MS の間は
-    // 送信広告に接続しない
-    let mut transfer_cooldown: Vec<(BLEAddress, u64)> = Vec::new();
     loop {
         // 再ペアリング要求: 保存済みボンドを全消去する。壊れた/古いボンドが
         // 血圧計の暗号化接続を妨げている場合の復旧手段 (Pages のペアリングボタン)
@@ -237,10 +231,8 @@ async fn task(
         }
 
         // バックオフ期限切れの機器を解放
-        empty_backoff.retain(|(_, at)| now_ms().saturating_sub(*at) < EMPTY_BACKOFF_MS);
+        empty_backoff.retain(|(_, until)| now_ms() < *until);
         paired_backoff.retain(|(_, at)| now_ms().saturating_sub(*at) < OMRON_PAIRED_BACKOFF_MS);
-        transfer_cooldown
-            .retain(|(_, at)| now_ms().saturating_sub(*at) < OMRON_TRANSFER_COOLDOWN_MS);
 
         // ニプロ機器は測定時にアドバタイズを開始するため、短いスキャンを
         // 繰り返して発見次第すぐ接続する (Arduino 版 loop() と同じ運用)。
@@ -253,23 +245,17 @@ async fn task(
             .start(device, SCAN_DURATION_MS, |dev, data| {
                 #[cfg(feature = "probe")]
                 probe::log_adv(dev, &data);
-                // 直近の接続がデータなしだった機器はバックオフ中 — 接続しない
-                if empty_backoff.iter().any(|(a, _)| *a == dev.addr()) {
+                let (kind, omron) = match_target(dev, &data)?;
+                let backoff = if omron == Some(OmronAdv::Pairing) {
+                    &paired_backoff
+                } else {
+                    // 直近の接続がデータなし (または Omron の送信接続) だった機器はバックオフ中
+                    &empty_backoff
+                };
+                if backoff.iter().any(|(a, _)| *a == dev.addr()) {
                     return None;
                 }
-                match match_target(dev, &data) {
-                    Some((_, Some(OmronAdv::Pairing)))
-                        if paired_backoff.iter().any(|(a, _)| *a == dev.addr()) =>
-                    {
-                        None
-                    }
-                    Some((_, Some(OmronAdv::Transfer)))
-                        if transfer_cooldown.iter().any(|(a, _)| *a == dev.addr()) =>
-                    {
-                        None
-                    }
-                    target => target.map(|(kind, omron)| (*dev, kind, omron)),
-                }
+                Some((*dev, kind, omron))
             })
             .await
             .context("BLE スキャン失敗")?;
@@ -284,7 +270,7 @@ async fn task(
         if omron == Some(OmronAdv::Transfer) && !matches!(omron_find_bond(&adv.addr()), Ok(Some(_)))
         {
             alc_hub_common::evtlog::emit("EVT OMRON_ENC nobond");
-            empty_backoff.push((adv.addr(), now_ms()));
+            empty_backoff.push((adv.addr(), now_ms() + EMPTY_BACKOFF_MS));
             continue;
         }
 
@@ -293,15 +279,24 @@ async fn task(
         let _ = ui_tx.send(UiCommand::BleAcquiring { device: kind });
 
         let mut client = device.new_client();
-        match handle_device(&mut client, &adv, kind, omron, &status, &meas_tx).await {
+        let res = handle_device(&mut client, &adv, kind, omron, &status, &meas_tx).await;
+        // Omron の送信接続は結果を問わず長めに控える
+        if omron == Some(OmronAdv::Transfer) {
+            let until = now_ms() + OMRON_TRANSFER_BACKOFF_MS;
+            empty_backoff.push((adv.addr(), until));
+            alc_hub_common::evtlog::emit(&format!("EVT OMRON_COOLDOWN until_ms={until}"));
+        }
+        match res {
             // データなし: しばらくこの機器への再接続を控える (機器を空ける)。
             // 接続失敗 (Err) はバックオフしない — 新規測定の広告での一時的な
             // 接続失敗もあり、その場合は即リトライで拾いたい
-            Ok(false) => empty_backoff.push((adv.addr(), now_ms())),
+            Ok(false) if omron.is_none() => {
+                empty_backoff.push((adv.addr(), now_ms() + EMPTY_BACKOFF_MS))
+            }
             Ok(true) if omron == Some(OmronAdv::Pairing) => {
                 paired_backoff.push((adv.addr(), now_ms()))
             }
-            Ok(true) => {}
+            Ok(_) => {}
             Err(e) => {
                 log::warn!("ble: {} 処理失敗: {e:?}", kind.json_name());
                 println!(
@@ -311,15 +306,6 @@ async fn task(
             }
         }
         drop(client);
-
-        if omron == Some(OmronAdv::Transfer) {
-            let now = now_ms();
-            transfer_cooldown.push((adv.addr(), now));
-            alc_hub_common::evtlog::emit(&format!(
-                "EVT OMRON_COOLDOWN until_ms={}",
-                now + OMRON_TRANSFER_COOLDOWN_MS
-            ));
-        }
 
         if let Ok(mut st) = status.lock() {
             st.ble_connected = false;
@@ -403,9 +389,6 @@ async fn handle_device(
         omron_unbond(&adv.addr());
     }
 
-    // 送信接続の間に NimBLE が受けた notify / indication を数え、抜けるときに出す (計測用)
-    let _omron_trace = (omron == Some(OmronAdv::Transfer)).then(OmronTrace::start);
-
     // Arduino 版と同様に最大 3 回リトライ
     let mut attempt = 0;
     // Omron の送信広告への接続では、接続ができた瞬間に暗号化を始める
@@ -442,7 +425,7 @@ async fn handle_device(
 
     match omron {
         Some(OmronAdv::Pairing) => {
-            let res = omron_pair(client, &adv.addr(), &disconnected).await;
+            let res = omron_pair(client, &disconnected).await;
             let _ = client.disconnect();
             res?;
             // ペアリングはデータなしでも Ok(true) を返す。Ok(false) だと呼び出し側が
@@ -457,46 +440,55 @@ async fn handle_device(
             // early start が通っていれば secure_connection は呼ばない: 暗号化が済んだリンクで
             // 呼ぶと NimBLE は 2 回目の暗号化を始める (EALREADY になるのは手順の進行中だけ)
             let mut early = early_enc.filter(|e| e.rc == 0);
-            let res = if let Some(e) = early.as_mut() {
-                // 暗号化の完了時刻 (connect の間に見えていればその時刻) から、接続確立からの ms を出す
-                let done = match e.encrypted_at {
-                    Some(at) => Ok(at),
-                    None => wait_encrypted(client, &disconnected, OMRON_SECURE_TIMEOUT_MS, e),
-                };
-                done.map(|at| Ok(Some(at.saturating_sub(e.connected_at))))
-            } else {
-                disconnected
-                    .until_timeout(client.secure_connection(), OMRON_SECURE_TIMEOUT_MS)
-                    .await
-                    .map(|r| r.map(|()| None))
+            let res = match early.as_mut() {
+                Some(e) if e.encrypted => Ok(Ok(())),
+                Some(e) => {
+                    wait_encrypted(client, &disconnected, OMRON_SECURE_TIMEOUT_MS, e).map(Ok)
+                }
+                None => {
+                    disconnected
+                        .until_timeout(client.secure_connection(), OMRON_SECURE_TIMEOUT_MS)
+                        .await
+                }
             };
-            // early start を張り直した回数 (0x3e などで接続が張り直されたとき)
-            let retry = early.map_or(String::new(), |e| format!(" retry={}", e.retry));
+            // early start を始め直した回数 (0x3e などで接続が張り直されたとき)
+            let retry = early.map_or(0, |e| e.retry);
             match res {
-                Ok(Ok(t)) => {
-                    let line = match t {
-                        Some(t) => format!("EVT OMRON_ENC ok t={t}{retry}"),
-                        None => "EVT OMRON_ENC ok".to_string(),
-                    };
-                    alc_hub_common::evtlog::emit(&line);
-                    emit_omron_desc(client);
+                Ok(Ok(())) => {
+                    alc_hub_common::evtlog::emit(&format!("EVT OMRON_ENC ok retry={retry}"))
                 }
                 Ok(Err(e)) => {
                     log::warn!("ble: Omron 暗号化失敗: {e:?}");
-                    alc_hub_common::evtlog::emit("EVT OMRON_ENC err");
+                    alc_hub_common::evtlog::emit(&format!("EVT OMRON_ENC err retry={retry}"));
                 }
                 // 切断・時間切れ: 暗号化の途中なので打ち切って切断する
                 Err(e) => {
-                    alc_hub_common::evtlog::emit(&format!("EVT OMRON_ENC err{retry}"));
+                    alc_hub_common::evtlog::emit(&format!("EVT OMRON_ENC err retry={retry}"));
                     let _ = client.disconnect();
                     return Err(e.context("Omron 暗号化の打ち切り"));
                 }
             }
-            // 張り直しがあれば、EVT の t= は張り直した接続を基準にする
-            early_enc = early.or(early_enc);
+            if early.is_some() {
+                omron_settle_services(client, &disconnected).await?;
+            }
         }
         None => {}
     }
+
+    // ニプロ機では明示的な secure_connection は行わない。血圧計 (NBP-1BLE) は
+    // 「接続 → 測定値 indication → 即切断」を非常に短時間で行うため、
+    // ペアリングの往復待ちを挟むと購読前に切断され indication を取り逃す
+    // (実機ログで確認: secure_connection 成功直後に Remote User Terminated)。
+    // Arduino 版と同様に接続後すぐ購読し、暗号化が要求される場合は NimBLE が
+    // 購読時 (CCCD 書き込み) に自動ネゴする。ボンドは NVS に永続化される。
+    let service = client
+        .get_service(service_uuid(kind))
+        .await
+        .context("サービスが見つからない")?;
+    let characteristic = service
+        .get_characteristic(measurement_uuid(kind))
+        .await
+        .context("キャラクタリスティックが見つからない")?;
 
     // 血圧計は保存済みの過去測定をまとめて送ってくる。セッション中の測定を
     // すべて貯め、最後に「最新 (タイムスタンプ最大) の 1 件」だけを recorder へ
@@ -507,7 +499,7 @@ async fn handle_device(
     // ESP32-S3 (Xtensa) はネイティブ 64bit アトミックが無いため u32
     let last_rx = Arc::new(AtomicU32::new(0));
     let buffer: Arc<Mutex<Vec<(Measurement, u64)>>> = Arc::new(Mutex::new(Vec::new()));
-    let on_measurement = {
+    {
         let got_data = Arc::clone(&got_data);
         let last_rx = Arc::clone(&last_rx);
         let buffer = Arc::clone(&buffer);
@@ -515,7 +507,7 @@ async fn handle_device(
         // パースしてバッファに積むだけに留める — println!/format!/NVS 等の
         // 重い処理は recorder スレッドで行う (以前ここで直接やって血圧受信時に
         // スタックオーバーフロー→再起動していた)。
-        move |raw: &[u8]| {
+        characteristic.on_notify(move |raw| {
             let now = now_ms();
             if let Some(pair) = parse_measurement(kind, raw, now) {
                 if let Ok(mut buf) = buffer.lock() {
@@ -524,66 +516,32 @@ async fn handle_device(
             }
             last_rx.store(now as u32, Ordering::SeqCst);
             got_data.store(true, Ordering::SeqCst);
-        }
-    };
+        });
+    }
 
-    // Omron の受信の振り分けを、この関数を抜けるときに必ず外す
-    let _omron_rx_guard = OmronRxGuard;
+    // 体温計/血圧計の Measurement は indication ベースの機器が多い
+    // (Arduino 版は canIndicate() 優先で登録)。CCCD はニプロ機では応答なしの書き込み、
+    // Omron 機は応答あり (Write Request) でないと購読を無視する (Refs #237)
+    let cccd_response = omron.is_some();
     if omron.is_some() {
-        // Omron 機は探索をせず、保存した CCCD の一覧で暗号化の直後に全部購読する
-        // (Linux で記録が届いた接続は、0x2A35 の CCCD を接続から約 0.1 秒で書いていた)。
-        // 受信は値ハンドルで振り分け、0x2A35 は on_measurement へ。
-        // t= の基準は接続確立の時刻 (early start なら接続を見つけた時刻)
-        let connected_at = early_enc.map_or_else(now_ms, |e| e.connected_at);
-        let res = omron_subscribe_saved(
-            client,
-            &adv.addr(),
-            &disconnected,
-            connected_at,
-            Box::new(on_measurement),
-        );
-        let n = match res {
-            Ok(n) => n,
-            Err(e) => {
-                let _ = client.disconnect();
-                return Err(e);
-            }
-        };
-        let t = now_ms().saturating_sub(connected_at);
-        alc_hub_common::evtlog::emit(&format!("EVT OMRON_SUB n={n} t={t}"));
+        // Omron 機は 0x2A35 だけの購読では記録を送らない。Linux で記録が届いた回と同じく、
+        // 全 service の notify / indicate を GATT の並び順に全部購読する
+        // (0x2A35 には上の受信コールバックが付いている)
+        let n = omron_subscribe_all(client, &disconnected).await?;
+        alc_hub_common::evtlog::emit(&format!("EVT OMRON_SUB n={n}"));
+    } else if characteristic.can_indicate() {
+        characteristic
+            .subscribe_indicate(cccd_response)
+            .await
+            .context("indication 購読失敗")?;
+    } else if characteristic.can_notify() {
+        characteristic
+            .subscribe_notify(cccd_response)
+            .await
+            .context("notification 購読失敗")?;
     } else {
-        // ニプロ機では明示的な secure_connection は行わない。血圧計 (NBP-1BLE) は
-        // 「接続 → 測定値 indication → 即切断」を非常に短時間で行うため、
-        // ペアリングの往復待ちを挟むと購読前に切断され indication を取り逃す
-        // (実機ログで確認: secure_connection 成功直後に Remote User Terminated)。
-        // Arduino 版と同様に接続後すぐ購読し、暗号化が要求される場合は NimBLE が
-        // 購読時 (CCCD 書き込み) に自動ネゴする。ボンドは NVS に永続化される。
-        let service = client
-            .get_service(service_uuid(kind))
-            .await
-            .context("サービスが見つからない")?;
-        let characteristic = service
-            .get_characteristic(measurement_uuid(kind))
-            .await
-            .context("キャラクタリスティックが見つからない")?;
-        characteristic.on_notify(on_measurement);
-
-        // 体温計/血圧計の Measurement は indication ベースの機器が多い
-        // (Arduino 版は canIndicate() 優先で登録)。CCCD は応答なしの書き込み
-        if characteristic.can_indicate() {
-            characteristic
-                .subscribe_indicate(false)
-                .await
-                .context("indication 購読失敗")?;
-        } else if characteristic.can_notify() {
-            characteristic
-                .subscribe_notify(false)
-                .await
-                .context("notification 購読失敗")?;
-        } else {
-            let _ = client.disconnect();
-            anyhow::bail!("notify/indicate 非対応のキャラクタリスティック");
-        }
+        let _ = client.disconnect();
+        anyhow::bail!("notify/indicate 非対応のキャラクタリスティック");
     }
 
     println!(
@@ -653,11 +611,7 @@ async fn handle_device(
 /// unlock 購読 → プログラムモード → 鍵の登録。各段を `EVT OMRON_PAIR <段> ok|err` で出す。
 /// 登録後の受信は標準 0x2A35 で鍵を使わないので、鍵は毎回乱数で作って保存しない
 /// (値はログに出さない)。切断は呼び出し側
-async fn omron_pair(
-    client: &mut BLEClient,
-    addr: &BLEAddress,
-    disconnected: &Disconnected,
-) -> Result<()> {
+async fn omron_pair(client: &mut BLEClient, disconnected: &Disconnected) -> Result<()> {
     fn step<T, E: core::fmt::Debug>(stage: &str, res: Result<T, E>) -> Result<T> {
         match res {
             Ok(v) => {
@@ -699,7 +653,6 @@ async fn omron_pair(
         }
         log::warn!("ble: {e:?}");
     }
-    emit_omron_desc(client);
 
     // 3. unlock を購読し、応答 notify の先頭 2 byte を受け取れるようにする
     // (bit16 = 受信あり。nimble_host タスク上で走るので値を置くだけ)
@@ -782,20 +735,6 @@ async fn omron_pair(
         log::warn!("ble: {e:?}");
     }
     let start = now_ms();
-
-    // 7. 送信接続で探索しなくて済むよう、ここで CCCD の一覧を探索して保存する。
-    // 失敗しても登録は済んでいるので Err にはしない (送信接続で 1 回探索する)
-    if let Ok(desc) = client.desc() {
-        match omron_discover_and_save(desc.conn_handle(), addr, disconnected) {
-            Ok(list) => {
-                alc_hub_common::evtlog::emit(&format!("EVT OMRON_CCCD saved n={}", list.len()))
-            }
-            Err(e) => {
-                log::warn!("ble: Omron CCCD 一覧の保存失敗: {e:?}");
-                alc_hub_common::evtlog::emit("EVT OMRON_CCCD err");
-            }
-        }
-    }
     while !disconnected.is_set() && now_ms().saturating_sub(start) < OMRON_PAIR_LINGER_MS {
         FreeRtos::delay_ms(100);
     }
@@ -858,14 +797,13 @@ async fn connect_encrypting<F: Future>(
                     alc_hub_common::evtlog::emit(&format!("EVT OMRON_ENC start rc={rc} retry=0"));
                     early = Some(EarlyEnc {
                         rc,
-                        connected_at: now_ms(),
-                        encrypted_at: None,
+                        encrypted: false,
                         retry: 0,
                         lost: false,
                     });
                 }
                 // 暗号化の完了前に接続が消えた
-                Some(e) if !found && e.encrypted_at.is_none() => {
+                Some(e) if !found && !e.encrypted => {
                     e.lost = true;
                 }
                 // 張り直された接続が見えたので、暗号化を始め直す
@@ -878,17 +816,13 @@ async fn connect_encrypting<F: Future>(
                         e.retry
                     ));
                     e.rc = rc;
-                    e.connected_at = now_ms();
                     e.lost = false;
                 }
-                // 暗号化が connect (MTU 待ち) の間に終わったら、その時刻を控える
+                // 暗号化が connect (MTU 待ち) の間に終わった
                 Some(e)
-                    if found
-                        && e.rc == 0
-                        && e.encrypted_at.is_none()
-                        && desc.sec_state.encrypted() != 0 =>
+                    if found && e.rc == 0 && !e.encrypted && desc.sec_state.encrypted() != 0 =>
                 {
-                    e.encrypted_at = Some(now_ms());
+                    e.encrypted = true;
                 }
                 _ => {}
             }
@@ -897,7 +831,7 @@ async fn connect_encrypting<F: Future>(
             return Poll::Ready((out, early));
         }
         // 接続の検出・消失と暗号化の完了を 5 ms おきに見る
-        if encrypt && early.map_or(true, |e| e.encrypted_at.is_none()) {
+        if encrypt && early.map_or(true, |e| !e.encrypted) {
             FreeRtos::delay_ms(5);
             cx.waker().wake_by_ref();
         }
@@ -911,30 +845,28 @@ async fn connect_encrypting<F: Future>(
 struct EarlyEnc {
     /// ble_gap_security_initiate の戻り値
     rc: i32,
-    /// 接続を見つけた時刻 (now_ms)
-    connected_at: u64,
-    /// connect の間に暗号化の完了が見えた時刻 (now_ms)
-    encrypted_at: Option<u64>,
+    /// connect の間に暗号化の完了が見えた
+    encrypted: bool,
     /// 暗号化を始め直した回数
     retry: u32,
     /// 暗号化の完了前に接続が消え、張り直しを待っている
     lost: bool,
 }
 
-/// リンクが暗号化されるまで最大 `timeout_ms` 待ち、暗号化が見えた時刻 (now_ms) を返す
-/// (切断されたら Err)。OMRON_ENC_RESTART_MS の間暗号化されなければ、暗号化の手順が接続の
-/// 張り直しで失われた場合に備えて始め直す (手順が進行中なら NimBLE は EALREADY を返すだけ)
+/// リンクが暗号化されるまで最大 `timeout_ms` 待つ (切断されたら Err)。OMRON_ENC_RESTART_MS の間
+/// 暗号化されなければ、暗号化の手順が接続の張り直しで失われた場合に備えて始め直す
+/// (手順が進行中なら NimBLE は EALREADY を返すだけ)
 fn wait_encrypted(
     client: &BLEClient,
     disconnected: &Disconnected,
     timeout_ms: u64,
     early: &mut EarlyEnc,
-) -> Result<u64> {
+) -> Result<()> {
     let start = now_ms();
     let mut last_start = start;
     loop {
         match client.desc() {
-            Ok(d) if d.encrypted() => return Ok(now_ms()),
+            Ok(d) if d.encrypted() => return Ok(()),
             Ok(d) if now_ms().saturating_sub(last_start) >= OMRON_ENC_RESTART_MS => {
                 let rc = unsafe { esp_idf_svc::sys::ble_gap_security_initiate(d.conn_handle()) };
                 early.retry += 1;
@@ -956,19 +888,33 @@ fn wait_encrypted(
     }
 }
 
-/// `EVT OMRON_DESC bonded=.. encrypted=.. authenticated=.. key_size=..` を出す
-fn emit_omron_desc(client: &BLEClient) {
-    let line = match client.desc() {
-        Ok(d) => format!(
-            "EVT OMRON_DESC bonded={} encrypted={} authenticated={} key_size={}",
-            d.bonded(),
-            d.encrypted(),
-            d.authenticated(),
-            d.sec_key_size()
-        ),
-        Err(e) => format!("EVT OMRON_DESC err={e:?}"),
-    };
-    alc_hub_common::evtlog::emit(&line);
+/// early start のあとのサービス探索を、見つかった数が落ち着くまで待つ。client の signal は
+/// MTU 完了と ENC_CHANGE の両方が送り、connect はその片方しか受け取らないので、残った値で
+/// get_services の待ちが探索の途中で戻り得る (探索のコールバックはその後も一覧を埋める)
+async fn omron_settle_services(client: &mut BLEClient, disconnected: &Disconnected) -> Result<()> {
+    disconnected
+        .until(async { client.get_services().await.map(|it| it.len()) })
+        .await?
+        .context("サービス探索失敗")?;
+    let start = now_ms();
+    let mut last = usize::MAX;
+    let mut stable_since = start;
+    loop {
+        let n = client.get_services().await.map(|it| it.len()).unwrap_or(0);
+        if n != last {
+            last = n;
+            stable_since = now_ms();
+        } else if now_ms().saturating_sub(stable_since) >= OMRON_SERVICES_SETTLE_MS {
+            return Ok(());
+        }
+        if disconnected.is_set() {
+            anyhow::bail!("切断された");
+        }
+        if now_ms().saturating_sub(start) >= OMRON_SECURE_TIMEOUT_MS {
+            return Ok(());
+        }
+        FreeRtos::delay_ms(100);
+    }
 }
 
 /// unlock に `op` + 16 byte を Write Request で書く (前回の応答は捨てる)
@@ -1016,592 +962,91 @@ fn wait_omron_ack(
     }
 }
 
-/// 購読する 1 本 (保存する CCCD の一覧の要素)
-#[derive(Clone, Copy)]
-struct OmronCccd {
-    uuid: BleUuid,
-    value_handle: u16,
-    cccd_handle: u16,
-    /// indicate を持つ (CCCD に 02 00)。持たなければ notify (01 00)
-    indicate: bool,
-}
-
-/// NVS の名前空間 (CCCD の一覧を機器アドレスごとに保存する)
-const OMRON_NVS_NAMESPACE: &core::ffi::CStr = c"omron_cccd";
-/// 一覧の blob の形式の版
-const OMRON_CCCD_FORMAT: u8 = 1;
-/// 一覧の 1 要素の blob の大きさ: UUID の種別 1 + UUID 16 + 値ハンドル 2 + CCCD ハンドル 2 + indicate 1
-const OMRON_CCCD_ENTRY_LEN: usize = 22;
-
-/// Omron 機の送信接続で、保存した CCCD の一覧 (無ければ 1 回だけ探索して保存) を使って
-/// 全部 Write Request で購読する。購読できた数を返す (失敗した 1 本は飛ばす)。
-/// 順番は固定: 0x2A35 → 他 (ハンドル順) → 0x2A2B を最後。Linux で記録が届いた接続は
-/// 0x2A35 の CCCD を 0x2A2B より先に書いていて、逆順の接続では 0x2A2B の notify すら
-/// 来なかった (機器は 0x2A2B の購読を送信開始の合図にしていると読める)。
-/// 受信は GAP の listener で値ハンドルごとに振り分ける: 0x2A35 は `on_measurement`、
-/// それ以外は OMRON RX 行。1 本ごとに `EVT OMRON_SUB chr=<uuid> ok|err t=<接続からの ms>` を出す
-fn omron_subscribe_saved(
-    client: &BLEClient,
-    addr: &BLEAddress,
-    disconnected: &Disconnected,
-    connected_at: u64,
-    on_measurement: Box<dyn FnMut(&[u8]) + Send>,
-) -> Result<usize> {
-    let conn_handle = client.desc().context("接続が無い")?.conn_handle();
-    let list = match omron_cccd_load(addr) {
-        Some(list) => {
-            alc_hub_common::evtlog::emit(&format!("EVT OMRON_CCCD loaded n={}", list.len()));
-            list
-        }
-        None => {
-            let list = omron_discover_and_save(conn_handle, addr, disconnected)?;
-            let t = now_ms().saturating_sub(connected_at);
-            alc_hub_common::evtlog::emit(&format!(
-                "EVT OMRON_CCCD discovered n={} t={t}",
-                list.len()
-            ));
-            list
-        }
-    };
-
-    let bpm_uuid = BleUuid::from_uuid16(BLOOD_PRESSURE_MEASUREMENT);
-    let ct_uuid = BleUuid::from_uuid16(CURRENT_TIME);
-    omron_rx_install(OmronRx {
-        conn_handle,
-        measurement_handle: list
-            .iter()
-            .find(|c| c.uuid == bpm_uuid)
-            .map(|c| c.value_handle),
-        names: list.iter().map(|c| (c.value_handle, c.uuid)).collect(),
-        on_measurement,
-    });
-
-    let mut targets: Vec<OmronCccd> = Vec::new();
-    targets.extend(list.iter().filter(|c| c.uuid == bpm_uuid));
-    targets.extend(
-        list.iter()
-            .filter(|c| c.uuid != bpm_uuid && c.uuid != ct_uuid),
-    );
-    targets.extend(list.iter().filter(|c| c.uuid == ct_uuid));
-
-    let mut n = 0;
-    for c in targets {
-        let value: [u8; 2] = if c.indicate {
-            [0x02, 0x00]
-        } else {
-            [0x01, 0x00]
-        };
-        let res = gatt_write(conn_handle, c.cccd_handle, &value, disconnected);
-        let t = now_ms().saturating_sub(connected_at);
-        let result = match &res {
-            Ok(()) => {
-                n += 1;
-                "ok"
-            }
+/// Omron 機の notify / indicate を全部 Write Request で購読する。購読できた数を返す
+/// (失敗した 1 本は飛ばす)。順番は固定: 0x2A35 → 他の service (並び順) → 0x2A2B を最後。
+/// Linux で記録が届いた接続は 0x2A35 の CCCD を 0x2A2B より先に書いていて、逆順 (ESP32 の
+/// ハンドル順) の接続では 0x2A2B の notify すら来なかった。機器は 0x2A2B の購読を送信開始の
+/// 合図にしていて、そのとき 0x2A35 が未購読だと何も送らないと読める (Refs #237)。
+/// 1 本ごとに `EVT OMRON_SUB chr=<uuid> ok|err` を出す
+async fn omron_subscribe_all(client: &mut BLEClient, disconnected: &Disconnected) -> Result<usize> {
+    fn log_sub(uuid: BleUuid, res: &Result<(), esp32_nimble::BLEError>) -> usize {
+        let ok = match res {
+            Ok(()) => true,
             Err(e) => {
-                log::warn!("ble: Omron {} の購読失敗: {e:?}", c.uuid);
-                "err"
+                log::warn!("ble: Omron {uuid} の購読失敗: {e:?}");
+                false
             }
         };
-        alc_hub_common::evtlog::emit(&format!("EVT OMRON_SUB chr={} {result} t={t}", c.uuid));
-        if disconnected.is_set() {
-            anyhow::bail!("切断された");
-        }
+        let result = if ok { "ok" } else { "err" };
+        alc_hub_common::evtlog::emit(&format!("EVT OMRON_SUB chr={uuid} {result}"));
+        usize::from(ok)
     }
-    Ok(n)
-}
 
-/// characteristic の全範囲探索と Find Information を 1 回ずつ行い、notify / indicate を持つ
-/// characteristic の CCCD の一覧 (ハンドル順) を作って NVS に保存する
-fn omron_discover_and_save(
-    conn_handle: u16,
-    addr: &BLEAddress,
-    disconnected: &Disconnected,
-) -> Result<Vec<OmronCccd>> {
-    let chrs = gatt_discover_characteristics(conn_handle, disconnected)?;
-    let attrs = gatt_find_information(conn_handle, disconnected)?;
-    let cccds = cccd_handles(&attrs);
-    let props_mask = (esp_idf_svc::sys::BLE_GATT_CHR_PROP_NOTIFY
-        | esp_idf_svc::sys::BLE_GATT_CHR_PROP_INDICATE) as u8;
-    let list: Vec<OmronCccd> = chrs
-        .iter()
-        .filter(|(_, props, _)| props & props_mask != 0)
-        .filter_map(|&(value_handle, props, uuid)| {
-            let cccd_handle = cccds.iter().find(|(v, _)| *v == value_handle)?.1;
-            Some(OmronCccd {
-                uuid,
-                value_handle,
-                cccd_handle,
-                indicate: props & esp_idf_svc::sys::BLE_GATT_CHR_PROP_INDICATE as u8 != 0,
-            })
+    let bls_uuid = BleUuid::from_uuid16(BLOOD_PRESSURE_SERVICE);
+    let bpm_uuid = BleUuid::from_uuid16(BLOOD_PRESSURE_MEASUREMENT);
+    let cts_uuid = BleUuid::from_uuid16(CURRENT_TIME_SERVICE);
+    let ct_uuid = BleUuid::from_uuid16(CURRENT_TIME);
+    disconnected
+        .until(async {
+            let mut n = 0;
+
+            // 1. 0x2A35 を最初に (on_notify は handle_device が付けた受信コールバックを残す)
+            let res = async {
+                client
+                    .get_service(bls_uuid)
+                    .await?
+                    .get_characteristic(bpm_uuid)
+                    .await?
+                    .subscribe_indicate(true)
+                    .await
+            }
+            .await;
+            n += log_sub(bpm_uuid, &res);
+
+            // 2. 0x1810 と 0x1805 以外を並び順に
+            let services: Vec<_> = client.get_services().await?.collect();
+            for svc in services {
+                let svc_uuid = svc.uuid();
+                if svc_uuid == bls_uuid || svc_uuid == cts_uuid {
+                    continue;
+                }
+                let chars = match svc.get_characteristics().await {
+                    Ok(chars) => chars,
+                    Err(e) => {
+                        log::warn!("ble: Omron {svc_uuid} の列挙失敗: {e:?}");
+                        continue;
+                    }
+                };
+                for chr in chars {
+                    if !(chr.can_indicate() || chr.can_notify()) {
+                        continue;
+                    }
+                    let chr_uuid = chr.uuid();
+                    let res = if chr.can_indicate() {
+                        chr.subscribe_indicate(true).await
+                    } else {
+                        chr.subscribe_notify(true).await
+                    };
+                    n += log_sub(chr_uuid, &res);
+                }
+            }
+
+            // 3. 0x2A2B を最後に
+            let res = async {
+                client
+                    .get_service(cts_uuid)
+                    .await?
+                    .get_characteristic(ct_uuid)
+                    .await?
+                    .subscribe_notify(true)
+                    .await
+            }
+            .await;
+            n += log_sub(ct_uuid, &res);
+
+            anyhow::Ok(n)
         })
-        .collect();
-    if list.is_empty() {
-        anyhow::bail!("CCCD が 1 本も見つからない");
-    }
-    omron_cccd_save(addr, &list)?;
-    Ok(list)
-}
-
-/// Find Information の結果 (属性ハンドル, 型 UUID) の並びから、characteristic の値ハンドルと
-/// その最初の CCCD のハンドルを並び順に取り出す。値の属性は宣言 (0x2803) の直後に来る
-fn cccd_handles(attrs: &[(u16, BleUuid)]) -> Vec<(u16, u16)> {
-    let decl = BleUuid::from_uuid16(GATT_CHARACTERISTIC);
-    let primary = BleUuid::from_uuid16(GATT_PRIMARY_SERVICE);
-    let secondary = BleUuid::from_uuid16(GATT_SECONDARY_SERVICE);
-    let cccd = BleUuid::from_uuid16(GATT_CCCD);
-    let mut out = Vec::new();
-    let mut after_decl = false;
-    let mut current: Option<u16> = None;
-    for &(handle, uuid) in attrs {
-        if uuid == decl {
-            after_decl = true;
-            current = None;
-        } else if uuid == primary || uuid == secondary {
-            after_decl = false;
-            current = None;
-        } else if after_decl {
-            after_decl = false;
-            current = Some(handle);
-        } else if uuid == cccd {
-            if let Some(value_handle) = current.take() {
-                out.push((value_handle, handle));
-            }
-        }
-    }
-    out
-}
-
-/// NVS のキー: 機器アドレスの 12 桁 16 進 (ログには出さない)
-fn omron_cccd_key(addr: &BLEAddress) -> std::ffi::CString {
-    let mut b = addr.as_le_bytes();
-    b.reverse();
-    std::ffi::CString::new(hex(&b)).unwrap_or_default()
-}
-
-fn omron_cccd_encode(list: &[OmronCccd]) -> Vec<u8> {
-    let mut blob = Vec::with_capacity(2 + list.len() * OMRON_CCCD_ENTRY_LEN);
-    blob.push(OMRON_CCCD_FORMAT);
-    blob.push(list.len() as u8);
-    for c in list {
-        let mut uuid = [0u8; 16];
-        let tag = match c.uuid {
-            BleUuid::Uuid16(u) => {
-                uuid[..2].copy_from_slice(&u.to_le_bytes());
-                16
-            }
-            BleUuid::Uuid32(u) => {
-                uuid[..4].copy_from_slice(&u.to_le_bytes());
-                32
-            }
-            BleUuid::Uuid128(u) => {
-                uuid = u;
-                128
-            }
-        };
-        blob.push(tag);
-        blob.extend_from_slice(&uuid);
-        blob.extend_from_slice(&c.value_handle.to_le_bytes());
-        blob.extend_from_slice(&c.cccd_handle.to_le_bytes());
-        blob.push(u8::from(c.indicate));
-    }
-    blob
-}
-
-fn omron_cccd_decode(blob: &[u8]) -> Option<Vec<OmronCccd>> {
-    let [OMRON_CCCD_FORMAT, count, rest @ ..] = blob else {
-        return None;
-    };
-    if rest.len() != *count as usize * OMRON_CCCD_ENTRY_LEN || *count == 0 {
-        return None;
-    }
-    rest.chunks_exact(OMRON_CCCD_ENTRY_LEN)
-        .map(|e| {
-            let uuid = match e[0] {
-                16 => BleUuid::from_uuid16(u16::from_le_bytes([e[1], e[2]])),
-                32 => BleUuid::Uuid32(u32::from_le_bytes([e[1], e[2], e[3], e[4]])),
-                128 => BleUuid::Uuid128(e[1..17].try_into().ok()?),
-                _ => return None,
-            };
-            Some(OmronCccd {
-                uuid,
-                value_handle: u16::from_le_bytes([e[17], e[18]]),
-                cccd_handle: u16::from_le_bytes([e[19], e[20]]),
-                indicate: e[21] != 0,
-            })
-        })
-        .collect()
-}
-
-/// 保存した一覧を読む (無い・壊れていれば None)
-fn omron_cccd_load(addr: &BLEAddress) -> Option<Vec<OmronCccd>> {
-    use esp_idf_svc::sys::*;
-    let key = omron_cccd_key(addr);
-    let mut handle: nvs_handle_t = 0;
-    if unsafe {
-        nvs_open(
-            OMRON_NVS_NAMESPACE.as_ptr(),
-            nvs_open_mode_t_NVS_READONLY,
-            &mut handle,
-        )
-    } != ESP_OK
-    {
-        return None;
-    }
-    let mut buf = [0u8; 2 + 32 * OMRON_CCCD_ENTRY_LEN];
-    let mut len = buf.len();
-    let rc = unsafe { nvs_get_blob(handle, key.as_ptr(), buf.as_mut_ptr().cast(), &mut len) };
-    unsafe { nvs_close(handle) };
-    if rc != ESP_OK {
-        return None;
-    }
-    omron_cccd_decode(&buf[..len])
-}
-
-/// 一覧を保存する
-fn omron_cccd_save(addr: &BLEAddress, list: &[OmronCccd]) -> Result<()> {
-    use esp_idf_svc::sys::*;
-    let key = omron_cccd_key(addr);
-    let blob = omron_cccd_encode(list);
-    let mut handle: nvs_handle_t = 0;
-    esp!(unsafe {
-        nvs_open(
-            OMRON_NVS_NAMESPACE.as_ptr(),
-            nvs_open_mode_t_NVS_READWRITE,
-            &mut handle,
-        )
-    })
-    .context("NVS を開けない")?;
-    let rc = esp!(unsafe { nvs_set_blob(handle, key.as_ptr(), blob.as_ptr().cast(), blob.len()) })
-        .and_then(|()| esp!(unsafe { nvs_commit(handle) }));
-    unsafe { nvs_close(handle) };
-    rc.context("CCCD の一覧を NVS に保存できない")
-}
-
-/// 送信接続中の受信の振り分け先 (GAP の listener が nimble_host タスク上で読む)
-struct OmronRx {
-    conn_handle: u16,
-    /// 0x2A35 の値ハンドル
-    measurement_handle: Option<u16>,
-    /// 値ハンドル → characteristic の UUID (OMRON RX 行用)
-    names: Vec<(u16, BleUuid)>,
-    on_measurement: Box<dyn FnMut(&[u8]) + Send>,
-}
-
-static OMRON_RX: Mutex<Option<OmronRx>> = Mutex::new(None);
-
-/// 受信の振り分け先を設定する (GAP の listener は初回に 1 度だけ登録する)
-fn omron_rx_install(rx: OmronRx) {
-    omron_listener_register();
-    if let Ok(mut slot) = OMRON_RX.lock() {
-        *slot = Some(rx);
-    }
-}
-
-/// GAP の listener を初回に 1 度だけ登録する
-fn omron_listener_register() {
-    static REGISTER: std::sync::Once = std::sync::Once::new();
-    REGISTER.call_once(|| {
-        let listener: &'static mut esp_idf_svc::sys::ble_gap_event_listener =
-            Box::leak(Box::default());
-        let rc = unsafe {
-            esp_idf_svc::sys::ble_gap_event_listener_register(
-                listener,
-                Some(omron_gap_listener),
-                core::ptr::null_mut(),
-            )
-        };
-        if rc != 0 {
-            log::warn!("ble: GAP listener の登録失敗 rc={rc}");
-        }
-    });
-}
-
-/// 計測中 (Omron の送信接続の間) か
-static OMRON_TRACE: AtomicBool = AtomicBool::new(false);
-/// 計測中に GAP の listener が受けた indication / notification の数
-static OMRON_IND_RX: AtomicU32 = AtomicU32::new(0);
-static OMRON_NTF_RX: AtomicU32 = AtomicU32::new(0);
-
-/// Omron の送信接続の間、NimBLE が受けた notify / indication を数える (計測用)。
-/// NimBLE の ble_att_stats は esp-idf のポートでは STATS_INC が空マクロ
-/// (porting/nimble/include/stats/stats.h:46) で 0 のままなので使えない。代わりに
-/// GAP の listener で NOTIFY_RX を indication フラグ別に数える: ATT 層は受けた indication を
-/// ble_att_svr_rx_indicate (ble_att_svr.c:3257) で、notification を ble_att_svr_rx_notify
-/// (ble_att_svr.c:3060) で ble_gap_notify_rx_event に渡し、そこで listener を必ず呼ぶ
-/// (ble_gap.c:9329)。届かないのは、PDU が壊れている・ハンドルが 0・Confirmation 用の mbuf が
-/// 取れない・sm_sec_lvl >= 2 で未暗号化、のときだけ。抜けるときに
-/// `EVT OMRON_ATT ind_rx=<n> ind_rsp_tx=na ntf_rx=<n>` を出す
-/// (Confirmation の送信数は stats 無しでは数えられないので na)
-struct OmronTrace;
-
-impl OmronTrace {
-    fn start() -> Self {
-        omron_listener_register();
-        OMRON_IND_RX.store(0, Ordering::SeqCst);
-        OMRON_NTF_RX.store(0, Ordering::SeqCst);
-        OMRON_TRACE.store(true, Ordering::SeqCst);
-        Self
-    }
-}
-
-impl Drop for OmronTrace {
-    fn drop(&mut self) {
-        OMRON_TRACE.store(false, Ordering::SeqCst);
-        alc_hub_common::evtlog::emit(&format!(
-            "EVT OMRON_ATT ind_rx={} ind_rsp_tx=na ntf_rx={}",
-            OMRON_IND_RX.load(Ordering::SeqCst),
-            OMRON_NTF_RX.load(Ordering::SeqCst)
-        ));
-    }
-}
-
-/// handle_device を抜けるときに Omron の受信の振り分け先を外す
-struct OmronRxGuard;
-
-impl Drop for OmronRxGuard {
-    fn drop(&mut self) {
-        if let Ok(mut slot) = OMRON_RX.lock() {
-            *slot = None;
-        }
-    }
-}
-
-/// GAP の listener: 送信接続中の notify / indicate を値ハンドルで振り分ける
-/// (nimble_host タスク上。esp32-nimble の振り分けは探索した characteristic にしか届かない)
-unsafe extern "C" fn omron_gap_listener(
-    event: *mut esp_idf_svc::sys::ble_gap_event,
-    _arg: *mut core::ffi::c_void,
-) -> core::ffi::c_int {
-    let event = unsafe { &*event };
-    if u32::from(event.type_) != esp_idf_svc::sys::BLE_GAP_EVENT_NOTIFY_RX {
-        return 0;
-    }
-    let rx = unsafe { &event.__bindgen_anon_1.notify_rx };
-    let is_indication = rx.indication() != 0;
-    if OMRON_TRACE.load(Ordering::SeqCst) {
-        if is_indication {
-            OMRON_IND_RX.fetch_add(1, Ordering::SeqCst);
-        } else {
-            OMRON_NTF_RX.fetch_add(1, Ordering::SeqCst);
-        }
-        let len = unsafe { esp_idf_svc::sys::os_mbuf_len(rx.om) };
-        alc_hub_common::evtlog::emit(&format!(
-            "EVT OMRON_NTF handle=0x{:04x} ind={} len={len}",
-            rx.attr_handle,
-            u8::from(is_indication)
-        ));
-    }
-    let Ok(mut slot) = OMRON_RX.lock() else {
-        return 0;
-    };
-    let Some(s) = slot.as_mut() else {
-        return 0;
-    };
-    if rx.conn_handle != s.conn_handle {
-        return 0;
-    }
-    let mut buf = [0u8; 160];
-    let mut len: u16 = 0;
-    unsafe {
-        esp_idf_svc::sys::ble_hs_mbuf_to_flat(
-            rx.om,
-            buf.as_mut_ptr().cast(),
-            buf.len() as u16,
-            &mut len,
-        )
-    };
-    let data = &buf[..usize::from(len)];
-    match s.names.iter().find(|(h, _)| *h == rx.attr_handle) {
-        Some((_, uuid)) => log_omron_rx(*uuid, data),
-        None => println!(
-            "OMRON RX handle=0x{:04x} len={} hex={}",
-            rx.attr_handle,
-            data.len(),
-            hex(data)
-        ),
-    }
-    if s.measurement_handle == Some(rx.attr_handle) {
-        (s.on_measurement)(data);
-    }
-    0
-}
-
-/// NimBLE の GATT 手順 1 本の結果を nimble_host タスクから受け取る場所
-struct GattOp {
-    /// 完了時の status (GATT_OP_PENDING = 進行中)
-    status: AtomicU32,
-    /// Find Information で見えた属性 (ハンドル, 型 UUID)
-    attrs: Mutex<Vec<(u16, BleUuid)>>,
-    /// characteristic の探索で見えたもの (値ハンドル, property, UUID)
-    chrs: Mutex<Vec<(u16, u8, BleUuid)>>,
-}
-
-const GATT_OP_PENDING: u32 = u32::MAX;
-
-impl GattOp {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            status: AtomicU32::new(GATT_OP_PENDING),
-            attrs: Mutex::new(Vec::new()),
-            chrs: Mutex::new(Vec::new()),
-        })
-    }
-
-    /// 手順の完了を待つ。切断・時間切れなら Err。時間切れのときは NimBLE があとで
-    /// callback を呼んでも壊れないよう、Arc を 1 つ手放さずに残す
-    fn wait(op: &Arc<Self>, disconnected: &Disconnected) -> Result<()> {
-        let start = now_ms();
-        loop {
-            match op.status.load(Ordering::SeqCst) {
-                GATT_OP_PENDING => {}
-                0 => return Ok(()),
-                st if st == esp_idf_svc::sys::BLE_HS_EDONE => return Ok(()),
-                st => anyhow::bail!("GATT 手順の失敗 status={st}"),
-            }
-            if disconnected.is_set() || now_ms().saturating_sub(start) >= OMRON_GATT_OP_TIMEOUT_MS {
-                std::mem::forget(Arc::clone(op));
-                anyhow::bail!("GATT 手順の打ち切り (切断または時間切れ)");
-            }
-            FreeRtos::delay_ms(2);
-        }
-    }
-}
-
-/// 全ハンドル範囲 (0x0001〜0xFFFF) に Find Information を 1 回かけ、属性の並びを返す
-fn gatt_find_information(
-    conn_handle: u16,
-    disconnected: &Disconnected,
-) -> Result<Vec<(u16, BleUuid)>> {
-    unsafe extern "C" fn cb(
-        _conn_handle: u16,
-        error: *const esp_idf_svc::sys::ble_gatt_error,
-        _chr_val_handle: u16,
-        dsc: *const esp_idf_svc::sys::ble_gatt_dsc,
-        arg: *mut core::ffi::c_void,
-    ) -> core::ffi::c_int {
-        let op = unsafe { &*(arg as *const GattOp) };
-        let status = unsafe { (*error).status };
-        if status == 0 && !dsc.is_null() {
-            let dsc = unsafe { &*dsc };
-            if let Ok(mut attrs) = op.attrs.lock() {
-                attrs.push((dsc.handle, BleUuid::from(dsc.uuid)));
-            }
-        } else {
-            op.status.store(u32::from(status), Ordering::SeqCst);
-        }
-        0
-    }
-
-    let op = GattOp::new();
-    let rc = unsafe {
-        esp_idf_svc::sys::ble_gattc_disc_all_dscs(
-            conn_handle,
-            0,
-            0xFFFF,
-            Some(cb),
-            Arc::as_ptr(&op) as *mut core::ffi::c_void,
-        )
-    };
-    if rc != 0 {
-        anyhow::bail!("Find Information を始められない rc={rc}");
-    }
-    GattOp::wait(&op, disconnected)?;
-    let attrs = op.attrs.lock().map(|a| a.clone()).unwrap_or_default();
-    Ok(attrs)
-}
-
-/// 全ハンドル範囲の characteristic を 1 回の手順で探索する
-fn gatt_discover_characteristics(
-    conn_handle: u16,
-    disconnected: &Disconnected,
-) -> Result<Vec<(u16, u8, BleUuid)>> {
-    unsafe extern "C" fn cb(
-        _conn_handle: u16,
-        error: *const esp_idf_svc::sys::ble_gatt_error,
-        chr: *const esp_idf_svc::sys::ble_gatt_chr,
-        arg: *mut core::ffi::c_void,
-    ) -> core::ffi::c_int {
-        let op = unsafe { &*(arg as *const GattOp) };
-        let status = unsafe { (*error).status };
-        if status == 0 && !chr.is_null() {
-            let chr = unsafe { &*chr };
-            if let Ok(mut chrs) = op.chrs.lock() {
-                chrs.push((chr.val_handle, chr.properties, BleUuid::from(chr.uuid)));
-            }
-        } else {
-            op.status.store(u32::from(status), Ordering::SeqCst);
-        }
-        0
-    }
-
-    let op = GattOp::new();
-    let rc = unsafe {
-        esp_idf_svc::sys::ble_gattc_disc_all_chrs(
-            conn_handle,
-            1,
-            0xFFFF,
-            Some(cb),
-            Arc::as_ptr(&op) as *mut core::ffi::c_void,
-        )
-    };
-    if rc != 0 {
-        anyhow::bail!("characteristic の探索を始められない rc={rc}");
-    }
-    GattOp::wait(&op, disconnected)?;
-    let chrs = op.chrs.lock().map(|c| c.clone()).unwrap_or_default();
-    Ok(chrs)
-}
-
-/// 属性に Write Request で書き、応答を待つ
-fn gatt_write(
-    conn_handle: u16,
-    handle: u16,
-    value: &[u8],
-    disconnected: &Disconnected,
-) -> Result<()> {
-    unsafe extern "C" fn cb(
-        _conn_handle: u16,
-        error: *const esp_idf_svc::sys::ble_gatt_error,
-        _attr: *mut esp_idf_svc::sys::ble_gatt_attr,
-        arg: *mut core::ffi::c_void,
-    ) -> core::ffi::c_int {
-        let op = unsafe { &*(arg as *const GattOp) };
-        op.status
-            .store(u32::from(unsafe { (*error).status }), Ordering::SeqCst);
-        0
-    }
-
-    let op = GattOp::new();
-    let rc = unsafe {
-        esp_idf_svc::sys::ble_gattc_write_flat(
-            conn_handle,
-            handle,
-            value.as_ptr().cast(),
-            value.len() as u16,
-            Some(cb),
-            Arc::as_ptr(&op) as *mut core::ffi::c_void,
-        )
-    };
-    if rc != 0 {
-        anyhow::bail!("書き込みを始められない rc={rc}");
-    }
-    GattOp::wait(&op, disconnected)
-}
-
-/// Omron 機から届いた notify / indicate を serial に 1 行出す。nimble_host タスク上で
-/// 呼ばれるので println と hex 化だけにする (evtlog はサーバーへ流れるので使わない)
-fn log_omron_rx(uuid: BleUuid, raw: &[u8]) {
-    println!("OMRON RX chr={uuid} len={} hex={}", raw.len(), hex(raw));
-}
-
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+        .await?
 }
 
 /// on_disconnect で立つ印。立ったら待っている future を起こす。
