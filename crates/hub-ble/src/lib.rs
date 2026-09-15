@@ -140,6 +140,10 @@ const EMPTY_BACKOFF_MS: u64 = 10_000;
 /// ペアリングを終えた Omron 機へペアリング接続を控える時間。鍵登録の直後も
 /// ペアリング待ちの広告が数秒残り、そこへ再接続すると機器に切られる (S3R で実測)
 const OMRON_PAIRED_BACKOFF_MS: u64 = 30_000;
+/// Omron 機の送信接続が終わったら (成功・失敗・機器からの切断を問わず) 同じ機器へ送信接続を
+/// 控える時間。機器は記録を送り終えても送信広告を出し続け、S3R が約 20 秒おきに接続し続けて
+/// 機器が終了しなかった (ユーザー指摘)。ペアリング待ちの広告は対象外
+const OMRON_TRANSFER_COOLDOWN_MS: u64 = 5 * 60_000;
 /// Omron 機の全購読が終わってからデータを待つ時間。ニプロ機の DATA_WAIT_TIMEOUT_MS より長い
 const OMRON_DATA_WAIT_TIMEOUT_MS: u64 = 10_000;
 
@@ -200,6 +204,9 @@ async fn task(
     // ペアリングを終えた Omron 機 (アドレス, 終了時刻)。OMRON_PAIRED_BACKOFF_MS の間は
     // ペアリング待ちの広告に接続しない (送信広告には接続する)
     let mut paired_backoff: Vec<(BLEAddress, u64)> = Vec::new();
+    // 送信接続を終えた Omron 機 (アドレス, 終了時刻)。OMRON_TRANSFER_COOLDOWN_MS の間は
+    // 送信広告に接続しない
+    let mut transfer_cooldown: Vec<(BLEAddress, u64)> = Vec::new();
     loop {
         // 再ペアリング要求: 保存済みボンドを全消去する。壊れた/古いボンドが
         // 血圧計の暗号化接続を妨げている場合の復旧手段 (Pages のペアリングボタン)
@@ -232,6 +239,8 @@ async fn task(
         // バックオフ期限切れの機器を解放
         empty_backoff.retain(|(_, at)| now_ms().saturating_sub(*at) < EMPTY_BACKOFF_MS);
         paired_backoff.retain(|(_, at)| now_ms().saturating_sub(*at) < OMRON_PAIRED_BACKOFF_MS);
+        transfer_cooldown
+            .retain(|(_, at)| now_ms().saturating_sub(*at) < OMRON_TRANSFER_COOLDOWN_MS);
 
         // ニプロ機器は測定時にアドバタイズを開始するため、短いスキャンを
         // 繰り返して発見次第すぐ接続する (Arduino 版 loop() と同じ運用)。
@@ -251,6 +260,11 @@ async fn task(
                 match match_target(dev, &data) {
                     Some((_, Some(OmronAdv::Pairing)))
                         if paired_backoff.iter().any(|(a, _)| *a == dev.addr()) =>
+                    {
+                        None
+                    }
+                    Some((_, Some(OmronAdv::Transfer)))
+                        if transfer_cooldown.iter().any(|(a, _)| *a == dev.addr()) =>
                     {
                         None
                     }
@@ -297,6 +311,15 @@ async fn task(
             }
         }
         drop(client);
+
+        if omron == Some(OmronAdv::Transfer) {
+            let now = now_ms();
+            transfer_cooldown.push((adv.addr(), now));
+            alc_hub_common::evtlog::emit(&format!(
+                "EVT OMRON_COOLDOWN until_ms={}",
+                now + OMRON_TRANSFER_COOLDOWN_MS
+            ));
+        }
 
         if let Ok(mut st) = status.lock() {
             st.ble_connected = false;
