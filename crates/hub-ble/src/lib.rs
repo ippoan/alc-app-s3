@@ -136,10 +136,6 @@ const EMPTY_BACKOFF_MS: u64 = 10_000;
 /// ペアリングを終えた Omron 機へペアリング接続を控える時間。鍵登録の直後も
 /// ペアリング待ちの広告が数秒残り、そこへ再接続すると機器に切られる (S3R で実測)
 const OMRON_PAIRED_BACKOFF_MS: u64 = 30_000;
-/// Omron 機の送信接続が終わったら (成功・失敗・機器からの切断を問わず) 同じ機器へ接続を
-/// 控える時間。機器は送信を終えても送信広告を出し続け、約 20 秒おきに接続し続けて機器が
-/// 終了しなかった (ユーザー指摘)。ペアリング待ちの広告は対象外
-const OMRON_TRANSFER_BACKOFF_MS: u64 = 5 * 60_000;
 /// Omron 機の送信接続で、機器が自分で切断するのを待つ上限。機器は自分で切断するまで
 /// つながっていないと記録を送信済みにせず、S3R から切った回は次の接続で同じ記録を再送した
 /// (Linux で記録が届いた接続は、indication のあと約 8 秒で機器が切断していた)
@@ -196,9 +192,8 @@ async fn task(
         .set_io_cap(SecurityIOCap::NoInputNoOutput);
 
     let mut scan = BLEScan::new();
-    // データなしで終わった機器 (アドレス, 期限)。期限までは再接続せず、機器を空けて
-    // 測り直しを受け付けやすくする (EMPTY_BACKOFF_MS。Omron の送信接続のあとは
-    // OMRON_TRANSFER_BACKOFF_MS。Omron のペアリング待ちの広告は対象外)
+    // データなしで終わった機器 (アドレス, 終了時刻)。EMPTY_BACKOFF_MS の間は
+    // 再接続せず、機器を空けて測り直しを受け付けやすくする
     let mut empty_backoff: Vec<(BLEAddress, u64)> = Vec::new();
     // ペアリングを終えた Omron 機 (アドレス, 終了時刻)。OMRON_PAIRED_BACKOFF_MS の間は
     // ペアリング待ちの広告に接続しない (送信広告には接続する)
@@ -233,7 +228,7 @@ async fn task(
         }
 
         // バックオフ期限切れの機器を解放
-        empty_backoff.retain(|(_, until)| now_ms() < *until);
+        empty_backoff.retain(|(_, at)| now_ms().saturating_sub(*at) < EMPTY_BACKOFF_MS);
         paired_backoff.retain(|(_, at)| now_ms().saturating_sub(*at) < OMRON_PAIRED_BACKOFF_MS);
 
         // ニプロ機器は測定時にアドバタイズを開始するため、短いスキャンを
@@ -247,17 +242,18 @@ async fn task(
             .start(device, SCAN_DURATION_MS, |dev, data| {
                 #[cfg(feature = "probe")]
                 probe::log_adv(dev, &data);
-                let (kind, omron) = match_target(dev, &data)?;
-                let backoff = if omron == Some(OmronAdv::Pairing) {
-                    &paired_backoff
-                } else {
-                    // 直近の接続がデータなし (または Omron の送信接続) だった機器はバックオフ中
-                    &empty_backoff
-                };
-                if backoff.iter().any(|(a, _)| *a == dev.addr()) {
+                // 直近の接続がデータなしだった機器はバックオフ中 — 接続しない
+                if empty_backoff.iter().any(|(a, _)| *a == dev.addr()) {
                     return None;
                 }
-                Some((*dev, kind, omron))
+                match match_target(dev, &data) {
+                    Some((_, Some(OmronAdv::Pairing)))
+                        if paired_backoff.iter().any(|(a, _)| *a == dev.addr()) =>
+                    {
+                        None
+                    }
+                    target => target.map(|(kind, omron)| (*dev, kind, omron)),
+                }
             })
             .await
             .context("BLE スキャン失敗")?;
@@ -272,7 +268,7 @@ async fn task(
         if omron == Some(OmronAdv::Transfer) && !matches!(omron_find_bond(&adv.addr()), Ok(Some(_)))
         {
             alc_hub_common::evtlog::emit("EVT OMRON_ENC nobond");
-            empty_backoff.push((adv.addr(), now_ms() + EMPTY_BACKOFF_MS));
+            empty_backoff.push((adv.addr(), now_ms()));
             continue;
         }
 
@@ -281,25 +277,20 @@ async fn task(
         let _ = ui_tx.send(UiCommand::BleAcquiring { device: kind });
 
         let mut client = device.new_client();
-        let res = handle_device(&mut client, &adv, kind, omron, &status, &meas_tx).await;
-        // Omron の送信接続は結果を問わず長めに控える
-        if omron == Some(OmronAdv::Transfer) {
-            let until = now_ms() + OMRON_TRANSFER_BACKOFF_MS;
-            empty_backoff.push((adv.addr(), until));
-            alc_hub_common::evtlog::emit(&format!("EVT OMRON_COOLDOWN until_ms={until}"));
-        }
-        match res {
+        match handle_device(&mut client, &adv, kind, omron, &status, &meas_tx).await {
             // データなし: しばらくこの機器への再接続を控える (機器を空ける)。
             // 接続失敗 (Err) はバックオフしない — 新規測定の広告での一時的な
-            // 接続失敗もあり、その場合は即リトライで拾いたい
-            Ok(false) if omron.is_none() => {
-                empty_backoff.push((adv.addr(), now_ms() + EMPTY_BACKOFF_MS))
-            }
+            // 接続失敗もあり、その場合は即リトライで拾いたい。Omron の送信接続は
+            // 失敗でも控える (送信広告に繰り返し接続して機器をふさがない)
+            Ok(false) => empty_backoff.push((adv.addr(), now_ms())),
             Ok(true) if omron == Some(OmronAdv::Pairing) => {
                 paired_backoff.push((adv.addr(), now_ms()))
             }
-            Ok(_) => {}
+            Ok(true) => {}
             Err(e) => {
+                if omron == Some(OmronAdv::Transfer) {
+                    empty_backoff.push((adv.addr(), now_ms()));
+                }
                 log::warn!("ble: {} 処理失敗: {e:?}", kind.json_name());
                 println!(
                     "{{\"type\":\"error\",\"message\":\"{}: connection failed\"}}",
