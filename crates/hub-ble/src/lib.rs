@@ -72,6 +72,8 @@ const HEALTH_THERMOMETER_SERVICE: u16 = 0x1809;
 const BLOOD_PRESSURE_SERVICE: u16 = 0x1810;
 const TEMPERATURE_MEASUREMENT: u16 = 0x2A1C;
 const BLOOD_PRESSURE_MEASUREMENT: u16 = 0x2A35;
+const CURRENT_TIME_SERVICE: u16 = 0x1805;
+const CURRENT_TIME: u16 = 0x2A2B;
 
 /// Omron の company id (Bluetooth SIG)。本体の広告のメーカーデータに載る
 const OMRON_COMPANY_ID: u16 = 0x020E;
@@ -936,15 +938,54 @@ fn wait_omron_ack(
     }
 }
 
-/// Omron 機の全 service を列挙し、notify / indicate を持つ characteristic を
-/// 並び順に全部 Write Request で購読する。購読できた数を返す (失敗した 1 本は飛ばす)
+/// Omron 機の notify / indicate を全部 Write Request で購読する。購読できた数を返す
+/// (失敗した 1 本は飛ばす)。順番は固定: 0x2A35 → 他の service (並び順) → 0x2A2B を最後。
+/// Linux で記録が届いた接続は 0x2A35 の CCCD を 0x2A2B より先に書いていて、逆順 (ESP32 の
+/// ハンドル順) の接続では 0x2A2B の notify すら来なかった。機器は 0x2A2B の購読を送信開始の
+/// 合図にしていて、そのとき 0x2A35 が未購読だと何も送らないと読める (Refs #237)。
+/// 1 本ごとに `EVT OMRON_SUB chr=<uuid> ok|err` を出す
 async fn omron_subscribe_all(client: &mut BLEClient, disconnected: &Disconnected) -> Result<usize> {
+    fn log_sub(uuid: BleUuid, res: &Result<(), esp32_nimble::BLEError>) -> usize {
+        let ok = match res {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("ble: Omron {uuid} の購読失敗: {e:?}");
+                false
+            }
+        };
+        let result = if ok { "ok" } else { "err" };
+        alc_hub_common::evtlog::emit(&format!("EVT OMRON_SUB chr={uuid} {result}"));
+        usize::from(ok)
+    }
+
+    let bls_uuid = BleUuid::from_uuid16(BLOOD_PRESSURE_SERVICE);
+    let bpm_uuid = BleUuid::from_uuid16(BLOOD_PRESSURE_MEASUREMENT);
+    let cts_uuid = BleUuid::from_uuid16(CURRENT_TIME_SERVICE);
+    let ct_uuid = BleUuid::from_uuid16(CURRENT_TIME);
     disconnected
         .until(async {
             let mut n = 0;
+
+            // 1. 0x2A35 を最初に (on_notify は handle_device が付けた受信コールバックを残す)
+            let res = async {
+                client
+                    .get_service(bls_uuid)
+                    .await?
+                    .get_characteristic(bpm_uuid)
+                    .await?
+                    .subscribe_indicate(true)
+                    .await
+            }
+            .await;
+            n += log_sub(bpm_uuid, &res);
+
+            // 2. 0x1810 と 0x1805 以外を並び順に
             let services: Vec<_> = client.get_services().await?.collect();
             for svc in services {
                 let svc_uuid = svc.uuid();
+                if svc_uuid == bls_uuid || svc_uuid == cts_uuid {
+                    continue;
+                }
                 let chars = match svc.get_characteristics().await {
                     Ok(chars) => chars,
                     Err(e) => {
@@ -952,28 +993,35 @@ async fn omron_subscribe_all(client: &mut BLEClient, disconnected: &Disconnected
                         continue;
                     }
                 };
-                let bpm_uuid = BleUuid::from_uuid16(BLOOD_PRESSURE_MEASUREMENT);
                 for chr in chars {
                     if !(chr.can_indicate() || chr.can_notify()) {
                         continue;
                     }
-                    // on_notify は後から付けた閉包で置き換わるので、0x2A35 には付けない
-                    // (handle_device が付けた受信コールバックを残す)
                     let chr_uuid = chr.uuid();
-                    if chr_uuid != bpm_uuid {
-                        chr.on_notify(move |raw| log_omron_rx(chr_uuid, raw));
-                    }
+                    chr.on_notify(move |raw| log_omron_rx(chr_uuid, raw));
                     let res = if chr.can_indicate() {
                         chr.subscribe_indicate(true).await
                     } else {
                         chr.subscribe_notify(true).await
                     };
-                    match res {
-                        Ok(()) => n += 1,
-                        Err(e) => log::warn!("ble: Omron {} の購読失敗: {e:?}", chr.uuid()),
-                    }
+                    n += log_sub(chr_uuid, &res);
                 }
             }
+
+            // 3. 0x2A2B を最後に
+            let res = async {
+                client
+                    .get_service(cts_uuid)
+                    .await?
+                    .get_characteristic(ct_uuid)
+                    .await?
+                    .on_notify(move |raw| log_omron_rx(ct_uuid, raw))
+                    .subscribe_notify(true)
+                    .await
+            }
+            .await;
+            n += log_sub(ct_uuid, &res);
+
             anyhow::Ok(n)
         })
         .await?
