@@ -109,7 +109,7 @@ pub enum HostCommand {
     },
 }
 
-/// PC (運行者タブ) の点呼の段 (`STAGE NFC|TEMP|ALCOHOL|PC`)。
+/// PC (運行者タブ) の点呼の段 (`STAGE NFC|TEMP|ALCOHOL|CARINS|PC`)。
 /// CoreS3 の点呼画面を PC の流れに合わせるためだけに使う
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostStage {
@@ -119,6 +119,8 @@ pub enum HostStage {
     Temp,
     /// アルコール (FC-1200)
     Alcohol,
+    /// 電子車検証をタップするか PC で選ぶ段 (免許証の次、#135)
+    Carins,
     /// PC の画面だけで進む段 (顔認証・自己申告・日常点検など)
     Pc,
 }
@@ -130,6 +132,7 @@ impl HostStage {
             Self::Nfc => "nfc",
             Self::Temp => "temp",
             Self::Alcohol => "alcohol",
+            Self::Carins => "carins",
             Self::Pc => "pc",
         }
     }
@@ -305,8 +308,9 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
             Some("NFC") => HostCommand::Stage(HostStage::Nfc),
             Some("TEMP") => HostCommand::Stage(HostStage::Temp),
             Some("ALCOHOL") => HostCommand::Stage(HostStage::Alcohol),
+            Some("CARINS") => HostCommand::Stage(HostStage::Carins),
             Some("PC") => HostCommand::Stage(HostStage::Pc),
-            _ => return Err("ERR STAGE: NFC|TEMP|ALCOHOL|PC が必要です".into()),
+            _ => return Err("ERR STAGE: NFC|TEMP|ALCOHOL|CARINS|PC が必要です".into()),
         },
         // 点呼キオスクからの heartbeat (警告デバイス、issue #135)。返信はしない
         "HB" => {
@@ -834,6 +838,10 @@ mod tests {
             Ok(Some(HostCommand::Stage(HostStage::Alcohol)))
         );
         assert_eq!(
+            parse_line("STAGE CARINS", T),
+            Ok(Some(HostCommand::Stage(HostStage::Carins)))
+        );
+        assert_eq!(
             parse_line("STAGE PC", T),
             Ok(Some(HostCommand::Stage(HostStage::Pc)))
         );
@@ -842,13 +850,17 @@ mod tests {
             parse_line("stage temp", T),
             Ok(Some(HostCommand::Stage(HostStage::Temp)))
         );
+        assert_eq!(
+            parse_line("stage carins", T),
+            Ok(Some(HostCommand::Stage(HostStage::Carins)))
+        );
     }
 
     #[test]
     fn stage_errors() {
         assert_eq!(
             parse_line("STAGE", T),
-            Err("ERR STAGE: NFC|TEMP|ALCOHOL|PC が必要です".into())
+            Err("ERR STAGE: NFC|TEMP|ALCOHOL|CARINS|PC が必要です".into())
         );
         // 結果は RESULT で送る (STAGE RESULT は無い)
         assert!(parse_line("STAGE RESULT", T).is_err());
@@ -860,6 +872,7 @@ mod tests {
         assert_eq!(HostStage::Nfc.label(), "nfc");
         assert_eq!(HostStage::Temp.label(), "temp");
         assert_eq!(HostStage::Alcohol.label(), "alcohol");
+        assert_eq!(HostStage::Carins.label(), "carins");
         assert_eq!(HostStage::Pc.label(), "pc");
     }
 
