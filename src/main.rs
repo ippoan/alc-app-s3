@@ -443,8 +443,8 @@ fn main() -> Result<()> {
                 // 壊れた免許証) は VoiceS3R と共有 (alc_hub_drivers::timecard)。
                 // 圏外でも punchq が NVS へ退避するので復帰後に届く。
                 // **打刻の `EVT …` 行は CoreS3 では出さない** (VoiceS3R だけが出す)
-                // — USB 先の PWA が読む行種を増やさない (ブラウザの classify()
-                // は `EVT NFC_LICENSE` のまま据え置き)
+                // — PC が読む行種は点呼動線の NFC_LICENSE / NFC_CARINS の 2 つだけ。
+                // 打刻の EVT は出さない
                 let punched = alc_hub_drivers::timecard::punch_record(
                     e,
                     alc_hub_common::status::now_ms(),
@@ -462,6 +462,12 @@ fn main() -> Result<()> {
                                 expiry: expiry.clone(),
                             },
                         ));
+                    }
+                    // 電子車検証は点呼の段 (STAGE CARINS) の入口。PC へ検知だけ
+                    // 知らせる — 値 (UID 等) は一切含めない (リングにも残り
+                    // 遠隔で読まれるため。public repo)。記録は PC 側で行う
+                    NfcEvent::CarInspection { .. } => {
+                        alc_hub_common::evtlog::emit("EVT NFC_CARINS");
                     }
                     // FeliCa / NFC-A は点呼の入口ではないので、打刻できたことを
                     // 画面で返す (Screen::Result = RESULT_AUTO_CLOSE_MS で自動的に

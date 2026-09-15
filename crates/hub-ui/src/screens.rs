@@ -673,6 +673,11 @@ fn draw_tenko(
     if host == Some(HostStage::Pc) {
         jp_center(d, "PC の画面で操作してください", h - 24, C_MUTED);
     }
+    // 電子車検証をタップするか PC で選ぶ段 (免許証の次、#135)。案内は最下行
+    // (14 文字以内)
+    if host == Some(HostStage::Carins) {
+        jp_center(d, "車検証をタップか PC で選択", h - 24, C_MUTED);
+    }
 }
 
 /// 点呼画面: 取得中機器のラベル横ミニスピナー (部分更新)。8 ドット。
