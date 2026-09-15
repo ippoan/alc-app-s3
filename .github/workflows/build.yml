@@ -106,7 +106,7 @@ jobs:
           # (sccache は CARGO_* env を hash に含める)。#63 の診断で実測済み
           # lib は probe 込みで build (sccache)、測定用 bin alc-hub-ble-probe (issue #237) は
           # 他の bin と同じくリンクを避けて check に留める
-          - { name: ble,     cmd: "cargo build --release --locked -p alc-hub-ble --features probe --lib && cargo check --release --locked -p alc-hub-ble --features probe --bin alc-hub-ble-probe", cache_key: build }
+          - { name: ble,     cmd: "cargo build --release --locked -p alc-hub-ble --features probe --lib ; cargo check --release --locked -p alc-hub-ble --features probe --bin alc-hub-ble-probe", cache_key: build }
           - { name: wifi,    cmd: "cargo build --release --locked -p alc-hub-wifi",    cache_key: build }
           - { name: drivers, cmd: "cargo build --release --locked -p alc-hub-drivers", cache_key: build }
           - { name: ui,      cmd: "cargo build --release --locked -p alc-hub-ui",      cache_key: build }
