@@ -97,7 +97,8 @@ crates/hub-core/src/improv.rs)。
 | `EVT QR_TIMEOUT` / `EVT RESULT_CLOSED` | 画面の自動遷移通知 |
 | `EVT TENKO_START` | 画面 (メニュー or 免許証タップ後の確認画面) から点呼が開始された |
 | `EVT NFC_LICENSE issue=YYYYMMDD expiry=YYYYMMDD` | 運転免許証 (IC) を読み取った |
-| `EVT NFC_CARINS` | 電子車検証を検知した。値は含まない。CoreS3 のみ |
+| `EVT NFC_CARINS mgno=<12〜13 桁> carid=<14 桁>` | 電子車検証の File 03 を読んだ (管理番号 / 車両 ID)。シリアルのみでログのリングには残らない |
+| `EVT NFC_CARINS rc=<token>` | 電子車検証を読み取れなかった (再タップを促す)。値は含まない |
 | `EVT LICENSE_EXPIRED <YYYYMMDD>` | 読み取った免許証が期限切れ (NTP 同期済みのときのみ判定) |
 | `EVT TENKO_CANCEL` / `EVT CONFIRM_TIMEOUT` | 点呼確認画面をキャンセル / 15 秒放置で待機へ戻った |
 | `EVT TENKO_SESSION <id>` | 点呼セッション ID を発番した (この点呼で採れた測定に載る、Refs #112) |

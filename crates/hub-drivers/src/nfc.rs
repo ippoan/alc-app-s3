@@ -32,7 +32,6 @@ use anyhow::{bail, Result};
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::gpio::{AnyIOPin, Pin};
 
-use alc_hub_common::evtlog;
 use alc_hub_common::status::{now_ms, SharedStatus};
 use alc_hub_core::desfire;
 use alc_hub_core::nfc_sticky::{self, Sticky};
@@ -51,12 +50,6 @@ extern "C" {
     fn nfc_shim_measure_amplitude() -> i32;
     fn nfc_shim_measure_phase() -> i32;
     fn nfc_shim_prepare_mode_b();
-    fn nfc_shim_transceive_apdu_a(
-        cmd: *const u8,
-        cmd_len: i32,
-        out: *mut u8,
-        out_cap: i32,
-    ) -> i32;
     fn nfc_shim_isodep_a_open(out_ats: *mut u8, ats_cap: i32) -> i32;
     fn nfc_shim_isodep_a_transceive(
         cmd: *const u8,
@@ -103,8 +96,10 @@ pub enum NfcEvent {
     Felica { idm: String },
     /// NFC-A の UID (HCE / NTAG 等)
     NfcaUid { uid: String },
-    /// 電子車検証 (Type-A ISO-DEP + SELECT MF 成功の簡易判定、issue #105)
-    CarInspection { uid: String },
+    /// 電子車検証 (Type-A ISO-DEP、File 03 を読めたもの、issue #110)。
+    /// `cert_no` = 電子車検証管理番号、`vehicle_id` = 車両 ID。**実在する車両の番号** —
+    /// 外へ出すのは [`deliver`] の println だけ (リング・遠隔ログ・打刻に載せない)
+    CarInspection { cert_no: String, vehicle_id: String },
     /// 従来 IC 運転免許証の PIN なし読み取り (EF 2F01)。日付は YYYYMMDD
     License { issue: String, expiry: String },
     /// 何かかざされたが読めなかった (免許証の途中死・カード引き抜き等)。
@@ -299,9 +294,8 @@ fn run(
     // -2 (カード無し) は定常状態なのでログしない。未実行センチネルは i32::MIN。
     // **これは失敗ログの抑止専用** — 成功時の発火判定は license_gate が持つ
     let mut last_license_rc = i32::MIN;
-    // 直近に構造 probe を打った車検証の UID と時刻 (issue #110)。同じカードを
-    // 置きっぱなしにしても 10 秒に 1 回しか probe しない
-    let mut last_carins: Option<(String, u64)> = None;
+    // 読み終えた電子車検証 (issue #110)。載っている間は読み直さない (`CarinsHold` の doc)
+    let mut carins_hold: Option<CarinsHold> = None;
 
     // 存在検知のベースライン (-1 = 未較正、初回測定値で初期化)。
     // 振幅はカード系、位相はスマホ系 (モバイルSuica 等、振幅に出にくい) を拾う
@@ -383,6 +377,22 @@ fn run(
         // 上の amp/ph 判定と baseline の追従はそのまま走らせる (heartbeat の設置診断に使う)。
         // `present` は触らない — LicenseFirst は下 (touch の直前) で RF の応答に上書きする
         let triggered = always_poll || triggered;
+
+        // --- 電子車検証の hold の解除 (A が同じ uid で応答しない状態が続いた) ---
+        // **下の `if !triggered { … continue; }` より前に置くこと** — ゲートが閉じた周
+        // (カードが離れて振幅が戻った) にも解ける。解いた周にだけタップを区切る
+        if carins_hold
+            .as_ref()
+            .is_some_and(|h| now_ms().saturating_sub(h.last_seen) >= CARINS_HOLD_RELEASE_MS)
+        {
+            carins_hold = None;
+            tap_gate.release();
+            if license_first {
+                // 待機と次周先頭の B を切替ゼロにする (周末の戻しと同じ)
+                unsafe { nfc_shim_prepare_mode_b() };
+            }
+        }
+
         if !triggered {
             triggered_since = None;
             FreeRtos::delay_ms(POLL_INTERVAL_MS);
@@ -455,6 +465,10 @@ fn run(
         // (実機で読了 373ms → 発火 911ms、うち ~290ms がこの待ち)。
         // `TapGate::poll` は「毎周期呼ぶこと」が規約なので、回数を増やすのは安全側
         let mut got = false;
+        // 電子車検証の hold 中に、A が同じ uid で応答したか。**B が読めた周と同じ扱い**にする
+        // (周の後半で `got` に畳む)。ここで `got` を立てないのは、FelicaFirst の B を
+        // hold 中も打つため (`if !got` で飛ばされる)
+        let mut held = false;
         cycle = cycle.wrapping_add(1);
         // step 4b (LicenseFirst のみ): この周に実際に打った poll のどれかが応答したか。
         // `present` (tap_gate.touch = 「まだ同じタップ」) をこれで上書きする — 理由は touch の直前
@@ -466,13 +480,19 @@ fn run(
         // F → A を回すか。FelicaFirst は常に回す。LicenseFirst は B の結果と
         // (AlwaysPoll の待機周では) 周回番号の偶奇で決める — `nfc_sticky::run_fa`
         let mut run_fa = true;
+        // B / F を打つ周か。電子車検証の hold 中は CARINS_HOLD_RESCAN_MS に 1 回だけ
+        let scan_bf = carins_hold
+            .as_mut()
+            .map_or(true, |h| h.rescan_due(now_ms()));
 
         // --- B 先行 (LicenseFirst、#155 step 4) ---
         // 待機中は B モードのまま電界 ON なので、ここは切替 (電界断) ゼロで入れる
-        if license_first {
+        if license_first && scan_bf {
             let rc = poll_license(&mut tap_gate, &mut sink, &mut last_license_rc);
             if rc == 0 {
                 got = true;
+                // 車検証の上に重ねた免許証が読めた。hold を解き、次周から通常の周に戻す
+                carins_hold = None;
             }
             let (next, release) = nfc_sticky::next(sticky, rc);
             sticky = next;
@@ -493,19 +513,23 @@ fn run(
 
         // --- F → A (→ B) ---
         // LicenseFirst で読了済み / 粘着中 / AlwaysPoll の間引き周はここを丸ごと飛ばす
-        // (電界断ゼロを守る)
-        if run_fa {
-            let started = now_ms();
-            match poll_felica_idm() {
-                Ok(Some(idm)) => {
-                    // ここでは発火しない — 確定窓を抜けた後に `deliver` が出す (issue #143)
-                    tap_gate.observe(&idm, NfcEvent::Felica { idm: idm.clone() }, started, now_ms());
-                    got = true;
+        // (電界断ゼロを守る)。ただし電子車検証の hold 中は A を毎周打つ (まだ載っているか)
+        if run_fa || carins_hold.is_some() {
+            if run_fa && scan_bf {
+                let started = now_ms();
+                match poll_felica_idm() {
+                    Ok(Some(idm)) => {
+                        // ここでは発火しない — 確定窓を抜けた後に `deliver` が出す (issue #143)
+                        tap_gate.observe(&idm, NfcEvent::Felica { idm: idm.clone() }, started, now_ms());
+                        got = true;
+                        // 車検証の上に重ねた交通系が読めた。hold を解く
+                        carins_hold = None;
+                    }
+                    // 読めなかったことを理由に状態をクリアしない (issue #103)。
+                    // 空振りで状態が消えることが 2 重発火の原因だった
+                    Ok(None) => {}
+                    Err(e) => log::warn!("nfc: FeliCa poll error: {e:#}"),
                 }
-                // 読めなかったことを理由に状態をクリアしない (issue #103)。
-                // 空振りで状態が消えることが 2 重発火の原因だった
-                Ok(None) => {}
-                Err(e) => log::warn!("nfc: FeliCa poll error: {e:#}"),
             }
 
             // 確定窓の経過チェック (F の後)。重い A/B に入る前に発火できる
@@ -523,23 +547,46 @@ fn run(
                     Ok(Some(uid)) if alc_hub_core::nfca_uid::is_random_nfca_uid(&uid) => {
                         log::info!("nfc: nfca random UID — gate に載せない");
                     }
+                    // 保持中の電子車検証がまだ載っている。読み直さない
+                    Ok(Some(uid)) if carins_hold.as_ref().is_some_and(|h| h.uid == uid) => {
+                        if let Some(h) = carins_hold.as_mut() {
+                            h.last_seen = now_ms();
+                        }
+                        held = true;
+                    }
                     Ok(Some(uid)) => {
-                        // 電子車検証は Type-A + ISO14443-4 (ISO-DEP、RATS 応答あり) で
-                        // 応答することを実機確認済み (issue #105)。UID が取れた時点で
-                        // このカードがただの UID タグ (NTAG 等) かスマートカードかを
-                        // SELECT MF で追加確認する (詳細は detect_car_inspection_a
-                        // のコメント参照)。tap のたびに ISO-DEP セッション1回分の
-                        // コストが乗るが、非対応カードは RATS 非対応で即座に弾かれる
-                        // ため実害は小さい
-                        let event = if detect_car_inspection_a() {
-                            // 車検証と判定できた回だけ、カードの構造を実機で測る
-                            // (issue #110)。管理番号のパースと通知は実測が出てからの別 PR
-                            probe_carins_if_due(&uid, &mut last_carins, &status);
-                            NfcEvent::CarInspection { uid: uid.clone() }
-                        } else {
-                            NfcEvent::NfcaUid { uid: uid.clone() }
-                        };
-                        tap_gate.observe(&uid, event, started, now_ms());
+                        // hold 中に別の uid = 別のカード。hold を解き、新しいカードとして読む
+                        carins_hold = None;
+                        // 電子車検証は Type-A + ISO14443-4 (ISO-DEP) の DESFire (issue #105)。
+                        // UID が取れた時点で File 03 まで読んでみて、ISO-DEP でない (NTAG 等) /
+                        // 車検証のアプリが無いカードは NFC-A UID として扱う。非対応カードは
+                        // RATS 非対応で即座に弾かれるため、タップごとのコストは小さい
+                        match read_carins_mgmt() {
+                            Ok(rec) => {
+                                carins_hold = Some(CarinsHold::new(uid, now_ms()));
+                                let key = rec.cert_no.clone();
+                                let event = NfcEvent::CarInspection {
+                                    cert_no: rec.cert_no,
+                                    vehicle_id: rec.vehicle_id,
+                                };
+                                tap_gate.observe(&key, event, started, now_ms());
+                            }
+                            // 読み損ねた。PC に再タップを促させる。hold を張るので
+                            // 載せたままなら 1 回のタップにつき 1 行だけ出る (値は含まない)
+                            Err(CarinsRead::Failed(rc)) => {
+                                carins_hold = Some(CarinsHold::new(uid, now_ms()));
+                                println!("EVT NFC_CARINS rc={rc}");
+                                push_event(&status, "電子車検証 読取失敗");
+                            }
+                            Err(CarinsRead::NotIsoDep | CarinsRead::NotCarins) => {
+                                tap_gate.observe(
+                                    &uid,
+                                    NfcEvent::NfcaUid { uid: uid.clone() },
+                                    started,
+                                    now_ms(),
+                                );
+                            }
+                        }
                         got = true;
                     }
                     // issue #103: 空振りで状態をクリアしない (上の FeliCa と同じ理由)
@@ -551,9 +598,11 @@ fn run(
             // 確定窓の経過チェック (A の後)。いちばん重い B に入る前に発火できる
             deliver(tap_gate.poll(now_ms()), &status, &mut sink);
 
-            if !got && !license_first {
+            if !got && !license_first && scan_bf {
                 if poll_license(&mut tap_gate, &mut sink, &mut last_license_rc) == 0 {
                     got = true;
+                    // 車検証の上に重ねた免許証が読めた。hold を解く
+                    carins_hold = None;
                 }
             }
             if license_first {
@@ -563,6 +612,8 @@ fn run(
             }
         }
 
+        // hold 中に A が同じ uid で応答した周は、読めた周と同じ扱い
+        let got = got || held;
         if got {
             triggered_since = None;
             // 読めた = 固着ではない。巻き戻しの回数を数え直す
@@ -589,11 +640,15 @@ fn run(
             // の 1 回の -2 では解かない — 電界の縁で -2 → 0 と揺れる免許証が新タップになる
             // AlwaysPoll では待機中もこの周が毎回来るが、`release` は区切るものが無ければ
             // no-op で false を返す。計器行の `released=gate` は true の周だけ
-            let released_gate = !rf_present && run_fa && tap_gate.release();
+            // 電子車検証の hold 中は区切らない (A の空振り 1 周で解けると、載せたまま
+            // 次の読みが新タップになる)。hold を解いた周に上で 1 回だけ区切る
+            let released_gate =
+                !rf_present && run_fa && carins_hold.is_none() && tap_gate.release();
             // 待機中 (AlwaysPoll) に流さないための正規化: -1 (未初期化 / バッファ不足) は
             // -2 と同じ「無応答」に寄せ、fa の run/idle の交互 (待機周で毎周入れ替わる) は
             // 「B が周を取ったか」に置き換える。#169 でタップが区切られた周は必ず出す
-            let rc_norm = if b_rc == nfc_sticky::RC_NOT_READY {
+            // hold 中に B を打たなかった周 (i32::MIN) も同じく「無応答」に寄せる (B を打った周と交互に出さない)
+            let rc_norm = if b_rc == nfc_sticky::RC_NOT_READY || b_rc == i32::MIN {
                 nfc_sticky::RC_NO_CARD
             } else {
                 b_rc
@@ -627,68 +682,58 @@ fn run(
     }
 }
 
-/// SELECT MF (`00 A4 00 00`)。実機診断の結果 (issue #105、2026-07-21):
-/// AlcoholChecker (ippoan/AlcoholChecker) の AID ベース SELECT DF
-/// (`78 77 81 02 80 00`) は実機で SW=6A82 (該当ファイル無し) となり誤りだった
-/// — 電子車検証は AID ベース選択ではなく、免許証 (Type-B) と同じ伝統的な
-/// MF/EF 階層構造で、SELECT MF が SW=9000 で成功することを確認した。
-/// ⚠ 現状は「Type-A ISO14443-4 対応カードで SELECT MF が成功する」ことのみを
-/// 車検証の判定条件にしている簡易ヒューリスティクスであり、他の Type-A
-/// スマートカード (MF/EF構造を持つもの) との誤判定リスクはゼロではない。
-/// 車検証固有の EF (免許証の EF 2F01 に相当するもの) を特定し SELECT できれば
-/// より確実な判定になる — 未特定のため followup 課題として残す
-const APDU_SELECT_MF: [u8; 4] = [0x00, 0xA4, 0x00, 0x00];
-
-/// Type-A ISO-DEP 経由で電子車検証 (簡易判定: SELECT MF 成功) を確認する。
-/// ISO14443-4 非対応カード (単純メモリタグ等) では通信自体が成立せず false
-fn detect_car_inspection_a() -> bool {
-    let mut out = [0u8; 16];
-    let n = unsafe {
-        nfc_shim_transceive_apdu_a(
-            APDU_SELECT_MF.as_ptr(),
-            APDU_SELECT_MF.len() as i32,
-            out.as_mut_ptr(),
-            out.len() as i32,
-        )
-    };
-    if n < 2 {
-        return false; // カード無し/セッション失敗/SW未満の短いレスポンス
-    }
-    let n = n as usize;
-    out[n - 2] == 0x90 && out[n - 1] == 0x00
-}
-
-// ===== 電子車検証 (DESFire) の構造 probe (issue #110) =====
+// ===== 電子車検証 (DESFire) の管理番号 (issue #110) =====
 //
-// PIN 不要で読める「電子車検証管理番号」を取るのが最終目的だが、カードの構造を
-// まだ誰も実機で測っていない。測りたい未知数は 3 つだけ:
-//   1. AID は F33011 (登録車) / F33018 (軽) か、GetApplicationIDs が返す別の値か
-//   2. File 03 が実在し、通信モードが平文・アクセス権の Read が free か
-//   3. ReadData が返す中身の形 (`車両ID / 管理番号` の UTF-8 `/` 区切りか)
-//
-// **測定結果の出口**は 3 つに分ける。実機はオフラインで、戻ってきたら OTA して
-// 遠隔ログで読む段取りなので、EVT 行が主の出口になる:
-//   - evtlog::emit  … 識別子を含まない行だけ (crashlog のリングに残る = 遠隔で読める)
-//   - log::info!    … 生の応答 hex (シリアルのみ。リングには載らない)
-//   - push_event    … 1 行だけの要約 (値は出さない)
-//
-// ⚠ log::info! の生 hex には**実在する車両の管理番号が入る**。この repo は public
-// なので、その出力を issue / PR の本文やコメントに貼らないこと。実機の話を書く
-// 必要があるなら EVT 行 (識別子を含まない側) だけを引用する。
+// File 03 に平文・鍵なしで `車両ID/管理番号` が入っている (#234 の計器で実機を測った。
+// 形は `alc_hub_core::desfire::MgmtRecord`)。**読んだ値の出口は [`deliver`] の println
+// 1 か所だけ** — evtlog::emit (リング・PWALOG・遠隔ログに残る) / log::info! / push_event に
+// 値を出さない。⚠ 実在する車両の番号なので、シリアルの出力を issue / PR に貼らないこと
 
-/// 同じ車検証に probe を打ち直す間隔。置きっぱなしのカードで毎周 12 往復させない
-const CARINS_PROBE_INTERVAL_MS: u64 = 10_000;
-/// probe 全体の上限。1 往復の上限 (shim 側 1500ms) は 1 回ぶんの値でしかなく、
-/// 手順は最大 12 往復あるので全体にも上限が要る — 無いと最悪 18 秒かかり、
+/// 読み取り全体の上限。1 往復の上限 (shim 側 1500ms) は 1 回ぶんの値でしかなく、
+/// 手順は SELECT ×2 + ReadData (+ 継ぎ足し) の複数往復なので全体にも上限が要る —
 /// その間 TapGate の touch/poll が止まって watchdog にも効く
-const CARINS_PROBE_DEADLINE_MS: u64 = 2_000;
-/// GetFileSettings を掛けるファイル数の上限
-const CARINS_MAX_FILES: usize = 8;
+const CARINS_READ_DEADLINE_MS: u64 = 2_000;
 /// 1 フレームの受信バッファ。NFC スレッドは 8KB なので大きくしない
 const CARINS_RX_CAP: usize = 264;
+/// 車検証の hold を解く無応答時間: A が同じ uid で応答しない状態がこれだけ続いたら「離れた」
+const CARINS_HOLD_RELEASE_MS: u64 = 1_000;
+/// hold 中に B (免許証) と F (交通系) を打つ間隔。車検証の上に重ねたカードを読むため
+const CARINS_HOLD_RESCAN_MS: u64 = 500;
+
+/// 読み終えた (または読み損ねた) 電子車検証を、**載っている間は読み直さない**ための控え。
+///
+/// 載せたまま毎周 ISO-DEP を開いて File 03 を読み直すと、1 周が数百 ms 伸びて
+/// 確定窓・再タップの区切り・免許証の B 窓がすべて遅れる (離して再タップしても
+/// 前のタップにまとめられる)。hold 中は A (UID の応答だけ) で「まだ載っているか」を見て、
+/// B / F は [`CARINS_HOLD_RESCAN_MS`] に 1 回だけ打つ。解く条件は 3 つ:
+/// A が [`CARINS_HOLD_RELEASE_MS`] 同じ uid で応答しない / A が別の uid を返した /
+/// B か F でカードが読めた
+struct CarinsHold {
+    /// A (`poll_nfca_uid`) が返した uid
+    uid: String,
+    /// A が最後にこの uid で応答した時刻
+    last_seen: u64,
+    /// hold 中に B / F を最後に打った時刻
+    rescanned_at: u64,
+}
+
+impl CarinsHold {
+    fn new(uid: String, now: u64) -> Self {
+        Self { uid, last_seen: now, rescanned_at: now }
+    }
+
+    /// B / F を打つ周か。打つなら時刻を控える
+    fn rescan_due(&mut self, now: u64) -> bool {
+        if now.saturating_sub(self.rescanned_at) < CARINS_HOLD_RESCAN_MS {
+            return false;
+        }
+        self.rescanned_at = now;
+        true
+    }
+}
 
 /// Type-A ISO-DEP セッションの RAII ガード。`Drop` で必ず閉じる —
-/// DESFire の「選択中アプリ」は活性化セッションに紐づくので、probe の途中で
+/// DESFire の「選択中アプリ」は活性化セッションに紐づくので、読み取りの途中で
 /// 抜けてもカードを ACTIVE のまま残さない
 struct IsoDepA;
 
@@ -725,7 +770,7 @@ impl Drop for IsoDepA {
     }
 }
 
-/// EVT 行に出す rc トークン (DESFire の `91 xx` の xx、または shim の rc)
+/// EVT 行に出す rc トークン (DESFire の `91 xx` の xx)
 fn carins_rc(st: desfire::Status) -> String {
     match st {
         desfire::Status::Ok => "00".to_string(),
@@ -736,225 +781,87 @@ fn carins_rc(st: desfire::Status) -> String {
     }
 }
 
+/// 1 コマンドの往復の失敗
+enum Exchange {
+    /// カードが status で断った (応答は届いている)
+    Refused(desfire::Status),
+    /// 応答が届かない / 時間切れ (rc トークン)
+    Link(String),
+}
+
+impl Exchange {
+    fn rc(self) -> String {
+        match self {
+            Exchange::Refused(st) => carins_rc(st),
+            Exchange::Link(rc) => rc,
+        }
+    }
+}
+
 /// 1 コマンドを送り、`91 AF` で切れていれば `90 AF` を送って継ぎ足す
-/// (`IsoDEP::transceiveAPDU` は `61xx`/`6Cxx` しか追従しない)。
-/// `Ok((データ部, フレーム数))` / `Err(rc トークン)`
-fn carins_exchange(
-    session: &IsoDepA,
-    cmd: &[u8],
-    deadline: u64,
-    step: &str,
-) -> Result<(Vec<u8>, u32), String> {
+/// (`IsoDEP::transceiveAPDU` は `61xx`/`6Cxx` しか追従しない)。`Ok(データ部)`
+fn carins_exchange(session: &IsoDepA, cmd: &[u8], deadline: u64) -> Result<Vec<u8>, Exchange> {
     let mut out = [0u8; CARINS_RX_CAP];
     let mut acc: Vec<u8> = Vec::new();
-    let mut frames = 0u32;
     let mut next = cmd.to_vec();
     loop {
         if now_ms() > deadline {
-            evtlog::emit(&format!("EVT CARINS_DEADLINE step={step}"));
-            return Err("deadline".to_string());
+            return Err(Exchange::Link("deadline".to_string()));
         }
-        let n = match session.transceive(&next, &mut out) {
-            Ok(n) => n,
-            Err(rc) => return Err(format!("s{rc}")),
-        };
-        frames += 1;
-        // 生ダンプはシリアルのみ (リングには載らない)。⚠ 本文に貼らないこと
-        log::info!("carins probe: {step} rx={}", desfire::hex_upper(&out[..n]));
+        let n = session
+            .transceive(&next, &mut out)
+            .map_err(|rc| Exchange::Link(format!("s{rc}")))?;
         match desfire::accumulate(&mut acc, &out[..n]) {
-            desfire::ReadStep::Done(data) => return Ok((data, frames)),
+            desfire::ReadStep::Done(data) => return Ok(data),
             desfire::ReadStep::NeedMore => next = desfire::additional_frame(),
-            desfire::ReadStep::Failed(st) => return Err(carins_rc(st)),
+            desfire::ReadStep::Failed(st) => return Err(Exchange::Refused(st)),
         }
     }
 }
 
-/// `ReadData` の中身を**値を出さずに**形だけ書く。UTF-8 として読めたら
-/// `/` 区切りの各フィールドを「文字クラス (d=数字 / a=英数 / x=その他) + 長さ」で、
-/// 読めなければ非 0 バイト数だけを返す (先頭バイトも出さない)
-fn carins_shape(data: &[u8]) -> String {
-    let end = data
-        .iter()
-        .rposition(|&b| b != 0x00 && b != 0xFF)
-        .map_or(0, |i| i + 1);
-    match core::str::from_utf8(&data[..end]) {
-        Ok(s) => {
-            let fields: Vec<String> = s
-                .split('/')
-                .map(|f| {
-                    let f = f.trim();
-                    let class = if f.chars().all(|c| c.is_ascii_digit()) {
-                        'd'
-                    } else if f.chars().all(|c| c.is_ascii_alphanumeric()) {
-                        'a'
-                    } else {
-                        'x'
-                    };
-                    format!("{class}{}", f.chars().count())
-                })
-                .collect();
-            format!("utf8=1 fields={}", fields.join("/"))
-        }
-        Err(_) => format!(
-            "utf8=0 nonzero={}",
-            data.iter().filter(|&&b| b != 0).count()
-        ),
-    }
+/// [`read_carins_mgmt`] が管理番号を返せなかった理由
+enum CarinsRead {
+    /// ISO-DEP のセッションを開けない (NTAG 等の UID だけのタグ) → NFC-A UID として扱う
+    NotIsoDep,
+    /// ISO-DEP だが、登録車・軽のどちらのアプリもカードが断った → NFC-A UID として扱う
+    NotCarins,
+    /// 電子車検証として読めなかった (途中で応答が切れた / File 03 が読めない・形が違う)。
+    /// rc トークン (値を含まない) を `EVT NFC_CARINS rc=` で PC へ出し、再タップを促す
+    Failed(String),
 }
 
-/// 同じ UID には [`CARINS_PROBE_INTERVAL_MS`] に 1 回だけ probe を打つ
-fn probe_carins_if_due(uid: &str, last: &mut Option<(String, u64)>, status: &SharedStatus) {
-    let now = now_ms();
-    if let Some((prev_uid, at)) = last.as_ref() {
-        if prev_uid == uid && now.saturating_sub(*at) < CARINS_PROBE_INTERVAL_MS {
-            return;
-        }
-    }
-    *last = Some((uid.to_string(), now));
-    probe_carins(status);
-}
-
-/// 構造 probe 本体。手順の分岐 (AID の候補 / ファイルの探索) は実測が出れば
-/// 定数に畳まれて消えるものなので、純粋関数へ切り出さず直線で書く
-fn probe_carins(status: &SharedStatus) {
-    let deadline = now_ms() + CARINS_PROBE_DEADLINE_MS;
-
+/// 電子車検証の File 03 を読む: ISO-DEP を開く → SELECT F33011 (断られたら F33018) →
+/// ReadData(03) → [`desfire::parse_mgmt_record`]
+fn read_carins_mgmt() -> Result<desfire::MgmtRecord, CarinsRead> {
+    let deadline = now_ms() + CARINS_READ_DEADLINE_MS;
     let mut ats = [0u8; 64];
-    let (session, ats_len) = match IsoDepA::open(&mut ats) {
-        Ok(v) => v,
-        Err(rc) => {
-            evtlog::emit(&format!("EVT CARINS_PROBE rc=s{rc}"));
-            return;
-        }
-    };
-    evtlog::emit(&format!(
-        "EVT CARINS_PROBE ats={}",
-        desfire::hex_upper(&ats[..ats_len])
-    ));
-    push_event(status, "電子車検証 構造 probe");
-
-    // 1) AID 一覧。取れなければ候補 2 つを順に試す
-    let aids = match carins_exchange(&session, &desfire::get_application_ids(), deadline, "apps") {
-        Ok((data, _)) => match desfire::parse_application_ids(&data) {
-            Ok(v) => {
-                let list: Vec<String> = v.iter().map(|a| desfire::hex_upper(a)).collect();
-                evtlog::emit(&format!("EVT CARINS_APPS rc=00 aids={}", list.join(",")));
-                v
-            }
-            Err(e) => {
-                evtlog::emit(&format!("EVT CARINS_APPS rc=00 aids=err{e:?}"));
-                Vec::new()
-            }
-        },
-        Err(rc) => {
-            evtlog::emit(&format!("EVT CARINS_APPS rc={rc}"));
-            Vec::new()
-        }
-    };
-    if now_ms() > deadline {
-        return;
-    }
-
-    // 2) 選ぶ AID。一覧に既知の候補があればそれ、無ければ一覧の先頭、
-    //    一覧が取れていなければ F33011 → F33018 の順に試す
-    let candidates: Vec<[u8; 3]> = if aids.contains(&desfire::AID_REGISTERED) {
-        vec![desfire::AID_REGISTERED]
-    } else if aids.contains(&desfire::AID_KEI) {
-        vec![desfire::AID_KEI]
-    } else if let Some(first) = aids.first() {
-        vec![*first]
-    } else {
-        vec![desfire::AID_REGISTERED, desfire::AID_KEI]
-    };
+    let (session, _) = IsoDepA::open(&mut ats).map_err(|_| CarinsRead::NotIsoDep)?;
 
     let mut selected = false;
-    for aid in candidates {
-        let hex = desfire::hex_upper(&aid);
-        match carins_exchange(&session, &desfire::select_application(aid), deadline, "select") {
+    for aid in [desfire::AID_REGISTERED, desfire::AID_KEI] {
+        match carins_exchange(&session, &desfire::select_application(aid), deadline) {
             Ok(_) => {
-                evtlog::emit(&format!("EVT CARINS_SELECT aid={hex} rc=00"));
                 selected = true;
                 break;
             }
-            Err(rc) => evtlog::emit(&format!("EVT CARINS_SELECT aid={hex} rc={rc}")),
-        }
-        if now_ms() > deadline {
-            return;
+            // このアプリは無い。次の候補へ
+            Err(Exchange::Refused(_)) => {}
+            // 応答が切れた / 時間切れ。電子車検証の読み損ないかもしれないので
+            // NFC-A UID (= 打刻) に落とさず、再タップを促す側に倒す
+            Err(Exchange::Link(rc)) => return Err(CarinsRead::Failed(rc)),
         }
     }
     if !selected {
-        return;
+        return Err(CarinsRead::NotCarins);
     }
 
-    // 3) ファイル一覧
-    let files = match carins_exchange(&session, &desfire::get_file_ids(), deadline, "files") {
-        Ok((data, _)) => {
-            let ids = desfire::parse_file_ids(&data);
-            let list: Vec<String> = ids.iter().map(|f| format!("{f:02X}")).collect();
-            evtlog::emit(&format!("EVT CARINS_FILES rc=00 ids={}", list.join(",")));
-            ids
-        }
-        Err(rc) => {
-            evtlog::emit(&format!("EVT CARINS_FILES rc={rc}"));
-            return;
-        }
-    };
-
-    // 4) 各ファイルの設定。平文かつ free read の最初のものを控えておく
-    let mut plain_free: Option<u8> = None;
-    for &f in files.iter().take(CARINS_MAX_FILES) {
-        if now_ms() > deadline {
-            evtlog::emit("EVT CARINS_DEADLINE step=settings");
-            return;
-        }
-        match carins_exchange(&session, &desfire::get_file_settings(f), deadline, "settings") {
-            Ok((data, _)) => match desfire::parse_file_settings(&data) {
-                Ok(fs) => {
-                    evtlog::emit(&format!(
-                        "EVT CARINS_FILE file={f:02X} rc=00 type={:02X} comm={:02X} rights={:04X} size={}",
-                        fs.file_type,
-                        fs.comm_mode(),
-                        fs.access_rights,
-                        fs.file_size
-                    ));
-                    if plain_free.is_none() && fs.is_plain() && fs.is_free_read() {
-                        plain_free = Some(f);
-                    }
-                }
-                Err(e) => evtlog::emit(&format!("EVT CARINS_FILE file={f:02X} rc=00 parse={e:?}")),
-            },
-            Err(rc) => evtlog::emit(&format!("EVT CARINS_FILE file={f:02X} rc={rc}")),
-        }
-    }
-
-    // 5) 03 があればそれ、無ければ平文 free read の最初のファイルを読む
-    let target = if files.contains(&desfire::FILE_NO_MGMT) {
-        Some(desfire::FILE_NO_MGMT)
-    } else {
-        plain_free
-    };
-    let Some(file_no) = target else {
-        return;
-    };
-    if now_ms() > deadline {
-        evtlog::emit("EVT CARINS_DEADLINE step=read");
-        return;
-    }
-    match carins_exchange(&session, &desfire::read_data(file_no, 0, 0), deadline, "read") {
-        Ok((data, frames)) => {
-            // ⚠ この 1 行に実在する車両の管理番号が入る。シリアルのみ・本文に貼らない
-            log::info!(
-                "carins probe: read file={file_no:02X} hex={}",
-                desfire::hex_upper(&data)
-            );
-            evtlog::emit(&format!(
-                "EVT CARINS_READ file={file_no:02X} rc=00 len={} frames={frames} {}",
-                data.len(),
-                carins_shape(&data)
-            ));
-        }
-        Err(rc) => evtlog::emit(&format!("EVT CARINS_READ file={file_no:02X} rc={rc}")),
-    }
+    let data = carins_exchange(
+        &session,
+        &desfire::read_data(desfire::FILE_NO_MGMT, 0, 0),
+        deadline,
+    )
+    .map_err(|e| CarinsRead::Failed(e.rc()))?;
+    desfire::parse_mgmt_record(&data).map_err(|e| CarinsRead::Failed(format!("parse{e:?}")))
 }
 
 /// B (免許証) を 1 回読み、読めたら gate に載せる。戻り値は shim の rc (0 = 読了)。
@@ -1086,9 +993,11 @@ fn deliver(outcome: TapOutcome<NfcEvent>, status: &SharedStatus, sink: &mut impl
             log::info!("NFC IDm={idm}");
             push_event(status, &format!("NFC IDm={idm}"));
         }
-        NfcEvent::CarInspection { uid } => {
-            log::info!("電子車検証 検知 (UID={uid})");
+        NfcEvent::CarInspection { cert_no, vehicle_id } => {
             push_event(status, "電子車検証 検知");
+            // ホストへ番号を渡す (PC が点呼の記録に載せる)。**値の出口はこの println だけ** —
+            // リング・PWALOG・遠隔ログ・イベントログには値を出さない (public repo、実在の車両)
+            println!("EVT NFC_CARINS mgno={cert_no} carid={vehicle_id}");
         }
         NfcEvent::NfcaUid { uid } => {
             log::info!("NFC-A UID={uid}");
