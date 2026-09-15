@@ -66,7 +66,7 @@ type MeasTx = Arc<Mutex<Sender<Measurement>>>;
 const HEALTH_THERMOMETER_SERVICE: u16 = 0x1809;
 const BLOOD_PRESSURE_SERVICE: u16 = 0x1810;
 const TEMPERATURE_MEASUREMENT: u16 = 0x2A1C;
-const BLOOD_PRESSURE_MEASUREMENT: u16 = 0x2A35;
+pub(crate) const BLOOD_PRESSURE_MEASUREMENT: u16 = 0x2A35;
 
 // スキャンを連続化して隙間を無くす。ニプロ機器は測定後の短時間しか広告
 // しないため、隙間があると取り逃す。5 秒ごとに coex/再ペアリング要求を確認し、
