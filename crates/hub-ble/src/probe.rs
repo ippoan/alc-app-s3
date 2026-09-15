@@ -5,15 +5,20 @@
 //! scan / connect / bond は lib.rs の本番経路をそのまま通し、ここは「見えたものを出す」
 //! だけに留める。**書き込みは一切しない** (unlock 鍵を含む)。
 //!
+//! 順番は「先に bond してから購読する」— 購読だけでは暗号化されず、機器が
+//! 暗号化前に書いた CCCD を受け付けていない疑いがあるため (#c237-1 の実測)。
+//!
 //! 出力は全部 `PROBE ` で始まる 1 行 (grep で拾う):
 //!
 //! ```text
+//! PROBE BOND stage=pre_subscribe result=Ok|Err(..)
+//! PROBE BOND stage=pre_subscribe bonded=.. encrypted=.. authenticated=..
 //! PROBE ADV addr=.. type=.. rssi=.. name=.. svc=[..] mfg=<hex>
 //! PROBE GATT svc=.. chr=.. props=read|write|write_no_rsp|notify|indicate
 //! PROBE SUB chr=.. kind=notify|indicate result=Ok|Err(..)
-//! PROBE RX chr=.. hex=..
 //! PROBE BOND stage=after_subscribe bonded=.. encrypted=.. authenticated=..
-//! PROBE BOND stage=explicit result=Ok|Err(..)
+//! PROBE RX chr=.. hex=..
+//! PROBE BP parsed=Some(..)|None
 //! PROBE DISCONNECT stage=.. reason=..
 //! PROBE DONE bls=true|false
 //! ```
@@ -32,10 +37,8 @@ use esp_idf_svc::hal::delay::FreeRtos;
 
 /// HEM-6231T を含む Omron の BLE 機器が広告で使う名前の接頭辞
 const NAME_PREFIX: &str = "BLEsmart_";
-/// 購読してから bond の状態を読むまでの待ち (機器側の Security Request を待つ)
-const BOND_WAIT_MS: u64 = 5_000;
 /// 購読してから切断するまでの受信時間
-const RX_TOTAL_MS: u64 = 20_000;
+const RX_TOTAL_MS: u64 = 60_000;
 
 /// 1 回の scan 窓の中で出したアドレス。窓 (SCAN_DURATION_MS) を過ぎたら忘れる
 static ADV_SEEN: Mutex<(u64, Vec<(BLEAddress, bool)>)> = Mutex::new((0, Vec::new()));
@@ -93,10 +96,9 @@ pub fn match_name(name: &str) -> bool {
 #[derive(Clone, Copy)]
 #[repr(u8)]
 enum Stage {
-    Discover = 0,
+    Bond = 0,
+    Discover,
     Subscribe,
-    WaitBond,
-    Explicit,
     Receive,
     Done,
 }
@@ -104,21 +106,19 @@ enum Stage {
 impl Stage {
     fn name(v: u8) -> &'static str {
         match v {
-            0 => "discover",
-            1 => "subscribe",
-            2 => "wait_bond",
-            3 => "explicit",
-            4 => "receive",
+            0 => "bond",
+            1 => "discover",
+            2 => "subscribe",
+            3 => "receive",
             _ => "done",
         }
     }
 }
 
-/// connect 成功直後に呼ぶ: GATT 列挙 → notify/indicate を全部購読 → bond を待つ →
-/// (暗号化されていなければ) 明示の secure_connection を 1 回 → 受信して切断。
-/// 受信があったかを返す (handle_device と同じ意味)
+/// connect 成功直後に呼ぶ: 先に bond → GATT 列挙 → notify/indicate を全部購読 →
+/// 受信して切断。受信があったかを返す (handle_device と同じ意味)
 pub async fn inspect(client: &mut BLEClient) -> Result<bool> {
-    let stage = Arc::new(AtomicU8::new(Stage::Discover as u8));
+    let stage = Arc::new(AtomicU8::new(Stage::Bond as u8));
     // handle_device の on_disconnect を置き換える (probe では inspect から戻らない)
     {
         let stage = Arc::clone(&stage);
@@ -137,11 +137,18 @@ pub async fn inspect(client: &mut BLEClient) -> Result<bool> {
         });
     };
 
+    // 1. GATT 列挙より前に、先に bond する (購読だけでは暗号化されない機器がいる)
+    let res = client.secure_connection().await;
+    println!("PROBE BOND stage=pre_subscribe result={res:?}");
+    log_desc("pre_subscribe", client);
+
     let got_rx = Arc::new(AtomicU8::new(0));
     let mut bls = false;
     let bls_uuid = BleUuid::from_uuid16(crate::BLOOD_PRESSURE_SERVICE);
+    let bpm_uuid = BleUuid::from_uuid16(crate::BLOOD_PRESSURE_MEASUREMENT);
 
-    // 1-2. 列挙しながら notify/indicate を全部購読する (ディスカバリはキャッシュされるので 1 回)
+    // 2-3. 列挙しながら notify/indicate を全部購読する (ディスカバリはキャッシュされるので 1 回)
+    set_stage(Stage::Discover);
     match client.get_services().await {
         Ok(services) => {
             let services: Vec<_> = services.collect();
@@ -178,12 +185,17 @@ pub async fn inspect(client: &mut BLEClient) -> Result<bool> {
                     if !(chr.can_notify() || chr.can_indicate()) || disconnected() {
                         continue;
                     }
+                    let is_bpm = chr_uuid == bpm_uuid;
                     {
                         let got_rx = Arc::clone(&got_rx);
                         // nimble_host タスク上で走る — 16 進にして 1 行出すだけ
                         chr.on_notify(move |raw| {
                             got_rx.store(1, Ordering::SeqCst);
                             println!("PROBE RX chr={chr_uuid} hex={}", hex(raw));
+                            if is_bpm {
+                                let parsed = alc_hub_core::ieee11073::parse_blood_pressure(raw);
+                                println!("PROBE BP parsed={parsed:?}");
+                            }
                         });
                     }
                     let (kind, res) = if chr.can_indicate() {
@@ -198,23 +210,12 @@ pub async fn inspect(client: &mut BLEClient) -> Result<bool> {
         Err(e) => println!("PROBE GATT svc=- chr=- props=Err({e:?})"),
     }
 
-    // 3. 購読から BOND_WAIT_MS 待ってから bond の状態を読む
-    set_stage(Stage::WaitBond);
-    let sub_at = now_ms();
-    wait_until(sub_at + BOND_WAIT_MS, &disconnected);
-    let encrypted = log_desc("after_subscribe", client);
+    // 4. 購読がすべて終わった時点の bond の状態を 1 回だけ出す (待たない)
+    log_desc("after_subscribe", client);
 
-    // 4. 暗号化されていなければ、明示の secure_connection を最後の手段として 1 回だけ
-    if !encrypted && !disconnected() {
-        set_stage(Stage::Explicit);
-        let res = client.secure_connection().await;
-        println!("PROBE BOND stage=explicit result={res:?}");
-        log_desc("explicit", client);
-    }
-
-    // 5. 購読から合計 RX_TOTAL_MS 受信して切断する
+    // 5. ここから RX_TOTAL_MS 受信して切断する
     set_stage(Stage::Receive);
-    wait_until(sub_at + RX_TOTAL_MS, &disconnected);
+    wait_until(now_ms() + RX_TOTAL_MS, &disconnected);
     if !disconnected() {
         set_stage(Stage::Done);
         let _ = client.disconnect();
