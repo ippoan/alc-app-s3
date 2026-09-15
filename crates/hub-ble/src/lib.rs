@@ -72,8 +72,14 @@ const HEALTH_THERMOMETER_SERVICE: u16 = 0x1809;
 const BLOOD_PRESSURE_SERVICE: u16 = 0x1810;
 const TEMPERATURE_MEASUREMENT: u16 = 0x2A1C;
 const BLOOD_PRESSURE_MEASUREMENT: u16 = 0x2A35;
-const CURRENT_TIME_SERVICE: u16 = 0x1805;
 const CURRENT_TIME: u16 = 0x2A2B;
+// GATT の属性型 (Find Information で見える UUID)
+const GATT_PRIMARY_SERVICE: u16 = 0x2800;
+const GATT_SECONDARY_SERVICE: u16 = 0x2801;
+const GATT_CHARACTERISTIC: u16 = 0x2803;
+const GATT_CCCD: u16 = 0x2902;
+/// NimBLE の GATT 手順 (探索・CCCD 書き込み) 1 本の待ちの上限
+const OMRON_GATT_OP_TIMEOUT_MS: u64 = 5_000;
 
 /// Omron の company id (Bluetooth SIG)。本体の広告のメーカーデータに載る
 const OMRON_COMPANY_ID: u16 = 0x020E;
@@ -407,6 +413,8 @@ async fn handle_device(
             Err(e) => return Err(e).context("接続失敗 (リトライ上限)"),
         }
     }
+    // 接続確立の時刻 (EVT の t= の基準)。early start なら接続を見つけた時刻
+    let connected_at = early_enc.map_or_else(now_ms, |e| e.connected_at);
 
     match omron {
         Some(OmronAdv::Pairing) => {
@@ -522,8 +530,9 @@ async fn handle_device(
         // Omron 機は 0x2A35 だけの購読では記録を送らない。Linux で記録が届いた回と同じく、
         // 全 service の notify / indicate を GATT の並び順に全部購読する
         // (0x2A35 には上の受信コールバックが付いている)
-        let n = omron_subscribe_all(client, &disconnected).await?;
-        alc_hub_common::evtlog::emit(&format!("EVT OMRON_SUB n={n}"));
+        let n = omron_subscribe_all(client, &disconnected, connected_at).await?;
+        let t = now_ms().saturating_sub(connected_at);
+        alc_hub_common::evtlog::emit(&format!("EVT OMRON_SUB n={n} t={t}"));
     } else if characteristic.can_indicate() {
         characteristic
             .subscribe_indicate(cccd_response)
@@ -939,53 +948,33 @@ fn wait_omron_ack(
 }
 
 /// Omron 機の notify / indicate を全部 Write Request で購読する。購読できた数を返す
-/// (失敗した 1 本は飛ばす)。順番は固定: 0x2A35 → 他の service (並び順) → 0x2A2B を最後。
+/// (失敗した 1 本は飛ばす)。順番は固定: 0x2A35 → 他 (ハンドル順) → 0x2A2B を最後。
 /// Linux で記録が届いた接続は 0x2A35 の CCCD を 0x2A2B より先に書いていて、逆順 (ESP32 の
 /// ハンドル順) の接続では 0x2A2B の notify すら来なかった。機器は 0x2A2B の購読を送信開始の
 /// 合図にしていて、そのとき 0x2A35 が未購読だと何も送らないと読める (Refs #237)。
-/// 1 本ごとに `EVT OMRON_SUB chr=<uuid> ok|err` を出す
-async fn omron_subscribe_all(client: &mut BLEClient, disconnected: &Disconnected) -> Result<usize> {
-    fn log_sub(uuid: BleUuid, res: &Result<(), esp32_nimble::BLEError>) -> usize {
-        let ok = match res {
-            Ok(()) => true,
-            Err(e) => {
-                log::warn!("ble: Omron {uuid} の購読失敗: {e:?}");
-                false
-            }
-        };
-        let result = if ok { "ok" } else { "err" };
-        alc_hub_common::evtlog::emit(&format!("EVT OMRON_SUB chr={uuid} {result}"));
-        usize::from(ok)
-    }
-
-    let bls_uuid = BleUuid::from_uuid16(BLOOD_PRESSURE_SERVICE);
+///
+/// 書き込みは続けて行う: esp32-nimble の subscribe は 1 本ごとに characteristic と descriptor を
+/// 探索し直し、14 本に約 4 秒かかった (Linux は 0.7 秒)。そこで探索を先に 1 回で済ませる —
+/// esp32-nimble の characteristic 列挙 (property と受信の閉包のため) と、全ハンドル範囲の
+/// Find Information 1 回 (値ハンドルと CCCD のハンドルのため) — そのあと CCCD を NimBLE に直接、
+/// Write Request で続けて書く。1 本ごとに `EVT OMRON_SUB chr=<uuid> ok|err t=<接続からの ms>` を出す
+async fn omron_subscribe_all(
+    client: &mut BLEClient,
+    disconnected: &Disconnected,
+    connected_at: u64,
+) -> Result<usize> {
     let bpm_uuid = BleUuid::from_uuid16(BLOOD_PRESSURE_MEASUREMENT);
-    let cts_uuid = BleUuid::from_uuid16(CURRENT_TIME_SERVICE);
     let ct_uuid = BleUuid::from_uuid16(CURRENT_TIME);
-    disconnected
+
+    // 1. characteristic の列挙 (service ごと、esp32-nimble がキャッシュする)。notify / indicate を
+    // 持つものの (uuid, indicate か) を控え、0x2A35 以外に受信の閉包を付ける
+    // (0x2A35 は handle_device が付けた受信コールバックを残す)
+    let props = disconnected
         .until(async {
-            let mut n = 0;
-
-            // 1. 0x2A35 を最初に (on_notify は handle_device が付けた受信コールバックを残す)
-            let res = async {
-                client
-                    .get_service(bls_uuid)
-                    .await?
-                    .get_characteristic(bpm_uuid)
-                    .await?
-                    .subscribe_indicate(true)
-                    .await
-            }
-            .await;
-            n += log_sub(bpm_uuid, &res);
-
-            // 2. 0x1810 と 0x1805 以外を並び順に
+            let mut props: Vec<(BleUuid, bool)> = Vec::new();
             let services: Vec<_> = client.get_services().await?.collect();
             for svc in services {
                 let svc_uuid = svc.uuid();
-                if svc_uuid == bls_uuid || svc_uuid == cts_uuid {
-                    continue;
-                }
                 let chars = match svc.get_characteristics().await {
                     Ok(chars) => chars,
                     Err(e) => {
@@ -998,33 +987,203 @@ async fn omron_subscribe_all(client: &mut BLEClient, disconnected: &Disconnected
                         continue;
                     }
                     let chr_uuid = chr.uuid();
-                    chr.on_notify(move |raw| log_omron_rx(chr_uuid, raw));
-                    let res = if chr.can_indicate() {
-                        chr.subscribe_indicate(true).await
-                    } else {
-                        chr.subscribe_notify(true).await
-                    };
-                    n += log_sub(chr_uuid, &res);
+                    if chr_uuid != bpm_uuid {
+                        chr.on_notify(move |raw| log_omron_rx(chr_uuid, raw));
+                    }
+                    props.push((chr_uuid, chr.can_indicate()));
                 }
             }
-
-            // 3. 0x2A2B を最後に
-            let res = async {
-                client
-                    .get_service(cts_uuid)
-                    .await?
-                    .get_characteristic(ct_uuid)
-                    .await?
-                    .on_notify(move |raw| log_omron_rx(ct_uuid, raw))
-                    .subscribe_notify(true)
-                    .await
-            }
-            .await;
-            n += log_sub(ct_uuid, &res);
-
-            anyhow::Ok(n)
+            anyhow::Ok(props)
         })
-        .await?
+        .await??;
+
+    // 2. 全ハンドル範囲の Find Information 1 回で、各 characteristic の CCCD のハンドルを得る
+    let conn_handle = client.desc().context("接続が無い")?.conn_handle();
+    let attrs = gatt_find_information(conn_handle, disconnected)?;
+    let cccds = cccd_handles(&attrs);
+
+    // 3. 順番を決める: 0x2A35 → 他 (ハンドル順) → 0x2A2B
+    let mut targets: Vec<(BleUuid, u16)> = Vec::new();
+    targets.extend(cccds.iter().filter(|(u, _)| *u == bpm_uuid));
+    targets.extend(
+        cccds
+            .iter()
+            .filter(|(u, _)| *u != bpm_uuid && *u != ct_uuid),
+    );
+    targets.extend(cccds.iter().filter(|(u, _)| *u == ct_uuid));
+
+    // 4. CCCD を続けて書く (indicate を持つものは 02 00、notify だけなら 01 00)
+    let mut n = 0;
+    for (uuid, cccd) in targets {
+        let Some(&(_, indicate)) = props.iter().find(|(u, _)| *u == uuid) else {
+            continue;
+        };
+        let value: [u8; 2] = if indicate { [0x02, 0x00] } else { [0x01, 0x00] };
+        let res = gatt_write(conn_handle, cccd, &value, disconnected);
+        let t = now_ms().saturating_sub(connected_at);
+        let result = match &res {
+            Ok(()) => {
+                n += 1;
+                "ok"
+            }
+            Err(e) => {
+                log::warn!("ble: Omron {uuid} の購読失敗: {e:?}");
+                "err"
+            }
+        };
+        alc_hub_common::evtlog::emit(&format!("EVT OMRON_SUB chr={uuid} {result} t={t}"));
+        if disconnected.is_set() {
+            anyhow::bail!("切断された");
+        }
+    }
+    Ok(n)
+}
+
+/// Find Information の結果 (属性ハンドル, 型 UUID) の並びから、characteristic の値の UUID と
+/// その最初の CCCD のハンドルを並び順に取り出す。値の属性は宣言 (0x2803) の直後に来て、
+/// その型 UUID が characteristic の UUID になる
+fn cccd_handles(attrs: &[(u16, BleUuid)]) -> Vec<(BleUuid, u16)> {
+    let decl = BleUuid::from_uuid16(GATT_CHARACTERISTIC);
+    let primary = BleUuid::from_uuid16(GATT_PRIMARY_SERVICE);
+    let secondary = BleUuid::from_uuid16(GATT_SECONDARY_SERVICE);
+    let cccd = BleUuid::from_uuid16(GATT_CCCD);
+    let mut out = Vec::new();
+    let mut after_decl = false;
+    let mut current: Option<BleUuid> = None;
+    for &(handle, uuid) in attrs {
+        if uuid == decl {
+            after_decl = true;
+            current = None;
+        } else if uuid == primary || uuid == secondary {
+            after_decl = false;
+            current = None;
+        } else if after_decl {
+            after_decl = false;
+            current = Some(uuid);
+        } else if uuid == cccd {
+            if let Some(value_uuid) = current.take() {
+                out.push((value_uuid, handle));
+            }
+        }
+    }
+    out
+}
+
+/// NimBLE の GATT 手順 1 本の結果を nimble_host タスクから受け取る場所
+struct GattOp {
+    /// 完了時の status (GATT_OP_PENDING = 進行中)
+    status: AtomicU32,
+    /// Find Information で見えた属性 (ハンドル, 型 UUID)
+    attrs: Mutex<Vec<(u16, BleUuid)>>,
+}
+
+const GATT_OP_PENDING: u32 = u32::MAX;
+
+impl GattOp {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            status: AtomicU32::new(GATT_OP_PENDING),
+            attrs: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// 手順の完了を待つ。切断・時間切れなら Err。時間切れのときは NimBLE があとで
+    /// callback を呼んでも壊れないよう、Arc を 1 つ手放さずに残す
+    fn wait(op: &Arc<Self>, disconnected: &Disconnected) -> Result<()> {
+        let start = now_ms();
+        loop {
+            match op.status.load(Ordering::SeqCst) {
+                GATT_OP_PENDING => {}
+                0 => return Ok(()),
+                st if st == esp_idf_svc::sys::BLE_HS_EDONE => return Ok(()),
+                st => anyhow::bail!("GATT 手順の失敗 status={st}"),
+            }
+            if disconnected.is_set() || now_ms().saturating_sub(start) >= OMRON_GATT_OP_TIMEOUT_MS {
+                std::mem::forget(Arc::clone(op));
+                anyhow::bail!("GATT 手順の打ち切り (切断または時間切れ)");
+            }
+            FreeRtos::delay_ms(2);
+        }
+    }
+}
+
+/// 全ハンドル範囲 (0x0001〜0xFFFF) に Find Information を 1 回かけ、属性の並びを返す
+fn gatt_find_information(
+    conn_handle: u16,
+    disconnected: &Disconnected,
+) -> Result<Vec<(u16, BleUuid)>> {
+    unsafe extern "C" fn cb(
+        _conn_handle: u16,
+        error: *const esp_idf_svc::sys::ble_gatt_error,
+        _chr_val_handle: u16,
+        dsc: *const esp_idf_svc::sys::ble_gatt_dsc,
+        arg: *mut core::ffi::c_void,
+    ) -> core::ffi::c_int {
+        let op = unsafe { &*(arg as *const GattOp) };
+        let status = unsafe { (*error).status };
+        if status == 0 && !dsc.is_null() {
+            let dsc = unsafe { &*dsc };
+            if let Ok(mut attrs) = op.attrs.lock() {
+                attrs.push((dsc.handle, BleUuid::from(dsc.uuid)));
+            }
+        } else {
+            op.status.store(u32::from(status), Ordering::SeqCst);
+        }
+        0
+    }
+
+    let op = GattOp::new();
+    let rc = unsafe {
+        esp_idf_svc::sys::ble_gattc_disc_all_dscs(
+            conn_handle,
+            0,
+            0xFFFF,
+            Some(cb),
+            Arc::as_ptr(&op) as *mut core::ffi::c_void,
+        )
+    };
+    if rc != 0 {
+        anyhow::bail!("Find Information を始められない rc={rc}");
+    }
+    GattOp::wait(&op, disconnected)?;
+    let attrs = op.attrs.lock().map(|a| a.clone()).unwrap_or_default();
+    Ok(attrs)
+}
+
+/// 属性に Write Request で書き、応答を待つ
+fn gatt_write(
+    conn_handle: u16,
+    handle: u16,
+    value: &[u8],
+    disconnected: &Disconnected,
+) -> Result<()> {
+    unsafe extern "C" fn cb(
+        _conn_handle: u16,
+        error: *const esp_idf_svc::sys::ble_gatt_error,
+        _attr: *mut esp_idf_svc::sys::ble_gatt_attr,
+        arg: *mut core::ffi::c_void,
+    ) -> core::ffi::c_int {
+        let op = unsafe { &*(arg as *const GattOp) };
+        op.status
+            .store(u32::from(unsafe { (*error).status }), Ordering::SeqCst);
+        0
+    }
+
+    let op = GattOp::new();
+    let rc = unsafe {
+        esp_idf_svc::sys::ble_gattc_write_flat(
+            conn_handle,
+            handle,
+            value.as_ptr().cast(),
+            value.len() as u16,
+            Some(cb),
+            Arc::as_ptr(&op) as *mut core::ffi::c_void,
+        )
+    };
+    if rc != 0 {
+        anyhow::bail!("書き込みを始められない rc={rc}");
+    }
+    GattOp::wait(&op, disconnected)
 }
 
 /// Omron 機から届いた notify / indicate を serial に 1 行出す。nimble_host タスク上で
