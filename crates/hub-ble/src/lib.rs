@@ -39,6 +39,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
+use std::time::Duration;
 
 use alc_hub_core::{
     device::{match_device_name, omron_adv, DeviceKind, OmronAdv},
@@ -51,6 +52,7 @@ use esp32_nimble::{
     uuid128, BLEAddress, BLEAdvertisedData, BLEAdvertisedDevice, BLEClient, BLEDevice, BLEScan,
 };
 use esp_idf_svc::hal::{delay::FreeRtos, task::block_on};
+use esp_idf_svc::timer::EspTaskTimerService;
 
 use alc_hub_common::control::PairFlag;
 use alc_hub_common::measurement::Measurement;
@@ -92,6 +94,9 @@ const OMRON_ACK_SET_KEY: [u8; 2] = [0x80, 0x00];
 const OMRON_PROGRAM_MODE_TRIES: u32 = 10;
 const OMRON_PROGRAM_MODE_WAIT_MS: u64 = 1_000;
 const OMRON_SET_KEY_WAIT_MS: u64 = 3_000;
+/// Omron 機への secure_connection の上限。保存済みの鍵で暗号化を始めて機器が応じないと、
+/// ENC_CHANGE も切断も来ずに止まる (S3R で実測)
+const OMRON_SECURE_TIMEOUT_MS: u64 = 10_000;
 /// 鍵登録の後始末 (CCCD を 0 に) のあと、切断までに置く時間 (Linux の手順と同じ)
 const OMRON_PAIR_LINGER_MS: u64 = 3_000;
 
@@ -250,6 +255,15 @@ async fn task(
             continue;
         };
 
+        // bond の無い Omron 機の送信広告には接続しない。secure_connection がその場で新しく
+        // ペアリングしてしまい、機器はその bond には記録を送らない (S3R で実測)
+        if omron == Some(OmronAdv::Transfer) && !matches!(omron_find_bond(&adv.addr()), Ok(Some(_)))
+        {
+            alc_hub_common::evtlog::emit("EVT OMRON_ENC nobond");
+            empty_backoff.push((adv.addr(), now_ms()));
+            continue;
+        }
+
         println!("{{\"type\":\"found\",\"device\":\"{}\"}}", kind.json_name());
         // 接続開始を UI へ通知 → 点呼画面のラベル横に取得中スピナーを表示
         let _ = ui_tx.send(UiCommand::BleAcquiring { device: kind });
@@ -392,14 +406,23 @@ async fn handle_device(
             // Omron 機はニプロ機と違い、保存済み bond で先に暗号化しないと 0x2A35 を
             // 送らない (Linux で実測)。時刻 (0x2A2B) は書かない — 書くと記録が独自形式の
             // 別 characteristic に移る
-            match disconnected.until(client.secure_connection()).await? {
-                Ok(()) => {
+            match disconnected
+                .until_timeout(client.secure_connection(), OMRON_SECURE_TIMEOUT_MS)
+                .await
+            {
+                Ok(Ok(())) => {
                     alc_hub_common::evtlog::emit("EVT OMRON_ENC ok");
                     emit_omron_desc(client);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     log::warn!("ble: Omron 暗号化失敗: {e:?}");
                     alc_hub_common::evtlog::emit("EVT OMRON_ENC err");
+                }
+                // 切断・時間切れ: 暗号化の途中なので打ち切って切断する
+                Err(e) => {
+                    alc_hub_common::evtlog::emit("EVT OMRON_ENC err");
+                    let _ = client.disconnect();
+                    return Err(e.context("Omron 暗号化の打ち切り"));
                 }
             }
         }
@@ -577,12 +600,16 @@ async fn omron_pair(client: &mut BLEClient, disconnected: &Disconnected) -> Resu
         .and_then(|r| Ok(r?));
     step("rx0_sub", res)?;
 
-    // 2. bond。機器は Legacy / Just Works で応じる。失敗しても続ける (次段の書き込みで分かる)
+    // 2. bond。機器は Legacy / Just Works で応じる。失敗しても続ける (次段の書き込みで分かる)。
+    // ただし切断・時間切れ (OMRON_SECURE_TIMEOUT_MS) は打ち切る (切断は呼び出し側)
     let res = disconnected
-        .until(client.secure_connection())
-        .await
-        .and_then(|r| Ok(r?));
-    if let Err(e) = step("bond", res) {
+        .until_timeout(client.secure_connection(), OMRON_SECURE_TIMEOUT_MS)
+        .await;
+    let aborted = res.is_err();
+    if let Err(e) = step("bond", res.and_then(|r| Ok(r?))) {
+        if aborted {
+            return Err(e);
+        }
         log::warn!("ble: {e:?}");
     }
     emit_omron_desc(client);
@@ -677,25 +704,30 @@ async fn omron_pair(client: &mut BLEClient, disconnected: &Disconnected) -> Resu
 /// その機器の bond だけを消し、`EVT OMRON_PAIR unbond ok|err|none` を出す
 /// (全消去はニプロ機の bond を巻き込むので使わない)
 fn omron_unbond(addr: &BLEAddress) {
-    let device = BLEDevice::take();
-    // BLEAddress の == は 6 byte だけを比べる。消すときは保存側のアドレス (型付き) を渡す
-    let result = match device.bonded_addresses() {
-        Ok(addrs) => match addrs.iter().find(|a| *a == addr) {
-            Some(bonded) => match device.delete_bond(bonded) {
-                Ok(()) => "ok",
-                Err(e) => {
-                    log::warn!("ble: Omron bond 消去失敗: {e:?}");
-                    "err"
-                }
-            },
-            None => "none",
+    let result = match omron_find_bond(addr) {
+        Ok(Some(bonded)) => match BLEDevice::take().delete_bond(&bonded) {
+            Ok(()) => "ok",
+            Err(e) => {
+                log::warn!("ble: Omron bond 消去失敗: {e:?}");
+                "err"
+            }
         },
+        Ok(None) => "none",
         Err(e) => {
-            log::warn!("ble: bond 一覧の取得失敗: {e:?}");
+            log::warn!("ble: {e:?}");
             "err"
         }
     };
     alc_hub_common::evtlog::emit(&format!("EVT OMRON_PAIR unbond {result}"));
+}
+
+/// 保存済みの bond からその機器のアドレスを探す。BLEAddress の == は 6 byte だけを比べるので、
+/// 返すのは保存側のアドレス (型付き。delete_bond にはこちらを渡す)
+fn omron_find_bond(addr: &BLEAddress) -> Result<Option<BLEAddress>> {
+    let addrs = BLEDevice::take()
+        .bonded_addresses()
+        .context("bond 一覧の取得失敗")?;
+    Ok(addrs.into_iter().find(|a| a == addr))
 }
 
 /// `EVT OMRON_DESC bonded=.. encrypted=.. authenticated=..` を出す
@@ -853,6 +885,23 @@ impl Disconnected {
                 return Poll::Ready(Err(anyhow::anyhow!("切断された")));
             }
             fut.as_mut().poll(cx).map(Ok)
+        })
+        .await
+    }
+
+    /// `fut` を最大 `timeout_ms` 待つ。先に切断されたか時間切れなら Err で戻る
+    async fn until_timeout<F: Future>(&self, fut: F, timeout_ms: u64) -> Result<F::Output> {
+        let mut timer = EspTaskTimerService::new()?.timer_async()?;
+        let mut sleep = pin!(timer.after(Duration::from_millis(timeout_ms)));
+        let mut guarded = pin!(self.until(fut));
+        poll_fn(|cx| {
+            if let Poll::Ready(res) = guarded.as_mut().poll(cx) {
+                return Poll::Ready(res);
+            }
+            sleep
+                .as_mut()
+                .poll(cx)
+                .map(|_| Err(anyhow::anyhow!("時間切れ ({timeout_ms} ms)")))
         })
         .await
     }
