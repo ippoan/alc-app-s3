@@ -92,6 +92,8 @@ const OMRON_ACK_SET_KEY: [u8; 2] = [0x80, 0x00];
 const OMRON_PROGRAM_MODE_TRIES: u32 = 10;
 const OMRON_PROGRAM_MODE_WAIT_MS: u64 = 1_000;
 const OMRON_SET_KEY_WAIT_MS: u64 = 3_000;
+/// 鍵登録の後始末 (CCCD を 0 に) のあと、切断までに置く時間 (Linux の手順と同じ)
+const OMRON_PAIR_LINGER_MS: u64 = 3_000;
 
 // スキャンを連続化して隙間を無くす。ニプロ機器は測定後の短時間しか広告
 // しないため、隙間があると取り逃す。5 秒ごとに coex/再ペアリング要求を確認し、
@@ -335,7 +337,12 @@ async fn handle_device(
         let disconnected = Arc::clone(&disconnected);
         client.on_disconnect(move |_| disconnected.set());
     }
-    client.on_connect(|client| {
+    // Omron 機には送らない (Linux で記録が届いた回は接続パラメータを変えていない)
+    let tune_conn_params = omron.is_none();
+    client.on_connect(move |client| {
+        if !tune_conn_params {
+            return;
+        }
         // Arduino 版と同様、接続直後に conn params を更新する
         if let Err(e) = client.update_conn_params(120, 120, 0, 60) {
             log::warn!("ble: update_conn_params 失敗: {e:?}");
@@ -379,7 +386,10 @@ async fn handle_device(
             // 送らない (Linux で実測)。時刻 (0x2A2B) は書かない — 書くと記録が独自形式の
             // 別 characteristic に移る
             match disconnected.until(client.secure_connection()).await? {
-                Ok(()) => alc_hub_common::evtlog::emit("EVT OMRON_ENC ok"),
+                Ok(()) => {
+                    alc_hub_common::evtlog::emit("EVT OMRON_ENC ok");
+                    emit_omron_desc(client);
+                }
                 Err(e) => {
                     log::warn!("ble: Omron 暗号化失敗: {e:?}");
                     alc_hub_common::evtlog::emit("EVT OMRON_ENC err");
@@ -568,6 +578,7 @@ async fn omron_pair(client: &mut BLEClient, disconnected: &Disconnected) -> Resu
     if let Err(e) = step("bond", res) {
         log::warn!("ble: {e:?}");
     }
+    emit_omron_desc(client);
 
     // 3. unlock を購読し、応答 notify の先頭 2 byte を受け取れるようにする
     // (bit16 = 受信あり。nimble_host タスク上で走るので値を置くだけ)
@@ -622,7 +633,52 @@ async fn omron_pair(client: &mut BLEClient, disconnected: &Disconnected) -> Resu
                 .then_some(())
                 .context("応答なし")
         });
-    step("key", res)
+    step("key", res)?;
+
+    // 6. 後始末は Linux (omblepy と同じ手順) に合わせる: unlock → RX[0] の順に CCCD を 0 に
+    // (Write Request) してから 3 秒待つ。切断は呼び出し側。登録は済んでいるので、ここで
+    // 失敗しても Err にはしない
+    let res = disconnected
+        .until(async {
+            client
+                .get_service(OMRON_SERVICE)
+                .await?
+                .get_characteristic(OMRON_UNLOCK)
+                .await?
+                .unsubscribe(true)
+                .await?;
+            client
+                .get_service(OMRON_SERVICE)
+                .await?
+                .get_characteristic(OMRON_RX0)
+                .await?
+                .unsubscribe(true)
+                .await
+        })
+        .await
+        .and_then(|r| Ok(r?));
+    if let Err(e) = step("unsub", res) {
+        log::warn!("ble: {e:?}");
+    }
+    let start = now_ms();
+    while !disconnected.is_set() && now_ms().saturating_sub(start) < OMRON_PAIR_LINGER_MS {
+        FreeRtos::delay_ms(100);
+    }
+    Ok(())
+}
+
+/// `EVT OMRON_DESC bonded=.. encrypted=.. authenticated=..` を出す
+fn emit_omron_desc(client: &BLEClient) {
+    let line = match client.desc() {
+        Ok(d) => format!(
+            "EVT OMRON_DESC bonded={} encrypted={} authenticated={}",
+            d.bonded(),
+            d.encrypted(),
+            d.authenticated()
+        ),
+        Err(e) => format!("EVT OMRON_DESC err={e:?}"),
+    };
+    alc_hub_common::evtlog::emit(&line);
 }
 
 /// unlock に `op` + 16 byte を Write Request で書く (前回の応答は捨てる)
