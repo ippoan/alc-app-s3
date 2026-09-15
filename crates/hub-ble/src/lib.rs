@@ -1,4 +1,4 @@
-//! 内蔵 BLE central: ニプロ体温計 NT-100B / 血圧計 NBP-1BLE の読み取り。
+//! 内蔵 BLE central: ニプロ体温計 NT-100B / 血圧計 NBP-1BLE、Omron 血圧計 HEM-6231T の読み取り。
 //!
 //! `ippoan/ble-medical-gateway` からの移植:
 //! - スキャン → 接続 → notify/indicate 購読の骨組み:
@@ -38,14 +38,14 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use alc_hub_core::{
-    device::{match_device_name, DeviceKind},
+    device::{match_device_name, omron_adv, DeviceKind, OmronAdv},
     ieee11073::{parse_blood_pressure, parse_temperature},
 };
 use anyhow::{Context, Result};
 use esp32_nimble::{
     enums::{AuthReq, SecurityIOCap},
     utilities::BleUuid,
-    BLEAddress, BLEAdvertisedData, BLEAdvertisedDevice, BLEClient, BLEDevice, BLEScan,
+    uuid128, BLEAddress, BLEAdvertisedData, BLEAdvertisedDevice, BLEClient, BLEDevice, BLEScan,
 };
 use esp_idf_svc::hal::{delay::FreeRtos, task::block_on};
 
@@ -66,7 +66,26 @@ type MeasTx = Arc<Mutex<Sender<Measurement>>>;
 const HEALTH_THERMOMETER_SERVICE: u16 = 0x1809;
 const BLOOD_PRESSURE_SERVICE: u16 = 0x1810;
 const TEMPERATURE_MEASUREMENT: u16 = 0x2A1C;
-pub(crate) const BLOOD_PRESSURE_MEASUREMENT: u16 = 0x2A35;
+const BLOOD_PRESSURE_MEASUREMENT: u16 = 0x2A35;
+
+// Omron 独自 service のペアリング (unlock 鍵の登録)。UUID と電文は omblepy
+// (https://github.com/userx14/omblepy) の LEGACY_* / writeNewUnlockKey と同じ (Refs #237)
+const OMRON_SERVICE: BleUuid = uuid128!("ecbe3980-c9a2-11e1-b1bd-0002a5d5c51b");
+/// RX[0]。購読すると機器が bond (SMP) を始める
+const OMRON_RX0: BleUuid = uuid128!("49123040-aee8-11e1-a74d-0002a5d5c51b");
+/// unlock。書き込みへの応答が notify で返る
+const OMRON_UNLOCK: BleUuid = uuid128!("b305b680-aee7-11e1-a730-0002a5d5c51b");
+/// unlock の電文の先頭: プログラムモードへ入る (続く 16 byte は 0)
+const OMRON_OP_PROGRAM_MODE: u8 = 0x02;
+/// unlock の電文の先頭: 続く 16 byte を鍵として登録する
+const OMRON_OP_SET_KEY: u8 = 0x00;
+/// 応答 notify の先頭 2 byte (成功)
+const OMRON_ACK_PROGRAM_MODE: [u8; 2] = [0x82, 0x00];
+const OMRON_ACK_SET_KEY: [u8; 2] = [0x80, 0x00];
+/// プログラムモードの要求を繰り返す回数と、1 回ごとの応答待ち
+const OMRON_PROGRAM_MODE_TRIES: u32 = 10;
+const OMRON_PROGRAM_MODE_WAIT_MS: u64 = 1_000;
+const OMRON_SET_KEY_WAIT_MS: u64 = 3_000;
 
 // スキャンを連続化して隙間を無くす。ニプロ機器は測定後の短時間しか広告
 // しないため、隙間があると取り逃す。5 秒ごとに coex/再ペアリング要求を確認し、
@@ -196,12 +215,12 @@ async fn task(
                 if empty_backoff.iter().any(|(a, _)| *a == dev.addr()) {
                     return None;
                 }
-                match_target(dev, &data).map(|kind| (*dev, kind))
+                match_target(dev, &data).map(|(kind, omron)| (*dev, kind, omron))
             })
             .await
             .context("BLE スキャン失敗")?;
 
-        let Some((adv, kind)) = target else {
+        let Some((adv, kind, omron)) = target else {
             FreeRtos::delay_ms(SCAN_COOLDOWN_MS);
             continue;
         };
@@ -211,7 +230,7 @@ async fn task(
         let _ = ui_tx.send(UiCommand::BleAcquiring { device: kind });
 
         let mut client = device.new_client();
-        match handle_device(&mut client, &adv, kind, &status, &meas_tx).await {
+        match handle_device(&mut client, &adv, kind, omron, &status, &meas_tx).await {
             // データなし: しばらくこの機器への再接続を控える (機器を空ける)。
             // 接続失敗 (Err) はバックオフしない — 新規測定の広告での一時的な
             // 接続失敗もあり、その場合は即リトライで拾いたい
@@ -239,27 +258,27 @@ async fn task(
 
 /// 広告が対象サービス (体温計/血圧計) を含み RSSI が閾値以上なら種別を返す。
 /// Arduino 版と同様、標準サービス UUID に加えてデバイス名でも判定する
-/// (ニプロ機器が独自名を使う場合の対策)。
-fn match_target(dev: &BLEAdvertisedDevice, data: &BLEAdvertisedData<&[u8]>) -> Option<DeviceKind> {
+/// (ニプロ機器が独自名を使う場合の対策)。Omron 機器は service UUID を広告しないので
+/// 名前で当たり、広告の状態 (ペアリング待ち / 送信) も一緒に返す
+fn match_target(
+    dev: &BLEAdvertisedDevice,
+    data: &BLEAdvertisedData<&[u8]>,
+) -> Option<(DeviceKind, Option<OmronAdv>)> {
     if dev.rssi() < MIN_RSSI {
         return None;
     }
 
     if data.is_advertising_service(&BleUuid::from_uuid16(HEALTH_THERMOMETER_SERVICE)) {
-        return Some(DeviceKind::Thermometer);
+        return Some((DeviceKind::Thermometer, None));
     }
     if data.is_advertising_service(&BleUuid::from_uuid16(BLOOD_PRESSURE_SERVICE)) {
-        return Some(DeviceKind::BloodPressure);
+        return Some((DeviceKind::BloodPressure, None));
     }
 
     if let Some(name) = data.name() {
-        // 測定モードでは Omron の機器 (独自名) も拾う。hub-core の名前判定は変えない
-        #[cfg(feature = "probe")]
-        if probe::match_name(&String::from_utf8_lossy(name)) {
-            return Some(DeviceKind::BloodPressure);
-        }
         // name() は生バイト列 (&[u8]) を返す
-        return match_device_name(&String::from_utf8_lossy(name));
+        let name = String::from_utf8_lossy(name);
+        return match_device_name(&name).map(|kind| (kind, omron_adv(&name)));
     }
     None
 }
@@ -270,6 +289,7 @@ async fn handle_device(
     client: &mut BLEClient,
     adv: &BLEAdvertisedDevice,
     kind: DeviceKind,
+    omron: Option<OmronAdv>,
     status: &SharedStatus,
     meas_tx: &MeasTx,
 ) -> Result<bool> {
@@ -299,14 +319,32 @@ async fn handle_device(
         }
     }
 
-    // 測定モード: 以下の本番経路 (固定サービスの購読) より前に抜け、GATT と bond を出す
-    #[cfg(feature = "probe")]
-    {
-        let _ = (kind, status, meas_tx);
-        return probe::inspect(client).await;
+    match omron {
+        Some(OmronAdv::Pairing) => {
+            let res = omron_pair(client).await;
+            let _ = client.disconnect();
+            res?;
+            // ペアリングはデータなしでも Ok(true) を返す。Ok(false) だと呼び出し側が
+            // EMPTY_BACKOFF_MS の間この機器へ接続しなくなり、ペアリング直後に機器が出す
+            // 送信広告 (未送信の記録) を取り逃す
+            return Ok(true);
+        }
+        Some(OmronAdv::Transfer) => {
+            // Omron 機はニプロ機と違い、保存済み bond で先に暗号化しないと 0x2A35 を
+            // 送らない (Linux で実測)。時刻 (0x2A2B) は書かない — 書くと記録が独自形式の
+            // 別 characteristic に移る
+            match client.secure_connection().await {
+                Ok(()) => alc_hub_common::evtlog::emit("EVT OMRON_ENC ok"),
+                Err(e) => {
+                    log::warn!("ble: Omron 暗号化失敗: {e:?}");
+                    alc_hub_common::evtlog::emit("EVT OMRON_ENC err");
+                }
+            }
+        }
+        None => {}
     }
 
-    // 明示的な secure_connection は行わない。血圧計 (NBP-1BLE) は
+    // ニプロ機では明示的な secure_connection は行わない。血圧計 (NBP-1BLE) は
     // 「接続 → 測定値 indication → 即切断」を非常に短時間で行うため、
     // ペアリングの往復待ちを挟むと購読前に切断され indication を取り逃す
     // (実機ログで確認: secure_connection 成功直後に Remote User Terminated)。
@@ -351,15 +389,17 @@ async fn handle_device(
     }
 
     // 体温計/血圧計の Measurement は indication ベースの機器が多い
-    // (Arduino 版は canIndicate() 優先で登録)
+    // (Arduino 版は canIndicate() 優先で登録)。CCCD はニプロ機では応答なしの書き込み、
+    // Omron 機は応答あり (Write Request) でないと購読を無視する (Refs #237)
+    let cccd_response = omron.is_some();
     if characteristic.can_indicate() {
         characteristic
-            .subscribe_indicate(false)
+            .subscribe_indicate(cccd_response)
             .await
             .context("indication 購読失敗")?;
     } else if characteristic.can_notify() {
         characteristic
-            .subscribe_notify(false)
+            .subscribe_notify(cccd_response)
             .await
             .context("notification 購読失敗")?;
     } else {
@@ -420,6 +460,128 @@ async fn handle_device(
         }
     }
     Ok(got_data.load(Ordering::SeqCst))
+}
+
+/// Omron 機のペアリング待ち (-P- 点滅) に接続した直後に呼ぶ: RX[0] 購読 → bond →
+/// unlock 購読 → プログラムモード → 鍵の登録。各段を `EVT OMRON_PAIR <段> ok|err` で出す。
+/// 登録後の受信は標準 0x2A35 で鍵を使わないので、鍵は毎回乱数で作って保存しない
+/// (値はログに出さない)。切断は呼び出し側
+async fn omron_pair(client: &mut BLEClient) -> Result<()> {
+    fn step<T, E: core::fmt::Debug>(stage: &str, res: Result<T, E>) -> Result<T> {
+        match res {
+            Ok(v) => {
+                alc_hub_common::evtlog::emit(&format!("EVT OMRON_PAIR {stage} ok"));
+                Ok(v)
+            }
+            Err(e) => {
+                alc_hub_common::evtlog::emit(&format!("EVT OMRON_PAIR {stage} err"));
+                Err(anyhow::anyhow!("Omron ペアリング {stage} 失敗: {e:?}"))
+            }
+        }
+    }
+
+    // 1. RX[0] を購読する (CCCD は Write Request)。これで機器が bond を求めてくる
+    let res = async {
+        client
+            .get_service(OMRON_SERVICE)
+            .await?
+            .get_characteristic(OMRON_RX0)
+            .await?
+            .subscribe_notify(true)
+            .await
+    }
+    .await;
+    step("rx0_sub", res)?;
+
+    // 2. bond。機器は Legacy / Just Works で応じる。失敗しても続ける (次段の書き込みで分かる)
+    if let Err(e) = step("bond", client.secure_connection().await) {
+        log::warn!("ble: {e:?}");
+    }
+
+    // 3. unlock を購読し、応答 notify の先頭 2 byte を受け取れるようにする
+    // (bit16 = 受信あり。nimble_host タスク上で走るので値を置くだけ)
+    let ack = Arc::new(AtomicU32::new(0));
+    let res = async {
+        let unlock = client
+            .get_service(OMRON_SERVICE)
+            .await?
+            .get_characteristic(OMRON_UNLOCK)
+            .await?;
+        let ack = Arc::clone(&ack);
+        unlock.on_notify(move |raw| {
+            if let [a, b, ..] = raw {
+                ack.store(
+                    0x1_0000 | (u32::from(*a) << 8) | u32::from(*b),
+                    Ordering::SeqCst,
+                );
+            }
+        });
+        unlock.subscribe_notify(true).await
+    }
+    .await;
+    step("unlock_sub", res)?;
+
+    // 4. プログラムモード。応答が来なければ 1 秒おきに繰り返す
+    let mut res = Err(anyhow::anyhow!("応答なし"));
+    for _ in 0..OMRON_PROGRAM_MODE_TRIES {
+        if let Err(e) = omron_unlock_write(client, &ack, OMRON_OP_PROGRAM_MODE, &[0; 16]).await {
+            res = Err(e);
+            break;
+        }
+        if wait_omron_ack(&ack, OMRON_PROGRAM_MODE_WAIT_MS) == Some(OMRON_ACK_PROGRAM_MODE) {
+            res = Ok(());
+            break;
+        }
+    }
+    step("program_mode", res)?;
+
+    // 5. 乱数の鍵を登録する。応答が来ると機器の -P- が消える
+    let mut key = [0u8; 16];
+    unsafe { esp_idf_svc::sys::esp_fill_random(key.as_mut_ptr().cast(), key.len()) };
+    let res = omron_unlock_write(client, &ack, OMRON_OP_SET_KEY, &key)
+        .await
+        .and_then(|()| {
+            (wait_omron_ack(&ack, OMRON_SET_KEY_WAIT_MS) == Some(OMRON_ACK_SET_KEY))
+                .then_some(())
+                .context("応答なし")
+        });
+    step("key", res)
+}
+
+/// unlock に `op` + 16 byte を Write Request で書く (前回の応答は捨てる)
+async fn omron_unlock_write(
+    client: &mut BLEClient,
+    ack: &AtomicU32,
+    op: u8,
+    body: &[u8; 16],
+) -> Result<()> {
+    let mut frame = [0u8; 17];
+    frame[0] = op;
+    frame[1..].copy_from_slice(body);
+    ack.store(0, Ordering::SeqCst);
+    client
+        .get_service(OMRON_SERVICE)
+        .await?
+        .get_characteristic(OMRON_UNLOCK)
+        .await?
+        .write_value(&frame, true)
+        .await
+        .context("Omron unlock 書き込み失敗")
+}
+
+/// unlock の応答 notify を最大 `timeout_ms` 待ち、先頭 2 byte を返す
+fn wait_omron_ack(ack: &AtomicU32, timeout_ms: u64) -> Option<[u8; 2]> {
+    let start = now_ms();
+    loop {
+        let v = ack.load(Ordering::SeqCst);
+        if v != 0 {
+            return Some([(v >> 8) as u8, v as u8]);
+        }
+        if now_ms().saturating_sub(start) >= timeout_ms {
+            return None;
+        }
+        FreeRtos::delay_ms(50);
+    }
 }
 
 /// notify コールバック用の軽量パース: raw → (Measurement, 並び順キー)。
