@@ -16,6 +16,7 @@
 //! | `OTA <url>` | オンラインアップデート (`EVT OTA_*`、LAN 確立を待つ) |
 //! | `AUTH SET/UNPAIR/STATUS/TOKEN/URL` | device credential 管理 (共通実装) |
 //! | `WS URL <url>` / `WS STATUS` | cf-alc-recorder 常時接続の URL 上書き / 状態 (共通実装) |
+//! | `OMRON BP ON\|OFF` / `OMRON STATUS` | 血圧計 (HEM-6231T) を拾うか (共通実装、既定 OFF)。**ON にしたら再起動が要る** — main.rs 冒頭の「血圧計」節 |
 
 use alc_hub_common::{
     config,
@@ -46,6 +47,12 @@ fn handle_line(line: &str, status: &SharedStatus, settings: &Settings) {
     // 機種に依らないコマンドは共通実装へ (hub-drivers/src/console.rs)。
     // 捌かれなかったものだけがここへ落ちてくる
     let Some(command) = console::handle_common(command, status, settings, false) else {
+        return;
+    };
+    // 血圧計 (HEM-6231T) の設定も共通実装へ (CoreS3 の host_link と同じ口)。
+    // **本機は BLE を起動時の設定で立てる**ので、OFF → ON の反映には再起動が
+    // 要る (main.rs 冒頭の「血圧計」節)
+    let Some(command) = console::handle_omron(command, status, settings) else {
         return;
     };
 

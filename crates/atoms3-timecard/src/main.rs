@@ -66,10 +66,23 @@
 //! 当面 **検知の可否は serial ログ (`EVT TIMECARD` / `EVT NFC_MULTI_CARD`)
 //! で見る。**現場向けの可視/可聴フィードバックは ES8311 の音を入れる別 issue で戻す。
 //!
+//! # 血圧計 (Omron HEM-6231T) — **既定 OFF** (#135 / #237)
+//!
+//! `OMRON BP ON` (NVS `omron_bp`) のときだけ BLE central (`alc_hub_ble`) を
+//! 起こし、受けた測定を CoreS3 と同じ `recorder` 経由で `kind="blood_pressure"`
+//! として上り (cf-alc-recorder) へ積む。**スキャン・ボンド・鍵登録・デコードは
+//! CoreS3 と同一の crate** で、ここは配線だけ。
+//!
+//! **BLE を起動時の設定で立てるかどうか決めている** — BT controller は内部RAM を
+//! 使うため、打刻だけの端末で常時初期化すると `ws_uplink` の TLS ゲート
+//! (内部RAM 60KB) を削る。したがって `OFF → ON` の切り替えには**再起動が要る**
+//! (OFF のまま起動したときは `EVT BLE_DISABLED` を出す)。CoreS3 は BLE を常に
+//! 起こすので再起動不要 — 差は「打刻端末では血圧が従」であることから来る。
+//!
 //! # 起動順 (変えてはいけない)
 //!
 //! `crashlog::init` → `Settings::new` → `heap::start` → `console::start` →
-//! `ws_uplink::start` → LAN (OTA の確定は ws_uplink が初回の WS 接続で行う)。**`crashlog::init` は
+//! `ws_uplink::start` → LAN → (任意) BLE (OTA の確定は ws_uplink が初回の WS 接続で行う)。**`crashlog::init` は
 //! `heap::start` より前**。配線漏れで `.noinit` のゴミ帳簿に書いて boot loop に
 //! なった実害が 2026-07-14 にある。
 
@@ -84,7 +97,7 @@ use alc_hub_common::{
 use alc_hub_drivers::nfc::NfcEvent;
 use alc_hub_drivers::speaker::Sound;
 use alc_hub_drivers::timecard::Punch;
-use alc_hub_drivers::{crashlog, es8311, eth_w5500, heap, nfc, ntp, speaker, ws_uplink};
+use alc_hub_drivers::{crashlog, es8311, eth_w5500, heap, nfc, ntp, recorder, speaker, ws_uplink};
 use anyhow::Result;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::{
@@ -120,7 +133,13 @@ fn main() -> Result<()> {
     let nvs_partition = EspDefaultNvsPartition::take()?;
     let settings = Settings::new(nvs_partition)?;
 
-    let status: SharedStatus = Arc::new(Mutex::new(HubStatus::default()));
+    // Omron 血圧計を拾うか (`OMRON BP ON|OFF`、NVS `omron_bp`、**既定 OFF**)。
+    // hub-ble はスキャンのたびにこの写しを読む (console::handle_omron が更新する)
+    let omron_bp = settings.omron_bp();
+    let status: SharedStatus = Arc::new(Mutex::new(HubStatus {
+        omron_bp,
+        ..HubStatus::default()
+    }));
     // ヒープ監視 (OOM 捕捉 + low-water 計測) は重いアロケーションより先に登録
     heap::start(Arc::clone(&status))?;
 
@@ -131,9 +150,14 @@ fn main() -> Result<()> {
     // 接続には AUTH SET 済み credential と LAN 接続が必要 (未登録の間は
     // 接続しないだけで無害 — 送信キューは NVS 永続なので打刻は失わない)
     let (ws_meas_tx, ws_meas_rx) = mpsc::channel();
-    // 本機は画面を持たないので UiCommand の受け側は捨てる。_ui_rx は main が
-    // 保持し続ける (drop すると ws_uplink スレッドが channel 切断で終了する)
-    let (ui_tx, _ui_rx) = mpsc::channel();
+    // 本機は画面を持たないので UiCommand は捨てる。ただし **受け側を保持したまま
+    // 読み捨てないこと** — drop すると ws_uplink スレッドが channel 切断で終了し、
+    // 放置すると届いた分がキューに溜まり続ける。**下のメインループで毎周
+    // 読み捨てる** (専用スレッドは立てない — 8KB の内部RAM を使わないため)。
+    // 送り手は ws_uplink / recorder / hub-ble の 3 つ
+    let (ui_tx, ui_rx) = mpsc::channel();
+    let recorder_ui_tx = ui_tx.clone();
+    let ui_tx_for_ble = ui_tx.clone();
     // boot_id は NTP 未同期で記録した測定の時刻補正に使う (ws_uplink.rs)。
     // **打刻は時刻が命**なので、この補正は本機でこそ効く
     let boot_id = settings.next_boot_id();
@@ -209,6 +233,10 @@ fn main() -> Result<()> {
         }
     };
 
+    // 血圧の上り経路も打刻と同じ送信キューへ積む。**下の nfc::start が
+    // ws_meas_tx 本体を move する**ので、ここで clone を取っておく
+    let ws_for_bp = ws_meas_tx.clone();
+
     // Unit NFC (ST25R3916): Grove Port A (SDA=G2 / SCL=G1)。読み取りループは
     // hub-drivers/src/nfc.rs (CoreS3 と共有)。**ここに NFC のコードを書かない**
     nfc::start(
@@ -224,6 +252,42 @@ fn main() -> Result<()> {
         move |e: &NfcEvent| on_card(e, &ws_meas_tx, speaker_tx.as_ref()),
     )?;
 
+    // 血圧計 (Omron HEM-6231T) — **`OMRON BP ON` のときだけ**。
+    //
+    // BLE central の中身 (scan / bond / 鍵登録 / 0x2A35 のデコード) は CoreS3 と
+    // 同じ `alc_hub_ble`、測定値の JSON 化・重複排除・上りへの fan-out も同じ
+    // `recorder` を通す。**ここに血圧のコードを書かない** — 機種で割れると
+    // 「CoreS3 では届くのに VoiceS3R では届かない」になる。
+    //
+    // 起動時の設定で立てるかどうかを決める理由と、OFF → ON に再起動が要ることは
+    // このファイル冒頭の「血圧計」節を参照
+    if omron_bp {
+        let (meas_tx, meas_rx) = mpsc::channel();
+        // 測定値レコーダ (BLE の notify コールバックを軽量に保つ専用スレッド)。
+        // 本機に画面も alc-gw への生中継も無いので UI は捨て、GW は None
+        recorder::start(
+            meas_rx,
+            recorder_ui_tx,
+            Arc::clone(&status),
+            settings.clone(),
+            ws_for_bp,
+            None,
+        )?;
+        // 再ペアリング要求のフラグ。本機は要求する口 (画面のペアリングボタン) を
+        // 持たないので立つことはないが、**起動時にボンドを消さない**ことが大事
+        // (probe bin の作法を持ち込むと毎回ペアリングし直しになる)
+        let pair_flag = alc_hub_common::control::new_pair_flag();
+        // 本機は Wi-Fi を持たないので電波の取り合いは起きない。OTA 中の一時停止は
+        // hub-ble が status.ota_active を見て自前で行う
+        let coex = Arc::new(alc_hub_core::coex::RadioCoex::new());
+        alc_hub_ble::start(Arc::clone(&status), meas_tx, ui_tx_for_ble, coex, pair_flag)?;
+        alc_hub_common::evtlog::emit("EVT BLE_ENABLED omron_bp");
+    } else {
+        // 既定。**BT controller ごと起こさない** = 打刻だけの端末の内部RAM を
+        // 削らない。`OMRON BP ON` のあとは再起動が要ることをログに残す
+        alc_hub_common::evtlog::emit("EVT BLE_DISABLED omron_bp=0");
+    }
+
     // SNTP。**打刻端末では必須** — 起動しないとシステム時刻が 1970 のままで、
     // 打刻の `recorded_at_ms` が 1970 起点で送られる (範囲内なので DB 側で NULL
     // にもならず、静かに 55 年ずれた打刻が入る)。`ws_uplink` の
@@ -232,10 +296,13 @@ fn main() -> Result<()> {
     // **ここで即起動してはいけない** — 理由は ntp::start_when_online の doc
     let mut sntp = None;
 
-    // メインループ: SNTP の遅延起動だけ (ホスト向けイベントは
-    // eth_w5500 / heap / ws_uplink の各スレッドが出す)
+    // メインループ: SNTP の遅延起動と UiCommand の読み捨てだけ (ホスト向け
+    // イベントは eth_w5500 / heap / ws_uplink の各スレッドが出す)
     loop {
         FreeRtos::delay_ms(100);
+        // 画面が無いので UiCommand は捨てる。**捨てないと溜まり続ける**
+        // (受け側は上のとおり drop できない)
+        while ui_rx.try_recv().is_ok() {}
         ntp::start_when_online(
             &mut sntp,
             status.lock().map(|s| !s.lan_ip.is_empty()).unwrap_or(false),

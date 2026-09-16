@@ -58,6 +58,7 @@ dependencies = [
 name = "alc-hub-atoms3-timecard"
 version = "0.1.0"
 dependencies = [
+ "alc-hub-ble",
  "alc-hub-common",
  "alc-hub-core",
  "alc-hub-drivers",
