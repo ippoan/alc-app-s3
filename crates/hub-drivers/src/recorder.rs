@@ -44,7 +44,9 @@ pub fn start(
     status: SharedStatus,
     settings: Settings,
     ws_tx: Sender<UplinkRecord>,
-    gw_tx: Sender<UplinkRecord>,
+    // Windows GW (alc-gw) への生中継 (gw_link)。**GW を持たない機は None** —
+    // タイムカード端末 (VoiceS3R) は上り (cf-alc-recorder) だけを持つ
+    gw_tx: Option<Sender<UplinkRecord>>,
 ) -> Result<()> {
     crate::task::name_next(c"recorder");
     std::thread::Builder::new()
@@ -92,7 +94,9 @@ pub fn start(
                             at_ms,
                             session_id: current_session_id(&status),
                         };
-                        let _ = gw_tx.send(rec.clone());
+                        if let Some(gw_tx) = &gw_tx {
+                            let _ = gw_tx.send(rec.clone());
+                        }
                         let _ = ws_tx.send(rec);
                         record(&status, &settings, at_ms, &vitals::temp_event(celsius));
                         let _ = ui_tx.send(UiCommand::Temperature { celsius });
@@ -132,7 +136,9 @@ pub fn start(
                             at_ms,
                             session_id: current_session_id(&status),
                         };
-                        let _ = gw_tx.send(rec.clone());
+                        if let Some(gw_tx) = &gw_tx {
+                            let _ = gw_tx.send(rec.clone());
+                        }
                         let _ = ws_tx.send(rec);
                         record(&status, &settings, at_ms, &vitals::bp_event(systolic, diastolic, pulse));
                         let _ = ui_tx.send(UiCommand::BloodPressure {
@@ -183,7 +189,9 @@ pub fn start(
                             at_ms,
                             session_id: current_session_id(&status),
                         };
-                        let _ = gw_tx.send(rec.clone());
+                        if let Some(gw_tx) = &gw_tx {
+                            let _ = gw_tx.send(rec.clone());
+                        }
                         let _ = ws_tx.send(rec);
                         record(
                             &status,

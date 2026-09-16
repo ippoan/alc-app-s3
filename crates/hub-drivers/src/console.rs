@@ -14,6 +14,7 @@
 //! | [`take_line`] | 受信バッファから 1 行を切り出す (改行待ち + ゴミ捨て) |
 //! | [`spawn_reader`] | stdin を読んで行ごとにコールバックを呼ぶスレッド |
 //! | [`handle_common`] | 機種に依らないコマンド (PING / HEAP / LOG / AUTH / WS) |
+//! | [`handle_omron`] | `OMRON BP ON\|OFF` / `OMRON STATUS` (BLE 血圧計を積む機だけが呼ぶ) |
 //! | [`handle_ota_lan_guarded`] | LAN 専用機の `OTA <url>` (リンクアップ前を弾く) |
 //!
 //! 解析そのものは `alc_hub_core::protocol::parse_line` (純粋・テスト済み) が持つ。
@@ -252,6 +253,45 @@ pub fn handle_common(
                 st.ws_last_seq,
             );
         }
+        other => return Some(other),
+    }
+    None
+}
+
+/// Omron 血圧計 (HEM-6231T) を拾うかの設定 (`OMRON BP ON|OFF` / `OMRON STATUS`)。
+///
+/// **[`handle_common`] には入れない** — BLE を積まない機 (印刷ブリッジ・警告
+/// デバイス) が `OK OMRON BP=1` と答えると「設定したのに拾わない」になる。
+/// 呼ぶのは `alc-hub-ble` を依存に持つ機だけ (CoreS3 の [`crate::host_link`] と
+/// タイムカード端末 = Atom VoiceS3R)。**機種ごとに書き写さないこと** —
+/// NVS のキーと応答文言が割れると `/device/setup` からの設定が機種で分かれる。
+///
+/// 戻り値は [`handle_common`] と同じ規約 (処理しなかったコマンドを `Some` で返す)。
+///
+/// `status.omron_bp` も併せて更新する — hub-ble はスキャンのたびにこちらを読む
+/// ので、CoreS3 では**再起動なしで**切り替わる。タイムカード端末は BLE タスク
+/// 自体を起動時の設定で立てるかどうか決めるため、**OFF → ON は再起動が要る**
+/// (`crates/atoms3-timecard/src/main.rs` の `EVT BLE_DISABLED` 参照)。
+#[must_use]
+pub fn handle_omron(
+    command: HostCommand,
+    status: &SharedStatus,
+    settings: &Settings,
+) -> Option<HostCommand> {
+    match command {
+        HostCommand::OmronBp { enabled } => match settings.set_omron_bp(enabled) {
+            Ok(()) => {
+                if let Ok(mut st) = status.lock() {
+                    st.omron_bp = enabled;
+                }
+                println!("OK OMRON BP={}", u8::from(enabled));
+            }
+            Err(e) => {
+                log::error!("console: OMRON BP 保存失敗: {e:?}");
+                println!("ERR OMRON: 保存に失敗しました");
+            }
+        },
+        HostCommand::OmronStatus => println!("OMRON BP={}", u8::from(settings.omron_bp())),
         other => return Some(other),
     }
     None

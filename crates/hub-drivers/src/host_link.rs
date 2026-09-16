@@ -207,6 +207,12 @@ fn handle_line(
     let Some(command) = console::handle_common(command, status, settings, true) else {
         return;
     };
+    // BLE 血圧計の設定 (`OMRON BP` / `OMRON STATUS`) も共通実装へ。
+    // **タイムカード端末 (VoiceS3R) と共有する** — 応答文言と NVS キーを
+    // 機種ごとに書き写さないため (console::handle_omron の doc 参照)
+    let Some(command) = console::handle_omron(command, status, settings) else {
+        return;
+    };
 
     match command {
         HostCommand::ShowQr {
@@ -380,21 +386,6 @@ fn handle_line(
             }
         },
         HostCommand::TenkoStatus => println!("TENKO BP={}", u8::from(settings.tenko_bp())),
-        // Omron 血圧計 (HEM-6231T) を拾うか。NVS に保存し、hub-ble がスキャンの
-        // たびに読む
-        HostCommand::OmronBp { enabled } => match settings.set_omron_bp(enabled) {
-            Ok(()) => {
-                if let Ok(mut st) = status.lock() {
-                    st.omron_bp = enabled;
-                }
-                println!("OK OMRON BP={}", u8::from(enabled));
-            }
-            Err(e) => {
-                log::error!("host_link: OMRON BP 保存失敗: {e:?}");
-                println!("ERR OMRON: 保存に失敗しました");
-            }
-        },
-        HostCommand::OmronStatus => println!("OMRON BP={}", u8::from(settings.omron_bp())),
         // OTA 更新 (進捗・結果は EVT OTA_* で届く。シリアル経路は WS 進捗 sink
         // 無し = None。ota.rs 参照)
         HostCommand::Ota { url } => {

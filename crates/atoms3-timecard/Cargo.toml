@@ -18,6 +18,10 @@ name = "alc-hub-atoms3-timecard"
 harness = false
 
 [dependencies]
+# BLE central (Omron 血圧計 HEM-6231T)。**CoreS3 と同じ crate をそのまま使う** —
+# scan / bond / 鍵登録 / 0x2A35 のデコードは機種非依存で、#237 の実証もこの
+# crate の probe bin (VoiceS3R 実機) で取っている。配線 (main.rs) だけが機種側
+alc-hub-ble = { path = "../hub-ble" }
 alc-hub-common = { path = "../hub-common" }
 alc-hub-core = { path = "../hub-core" }
 # nfc = Unit NFC の読み取り / speaker = 打刻音 (ES8311、#154)。

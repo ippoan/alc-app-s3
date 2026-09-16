@@ -249,7 +249,8 @@ fn main() -> Result<()> {
         Arc::clone(&status),
         settings.clone(),
         ws_tx,
-        gw_tx,
+        // CoreS3 は alc-gw への生中継を持つ (持たない機は None — recorder.rs 参照)
+        Some(gw_tx),
     )?;
 
     // 沈黙警告 (issue #187): 運行者 PWA からの `HB OK` が途切れたら自分の判断で
