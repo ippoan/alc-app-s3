@@ -36,7 +36,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
 use alc_hub_core::uplink::{
     auth_header_line, command_action, command_gw_url, command_log_max_bytes, command_log_offset,
-    command_ota_url, command_print_chunk, command_print_url, command_result_frame,
+    command_ota_url, command_print_chunk, command_print_url, command_result_frame, jitter_ms,
     measurement_frame, ota_guard, parse_downlink, reconnect_backoff, should_wait_for_clock,
     token_needs_mint, Downlink, DroppedEntry, OtaGuard, UplinkQueue, OTA_VERIFY_TIMEOUT_MS,
     PING_FRAME, RECONNECT_BACKOFF_MAX_MS, RECONNECT_FAST_MS, RECONNECT_SLOW_MS,
@@ -418,8 +418,11 @@ fn run(
                 && now >= backoff_until
                 && heap_headroom_ok(now, &mut heap_log_at);
             if want_fast != reconnect_fast {
+                // FAST にだけジッターを乗せる。SLOW は「条件が揃うまでの
+                // 置き場」で、実際に張り直すのはループが FAST を書いた
+                // 瞬間なので、散らすのはそちらで足りる
                 let ms = if want_fast {
-                    RECONNECT_FAST_MS
+                    jitter_ms(RECONNECT_FAST_MS, rand_u32())
                 } else {
                     RECONNECT_SLOW_MS
                 };
@@ -672,7 +675,10 @@ fn held_ms(conn: &Option<Conn>) -> Option<u64> {
 /// C 側の再接続待ち (`wait_timeout_ms`) を書き換える。成功したら true。
 ///
 /// **短くしたときは待機中の C タスクを起こす** (`WAKEUP_BIT`) ので、その場で
-/// 再接続が走る。client を作り直さないので `Drop` の panic 経路には触れない
+/// 再接続が走る。client を作り直さないので `Drop` の panic 経路には触れない。
+///
+/// **`ms` は呼び側が [`jitter_ms`] を通してから渡す。** `esp_websocket_client`
+/// にジッターの仕組みは無く、固定値を 1 つ持つだけなので自前で散らす
 fn set_reconnect_wait(conn: Option<&Conn>, ms: u64) -> bool {
     let Some(c) = conn else {
         return false;
@@ -691,12 +697,22 @@ fn set_reconnect_wait(conn: Option<&Conn>, ms: u64) -> bool {
     err == esp_idf_svc::sys::ESP_OK
 }
 
+/// 再接続の待ちを散らすための乱数。RF が動いていれば真性、そうでなければ
+/// PRNG だが、**ジッターの用途にはどちらでも足りる**
+fn rand_u32() -> u32 {
+    // SAFETY: 引数も戻り値の解釈も無い純粋な読み出し
+    unsafe { esp_idf_svc::sys::esp_random() }
+}
+
 /// 切断を受けて、次の再接続を許す時刻と連続失敗回数を更新する。
-/// 政策そのものは hub-core の [`reconnect_backoff`] (テスト済み)
+/// 政策そのものは hub-core の [`reconnect_backoff`] (テスト済み)。
+/// 逓増の各段にもジッターを乗せる — **配信のたびに全端末が同時に切られる**
+/// ので、失敗が続く局面でも足並みが揃わないようにする
 fn note_disconnect(fails: &mut u32, backoff_until: &mut u64, held_ms: Option<u64>, now: u64) {
     let (delay, next) = reconnect_backoff(held_ms, *fails);
     *fails = next;
-    *backoff_until = now + delay;
+    // delay == 0 (サーバ都合の切断) は jitter_ms も 0 のまま = 待たない
+    *backoff_until = now + jitter_ms(delay, rand_u32());
 }
 
 /// WS の接続を「切れた」状態にする。**client は drop しない。**

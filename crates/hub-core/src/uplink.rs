@@ -104,11 +104,36 @@ pub const RECONNECT_FAST_MS: u64 = 1_000;
 /// ので、起動直後はこちらから始めて、条件が揃ってから FAST へ落とす
 pub const RECONNECT_SLOW_MS: u64 = 20_000;
 
-/// 逓増バックオフの上限 [ms]
+/// 逓増バックオフの上限 [ms]。**[`jitter_ms`] はこの上に乗る**ので、実効の
+/// 上限は +[`RECONNECT_JITTER_PCT`]% (26 秒) になる
 pub const RECONNECT_BACKOFF_MAX_MS: u64 = 20_000;
 
 /// 「一度ちゃんと繋がった」と見なす接続の長さ [ms]
 pub const HEALTHY_CONNECTION_MS: u64 = 30_000;
+
+/// 再接続の待ちに乗せるジッターの幅 [%] (Refs ippoan/rust-alc-api#644)。
+///
+/// **配信のたびに全端末が同時に切られる**ので、全部が同じ間隔で戻ると同じ
+/// ミリ秒に殺到する。Cloudflare 自身のクライアント実装 (PartySocket /
+/// cloudflare/backoff) もどちらも初手からランダム化している。
+/// `esp_websocket_client` にジッターは無いので自前で乗せる
+pub const RECONNECT_JITTER_PCT: u64 = 30;
+
+/// 再接続の待ちにジッターを乗せる (Refs ippoan/rust-alc-api#644)。
+///
+/// **上へだけ散らす。** 下へ散らすと [`RECONNECT_FAST_MS`] を割り、firmware の
+/// 500ms ループが `set_reconnect_timeout` を書き込む前に C 側の待ちが明けて
+/// しまう (= ゲートを通さずに再接続が走る)。戻り値は必ず `base_ms` 以上。
+///
+/// `rand` は呼び側が渡す任意の乱数 (firmware は `esp_random`)。純粋に保って
+/// テストできるようにするため、ここでは乱数を引かない
+pub fn jitter_ms(base_ms: u64, rand: u32) -> u64 {
+    let span = base_ms.saturating_mul(RECONNECT_JITTER_PCT) / 100;
+    if span == 0 {
+        return base_ms;
+    }
+    base_ms.saturating_add(u64::from(rand) % (span + 1))
+}
 
 /// 切断を受けて、次の再接続を許すまでの待ち [ms] と、更新後の連続失敗回数を返す
 /// (Refs ippoan/rust-alc-api#644)。
@@ -1712,6 +1737,45 @@ mod tests {
         assert_eq!(s.lines(), vec!["B".to_string()]);
         s.remove(2);
         assert!(s.seqs().is_empty());
+    }
+
+    #[test]
+    fn jitter_never_goes_below_the_base_so_fast_stays_at_one_second() {
+        // ★ 下限が RECONNECT_FAST_MS を割らないこと。割ると 500ms ループが
+        // set_reconnect_timeout を書き込む前に C 側の待ちが明ける
+        for rand in [0u32, 1, 7, 12345, u32::MAX / 2, u32::MAX] {
+            let ms = jitter_ms(RECONNECT_FAST_MS, rand);
+            assert!(
+                ms >= RECONNECT_FAST_MS,
+                "rand={rand} で {ms}ms まで下がった"
+            );
+            assert!(ms <= RECONNECT_FAST_MS * (100 + RECONNECT_JITTER_PCT) / 100);
+        }
+        // 乱数 0 = 素の値
+        assert_eq!(jitter_ms(RECONNECT_FAST_MS, 0), RECONNECT_FAST_MS);
+    }
+
+    #[test]
+    fn jitter_actually_spreads_the_wait() {
+        // 同じ base でも乱数が違えば値が散る (全端末が同じミリ秒に殺到しない)
+        let seen: std::collections::BTreeSet<u64> = (0..64u32)
+            .map(|r| jitter_ms(RECONNECT_FAST_MS, r * 7))
+            .collect();
+        assert!(seen.len() > 8, "散らばりが足りない: {seen:?}");
+        // 逓増側にも乗る
+        let seen: std::collections::BTreeSet<u64> =
+            (0..64u32).map(|r| jitter_ms(8_000, r * 97)).collect();
+        assert!(seen.len() > 8, "散らばりが足りない: {seen:?}");
+    }
+
+    #[test]
+    fn jitter_leaves_zero_alone_and_does_not_overflow() {
+        // 「待たない」(健康な切断) は待たないまま
+        assert_eq!(jitter_ms(0, u32::MAX), 0);
+        // 幅が 1ms 未満に潰れる小さい値も素通し
+        assert_eq!(jitter_ms(3, u32::MAX), 3);
+        // 桁が振り切れても panic しない
+        assert!(jitter_ms(u64::MAX, u32::MAX) >= u64::MAX / 2);
     }
 
     #[test]
