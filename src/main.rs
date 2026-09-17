@@ -445,16 +445,34 @@ fn main() -> Result<()> {
                 // 何を打刻にしないか (2 枚検知 / 読取失敗 / 電子車検証 / 日付の
                 // 壊れた免許証) は VoiceS3R と共有 (alc_hub_drivers::timecard)。
                 // 圏外でも punchq が NVS へ退避するので復帰後に届く。
-                // **打刻の `EVT …` 行は CoreS3 では出さない** (VoiceS3R だけが出す)
-                // — PC が読む行種は点呼動線の NFC_LICENSE / NFC_CARINS の 2 つだけ。
-                // 打刻の EVT は出さない。値付きの NFC_LICENSE / NFC_CARINS は
-                // nfc.rs の deliver が println で出す (リングには載せない)
-                let punched = alc_hub_drivers::timecard::punch_record(
-                    e,
-                    alc_hub_common::status::now_ms(),
-                    alc_hub_common::status::epoch_ms(),
-                )
-                .is_some_and(|rec| ws_for_nfc.send(rec).is_ok());
+                // **IC カードは打刻の `EVT TIMECARD` を出す** (Refs
+                // ippoan/rust-alc-api#644)。#191 は「PWA が読む行種を増やさない」
+                // ために出していなかったが、FeliCa / NFC-A には点呼動線の
+                // NFC_LICENSE / NFC_CARINS に当たる行が無く、PC は保存 → 合図 →
+                // 一覧の引き直しで**クラウドを一周**しないと打刻を知れなかった
+                // (WS 断で十数秒待たされ、起動直後は WS が繋がるまで動かない)。
+                // USB で繋がっている PC へ直接出す。行の形は VoiceS3R と共有
+                // (alc_hub_core::timecard::evt_line) — 同じ出来事に 2 つの行種を
+                // 作らない。**`evtlog::emit` にはしない** (card_id を載せる行は
+                // 遠隔から読めるリングへ入れない — evtlog.rs の規範)。
+                // **免許証では出さない** — 既存の NFC_LICENSE と 1 タップ 2 行に
+                // なり、下の「打刻の画面は出さない」(#191) が PC 側で崩れる。
+                // 値付きの NFC_LICENSE / NFC_CARINS は従来どおり nfc.rs の
+                // deliver が println で出す (リングには載せない)
+                let punched = alc_hub_drivers::timecard::Punch::from_event(e)
+                    .map(|punch| {
+                        if !matches!(e, NfcEvent::License { .. }) {
+                            println!(
+                                "{}",
+                                alc_hub_core::timecard::evt_line(&punch.card_id, punch.kind)
+                            );
+                        }
+                        punch.record(
+                            alc_hub_common::status::now_ms(),
+                            alc_hub_common::status::epoch_ms(),
+                        )
+                    })
+                    .is_some_and(|rec| ws_for_nfc.send(rec).is_ok());
                 match e {
                     // 免許証は従来どおり点呼確認画面へ直行させる (#121 / #125)。
                     // **打刻の画面は出さない** — 同じ 1 タップで 2 画面送ると

@@ -350,11 +350,9 @@ fn on_card(
     // 打刻時刻。NTP 未同期なら ws_uplink が送信時に稼働時間の差で補正する
     let recorded_at_ms = epoch_ms();
     let record = punch.record(now_ms(), recorded_at_ms);
-    println!(
-        "EVT TIMECARD card_id={} card_kind={}",
-        punch.card_id,
-        punch.kind.label()
-    );
+    // 行の形は CoreS3 と共有 (alc_hub_core::timecard::evt_line)。#644 で CoreS3 も
+    // 同じ行を出すようになったので、綴りを 2 か所に持たない (中身は従来と同一)
+    println!("{}", alc_hub_core::timecard::evt_line(&punch.card_id, punch.kind));
     if ws_tx.send(record).is_err() {
         // ws_uplink スレッドが死んでいる = 送信不能。**鳴らさない** —
         // 「鳴った = 打刻を預かった」を崩さないため

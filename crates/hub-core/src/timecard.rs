@@ -50,6 +50,31 @@ pub fn payload_json(card_id: &str, kind: CardKind) -> String {
     )
 }
 
+/// ホスト (USB シリアルで繋がった PC) へ打刻を知らせる 1 行。
+///
+/// **CoreS3 と VoiceS3R で同一の行**にする (同じ出来事に 2 つの行種を作らない)。
+/// 受け側は alc-app の `useCoreS3Serial` で、`EVT <NAME> <k=v>…` の汎用形を
+/// 名前で振り分ける。
+///
+/// # なぜ WS ではなくシリアルに出すのか (Refs ippoan/rust-alc-api#644)
+///
+/// IC カード (FeliCa IDm / NFC-A UID) には点呼動線の `EVT NFC_LICENSE` /
+/// `EVT NFC_CARINS` に相当する行が無く、PC は「保存 → 合図 → 一覧の引き直し」で
+/// **クラウドを一周**しないと打刻を知れなかった。WS が切れていると数秒〜十数秒
+/// 待たされ、再起動直後は WS が繋がるまで画面が動かない。**端末は PC と USB で
+/// 繋がっている**ので、目の前のケーブルに出せば即座に届く。
+///
+/// # `println!` で出すこと — `evtlog::emit` にしない
+///
+/// `card_id` は人を特定できる値で、`emit` の行は `.noinit` リングにも残る。
+/// リングは `LOG DUMP` / WS 下り `get_log` で**遠隔から読み出せる**ため、
+/// そこから issue / PR の本文へ転記されうる経路を作らない
+/// (`alc_hub_common::evtlog` の「どの行を emit にするか」。この行は同 doc の
+/// 除外例に `EVT TIMECARD` として最初から挙がっている)。
+pub fn evt_line(card_id: &str, kind: CardKind) -> String {
+    format!("EVT TIMECARD card_id={card_id} card_kind={}", kind.label())
+}
+
 /// JSON 文字列リテラルとして安全な形に直す。`"` と `\` は前置エスケープし、
 /// 制御文字は捨てる (hex/数字しか来ない前提の保険で、値を作り変えない)
 fn escape(s: &str) -> String {
@@ -100,6 +125,31 @@ mod tests {
         assert_eq!(
             payload_json("04AABBCC", CardKind::NfcaUid),
             r#"{"card_id":"04AABBCC","card_kind":"nfca_uid"}"#
+        );
+    }
+
+    /// シリアル行の形は alc-app (`useCoreS3Serial`) との取り決めなので、
+    /// **キーの綴りと順序ごと**固定する。IC カードの 2 種が出ることが主眼
+    /// (Refs ippoan/rust-alc-api#644)
+    #[test]
+    fn evt_line_is_fixed_for_both_ic_card_kinds() {
+        assert_eq!(
+            evt_line("01401D0B1D37B660", CardKind::FelicaIdm),
+            "EVT TIMECARD card_id=01401D0B1D37B660 card_kind=felica_idm"
+        );
+        assert_eq!(
+            evt_line("04AABBCC", CardKind::NfcaUid),
+            "EVT TIMECARD card_id=04AABBCC card_kind=nfca_uid"
+        );
+    }
+
+    /// 免許証の行も**組み立てられる** (VoiceS3R は出す)。CoreS3 が出さないのは
+    /// 呼び出し側の判断で、ここは種別を問わず同じ形を返す
+    #[test]
+    fn evt_line_covers_the_license_kind_too() {
+        assert_eq!(
+            evt_line("2023060920280513", CardKind::License),
+            "EVT TIMECARD card_id=2023060920280513 card_kind=license"
         );
     }
 
