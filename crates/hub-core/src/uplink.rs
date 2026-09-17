@@ -66,6 +66,30 @@ pub fn should_wait_for_clock(now_epoch_ms: u64, connected_for_ms: u64, has_corre
     now_epoch_ms < MIN_SYNCED_MS && has_correctable && connected_for_ms < CLOCK_WAIT_MS
 }
 
+/// device JWT を mint し直すべきか (Refs ippoan/rust-alc-api#644)。
+///
+/// `expires_at_ms` は稼働時間 (`now_ms` と同じ時間軸) で持った失効時刻で、
+/// まだ 1 度も mint していなければ `None`。`margin_s` は「切れる何秒前から
+/// 前倒しするか」で、用途によって 2 つある:
+///
+/// - ハンドシェイクの直前 (`connect`): 短くてよい。その場で mint し直せる
+/// - 接続を保ったままの差し替え: **再接続 1 回ぶんより桁で長く取る** —
+///   差し替える前に切断が来ても、transport に載っている古いトークンで
+///   ハンドシェイクが通る余裕を残すため
+pub fn token_needs_mint(now_ms: u64, expires_at_ms: Option<u64>, margin_s: u64) -> bool {
+    match expires_at_ms {
+        Some(at) => now_ms.saturating_add(margin_s.saturating_mul(1000)) >= at,
+        None => true,
+    }
+}
+
+/// WSS ハンドシェイクに載せる Authorization ヘッダ 1 行 (末尾 CRLF 込み)。
+/// esp_websocket_client の `headers` はこの綴りをそのまま追加のヘッダ行として
+/// 送るので、**CRLF を落とすと後続のヘッダと結合して壊れる**
+pub fn auth_header_line(jwt: &str) -> String {
+    format!("Authorization: Bearer {jwt}\r\n")
+}
+
 /// OTA 直後の image が WS に繋がらないまま、この時間が経ったら前の image に戻す
 /// (Refs #217)。起動からの稼働時間で測る
 pub const OTA_VERIFY_TIMEOUT_MS: u64 = 10 * 60 * 1000;
@@ -1645,6 +1669,42 @@ mod tests {
         assert_eq!(s.lines(), vec!["B".to_string()]);
         s.remove(2);
         assert!(s.seqs().is_empty());
+    }
+
+    #[test]
+    fn token_needs_mint_before_first_mint_and_inside_margin() {
+        // まだ 1 度も mint していない
+        assert!(token_needs_mint(0, None, 120));
+        // 期限まで margin より長い = まだ要らない
+        assert!(!token_needs_mint(0, Some(3_600_000), 120));
+        // margin ちょうどで前倒しする (境界は「要る」側)
+        assert!(token_needs_mint(3_480_000, Some(3_600_000), 120));
+        // 既に切れている
+        assert!(token_needs_mint(3_600_001, Some(3_600_000), 120));
+    }
+
+    #[test]
+    fn token_needs_mint_margin_is_the_only_difference_between_uses() {
+        // 同じ残り 5 分でも、ハンドシェイク直前 (2 分) はまだ要らず、
+        // 接続を保ったままの差し替え (10 分) は要る
+        let now = 3_300_000;
+        let expires_at = Some(3_600_000);
+        assert!(!token_needs_mint(now, expires_at, 120));
+        assert!(token_needs_mint(now, expires_at, 10 * 60));
+    }
+
+    #[test]
+    fn token_needs_mint_does_not_overflow_near_u64_max() {
+        // 稼働時間が異常に大きくても panic しない (saturating)
+        assert!(token_needs_mint(u64::MAX, Some(1), u64::MAX));
+    }
+
+    #[test]
+    fn auth_header_line_spells_bearer_and_ends_with_crlf() {
+        assert_eq!(
+            auth_header_line("abc.def"),
+            "Authorization: Bearer abc.def\r\n"
+        );
     }
 
     #[test]

@@ -109,6 +109,8 @@ crates/hub-core/src/improv.rs)。
 | `EVT GW_CONNECTED` / `EVT GW_DISCONNECTED` | Windows GW (alc-gw) への WS 接続状態 |
 | `EVT WS_COMMAND <id> <payload>` | サーバからの下り command (MEASURE 指示 / timecard 等) |
 | `EVT WS_DROPPED <seq> <kind>` | 送信キューの保存先が一杯で最古の未送信測定を破棄 (kind = 測定種別。打刻は `timecard`) |
+| `EVT WS_TOKEN_ROTATED` | 期限が近づいた device JWT を、WS を保ったまま差し替えた (Refs ippoan/rust-alc-api#644)。TTL は 1 時間なので通常 50 分ごとに 1 回出る |
+| `EVT WS_TOKEN_STALE fails=<n>` | 同 差し替えが n 回 (1 分間隔) 続けて失敗している。**このまま期限が切れると再接続が 401 で失敗し、5 分後に `WS_STALE_RESTART` で再起動する** |
 | `EVT PUNCHQ <mode> count=<n>` | 送信キューの保存先 (`nvs` = 専用パーティション punchq / `legacy` = 既定 nvs にフォールバック) と未送信件数 |
 | `EVT PUNCHQ migrated <n>` | 旧形式 (既定 nvs の文字列) に残っていた n 件を punchq へ移した |
 | `EVT WS_CLOCK_WAIT` | WS は繋がったが時計が未同期で、補正できる測定があるため送信を最大 60 秒待っている (NTP 同期後に補正して送る) |

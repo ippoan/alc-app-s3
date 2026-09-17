@@ -24,6 +24,8 @@
 //! | `EVT WS_CONNECTED` / `EVT WS_DISCONNECTED` | WS 接続状態の変化 |
 //! | `EVT WS_COMMAND <id> <payload>` | 下り command を受信。`get_log` のときはキオスク PWA が `PWALOG <id> …` を返す合図を兼ねる (#215、pwalog.rs) |
 //! | `EVT WS_DROPPED <seq> <kind>` | 保存先が一杯で最古の未送信測定を破棄 |
+//! | `EVT WS_TOKEN_ROTATED` | 期限が近づいた device JWT を、接続を保ったまま差し替えた (Refs ippoan/rust-alc-api#644) |
+//! | `EVT WS_TOKEN_STALE fails=<n>` | 同 差し替えが n 回続けて失敗している。**このまま期限が切れると再接続が 401 で失敗する** |
 //! | `EVT PUNCHQ <mode> count=<n>` | 送信キューの保存先と未送信件数 (punchq.rs) |
 //! | `EVT OTA_ROLLED_BACK free_int=<n> min_int=<n> reason=<語>` | 前の起動で OTA 直後の image を戻した (戻った先の起動で出る。Refs #217) |
 //! | `EVT OTA_ROLLBACK_UNAVAILABLE` | 戻そうとしたが戻し先が無い — この image を確定して続ける |
@@ -33,12 +35,13 @@ use std::net::TcpStream;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
 use alc_hub_core::uplink::{
-    command_action, command_gw_url, command_log_max_bytes, command_log_offset, command_ota_url,
-    command_print_chunk, command_print_url, command_result_frame, measurement_frame, ota_guard,
-    parse_downlink, should_wait_for_clock, Downlink, DroppedEntry, OtaGuard, UplinkQueue,
-    OTA_VERIFY_TIMEOUT_MS, PING_FRAME,
+    auth_header_line, command_action, command_gw_url, command_log_max_bytes, command_log_offset,
+    command_ota_url, command_print_chunk, command_print_url, command_result_frame,
+    measurement_frame, ota_guard, parse_downlink, should_wait_for_clock, token_needs_mint,
+    Downlink, DroppedEntry, OtaGuard, UplinkQueue, OTA_VERIFY_TIMEOUT_MS, PING_FRAME,
 };
 use anyhow::Result;
+use esp_idf_svc::handle::RawHandle;
 use esp_idf_svc::ws::client::{
     EspWebSocketClient, EspWebSocketClientConfig, FrameType, WebSocketEventType,
 };
@@ -65,8 +68,22 @@ const PING_INTERVAL_MS: u64 = 30_000;
 const RESEND_INTERVAL_MS: u64 = 15_000;
 /// 接続失敗・切断時の再接続バックオフ
 const RECONNECT_BACKOFF_MS: u64 = 20_000;
-/// device JWT の残り有効期間がこれを切ったら再 mint
+/// device JWT の残り有効期間がこれを切ったら再 mint (ハンドシェイクの直前)
 const TOKEN_REFRESH_MARGIN_S: u64 = 120;
+/// 接続を保ったまま Authorization ヘッダを差し替える閾値 (Refs
+/// ippoan/rust-alc-api#644)。
+///
+/// **再接続 1 回ぶん (実測 11.3 秒) より桁で大きく取る** — 差し替える前に切断が
+/// 来ても、transport に載っている古いトークンでハンドシェイクが通る余裕を残す。
+/// device JWT の TTL は 1 時間 (auth-worker `DEVICE_JWT_TTL_SECONDS`) なので、
+/// 実質「接続してから約 50 分後に 1 回」差し替わる
+const TOKEN_HEADER_SWAP_MARGIN_S: u64 = 10 * 60;
+/// 差し替え (再 mint / set_headers) に失敗したときの再試行間隔。
+/// auth-worker を 500ms ループで叩き続けない
+const TOKEN_SWAP_RETRY_MS: u64 = 60_000;
+/// 差し替えの失敗がこの回数続いたら、遠隔から見えるよう EVT を 1 回だけ残す。
+/// `TOKEN_SWAP_RETRY_MS` 間隔なので 5 回 = 約 5 分
+const TOKEN_SWAP_FAIL_ALERT: u32 = 5;
 
 /// 切断のまま自動再接続が来ない場合に端末を再起動するまでの時間。
 ///
@@ -195,6 +212,17 @@ fn run(
     let mut print_session: Option<PrintSession> = None;
     // device JWT と失効時刻 (稼働 ms)
     let mut token: Option<(String, u64)> = None;
+    // **transport に今載っているトークン**の失効時刻 (稼働 ms)。
+    //
+    // `token` の失効時刻とは**別に持つ**。一緒にすると「再 mint に成功して
+    // `set_headers` に失敗した」ときに差し替えの契機 (下の `swap_due`) が
+    // false へ落ち、**transport に古いトークンが載ったまま二度と直らない**
+    // — 踏むと再起動するまで直らず、原因究明も非常に高くつく形になる
+    let mut header_expires_at: u64 = 0;
+    // 差し替えの再試行時刻と、連続失敗の回数 (EVT を 1 回だけ出すため)
+    let mut token_swap_retry_at: u64 = 0;
+    let mut token_swap_fails: u32 = 0;
+    let mut token_swap_alerted = false;
     let mut backoff_until: u64 = 0;
     let mut last_ping: u64 = 0;
     let mut last_flush: u64 = 0;
@@ -364,6 +392,10 @@ fn run(
                 match connect(&settings, &mut token, ev_tx.clone(), now) {
                     Ok(c) => {
                         conn = Some(c);
+                        // このハンドシェイクに載せたトークンが transport に残る
+                        header_expires_at = token.as_ref().map_or(0, |(_, at)| *at);
+                        token_swap_fails = 0;
+                        token_swap_alerted = false;
                         // 接続を始めた。Connected が来なければここで止まっている
                         stall = "no_answer";
                     }
@@ -382,6 +414,49 @@ fn run(
         let connected = conn.as_ref().is_some_and(|c| c.connected);
         if !connected {
             continue;
+        }
+
+        // --- 3.5 device JWT の差し替え (Refs ippoan/rust-alc-api#644) ---
+        // Authorization は client 生成時に焼き込まれ、**C 側の自動再接続は
+        // 同じヘッダを送り続ける** (esp_websocket_client が config->headers を
+        // strdup して毎回のハンドシェイクに載せるため)。device JWT の TTL は
+        // 1 時間 (auth-worker `DEVICE_JWT_TTL_SECONDS`) で、受口は introspect で
+        // exp を検証するので、**切れた後の再接続は 401 で必ず失敗する** —
+        // そのまま 5 分経つと上の WS_STALE_RESTART で端末ごと再起動していた。
+        //
+        // 切れる前に、接続したまま transport のヘッダを差し替える。
+        // `esp_websocket_client_set_headers` は state == CONNECTED のときだけ
+        // 受け付け、中で古い値を free して strdup で置き換えるので**重複しない**
+        // (client を作り直さないので Drop の panic 経路にも触れない)。
+        // 再 mint は TLS をもう 1 本張るため、接続と同じく BLE とヒープを譲る
+        if token_needs_mint(now, Some(header_expires_at), TOKEN_HEADER_SWAP_MARGIN_S)
+            && now >= token_swap_retry_at
+            && !ble_busy
+            && heap_headroom_ok(now, &mut heap_log_at)
+        {
+            token_swap_retry_at = now + TOKEN_SWAP_RETRY_MS;
+            match swap_auth_header(&settings, &mut token, &conn, now) {
+                Ok(expires_at) => {
+                    header_expires_at = expires_at;
+                    token_swap_fails = 0;
+                    token_swap_alerted = false;
+                    log::info!("ws_uplink: device JWT を差し替えました");
+                    alc_hub_common::evtlog::emit("EVT WS_TOKEN_ROTATED");
+                }
+                Err(e) => {
+                    // **トークンそのものは絶対に載せない** — 残すのは事実と回数だけ
+                    log::warn!("ws_uplink: device JWT の差し替えに失敗: {e}");
+                    token_swap_fails = token_swap_fails.saturating_add(1);
+                    if token_swap_fails >= TOKEN_SWAP_FAIL_ALERT && !token_swap_alerted {
+                        // シリアルを見ていなくても気づけるようリングに 1 回だけ残す。
+                        // このまま期限が切れると再接続が 401 で失敗するようになる
+                        alc_hub_common::evtlog::emit(&format!(
+                            "EVT WS_TOKEN_STALE fails={token_swap_fails}"
+                        ));
+                        token_swap_alerted = true;
+                    }
+                }
+            }
         }
 
         // --- 4. キューの送信 (BLE 測定中は控える) ---
@@ -946,6 +1021,60 @@ fn send_command_result(conn: &mut Option<Conn>, id: &str, payload: &str) {
     }
 }
 
+/// device JWT を確保し (残りが `margin_s` を切っていたら再 mint)、WSS
+/// ハンドシェイクに載せる Authorization ヘッダ 1 行を返す。
+///
+/// **`connect` と「接続を保ったままの差し替え」の共通部** (Refs
+/// ippoan/rust-alc-api#644)。`margin_s` の違いだけが 2 つの用途の差になる。
+/// `mint_token` は別の HTTPS POST = TLS をもう 1 本張るので、**呼び側は
+/// `heap_headroom_ok` と `ble_busy` のゲートを通してから呼ぶこと**
+fn auth_header(
+    settings: &Settings,
+    token: &mut Option<(String, u64)>,
+    now: u64,
+    margin_s: u64,
+) -> Result<String, String> {
+    if token_needs_mint(now, token.as_ref().map(|(_, at)| *at), margin_s) {
+        let (id, secret) = settings
+            .device_credential()
+            .ok_or("未ペアリング (AUTH PAIR で登録してください)")?;
+        let t = auth_link::mint_token(&settings.auth_url(), &id, &secret)?;
+        *token = Some((t.access_token, now + t.expires_in_s * 1000));
+    }
+    Ok(auth_header_line(
+        &token.as_ref().expect("token minted above").0,
+    ))
+}
+
+/// 接続を保ったまま、transport の Authorization ヘッダを新しい device JWT へ
+/// 差し替える (Refs ippoan/rust-alc-api#644)。成功したら**差し替えた後の**
+/// 失効時刻 (稼働 ms) を返す。
+///
+/// `esp_websocket_client_set_headers` は `state == CONNECTED` のときだけ受け
+/// 付ける。失敗しても `token` は新しいまま残るので、呼び側は**戻り値でだけ**
+/// 「transport に載っているトークン」を更新すること
+fn swap_auth_header(
+    settings: &Settings,
+    token: &mut Option<(String, u64)>,
+    conn: &Option<Conn>,
+    now: u64,
+) -> Result<u64, String> {
+    let c = conn.as_ref().ok_or("接続がない")?;
+    let headers = auth_header(settings, token, now, TOKEN_HEADER_SWAP_MARGIN_S)?;
+    let expires_at = token.as_ref().map_or(0, |(_, at)| *at);
+    let line =
+        std::ffi::CString::new(headers).map_err(|_| "ヘッダに NUL が混じった".to_string())?;
+    // SAFETY: handle は生きている client のもので、line は呼び出しの間だけ生存
+    // すればよい (set_headers は中で strdup する)
+    let err = unsafe {
+        esp_idf_svc::sys::esp_websocket_client_set_headers(c.client.handle(), line.as_ptr())
+    };
+    if err != esp_idf_svc::sys::ESP_OK {
+        return Err(format!("set_headers が失敗 (err={err})"));
+    }
+    Ok(expires_at)
+}
+
 /// device JWT を確保し (期限切れ間近なら再 mint)、WSS 接続を開始する
 fn connect(
     settings: &Settings,
@@ -953,20 +1082,7 @@ fn connect(
     ev_tx: mpsc::Sender<WsEvent>,
     now: u64,
 ) -> Result<Conn, String> {
-    let needs_mint = match token {
-        Some((_, expires_at_ms)) => now + TOKEN_REFRESH_MARGIN_S * 1000 >= *expires_at_ms,
-        None => true,
-    };
-    if needs_mint {
-        let (id, secret) = settings
-            .device_credential()
-            .ok_or("未ペアリング (AUTH PAIR で登録してください)")?;
-        let t = auth_link::mint_token(&settings.auth_url(), &id, &secret)?;
-        *token = Some((t.access_token, now + t.expires_in_s * 1000));
-    }
-    let jwt = &token.as_ref().expect("token minted above").0;
-
-    let headers = format!("Authorization: Bearer {jwt}\r\n");
+    let headers = auth_header(settings, token, now, TOKEN_REFRESH_MARGIN_S)?;
     let config = EspWebSocketClientConfig {
         crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
         headers: Some(&headers),
