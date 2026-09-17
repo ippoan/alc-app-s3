@@ -11,7 +11,7 @@
 //! - 認証: auth_link::mint_token の device JWT を WSS ハンドシェイクの
 //!   Authorization ヘッダに載せる (未ペアリング時は送信しない)
 //! - 冪等: 再送は同じ seq のまま。サーバ側 UNIQUE (tenant, device, seq)
-//! - 電波共存: BLE (医療機器・優先) 接続中は新規接続・送信を控える。
+//! - 電波共存: BLE (医療機器・優先) 接続中は新規接続・再接続・送信を控える。
 //!   接続済みの WS は維持する (Hibernatable WS なのでサーバコストは低い)
 //! - 下り: `{"type":"command"}` は `EVT WS_COMMAND <id> <payload>` として
 //!   ホストへ中継し、`payload.action == "measure"` なら点呼画面を開く。
@@ -36,9 +36,10 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
 use alc_hub_core::uplink::{
     auth_header_line, command_action, command_gw_url, command_log_max_bytes, command_log_offset,
-    command_ota_url, command_print_chunk, command_print_url, command_result_frame,
-    measurement_frame, ota_guard, parse_downlink, should_wait_for_clock, token_needs_mint,
-    Downlink, DroppedEntry, OtaGuard, UplinkQueue, OTA_VERIFY_TIMEOUT_MS, PING_FRAME,
+    command_ota_url, command_print_chunk, command_print_url, command_result_frame, jitter_ms,
+    measurement_frame, ota_guard, parse_downlink, reconnect_backoff, should_wait_for_clock,
+    token_needs_mint, Downlink, DroppedEntry, OtaGuard, UplinkQueue, OTA_VERIFY_TIMEOUT_MS,
+    PING_FRAME, RECONNECT_BACKOFF_MAX_MS, RECONNECT_FAST_MS, RECONNECT_SLOW_MS,
 };
 use anyhow::Result;
 use esp_idf_svc::handle::RawHandle;
@@ -66,8 +67,6 @@ const CONNECT_TIMEOUT_S: u64 = 10;
 const PING_INTERVAL_MS: u64 = 30_000;
 /// 未 ack エントリの再送間隔 (サーバ側で冪等なので重複送信は無害)
 const RESEND_INTERVAL_MS: u64 = 15_000;
-/// 接続失敗・切断時の再接続バックオフ
-const RECONNECT_BACKOFF_MS: u64 = 20_000;
 /// device JWT の残り有効期間がこれを切ったら再 mint (ハンドシェイクの直前)
 const TOKEN_REFRESH_MARGIN_S: u64 = 120;
 /// 接続を保ったまま Authorization ヘッダを差し替える閾値 (Refs
@@ -210,6 +209,10 @@ fn run(
     // WS push 印刷 (#38) の進行中セッション (print_begin〜print_end)。フレーム
     // 跨ぎで 9100 の TcpStream を保持する。WS 切断で破棄する (未完印刷は中断)
     let mut print_session: Option<PrintSession> = None;
+    // C 側に今 FAST を書いてあるか (冗長な FFI 呼び出しを避けるだけの記憶)
+    let mut reconnect_fast = false;
+    // ハンドシェイク失敗の連鎖回数 (逓増バックオフ用)
+    let mut reconnect_fails: u32 = 0;
     // device JWT と失効時刻 (稼働 ms)
     let mut token: Option<(String, u64)> = None;
     // **transport に今載っているトークン**の失効時刻 (稼働 ms)。
@@ -281,15 +284,24 @@ fn run(
                     // 送信済みの印を落として窓の全件を送り直す
                     queue.reset_sent();
                     last_flush = 0; // 接続直後にキューを流す
+                    reconnect_fails = 0;
+                    // 次の切断は SLOW で受ける。BLE 測定中に切られても即 TLS を
+                    // 撃たないよう、条件が揃ってからループが FAST へ落とす
+                    set_reconnect_wait(conn.as_ref(), RECONNECT_SLOW_MS);
+                    reconnect_fast = false;
                     dirty = true;
                 }
                 WsEvent::Disconnected => {
+                    // **mark_disconnected より先に読む** — 中で connected_at を
+                    // 消すうえ、2 回目以降は `!c.connected` で早期 return するので、
+                    // ここでしか「今回は一度でも繋がったか」を見分けられない
+                    let held_ms = held_ms(&conn);
                     if mark_disconnected(&mut conn, "サーバ側から切断", &queue) {
                         alc_hub_common::evtlog::emit("EVT WS_DISCONNECTED");
                     }
                     // 印刷中の切断は未完なので破棄 (drop で 9100 を閉じる)
                     print_session = None;
-                    backoff_until = now_ms() + RECONNECT_BACKOFF_MS;
+                    note_disconnect(&mut reconnect_fails, &mut backoff_until, held_ms, now_ms());
                     dirty = true;
                 }
                 WsEvent::Text(text) => {
@@ -368,7 +380,9 @@ fn run(
         // 電波を使うため控える)。切断は行わず既存接続は維持する。
         // 空きヒープが少ない間も延期する (TLS と BLE のヒープ食い合い対策)
         // 自動再接続が来ないまま放置されていないか見張る。
-        // client を捨てて張り直す手が使えない以上、復帰手段は再起動しかない。
+        // 下のゲートで再接続を促しても駄目なら、client を捨てて作り直す手が
+        // 使えない以上 (Drop が切断済み client で panic する)、最後の復帰手段は
+        // 再起動しかない。
         if let Some(at) = conn.as_ref().and_then(|c| (!c.connected).then_some(c.disconnected_at)).flatten() {
             if now.saturating_sub(at) > WS_STALE_RESTART_MS {
                 let line = format!(
@@ -382,6 +396,39 @@ fn run(
                 settings.set_ws_last_seq(queue.last_seq());
                 std::thread::sleep(core::time::Duration::from_millis(300));
                 unsafe { esp_idf_svc::sys::esp_restart() };
+            }
+        }
+
+        // 切断中の再接続を「いつ起こすか」をファーム側が決める (Refs
+        // ippoan/rust-alc-api#644)。
+        //
+        // **下の `conn.is_none() && !ble_busy && ...` はここに来ない** —
+        // `mark_disconnected` は `conn` を `None` にしないので、最初の接続に
+        // 成功したあとその分岐は二度と成立せず、`ble_busy` も
+        // `heap_headroom_ok` も再接続には一切効いていなかった。その間 C 側の
+        // 自動再接続は 10 秒ごとに TLS ハンドシェイク (ピーク約 30KB の内部RAM)
+        // を撃ち続け、`MIN_FREE_HEAP_FOR_TLS` が防ぎたかったことが起きていた。
+        //
+        // `esp_websocket_client_set_reconnect_timeout` は待機中の C タスクを
+        // 起こす (WAKEUP_BIT) ので、短くすればその場で再接続が走る。長くする
+        // 方向も次の再評価で効く
+        if let Some(c) = conn.as_ref().filter(|c| !c.connected) {
+            let want_fast = net_up
+                && !ble_busy
+                && now >= backoff_until
+                && heap_headroom_ok(now, &mut heap_log_at);
+            if want_fast != reconnect_fast {
+                // FAST にだけジッターを乗せる。SLOW は「条件が揃うまでの
+                // 置き場」で、実際に張り直すのはループが FAST を書いた
+                // 瞬間なので、散らすのはそちらで足りる
+                let ms = if want_fast {
+                    jitter_ms(RECONNECT_FAST_MS, rand_u32())
+                } else {
+                    RECONNECT_SLOW_MS
+                };
+                if set_reconnect_wait(Some(c), ms) {
+                    reconnect_fast = want_fast;
+                }
             }
         }
 
@@ -404,7 +451,10 @@ fn run(
                             log::warn!("ws_uplink: 接続失敗 (バックオフ後に再試行): {e}");
                             connect_warned = true;
                         }
-                        backoff_until = now + RECONNECT_BACKOFF_MS;
+                        // ここは「client を作る前に失敗した」= 未ペアリングや
+                        // auth-worker に届かない類なので、逓増の初手 (2 秒) で
+                        // 突つき直しても無駄。**従来どおり上限で待つ**
+                        backoff_until = now + RECONNECT_BACKOFF_MAX_MS;
                         stall = "connect_err";
                     }
                 }
@@ -494,8 +544,9 @@ fn run(
             send_unsent = false;
             // 再送も同じ seq (サーバ冪等)。send 失敗は接続破棄 → 再接続
             if flush_queue(&mut conn, &mut queue, !periodic) {
+                let held_ms = held_ms(&conn);
                 mark_disconnected(&mut conn, "測定の送信失敗", &queue);
-                backoff_until = now + RECONNECT_BACKOFF_MS;
+                note_disconnect(&mut reconnect_fails, &mut backoff_until, held_ms, now);
                 publish_status(&status, &queue, false);
                 continue;
             }
@@ -513,8 +564,9 @@ fn run(
             };
             if let Err(e) = sent {
                 log::warn!("ws_uplink: ping 失敗: {e:?}");
+                let held_ms = held_ms(&conn);
                 mark_disconnected(&mut conn, "keep-alive ping の失敗", &queue);
-                backoff_until = now + RECONNECT_BACKOFF_MS;
+                note_disconnect(&mut reconnect_fails, &mut backoff_until, held_ms, now);
                 publish_status(&status, &queue, false);
                 continue;
             }
@@ -608,6 +660,59 @@ fn flush_queue(conn: &mut Option<Conn>, queue: &mut UplinkQueue, unsent_only: bo
         queue.mark_sent(seq);
     }
     false
+}
+
+/// 直前の接続が保った時間 [ms]。**一度も繋がっていなければ `None`**。
+///
+/// `mark_disconnected` が `connected_at` を消すので、切断を扱う側は**必ず
+/// これを先に読む**こと
+fn held_ms(conn: &Option<Conn>) -> Option<u64> {
+    conn.as_ref()
+        .and_then(|c| c.connected_at)
+        .map(|at| now_ms().saturating_sub(at))
+}
+
+/// C 側の再接続待ち (`wait_timeout_ms`) を書き換える。成功したら true。
+///
+/// **短くしたときは待機中の C タスクを起こす** (`WAKEUP_BIT`) ので、その場で
+/// 再接続が走る。client を作り直さないので `Drop` の panic 経路には触れない。
+///
+/// **`ms` は呼び側が [`jitter_ms`] を通してから渡す。** `esp_websocket_client`
+/// にジッターの仕組みは無く、固定値を 1 つ持つだけなので自前で散らす
+fn set_reconnect_wait(conn: Option<&Conn>, ms: u64) -> bool {
+    let Some(c) = conn else {
+        return false;
+    };
+    // SAFETY: handle は生きている client のもの。中で int を 1 つ書いて
+    // イベントグループのビットを立てるだけ
+    let err = unsafe {
+        esp_idf_svc::sys::esp_websocket_client_set_reconnect_timeout(
+            c.client.handle(),
+            ms as core::ffi::c_int,
+        )
+    };
+    if err != esp_idf_svc::sys::ESP_OK {
+        log::warn!("ws_uplink: 再接続間隔を {ms}ms にできません (err={err})");
+    }
+    err == esp_idf_svc::sys::ESP_OK
+}
+
+/// 再接続の待ちを散らすための乱数。RF が動いていれば真性、そうでなければ
+/// PRNG だが、**ジッターの用途にはどちらでも足りる**
+fn rand_u32() -> u32 {
+    // SAFETY: 引数も戻り値の解釈も無い純粋な読み出し
+    unsafe { esp_idf_svc::sys::esp_random() }
+}
+
+/// 切断を受けて、次の再接続を許す時刻と連続失敗回数を更新する。
+/// 政策そのものは hub-core の [`reconnect_backoff`] (テスト済み)。
+/// 逓増の各段にもジッターを乗せる — **配信のたびに全端末が同時に切られる**
+/// ので、失敗が続く局面でも足並みが揃わないようにする
+fn note_disconnect(fails: &mut u32, backoff_until: &mut u64, held_ms: Option<u64>, now: u64) {
+    let (delay, next) = reconnect_backoff(held_ms, *fails);
+    *fails = next;
+    // delay == 0 (サーバ都合の切断) は jitter_ms も 0 のまま = 待たない
+    *backoff_until = now + jitter_ms(delay, rand_u32());
 }
 
 /// WS の接続を「切れた」状態にする。**client は drop しない。**
@@ -1086,6 +1191,11 @@ fn connect(
     let config = EspWebSocketClientConfig {
         crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
         headers: Some(&headers),
+        // **明示しないと 0 のままで、C 側が既定の 10 秒に読み替える**
+        // (端末のログに `reconnect_timeout_ms is not set ... default 10000` が
+        // 出ていた)。起動直後は SLOW から始め、ネットワーク・BLE・ヒープの
+        // 条件が揃ったらループが set_reconnect_wait で FAST へ落とす
+        reconnect_timeout_ms: core::time::Duration::from_millis(RECONNECT_SLOW_MS),
         ..Default::default()
     };
     let client = EspWebSocketClient::new(
