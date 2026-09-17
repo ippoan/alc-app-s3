@@ -57,3 +57,58 @@ fn heap_start_requires_crashlog_init_wired_before_it() {
     // 検査が空振りしていないこと (cores3 + atoms3-print の 2 バイナリは必ず対象)
     assert!(checked >= 2, "検査対象が {checked} 個しかない (パス解決が壊れている?)");
 }
+
+/// 打刻の `EVT TIMECARD` 行の配線規約 (Refs ippoan/rust-alc-api#644)。
+///
+/// 3 つを機械検査する:
+///
+/// 1. **CoreS3 (root `src/main.rs`) が打刻の行を出している** — IC カード
+///    (FeliCa IDm / NFC-A UID) には点呼動線の `EVT NFC_LICENSE` に当たる行が
+///    無く、出さないと PC は WS でクラウドを一周しないと打刻を知れない
+///    (WS 断で十数秒、起動直後は WS が繋がるまで動かない)
+/// 2. **行の綴りを firmware 側に直書きしない** — CoreS3 と VoiceS3R が同じ
+///    出来事に別の行を出し始めると受け側 (alc-app) が 2 つ覚えることになる。
+///    綴りは `alc_hub_core::timecard::evt_line` の 1 か所 (host test で固定)
+/// 3. **`evtlog::emit` に渡さない** — `emit` の行は `.noinit` リングにも残り、
+///    `LOG DUMP` / WS 下り `get_log` で**遠隔から読み出せる**。`card_id` は人を
+///    特定できる値なので `println!` (シリアルだけ) で出す
+///    (`alc_hub_common::evtlog` の「どの行を emit にするか」)
+#[test]
+fn timecard_evt_line_is_wired_spelled_once_and_never_emitted() {
+    let mut punching = 0;
+    let mut cores3_wired = false;
+    for main in firmware_mains() {
+        let raw = fs::read_to_string(&main).unwrap_or_else(|e| panic!("{main:?} 読めない: {e}"));
+        // コメント行は走査対象外 (規約の説明文そのもので誤検知しないため)
+        let src: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !src.contains("\"EVT TIMECARD"),
+            "{main:?}: `EVT TIMECARD` の綴りを直書きしないこと \
+             (alc_hub_core::timecard::evt_line を使う — CoreS3 と VoiceS3R で同一の行にする)"
+        );
+        if !src.contains("timecard::evt_line") {
+            continue; // 打刻を出さないバイナリ (atoms3-print / atoms3-alarm 等)
+        }
+        for emit in ["emit(&alc_hub_core::timecard::evt_line", "emit(&evt_line"] {
+            assert!(
+                !src.contains(emit),
+                "{main:?}: 打刻の行を evtlog::emit に渡さないこと — card_id が \
+                 .noinit リングに残り LOG DUMP / get_log で遠隔から読める。println! で出す"
+            );
+        }
+        punching += 1;
+        // CoreS3 は workspace root の src/main.rs (crates/ の下ではない)
+        cores3_wired |= main == PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../src/main.rs");
+    }
+    assert!(
+        cores3_wired,
+        "CoreS3 (root src/main.rs) が打刻の EVT 行を出していない — IC カードの打刻が \
+         PC に届くまで WS をクラウドまで一周することになる (#644)"
+    );
+    // CoreS3 + VoiceS3R (atoms3-timecard) の 2 バイナリは必ず対象
+    assert!(punching >= 2, "検査対象が {punching} 個しかない (パス解決が壊れている?)");
+}

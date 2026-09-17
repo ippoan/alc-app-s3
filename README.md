@@ -99,6 +99,7 @@ crates/hub-core/src/improv.rs)。
 | `EVT NFC_LICENSE issue=YYYYMMDD expiry=YYYYMMDD` | 運転免許証 (IC) を読み取った |
 | `EVT NFC_CARINS mgno=<12〜13 桁> carid=<14 桁>` | 電子車検証の File 03 を読んだ (管理番号 / 車両 ID)。シリアルのみでログのリングには残らない |
 | `EVT NFC_CARINS rc=<token>` | 電子車検証を読み取れなかった (再タップを促す)。値は含まない |
+| `EVT TIMECARD card_id=<生値> card_kind=felica_idm\|nfca_uid` | IC カード (FeliCa IDm / NFC-A UID) で打刻した (Refs ippoan/rust-alc-api#644)。**免許証では出さない** — 点呼動線の `EVT NFC_LICENSE` が先に出るため。VoiceS3R が出すのと同一の行 (`alc_hub_core::timecard::evt_line`)。シリアルのみでログのリングには残らない |
 | `EVT LICENSE_EXPIRED <YYYYMMDD>` | 読み取った免許証が期限切れ (NTP 同期済みのときのみ判定) |
 | `EVT TENKO_CANCEL` / `EVT CONFIRM_TIMEOUT` | 点呼確認画面をキャンセル / 15 秒放置で待機へ戻った |
 | `EVT TENKO_SESSION <id>` | 点呼セッション ID を発番した (この点呼で採れた測定に載る、Refs #112) |
