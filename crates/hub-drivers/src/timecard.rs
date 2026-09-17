@@ -91,9 +91,3 @@ impl Punch {
         }
     }
 }
-
-/// `NfcEvent` → 送るレコード。打刻にしないイベントは `None` ([`Punch::from_event`])。
-/// `card_id` / 種別をログに出したい呼び出し側は `Punch` を直接使う
-pub fn punch_record(event: &NfcEvent, at_ms: u64, recorded_at_ms: u64) -> Option<UplinkRecord> {
-    Punch::from_event(event).map(|p| p.record(at_ms, recorded_at_ms))
-}
