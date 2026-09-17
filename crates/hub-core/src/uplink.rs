@@ -90,6 +90,49 @@ pub fn auth_header_line(jwt: &str) -> String {
     format!("Authorization: Bearer {jwt}\r\n")
 }
 
+/// 条件が揃っているときの再接続待ち [ms] (esp_websocket_client の
+/// `wait_timeout_ms`、Refs ippoan/rust-alc-api#644)。
+///
+/// **1 秒より短くしない。** C 側の待ちは切断を検知した瞬間 (`reconnect_tick_ms`)
+/// が起点なので、firmware の 500ms ループが `set_reconnect_timeout` を書き込む
+/// 前に待ちが明けてしまうと、ゲート (BLE・ヒープ・バックオフ) を通さないまま
+/// 再接続が走る。1 秒あれば必ず書き込みが間に合う
+pub const RECONNECT_FAST_MS: u64 = 1_000;
+
+/// BLE 測定中・ヒープ不足・バックオフ中の再接続待ち [ms]。
+/// **`reconnect_timeout_ms` を明示しないと C 側が 0 を既定 10 秒に読み替える**
+/// ので、起動直後はこちらから始めて、条件が揃ってから FAST へ落とす
+pub const RECONNECT_SLOW_MS: u64 = 20_000;
+
+/// 逓増バックオフの上限 [ms]
+pub const RECONNECT_BACKOFF_MAX_MS: u64 = 20_000;
+
+/// 「一度ちゃんと繋がった」と見なす接続の長さ [ms]
+pub const HEALTHY_CONNECTION_MS: u64 = 30_000;
+
+/// 切断を受けて、次の再接続を許すまでの待ち [ms] と、更新後の連続失敗回数を返す
+/// (Refs ippoan/rust-alc-api#644)。
+///
+/// `held_ms` は直前の接続が保った時間で、**一度も繋がらずにハンドシェイクが
+/// 失敗した場合は `None`**。
+///
+/// - 十分保った後の切断 = サーバ (Cloudflare の edge) 都合。実測で 1〜13 分の
+///   間隔で起きるが**こちらに落ち度は無いので待たない** (待ちは C 側の
+///   [`RECONNECT_FAST_MS`] だけ)
+/// - 短命 / 一度も繋がらない = ハンドシェイクの失敗が連鎖している。
+///   2→4→8→16→20 秒と逓増させて相手を叩き続けない
+pub fn reconnect_backoff(held_ms: Option<u64>, fails: u32) -> (u64, u32) {
+    if held_ms.is_some_and(|held| held >= HEALTHY_CONNECTION_MS) {
+        return (0, 0);
+    }
+    let fails = fails.saturating_add(1);
+    let delay = RECONNECT_FAST_MS
+        .checked_shl(fails.min(5))
+        .unwrap_or(RECONNECT_BACKOFF_MAX_MS)
+        .min(RECONNECT_BACKOFF_MAX_MS);
+    (delay, fails)
+}
+
 /// OTA 直後の image が WS に繋がらないまま、この時間が経ったら前の image に戻す
 /// (Refs #217)。起動からの稼働時間で測る
 pub const OTA_VERIFY_TIMEOUT_MS: u64 = 10 * 60 * 1000;
@@ -1669,6 +1712,35 @@ mod tests {
         assert_eq!(s.lines(), vec!["B".to_string()]);
         s.remove(2);
         assert!(s.seqs().is_empty());
+    }
+
+    #[test]
+    fn reconnect_backoff_does_not_wait_after_a_healthy_connection() {
+        // サーバ都合で切られただけ。連続失敗のカウンタも戻す
+        assert_eq!(reconnect_backoff(Some(HEALTHY_CONNECTION_MS), 4), (0, 0));
+        assert_eq!(reconnect_backoff(Some(13 * 60 * 1000), 0), (0, 0));
+    }
+
+    #[test]
+    fn reconnect_backoff_escalates_for_short_lived_connections() {
+        // 境界のすぐ下は「短命」側
+        let (delay, fails) = reconnect_backoff(Some(HEALTHY_CONNECTION_MS - 1), 0);
+        assert_eq!((delay, fails), (2_000, 1));
+        // 2→4→8→16→20 秒で頭打ち
+        assert_eq!(reconnect_backoff(None, 1), (4_000, 2));
+        assert_eq!(reconnect_backoff(None, 2), (8_000, 3));
+        assert_eq!(reconnect_backoff(None, 3), (16_000, 4));
+        assert_eq!(reconnect_backoff(None, 4), (RECONNECT_BACKOFF_MAX_MS, 5));
+        assert_eq!(reconnect_backoff(None, 5), (RECONNECT_BACKOFF_MAX_MS, 6));
+    }
+
+    #[test]
+    fn reconnect_backoff_stays_capped_and_does_not_overflow() {
+        // 一度も繋がらないまま何度失敗しても上限のまま (シフトも飽和も安全)
+        assert_eq!(
+            reconnect_backoff(None, u32::MAX),
+            (RECONNECT_BACKOFF_MAX_MS, u32::MAX)
+        );
     }
 
     #[test]
