@@ -76,6 +76,24 @@ pub fn bp_bonded(recorded: Option<[u8; 6]>, bonded: &[[u8; 6]]) -> bool {
     recorded.is_some_and(|addr| bonded.contains(&addr))
 }
 
+/// この接続結果を「血圧計としてボンドした」と記録してよいか (Refs #252)。
+///
+/// 記録は [`bp_bonded`] の片側 — つまり `AUTH SIGNBP` が署名する `bp=1` の根拠に
+/// なるので、**血圧の特性を実際に読めた経路だけ**に限る。[`match_device_name`] の
+/// 名前判定は `BP` / `Blood` を含むだけで血圧計としてしまうほど緩く、接続できた
+/// だけの無関係な機器を載せると、血圧計が無いのに `bp=1` を署名してしまう。
+///
+/// Omron 機 (`omron` が `Some`) は専用の経路が既に記録しているので `false` を
+/// 返す — 同じ機器を二重に書かない。
+///
+/// * `kind` — 広告名から確定した機器種別
+/// * `omron` — Omron 機の広告状態 (非 Omron なら `None`)
+/// * `got_data` — その接続で測定を実際に受け取れたか
+#[must_use]
+pub fn should_remember_bp_bond(kind: DeviceKind, omron: Option<OmronAdv>, got_data: bool) -> bool {
+    kind == DeviceKind::BloodPressure && omron.is_none() && got_data
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +112,45 @@ mod tests {
         assert!(!bp_bonded(Some(BP), &[]));
         // 体温計だけがボンドされていても血圧計にはならない
         assert!(!bp_bonded(None, &[OTHER]));
+    }
+
+    #[test]
+    fn remembers_bp_bond_only_when_bp_data_arrived() {
+        // 血圧計から測定を実際に受け取れた = 「血圧計としてボンドした」と記録する
+        assert!(should_remember_bp_bond(
+            DeviceKind::BloodPressure,
+            None,
+            true
+        ));
+        // 接続はできたがデータなし: 記録しない。名前判定が緩いので、無関係な
+        // 機器を載せると bp=1 を署名してしまう
+        assert!(!should_remember_bp_bond(
+            DeviceKind::BloodPressure,
+            None,
+            false
+        ));
+        // 体温計は測定を受け取れても血圧のボンド記録を書かない
+        assert!(!should_remember_bp_bond(
+            DeviceKind::Thermometer,
+            None,
+            true
+        ));
+        assert!(!should_remember_bp_bond(
+            DeviceKind::Thermometer,
+            None,
+            false
+        ));
+        // Omron は Pairing / Transfer とも専用経路が記録済み — 二重に書かない
+        assert!(!should_remember_bp_bond(
+            DeviceKind::BloodPressure,
+            Some(OmronAdv::Pairing),
+            true
+        ));
+        assert!(!should_remember_bp_bond(
+            DeviceKind::BloodPressure,
+            Some(OmronAdv::Transfer),
+            true
+        ));
     }
 
     #[test]
