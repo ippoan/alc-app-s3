@@ -284,7 +284,7 @@ fn main() -> Result<()> {
     host_link::start(
         tx.clone(),
         Arc::clone(&status),
-        settings,
+        settings.clone(),
         wifi,
         pair_flag.clone(),
         improv,
@@ -522,7 +522,7 @@ fn main() -> Result<()> {
     // Wi-Fi 接続/Improv セッション中は BLE スキャンを一時停止する (RadioCoex)
     // UI も Measurement を送る (点呼開始時の免許証 kind=license、#125)
     let ui_meas_tx = meas_tx.clone();
-    ble::start(Arc::clone(&status), meas_tx, tx, coex, pair_flag)?;
+    ble::start(Arc::clone(&status), meas_tx, tx, coex, pair_flag, settings)?;
 
     // UI ループ (メインタスクを占有, 戻らない)。alarm_monitor は**鳴動中の**
     // 画面タップで黙らせるためだけに渡す — 鳴らすのは上の専用スレッド

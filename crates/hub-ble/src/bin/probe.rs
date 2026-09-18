@@ -6,6 +6,7 @@
 
 use std::sync::{mpsc, Arc, Mutex};
 
+use alc_hub_common::settings::Settings;
 use alc_hub_common::status::HubStatus;
 
 fn main() -> anyhow::Result<()> {
@@ -26,8 +27,11 @@ fn main() -> anyhow::Result<()> {
     std::thread::spawn(move || for _ in meas_rx {});
     std::thread::spawn(move || for _ in ui_rx {});
 
+    // NVS は血圧計のボンド記録 (`bp_bond`) の読み書きに要る (Refs #249)
+    let settings = Settings::new(esp_idf_svc::nvs::EspDefaultNvsPartition::take()?)?;
+
     println!("PROBE START");
-    alc_hub_ble::start(status, meas_tx, ui_tx, coex, pair_flag)?;
+    alc_hub_ble::start(status, meas_tx, ui_tx, coex, pair_flag, settings)?;
 
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));

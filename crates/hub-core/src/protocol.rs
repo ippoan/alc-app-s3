@@ -50,8 +50,15 @@ pub enum HostCommand {
     AuthKeygen { force: bool },
     /// 生成済み公開鍵の提示 (`AUTH PUBKEY <base64url>` / 無ければエラー)
     AuthPubkey,
-    /// サーバの nonce (小文字 hex 32 文字) に署名する
+    /// サーバの nonce (小文字 hex 32 文字) に署名する。**署名対象は nonce その
+    /// もの** — 管理者ログイン (`/auth/device-login`) がこの署名を使うので、
+    /// ここに何かを足さないこと (Refs #249)
     AuthSign { nonce: String },
+    /// サーバの nonce に**血圧計のボンド状態を束縛して**署名する (Refs #249)。
+    /// キオスク端末の認証 (`/device/alarm-token`) 用で、[`HostCommand::AuthSign`]
+    /// とは応答 prefix ごと別の口。古いファームは知らないコマンドとしてエラーを
+    /// 返し、ホストが `AUTH SIGN` へフォールバックする
+    AuthSignBp { nonce: String },
     /// cf-alc-recorder WS URL の上書き (staging テスト用。NVS 保存)
     WsUrl { url: String },
     /// WS 送信の状態問い合わせ (`WS CONNECTED=1 QUEUE=3 SEQ=42` を応答)
@@ -409,9 +416,15 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                 },
                 None => return Err("ERR AUTH: SIGN には nonce が必要です".into()),
             },
+            Some("SIGNBP") => match it.next() {
+                Some(nonce) => HostCommand::AuthSignBp {
+                    nonce: nonce.to_string(),
+                },
+                None => return Err("ERR AUTH: SIGNBP には nonce が必要です".into()),
+            },
             _ => {
                 return Err(
-                    "ERR AUTH: SET|UNPAIR|STATUS|TOKEN|TICKET|URL|KEYGEN|PUBKEY|SIGN が必要です"
+                    "ERR AUTH: SET|UNPAIR|STATUS|TOKEN|TICKET|URL|KEYGEN|PUBKEY|SIGN|SIGNBP が必要です"
                         .into(),
                 )
             }
@@ -761,6 +774,25 @@ mod tests {
             }))
         );
         assert!(parse_line("AUTH SIGN", T).is_err());
+    }
+
+    /// `AUTH SIGNBP` は `AUTH SIGN` とは別の口 (Refs #249)。**`SIGN` に吸われない**
+    #[test]
+    fn parses_auth_signbp() {
+        assert_eq!(
+            parse_line("AUTH SIGNBP 0123456789abcdef0123456789abcdef", T),
+            Ok(Some(HostCommand::AuthSignBp {
+                nonce: "0123456789abcdef0123456789abcdef".into(),
+            }))
+        );
+        // 小文字でも同じ (サブコマンドは大文字化して比べる)
+        assert_eq!(
+            parse_line("auth signbp 0123456789abcdef0123456789abcdef", T),
+            Ok(Some(HostCommand::AuthSignBp {
+                nonce: "0123456789abcdef0123456789abcdef".into(),
+            }))
+        );
+        assert!(parse_line("AUTH SIGNBP", T).is_err());
     }
 
     #[test]
