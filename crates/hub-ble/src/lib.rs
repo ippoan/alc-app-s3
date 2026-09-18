@@ -48,7 +48,7 @@ use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use alc_hub_core::{
-    device::{match_device_name, omron_adv, DeviceKind, OmronAdv},
+    device::{match_device_name, omron_adv, should_remember_bp_bond, DeviceKind, OmronAdv},
     ieee11073::{parse_blood_pressure, parse_temperature},
 };
 use anyhow::{Context, Result};
@@ -213,6 +213,9 @@ async fn task(
     let mut bp_bond_rec = settings.bp_bond_addr();
     // ホストへ出した直近の値 (変化したときだけ 1 行出す)。None = 未出力
     let mut last_bp: Option<bool> = None;
+    // 「未ボンド」の内訳の直近値 `(記録が在るか, ボンド一覧に居るか)` (Refs #252)。
+    // これも変化したときだけ出す — スキャンは 1 周ごとに回るため
+    let mut last_bp_diag: Option<(bool, bool)> = None;
     loop {
         // 再ペアリング要求: 保存済みボンドを全消去する。壊れた/古いボンドが
         // 血圧計の暗号化接続を妨げている場合の復旧手段 (Pages のペアリングボタン)
@@ -257,7 +260,7 @@ async fn task(
 
         // 血圧計がボンドされているか (`AUTH SIGNBP` の署名対象に載る、Refs #249)。
         // 真偽を NVS には持たず、記録したアドレスがボンド一覧にまだ居るかで毎回決める
-        let bp = bp_bonded_now(bp_bond_rec);
+        let (bp_rec, bp) = bp_bond_parts(bp_bond_rec);
         if let Ok(mut st) = status.lock() {
             st.bp_bonded = bp;
             st.bp_read = true;
@@ -266,6 +269,19 @@ async fn task(
             last_bp = Some(bp);
             println!("{{\"type\":\"bp_bond\",\"bonded\":{bp}}}");
         }
+        // 「未ボンド」に見えるときの内訳 (Refs #252)。記録が無い (`rec=0`) のか、
+        // 記録はあるが NimBLE のボンド一覧に居ない (`rec=1 listed=0`) のかで原因が
+        // 違う — 前者は記録漏れ (測定がまだ一度も届いていない)、後者は機器が
+        // ボンドを張っていない。アドレスは端末の識別子になりうるので出さない
+        // ([`remember_bp_bond`] と同じ方針) — 真偽だけにする
+        if !bp && last_bp_diag != Some((bp_rec, bp)) {
+            alc_hub_common::evtlog::emit(&format!(
+                "EVT BP_BOND none rec={} listed={}",
+                u8::from(bp_rec),
+                u8::from(bp)
+            ));
+        }
+        last_bp_diag = Some((bp_rec, bp));
 
         // ニプロ機器は測定時にアドバタイズを開始するため、短いスキャンを
         // 繰り返して発見次第すぐ接続する (Arduino 版 loop() と同じ運用)。
@@ -318,11 +334,33 @@ async fn task(
         }
 
         println!("{{\"type\":\"found\",\"device\":\"{}\"}}", kind.json_name());
+        // 非 Omron の血圧計 (ニプロ NBP-1 等) は evtlog を 1 行も出しておらず、
+        // 実機で測ってもハブが血圧計を見つけたのかどうかログから判定できなかった
+        // (Refs #252)。Omron 経路は EVT OMRON_* が既に出すので二重に出さない
+        let bp_nonomron = kind == DeviceKind::BloodPressure && omron.is_none();
+        if bp_nonomron {
+            alc_hub_common::evtlog::emit("EVT BP_CONN try");
+        }
         // 接続開始を UI へ通知 → 点呼画面のラベル横に取得中スピナーを表示
         let _ = ui_tx.send(UiCommand::BleAcquiring { device: kind });
 
         let mut client = device.new_client();
-        match handle_device(&mut client, &adv, kind, omron, &status, &meas_tx).await {
+        let result = handle_device(&mut client, &adv, kind, omron, &status, &meas_tx).await;
+        // 測定を受け取れたか / 受け取れずに終わったか (Refs #252)
+        if bp_nonomron {
+            alc_hub_common::evtlog::emit(match &result {
+                Ok(true) => "EVT BP_RX ok",
+                Ok(false) => "EVT BP_RX none",
+                Err(_) => "EVT BP_RX err",
+            });
+        }
+        // 血圧の特性を実際に読めた経路だけ「血圧計としてボンド」に載せる (Refs #252)。
+        // 非 Omron 機はここまで記録を書く経路が無く、NimBLE のボンド一覧に居ても
+        // bp_bonded が永久に false のままだった。判定は hub-core の純粋関数が持つ
+        if should_remember_bp_bond(kind, omron, matches!(result, Ok(true))) {
+            remember_bp_bond(&settings, &adv.addr(), &mut bp_bond_rec);
+        }
+        match result {
             // データなし: しばらくこの機器への再接続を控える (機器を空ける)。
             // 接続失敗 (Err) はバックオフしない — 新規測定の広告での一時的な
             // 接続失敗もあり、その場合は即リトライで拾いたい。Omron の送信接続は
@@ -817,7 +855,7 @@ fn omron_unbond(addr: &BLEAddress) {
 }
 
 /// 血圧計としてボンドした機器のアドレスを NVS へ記録する (同じ値なら書かない)。
-/// **真偽はここに持たない** — 現在値は [`bp_bonded_now`] が毎回決める (Refs #249)。
+/// **真偽はここに持たない** — 現在値は [`bp_bond_parts`] が毎回決める (Refs #249)。
 /// アドレスは端末の識別子になりうるのでログには出さない
 fn remember_bp_bond(settings: &Settings, addr: &BLEAddress, recorded: &mut Option<[u8; 6]>) {
     let val = addr.as_le_bytes();
@@ -833,10 +871,14 @@ fn remember_bp_bond(settings: &Settings, addr: &BLEAddress, recorded: &mut Optio
     }
 }
 
-/// 血圧計がボンドされているか。判定そのものは hub-core の純粋関数が持つ。
-/// 記録が無ければ NimBLE には問い合わせない (スキャン 1 周ごとに呼ぶため)
-fn bp_bonded_now(recorded: Option<[u8; 6]>) -> bool {
-    recorded.is_some() && alc_hub_core::device::bp_bonded(recorded, &bonded_addrs())
+/// 血圧計のボンド判定を内訳つきで返す — `(記録が在るか, 記録したアドレスが
+/// ボンド一覧に居るか)`。2 つ目がそのまま「ボンドされているか」で、判定そのものは
+/// hub-core の純粋関数が持つ。記録が無ければ NimBLE には問い合わせない
+/// (スキャン 1 周ごとに呼ぶため) ので、そのときの 2 つ目は `false`
+fn bp_bond_parts(recorded: Option<[u8; 6]>) -> (bool, bool) {
+    let has_record = recorded.is_some();
+    let bonded = has_record && alc_hub_core::device::bp_bonded(recorded, &bonded_addrs());
+    (has_record, bonded)
 }
 
 /// NimBLE が今持っている bond のアドレス (native の little endian 6 B)。
