@@ -260,6 +260,7 @@ async fn task(
         let bp = bp_bonded_now(bp_bond_rec);
         if let Ok(mut st) = status.lock() {
             st.bp_bonded = bp;
+            st.bp_read = true;
         }
         if last_bp != Some(bp) {
             last_bp = Some(bp);

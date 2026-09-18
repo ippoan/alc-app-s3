@@ -57,6 +57,12 @@ pub struct HubStatus {
     /// 「血圧計なし」で正しい
     pub bp_bonded: bool,
 
+    /// BLE スキャンが一度でも回って `bp_bonded` を書いたか (Refs auth-worker#574)。
+    /// `power_read` (AXP2101 を一度でも読めたか) と同じ役割のゲート — 起動直後は
+    /// `bp_bonded` が既定値 `false` のままなので、これが `false` の間は
+    /// 「未ボンド」ではなく「まだ確認できていない」と描き分ける
+    pub bp_read: bool,
+
     /// 進行中の点呼セッションの識別子 (Refs #112)。点呼画面 (Measuring) に
     /// いる間だけ Some で、待機画面へ戻ると None に戻る。**発番と更新は UI
     /// スレッドだけが行い、recorder は読むだけ** — 点呼の開始/終了を知って

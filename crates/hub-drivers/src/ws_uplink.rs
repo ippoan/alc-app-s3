@@ -1082,6 +1082,22 @@ fn handle_downlink(
                     );
                     send_command_result(conn, &id, &payload);
                 }
+                // 血圧計のボンド状態の照会 (auth-worker#574): hub-ble がスキャン
+                // のたびに HubStatus へ写した `bp_bonded` を読むだけ (ここでは
+                // 計算し直さない)。`AUTH SIGNBP` の署名対象と同じ値だが、あちらの
+                // 署名経路には触れない — /device/setup からの表示専用の照会。
+                // `bp_read` は `power_read` (bus5v_status/battery) と同じ役割の
+                // ゲート — スキャンが一度も回っていない (起動直後) / lock 失敗の
+                // 間は「未ボンド」と答えず、`bp_bonded` 自体を省いて
+                // 「まだ確認できていない」と伝える (#322 で踏んだ誤断定を防ぐ)
+                Some("bp_status") => {
+                    let read = status.lock().map(|st| (st.bp_read, st.bp_bonded));
+                    let payload = match read {
+                        Ok((true, bonded)) => format!(r#"{{"bp_bonded":{bonded},"bp_read":true}}"#),
+                        Ok((false, _)) | Err(_) => r#"{"bp_read":false}"#.to_string(),
+                    };
+                    send_command_result(conn, &id, &payload);
+                }
                 // 遠隔再起動。OTA 中と点呼中は断る —
                 // OTA は書き込み途中で切ると起動不能になり、点呼中の再起動は
                 // 測定をやり直させる (点呼中の判定は src/main.rs の in_tenko と同じ)
