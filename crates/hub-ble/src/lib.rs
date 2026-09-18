@@ -36,7 +36,8 @@
 //!
 //! `bp_bond` は「血圧計がボンドされているか」の観測値 (Refs #249)。スキャン 1 周
 //! ごとに計算し、**変化したときだけ** 1 行出す。同じ値を `HubStatus::bp_bonded`
-//! へ写し、`AUTH SIGN` の署名対象 (`<nonce>|bp=<0|1>`) に載せる。
+//! へ写し、`AUTH SIGNBP` の署名対象 (`<nonce>|bp=<1|0>`) に載せる
+//! (管理者ログインが使う `AUTH SIGN` は nonce だけに署名し、これを載せない)。
 
 use std::future::{poll_fn, Future};
 use std::pin::pin;
@@ -254,7 +255,7 @@ async fn task(
         // スキャンの callback は広告 1 件ごとに呼ばれるため、その中で lock しない
         let omron_enabled = status.lock().map(|st| st.omron_bp).unwrap_or(false);
 
-        // 血圧計がボンドされているか (`AUTH SIGN` の署名対象に載る、Refs #249)。
+        // 血圧計がボンドされているか (`AUTH SIGNBP` の署名対象に載る、Refs #249)。
         // 真偽を NVS には持たず、記録したアドレスがボンド一覧にまだ居るかで毎回決める
         let bp = bp_bonded_now(bp_bond_rec);
         if let Ok(mut st) = status.lock() {

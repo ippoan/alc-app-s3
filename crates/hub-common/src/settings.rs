@@ -57,7 +57,7 @@ const KEY_OMRON_BP: &str = "omron_bp";
 /// Refs #249)。**真偽値ではない** — 「血圧計がボンドされているか」は、この記録が
 /// NimBLE のボンド一覧にまだ居るかで毎回決める
 /// ([`alc_hub_core::device::bp_bonded`])。`OMRON BP ON|OFF` (意思設定) とは別物で、
-/// こちらは**観測された**ボンド状態を答えるためだけに在る
+/// こちらは**観測された**ボンド状態を答えるためだけに在る (`AUTH SIGNBP`)
 const KEY_BP_BOND: &str = "bp_bond";
 
 #[derive(Clone)]

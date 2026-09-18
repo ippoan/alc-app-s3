@@ -229,14 +229,25 @@ pub fn handle_common(
             Some(seed) => println!("{}", alc_hub_core::alarm_key::auth_pubkey_line(&seed)),
             None => println!("ERR AUTH: no key"),
         },
-        // 署名対象は nonce だけではなく `<nonce>|bp=<0|1>` (Refs #249)。ブラウザは
-        // 素通しするだけなので、血圧計の有無は**鍵で裏付けられた端末の申告**になる。
-        // 値は hub-ble が観測したボンド状態 (HubStatus::bp_bonded) をそのまま使う —
-        // `OMRON BP ON|OFF` (意思設定) とは別物なので取り違えないこと
+        // ★ **署名対象は nonce そのもの。ここに何かを足さないこと** — 管理者ログイン
+        // (`/auth/device-login`) がこの署名を使っており、足すと 401 になる。
+        // ボンド状態を返すのは下の `AUTH SIGNBP` (応答 prefix ごと別の口、Refs #249)
         HostCommand::AuthSign { nonce } => match settings.alarm_sk() {
+            Some(seed) => match alc_hub_core::alarm_key::auth_sig_line(&seed, &nonce) {
+                Ok(line) => println!("{line}"),
+                Err(_) => println!("ERR AUTH: bad nonce"),
+            },
+            None => println!("ERR AUTH: no key"),
+        },
+        // キオスク端末の認証 (`/device/alarm-token`) 用。署名対象は
+        // `<nonce>|bp=<1|0>` で、ブラウザは素通しするだけなので、血圧計の有無が
+        // **鍵で裏付けられた端末の申告**になる。値は hub-ble が観測したボンド状態
+        // (HubStatus::bp_bonded) をそのまま使う — `OMRON BP ON|OFF` (意思設定) とは
+        // 別物なので取り違えないこと
+        HostCommand::AuthSignBp { nonce } => match settings.alarm_sk() {
             Some(seed) => {
                 let bp_bonded = status.lock().map(|st| st.bp_bonded).unwrap_or(false);
-                match alc_hub_core::alarm_key::auth_sig_line(&seed, &nonce, bp_bonded) {
+                match alc_hub_core::alarm_key::auth_sigbp_line(&seed, &nonce, bp_bonded) {
                     Ok(line) => println!("{line}"),
                     Err(_) => println!("ERR AUTH: bad nonce"),
                 }
