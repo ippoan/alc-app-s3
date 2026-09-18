@@ -229,11 +229,18 @@ pub fn handle_common(
             Some(seed) => println!("{}", alc_hub_core::alarm_key::auth_pubkey_line(&seed)),
             None => println!("ERR AUTH: no key"),
         },
+        // 署名対象は nonce だけではなく `<nonce>|bp=<0|1>` (Refs #249)。ブラウザは
+        // 素通しするだけなので、血圧計の有無は**鍵で裏付けられた端末の申告**になる。
+        // 値は hub-ble が観測したボンド状態 (HubStatus::bp_bonded) をそのまま使う —
+        // `OMRON BP ON|OFF` (意思設定) とは別物なので取り違えないこと
         HostCommand::AuthSign { nonce } => match settings.alarm_sk() {
-            Some(seed) => match alc_hub_core::alarm_key::auth_sig_line(&seed, &nonce) {
-                Ok(line) => println!("{line}"),
-                Err(_) => println!("ERR AUTH: bad nonce"),
-            },
+            Some(seed) => {
+                let bp_bonded = status.lock().map(|st| st.bp_bonded).unwrap_or(false);
+                match alc_hub_core::alarm_key::auth_sig_line(&seed, &nonce, bp_bonded) {
+                    Ok(line) => println!("{line}"),
+                    Err(_) => println!("ERR AUTH: bad nonce"),
+                }
+            }
             None => println!("ERR AUTH: no key"),
         },
         // cf-alc-recorder 常時接続 (ws_uplink.rs)

@@ -31,7 +31,7 @@
 //! | `AUTH TICKET` | 端末登録の一回券を auth-worker から取得し応答 (`AUTH TICKET <ticket> EXPIRES=<秒>` / `ERR AUTH TICKET: <理由>`)。運行者 PWA の端末登録用 (ippoan/auth-worker#519、ippoan/alc-app-s3#204)。**CoreS3 のみ**、他機は `unsupported` |
 //! | `AUTH KEYGEN [FORCE]` | 警告デバイス管理者認証用の ed25519 鍵対を生成し `AUTH PUBKEY <base64url>` を返す (既に在れば `ERR AUTH: key exists`、`FORCE` で作り直し。秘密鍵は NVS のみ、Refs #205) |
 //! | `AUTH PUBKEY` | 生成済み公開鍵を `AUTH PUBKEY <base64url>` で返す (無ければ `ERR AUTH: no key`) |
-//! | `AUTH SIGN <nonce>` | nonce (小文字 hex 32 文字) にその 32 バイトそのもので署名し `AUTH SIG <pubkey base64url> <sig base64url>` を返す (鍵が無ければ `ERR AUTH: no key`、nonce の形式不正は `ERR AUTH: bad nonce`) |
+//! | `AUTH SIGN <nonce>` | nonce (小文字 hex 32 文字) に血圧計のボンド状態を束縛した ASCII `<nonce>\|bp=<0\|1>` で署名し `AUTH SIG <pubkey base64url> <sig base64url> BP=<true\|false>` を返す (鍵が無ければ `ERR AUTH: no key`、nonce の形式不正は `ERR AUTH: bad nonce`)。**署名対象の形は `ippoan/auth-worker` の検証側と正本を共有する** — 片側だけ変えないこと (#249)。`BP=` は auth-worker が署名対象を組み立て直すための値そのもので、ホストは素通しするだけ |
 //! | `WS URL <url>` | cf-alc-recorder WS URL を上書き (staging テスト用) |
 //! | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` を返す |
 //! | `BUS5V STATUS` | M-Bus 5V 出力の現況 `BUS5V USB=1 OUT=1 BATTERY=0 BUS_IN=0` を返す。**設定は無い** — USB ホスト (PC) が列挙されていて、かつ M-Bus が外部給電でない (`BUS_IN=0`) 間だけ Core が 5V を出す固定動作で、hub-ui が 1 秒ごとに追随する (#202)。`BUS_IN` は起動時の W5500 probe で確定する M-Bus の外部給電判定 (`1`=PoE 等で外部給電中 `0`=無し `?`=未判定、Refs #211)。WS 下り command `{action:"bus5v_status"}` / `{action:"reboot"}` (auth-worker 端末一覧) でも遠隔で照会・再起動できる |

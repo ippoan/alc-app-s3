@@ -62,9 +62,39 @@ pub fn match_device_name(name: &str) -> Option<DeviceKind> {
     None
 }
 
+/// 血圧計がボンドされているか (Refs #249)。
+///
+/// `recorded` は**ペアリング成功時に NVS へ書いた血圧計のアドレス** (無ければ
+/// `None`)、`bonded` は NimBLE が今持っているボンド一覧のアドレス。
+/// **真偽そのものは永続化しない** — 記録したアドレスがボンド一覧にまだ居るか
+/// で毎回決めるので、`PAIR` でのボンド消去や機器側の解除と自動で整合する。
+///
+/// アドレスは NimBLE の native 表現 (little endian の 6 B) で比べる。
+/// `BLEAddress` の `==` も 6 B だけを見るので、型 (public/random) は無視してよい。
+#[must_use]
+pub fn bp_bonded(recorded: Option<[u8; 6]>, bonded: &[[u8; 6]]) -> bool {
+    recorded.is_some_and(|addr| bonded.contains(&addr))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BP: [u8; 6] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+    const OTHER: [u8; 6] = [0x11, 0x12, 0x13, 0x14, 0x15, 0x16];
+
+    #[test]
+    fn bp_bonded_needs_both_record_and_live_bond() {
+        // 記録が在り、ボンド一覧にも居る = ボンドされている
+        assert!(bp_bonded(Some(BP), &[OTHER, BP]));
+        // 記録が無い (一度もペアリングしていない)
+        assert!(!bp_bonded(None, &[BP]));
+        // 記録は在るがボンドは消えている (PAIR での全消去・機器側の解除)
+        assert!(!bp_bonded(Some(BP), &[OTHER]));
+        assert!(!bp_bonded(Some(BP), &[]));
+        // 体温計だけがボンドされていても血圧計にはならない
+        assert!(!bp_bonded(None, &[OTHER]));
+    }
 
     #[test]
     fn json_names() {

@@ -53,6 +53,12 @@ const KEY_GW_URL: &str = "gw_url";
 const KEY_TENKO_BP: &str = "tenko_bp";
 /// Omron 血圧計 (HEM-6231T) を拾うか (`OMRON BP ON|OFF`)。未設定は false
 const KEY_OMRON_BP: &str = "omron_bp";
+/// 血圧計としてボンドした機器のアドレス (NimBLE native の little endian 6 B、
+/// Refs #249)。**真偽値ではない** — 「血圧計がボンドされているか」は、この記録が
+/// NimBLE のボンド一覧にまだ居るかで毎回決める
+/// ([`alc_hub_core::device::bp_bonded`])。`OMRON BP ON|OFF` (意思設定) とは別物で、
+/// こちらは**観測された**ボンド状態を答えるためだけに在る
+const KEY_BP_BOND: &str = "bp_bond";
 
 #[derive(Clone)]
 pub struct Settings {
@@ -417,6 +423,30 @@ impl Settings {
     pub fn set_omron_bp(&self, enabled: bool) -> Result<()> {
         let nvs = self.nvs.lock().expect("settings nvs lock");
         nvs.set_u8(KEY_OMRON_BP, u8::from(enabled))?;
+        Ok(())
+    }
+
+    /// 血圧計としてボンドした機器のアドレス (little endian 6 B)。未記録は None。
+    /// 血圧計かどうかは**ペアリングの時点で** `match_target` が確定させている
+    /// (Refs #249)
+    pub fn bp_bond_addr(&self) -> Option<[u8; 6]> {
+        let nvs = self.nvs.lock().ok()?;
+        let mut buf = [0u8; 6];
+        let got = nvs.get_blob(KEY_BP_BOND, &mut buf).ok()??;
+        (got.len() == 6).then_some(buf)
+    }
+
+    /// 血圧計としてボンドした機器のアドレスを記録する (ペアリング成功時)
+    pub fn set_bp_bond_addr(&self, addr: &[u8; 6]) -> Result<()> {
+        let nvs = self.nvs.lock().expect("settings nvs lock");
+        nvs.set_blob(KEY_BP_BOND, addr)?;
+        Ok(())
+    }
+
+    /// 記録を消す (`PAIR` = 全ボンド消去に合わせる)。未記録でも成功扱い
+    pub fn clear_bp_bond_addr(&self) -> Result<()> {
+        let nvs = self.nvs.lock().expect("settings nvs lock");
+        nvs.remove(KEY_BP_BOND)?;
         Ok(())
     }
 

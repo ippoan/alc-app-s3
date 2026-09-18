@@ -79,7 +79,7 @@ Idle ─タップ→ Menu                                         自動/タッ�
 | `AUTH TOKEN` | device JWT 取得の自己診断 (`EVT AUTH_TOKEN OK\|NG ...`) |
 | `AUTH TICKET` | 端末登録の一回券を auth-worker から取得 (`AUTH TICKET <ticket> EXPIRES=<秒>` / `ERR AUTH TICKET: <理由>`)。運行者 PWA の端末登録用、**CoreS3 のみ**対応 |
 | `AUTH KEYGEN [FORCE]` / `AUTH PUBKEY` | 警告デバイス (VoiceS3R) 管理者認証用の ed25519 鍵対を機体内で生成 (`AUTH PUBKEY <base64url>` を返す。既に在れば `ERR AUTH: key exists`、`FORCE` で作り直し) / 生成済み公開鍵の再提示 (無ければ `ERR AUTH: no key`)。秘密鍵は NVS のみに留まり USB には出ない (Refs #205) |
-| `AUTH SIGN <nonce>` | サーバの nonce (小文字 hex 32 文字の ASCII、その 32 バイトそのものに署名) に署名し `AUTH SIG <pubkey base64url> <sig base64url>` を返す (鍵無しは `ERR AUTH: no key`、nonce の形式不正は `ERR AUTH: bad nonce`) |
+| `AUTH SIGN <nonce>` | サーバの nonce (小文字 hex 32 文字) に血圧計のボンド状態を束縛した ASCII `<nonce>\|bp=<0\|1>` へ署名し `AUTH SIG <pubkey base64url> <sig base64url> BP=<true\|false>` を返す (鍵無しは `ERR AUTH: no key`、nonce の形式不正は `ERR AUTH: bad nonce`)。ブラウザは素通しするだけなので、血圧計の有無が鍵で裏付けられた端末の申告になる (#249) |
 | `AUTH URL <url>` / `WS URL <url>` | auth-worker / cf-alc-recorder の URL 上書き (staging テスト用、NVS 保存) |
 | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` 応答 (測定データ WS 送信の状態) |
 | `TENKO BP ON\|OFF` / `TENKO STATUS` | 点呼に血圧を含めるか (NVS 保存、**既定 OFF** = 体温 + アルコールの 2 段)。`TENKO BP=0` 応答 |

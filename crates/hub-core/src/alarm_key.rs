@@ -6,7 +6,7 @@
 //! (ホストでテスト可能、副作用なし)。
 //!
 //! 秘密鍵を返す関数はここにも他のどこにも作らない — `AUTH PUBKEY` /
-//! `AUTH SIG` の応答は常に公開鍵と署名だけを含む。
+//! `AUTH SIG` の応答は公開鍵・署名・血圧計のボンド状態だけを含む。
 
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -35,12 +35,31 @@ pub fn pubkey_b64(seed: &[u8; 32]) -> String {
     b64url_encode(signing_key.verifying_key().as_bytes())
 }
 
-/// nonce (小文字 hex 32 文字の ASCII そのもの、hex デコードしない) に署名し、
+/// 署名対象の文字列 (ASCII)。nonce に血圧計のボンド状態を束縛する (Refs #249)。
+///
+/// ```text
+/// <nonce>|bp=1   血圧計がボンドされている
+/// <nonce>|bp=0   ボンドされていない
+/// ```
+///
+/// ★ **この形は `ippoan/auth-worker` の検証側と 1 文字も違わずに揃っている。**
+/// 区切りは半角パイプ 1 文字、`bp=` の後は `1` か `0` のみ、空白を入れない。
+/// **片側だけ変えないこと** — 変えると署名検証が全滅する。
+///
+/// 旧ファームは `<nonce>` だけに署名する。auth-worker は両方を受け付け、
+/// 署名だけの場合は「不明」として従来どおりに扱うので、こちら側に
+/// バージョン交渉は要らない。
+#[must_use]
+pub fn sign_payload(nonce: &str, bp_bonded: bool) -> String {
+    format!("{nonce}|bp={}", u8::from(bp_bonded))
+}
+
+/// [`sign_payload`] の組み立て結果 (nonce + ボンド状態) に署名し、
 /// 署名 (64 B) を base64url (padding 無し) で返す。
-pub fn sign_nonce(seed: &[u8; 32], nonce: &str) -> Result<String, BadNonce> {
+pub fn sign_nonce(seed: &[u8; 32], nonce: &str, bp_bonded: bool) -> Result<String, BadNonce> {
     check_nonce(nonce)?;
     let signing_key = SigningKey::from_bytes(seed);
-    let sig = signing_key.sign(nonce.as_bytes());
+    let sig = signing_key.sign(sign_payload(nonce, bp_bonded).as_bytes());
     Ok(b64url_encode(&sig.to_bytes()))
 }
 
@@ -50,10 +69,19 @@ pub fn auth_pubkey_line(seed: &[u8; 32]) -> String {
     format!("AUTH PUBKEY {}", pubkey_b64(seed))
 }
 
-/// `AUTH SIG <pubkey base64url> <sig base64url>` 応答行、または nonce 不正。
-pub fn auth_sig_line(seed: &[u8; 32], nonce: &str) -> Result<String, BadNonce> {
-    let sig = sign_nonce(seed, nonce)?;
-    Ok(format!("AUTH SIG {} {}", pubkey_b64(seed), sig))
+/// `AUTH SIG <pubkey base64url> <sig base64url> BP=<true|false>` 応答行、
+/// または nonce 不正。
+///
+/// `BP=` はホスト (ブラウザ) が署名と一緒に上流へ渡すための**ボンド状態の値
+/// そのもの**。auth-worker はこの値で [`sign_payload`] を組み立て直して検証する
+/// ので、**署名した値と必ず同じものを出すこと** (Refs #249)。
+pub fn auth_sig_line(seed: &[u8; 32], nonce: &str, bp_bonded: bool) -> Result<String, BadNonce> {
+    let sig = sign_nonce(seed, nonce, bp_bonded)?;
+    Ok(format!(
+        "AUTH SIG {} {} BP={bp_bonded}",
+        pubkey_b64(seed),
+        sig
+    ))
 }
 
 /// RFC 4648 base64url (padding 無し)。標準 base64 alphabet の `62`/`63` 番目
@@ -167,15 +195,45 @@ mod tests {
         out
     }
 
+    /// 署名対象の形。**auth-worker (ippoan/auth-worker#571) と揃える正本**なので、
+    /// 文字列リテラルを直に書いて比べる (組み立て式を写すと両方同時に壊れる)
+    #[test]
+    fn sign_payload_binds_bond_state() {
+        let nonce = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            sign_payload(nonce, true),
+            "0123456789abcdef0123456789abcdef|bp=1"
+        );
+        assert_eq!(
+            sign_payload(nonce, false),
+            "0123456789abcdef0123456789abcdef|bp=0"
+        );
+    }
+
     #[test]
     fn sign_nonce_roundtrips_through_verify() {
         let seed = hex_to_bytes32(RFC8032_SEED);
         let nonce = "0123456789abcdef0123456789abcdef";
-        let sig_b64 = sign_nonce(&seed, nonce).expect("valid nonce");
-        let sig_bytes = b64url_decode_for_test(&sig_b64);
-        let sig = ed25519_dalek::Signature::from_slice(&sig_bytes).unwrap();
         let vk = VerifyingKey::from_bytes(&hex_to_bytes32(RFC8032_PUBKEY)).unwrap();
-        assert!(vk.verify(nonce.as_bytes(), &sig).is_ok());
+        for bp in [true, false] {
+            let sig_b64 = sign_nonce(&seed, nonce, bp).expect("valid nonce");
+            let sig_bytes = b64url_decode_for_test(&sig_b64);
+            let sig = ed25519_dalek::Signature::from_slice(&sig_bytes).unwrap();
+            assert!(vk.verify(sign_payload(nonce, bp).as_bytes(), &sig).is_ok());
+            // nonce だけの署名にはならない (旧形式と取り違えない)
+            assert!(vk.verify(nonce.as_bytes(), &sig).is_err());
+        }
+    }
+
+    /// ボンド状態が違えば署名も違う — 署名が状態を実際に束縛している証拠
+    #[test]
+    fn sign_nonce_differs_by_bond_state() {
+        let seed = hex_to_bytes32(RFC8032_SEED);
+        let nonce = "0123456789abcdef0123456789abcdef";
+        assert_ne!(
+            sign_nonce(&seed, nonce, true).unwrap(),
+            sign_nonce(&seed, nonce, false).unwrap()
+        );
     }
 
     #[test]
@@ -189,17 +247,21 @@ mod tests {
     #[test]
     fn auth_sig_line_format() {
         let seed = hex_to_bytes32(RFC8032_SEED);
-        let line = auth_sig_line(&seed, "0123456789abcdef0123456789abcdef").unwrap();
-        let parts: Vec<&str> = line.split(' ').collect();
-        assert_eq!(parts.len(), 4);
-        assert_eq!(parts[0], "AUTH");
-        assert_eq!(parts[1], "SIG");
+        for (bp, field) in [(true, "BP=true"), (false, "BP=false")] {
+            let line = auth_sig_line(&seed, "0123456789abcdef0123456789abcdef", bp).unwrap();
+            let parts: Vec<&str> = line.split(' ').collect();
+            assert_eq!(parts.len(), 5);
+            assert_eq!(parts[0], "AUTH");
+            assert_eq!(parts[1], "SIG");
+            assert_eq!(parts[2], pubkey_b64(&seed));
+            assert_eq!(parts[4], field);
+        }
     }
 
     #[test]
     fn auth_sig_line_rejects_bad_nonce() {
         let seed = hex_to_bytes32(RFC8032_SEED);
-        assert_eq!(auth_sig_line(&seed, "short"), Err(BadNonce));
+        assert_eq!(auth_sig_line(&seed, "short", true), Err(BadNonce));
     }
 
     #[test]

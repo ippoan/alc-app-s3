@@ -280,7 +280,14 @@ fn main() -> Result<()> {
         // 本機は Wi-Fi を持たないので電波の取り合いは起きない。OTA 中の一時停止は
         // hub-ble が status.ota_active を見て自前で行う
         let coex = Arc::new(alc_hub_core::coex::RadioCoex::new());
-        alc_hub_ble::start(Arc::clone(&status), meas_tx, ui_tx_for_ble, coex, pair_flag)?;
+        alc_hub_ble::start(
+            Arc::clone(&status),
+            meas_tx,
+            ui_tx_for_ble,
+            coex,
+            pair_flag,
+            settings.clone(),
+        )?;
         alc_hub_common::evtlog::emit("EVT BLE_ENABLED omron_bp");
     } else {
         // 既定。**BT controller ごと起こさない** = 打刻だけの端末の内部RAM を
