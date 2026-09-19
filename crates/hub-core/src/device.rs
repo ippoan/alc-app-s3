@@ -24,8 +24,9 @@ impl DeviceKind {
     }
 }
 
-/// Omron の BLE 機器 (HEM-6231T) の広告がどちらの状態か。
-/// どちらも service UUID を広告しないので名前で見分ける (Refs #237、Linux で実測)。
+/// Omron の BLE 機器 (HEM-6231T / HCR-1901T2) の広告がどちらの状態か。
+/// HEM-6231T は service UUID を広告せず名前で見分ける (Refs #237、Linux で実測)。
+/// HCR-1901T2 は本体広告のメーカーデータで見分ける ([`omron_adv_from_mfg`])。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OmronAdv {
     /// ペアリング待ち (機器の -P- 点滅中)。unlock 鍵の登録に接続する
@@ -36,6 +37,9 @@ pub enum OmronAdv {
 
 /// 広告名から Omron 機器の状態を返す。接頭辞の大文字小文字で状態が変わる
 /// (ペアリング待ち `BLEsmart_`、送信 `BLESmart_`) ので区別して比べる。
+///
+/// **HCR-1901T2 には効かない** — ペアリング待ちでも `BLESmart_` のままなので、
+/// 本体広告のメーカーデータを見る [`omron_adv_from_mfg`] を先に当てる。
 pub fn omron_adv(name: &str) -> Option<OmronAdv> {
     if name.starts_with("BLEsmart_") {
         Some(OmronAdv::Pairing)
@@ -44,6 +48,35 @@ pub fn omron_adv(name: &str) -> Option<OmronAdv> {
     } else {
         None
     }
+}
+
+/// HCR-1901T2 のメーカーデータ (company `0x020E` の payload) の先頭バイト。
+/// 実測した payload は `06 <flags> <n1> 00 <n2> 00×7` の 12 byte
+const OMRON_MFG_HEAD: u8 = 0x06;
+const OMRON_MFG_LEN: usize = 12;
+/// `flags` のこのビットが立っている間だけ機器はペアリング待ち (`-P-` 点滅)
+const OMRON_MFG_PAIRING_BIT: u8 = 0x08;
+
+/// Omron 機の**接続可能な本体広告**のメーカーデータから状態を返す。
+///
+/// HCR-1901T2 は名前が scan response にしか載らず、しかも**ペアリング待ちでも
+/// `BLESmart_` (大文字 S) のまま**で [`omron_adv`] の大文字小文字判定が効かない
+/// (Windows で実測)。状態を持つのはメーカーデータの `flags` の bit3 だけで、
+/// `0x29` = `-P-` 点滅 / `0x21` = 通常。同じ payload の `n1` / `n2` は測定の
+/// 累積件数で、送信済みになっても減らない (= 未送信件数ではない) ので使わない。
+///
+/// 形 (12 byte・先頭 `0x06`) が違う機種 (HEM-6231T など) は `None` を返し、
+/// 従来どおり [`omron_adv`] の名前判定に任せる。
+#[must_use]
+pub fn omron_adv_from_mfg(payload: &[u8]) -> Option<OmronAdv> {
+    if payload.len() != OMRON_MFG_LEN || payload[0] != OMRON_MFG_HEAD {
+        return None;
+    }
+    Some(if payload[1] & OMRON_MFG_PAIRING_BIT == 0 {
+        OmronAdv::Transfer
+    } else {
+        OmronAdv::Pairing
+    })
 }
 
 /// アドバタイズのデバイス名から種別を判定する (Arduino 版の名前判定を移植。
@@ -198,6 +231,34 @@ mod tests {
         assert_eq!(omron_adv("BLESmart_test"), Some(OmronAdv::Transfer));
         assert_eq!(omron_adv("blesmart_test"), None);
         assert_eq!(omron_adv("NBP-1BLE"), None);
+    }
+
+    /// HCR-1901T2 の本体広告 (company 0x020E の payload) を実測値で当てる
+    #[test]
+    fn omron_adv_from_mfg_states() {
+        // -P- 点滅中 (flags bit3 が立つ)
+        let pairing = [
+            0x06, 0x29, 0x03, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(omron_adv_from_mfg(&pairing), Some(OmronAdv::Pairing));
+        // 通常 (測定の累積件数 n1/n2 が進んでも状態は変わらない)
+        let transfer = [
+            0x06, 0x21, 0x04, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(omron_adv_from_mfg(&transfer), Some(OmronAdv::Transfer));
+    }
+
+    /// 形が違うメーカーデータ (別機種・iBeacon 等) は名前判定に任せる
+    #[test]
+    fn omron_adv_from_mfg_ignores_other_shapes() {
+        // 長さ違い
+        assert_eq!(omron_adv_from_mfg(&[0x06, 0x21]), None);
+        assert_eq!(omron_adv_from_mfg(&[]), None);
+        // 先頭バイト違い
+        let head = [
+            0x02, 0x21, 0x04, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(omron_adv_from_mfg(&head), None);
     }
 
     #[test]

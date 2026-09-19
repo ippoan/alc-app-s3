@@ -1,4 +1,5 @@
-//! 内蔵 BLE central: ニプロ体温計 NT-100B / 血圧計 NBP-1BLE、Omron 血圧計 HEM-6231T の読み取り。
+//! 内蔵 BLE central: ニプロ体温計 NT-100B / 血圧計 NBP-1BLE、Omron 血圧計
+//! HEM-6231T / HCR-1901T2 の読み取り。
 //!
 //! `ippoan/ble-medical-gateway` からの移植:
 //! - スキャン → 接続 → notify/indicate 購読の骨組み:
@@ -48,7 +49,10 @@ use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use alc_hub_core::{
-    device::{match_device_name, omron_adv, should_remember_bp_bond, DeviceKind, OmronAdv},
+    device::{
+        match_device_name, omron_adv, omron_adv_from_mfg, should_remember_bp_bond, DeviceKind,
+        OmronAdv,
+    },
     ieee11073::{parse_blood_pressure, parse_temperature},
 };
 use anyhow::{Context, Result};
@@ -88,6 +92,11 @@ const OMRON_COMPANY_ID: u16 = 0x020E;
 // Omron 独自 service のペアリング (unlock 鍵の登録)。UUID と電文は omblepy
 // (https://github.com/userx14/omblepy) の LEGACY_* / writeNewUnlockKey と同じ (Refs #237)
 const OMRON_SERVICE: BleUuid = uuid128!("ecbe3980-c9a2-11e1-b1bd-0002a5d5c51b");
+/// HCR-1901T2 の Omron 独自 service (16bit)。中の特性 (unlock / RX0) は 128bit の
+/// [`OMRON_SERVICE`] と同じ UUID だが、**鍵の電文には一切応答しない** — この系統は
+/// bond だけで標準 BLS (0x2A35) を流す (Windows で実測)。この service が在るかで
+/// ペアリングの手順を分ける
+const OMRON_SERVICE_16: u16 = 0xFE4A;
 /// RX[0]。購読すると機器が bond (SMP) を始める
 const OMRON_RX0: BleUuid = uuid128!("49123040-aee8-11e1-a74d-0002a5d5c51b");
 /// unlock。書き込みへの応答が notify で返る
@@ -294,11 +303,17 @@ async fn task(
             .start(device, SCAN_DURATION_MS, |dev, data| {
                 #[cfg(feature = "probe")]
                 probe::log_adv(dev, &data);
-                // 直近の接続がデータなしだった機器はバックオフ中 — 接続しない
-                if empty_backoff.iter().any(|(a, _)| *a == dev.addr()) {
+                let target = match_target(dev, &data);
+                // 直近の接続がデータなしだった機器はバックオフ中 — 接続しない。
+                // ただしペアリング待ちは通す: HCR-1901T2 は同じ機器の scan response が
+                // 名前だけで「送信」に見え、未ボンドで弾かれて backoff に入る。その間
+                // ユーザーが -P- にした本体広告まで捨てると、ペアリングが永久に始まらない
+                if !matches!(target, Some((_, Some(OmronAdv::Pairing))))
+                    && empty_backoff.iter().any(|(a, _)| *a == dev.addr())
+                {
                     return None;
                 }
-                match match_target(dev, &data) {
+                match target {
                     Some((_, Some(_))) if !omron_enabled => None,
                     Some((_, Some(OmronAdv::Pairing)))
                         if paired_backoff.iter().any(|(a, _)| *a == dev.addr()) =>
@@ -411,10 +426,15 @@ fn match_target(
     // Omron 機の本体の広告は名前が無く 0x1810 を広告し、名前は別パケットの scan response
     // にだけ載る (S3R の PROBE ADV で実測)。本体の広告を 0x1810 で当てると Omron と
     // 分からずニプロ経路で接続するので無視し、scan response の名前で判定させる
-    if data
+    if let Some(mfg) = data
         .manufacture_data()
-        .is_some_and(|m| m.company_identifier == OMRON_COMPANY_ID)
+        .filter(|m| m.company_identifier == OMRON_COMPANY_ID)
     {
+        // HCR-1901T2 の状態はメーカーデータの flag だけが持つ。名前 (scan response) は
+        // ペアリング待ちでも `BLESmart_` のままで大文字小文字判定が効かない
+        if let Some(adv) = omron_adv_from_mfg(mfg.payload) {
+            return Some((DeviceKind::BloodPressure, Some(adv)));
+        }
         let name = String::from_utf8_lossy(data.name()?);
         return omron_adv(&name).map(|adv| (DeviceKind::BloodPressure, Some(adv)));
     }
@@ -700,8 +720,10 @@ async fn handle_device(
     Ok(got_data.load(Ordering::SeqCst))
 }
 
-/// Omron 機のペアリング待ち (-P- 点滅) に接続した直後に呼ぶ: RX[0] 購読 → bond →
-/// unlock 購読 → プログラムモード → 鍵の登録。各段を `EVT OMRON_PAIR <段> ok|err` で出す。
+/// Omron 機のペアリング待ち (-P- 点滅) に接続した直後に呼ぶ。機種の系統で手順が違い、
+/// 独自 service が 16bit `0xFE4A` の系統 (HCR-1901T2) は **bond だけ**、128bit の
+/// [`OMRON_SERVICE`] の系統 (HEM-6231T) は RX[0] 購読 → bond → unlock 購読 →
+/// プログラムモード → 鍵の登録。各段を `EVT OMRON_PAIR <段> ok|err` で出す。
 /// 登録後の受信は標準 0x2A35 で鍵を使わないので、鍵は毎回乱数で作って保存しない
 /// (値はログに出さない)。切断は呼び出し側
 async fn omron_pair(client: &mut BLEClient, disconnected: &Disconnected) -> Result<()> {
@@ -717,6 +739,38 @@ async fn omron_pair(client: &mut BLEClient, disconnected: &Disconnected) -> Resu
             }
         }
     }
+
+    // 系統の判定。16bit 0xFE4A が在れば HCR-1901T2 系 — unlock の電文には応答せず
+    // (02+16×00 を 10 回書いても無応答。Windows で実測)、bond だけで標準 BLS を流す。
+    // 見つからなければ従来どおり HEM-6231T の手順に進む (判定に失敗した回も同じ)
+    let bls_only = matches!(
+        disconnected
+            .until(async {
+                client
+                    .get_service(BleUuid::from_uuid16(OMRON_SERVICE_16))
+                    .await
+                    .map(|_| ())
+            })
+            .await,
+        Ok(Ok(()))
+    );
+    if bls_only {
+        alc_hub_common::evtlog::emit("EVT OMRON_PAIR style=bls");
+        // bond だけ張る。RX[0] の購読は bond 前だと Insufficient Authentication で
+        // 弾かれるので行わない (機器側からの Security Request も待たず、こちらから張る)
+        let res = disconnected
+            .until_timeout(client.secure_connection(), OMRON_SECURE_TIMEOUT_MS)
+            .await;
+        step("bond", res.and_then(|r| Ok(r?)))?;
+        // 鍵登録の系統と同じだけ間を置いてから切る (切断は呼び出し側)。記録は
+        // このあとの送信広告への接続で標準 0x2A35 から受け取る
+        let start = now_ms();
+        while !disconnected.is_set() && now_ms().saturating_sub(start) < OMRON_PAIR_LINGER_MS {
+            FreeRtos::delay_ms(100);
+        }
+        return Ok(());
+    }
+    alc_hub_common::evtlog::emit("EVT OMRON_PAIR style=legacy");
 
     // 各段は切断でも抜ける (Disconnected::until)。抜けた段も err として出す
     // 1. RX[0] を購読する (CCCD は Write Request)。これで機器が bond を求めてくる
