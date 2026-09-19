@@ -141,6 +141,10 @@ const BP_READY_POLL_MS: u32 = 100;
 fn wait_bp_report(status: &SharedStatus) -> alc_hub_core::device::BpReport {
     let mut waited = 0;
     loop {
+        // ★ **読めていれば 1 ミリ秒も待たない** — 判定が先、`delay_ms` は後。
+        // 2 回目以降の `AUTH SIGNBP` (`bp_read` が既に true) と、BLE を
+        // 起こさない機 (`ble_running` が false) はここで即座に返る。待たせると
+        // 測定台の起動が毎回 6 秒重くなる
         let report = alc_hub_common::status::bp_report(status);
         if report != alc_hub_core::device::BpReport::NotReady || waited >= BP_READY_WAIT_MS {
             return report;

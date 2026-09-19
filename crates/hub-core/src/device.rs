@@ -172,6 +172,11 @@ pub enum BpReport {
 /// | true | false | `NotReady` | スキャン前。既定値の false は観測結果ではない |
 /// | true | true | `Ready { bonded }` | 実測 |
 ///
+/// `ble_running=false` を**確定した観測**として扱えるのは、`HubStatus::bp_bonded`
+/// の doc が「BLE を積まない機・`OMRON BP OFF` で BLE を起こさない機では false の
+/// まま = **『血圧計なし』で正しい**」と定めているため。そこで待つと `bp_read` は
+/// 永久に立たず、`AUTH SIGNBP` が一生答えられない端末になる。
+///
 /// # なぜゲートが要るか
 ///
 /// `HubStatus::bp_bonded` の既定値は `false` で、hub-ble のスキャンが 1 周して
@@ -217,8 +222,17 @@ pub enum BpBondSite {
         kind: DeviceKind,
         /// Omron 機の広告状態 (非 Omron なら `None`)
         omron: Option<OmronAdv>,
-        /// その接続で測定を実際に受け取れたか
-        got_data: bool,
+        /// **血圧の測定特性 (`0x2A35`) の購読まで到達したか。**
+        /// 以前は「測定を実際に受け取れたか」だった (根拠を前倒しした理由は
+        /// [`should_remember_bp_bond`] の「なぜ『測定が届くまで待たない』のか」)。
+        ///
+        /// hub-ble の非 Omron 経路は `get_service(0x1810)` →
+        /// `get_characteristic(0x2A35)` → `subscribe_indicate|notify` を
+        /// すべて `?` で通すので、**そこまで進めた = 血圧計であることが確定**。
+        /// 「接続できただけ」とは区別する — `match_device_name` は名前に `BP` や
+        /// `Blood` を含むだけで血圧計にしてしまうほど緩く、無関係な機器を
+        /// 載せると `bp=1` を誤って署名する
+        bp_subscribed: bool,
     },
 }
 
@@ -235,10 +249,20 @@ pub enum BpBondSite {
 /// |---|---|---|
 /// | [`BpBondSite::OmronBondSeen`] | ✔ | ボンド一覧に居る Omron 機 = 血圧計が在る観測 |
 /// | [`BpBondSite::OmronPaired`] | ✔ | `EVT PAIR_OK` と同時に書く。成功表示と記録を一致させる |
-/// | `ConnectionFinished` 血圧計・非 Omron・測定あり | ✔ | 血圧の特性を実際に読めた |
-/// | `ConnectionFinished` 血圧計・非 Omron・測定なし | ✘ | 名前判定が緩く、無関係な機器を載せうる |
-/// | `ConnectionFinished` 体温計 (測定の有無によらず) | ✘ | 血圧計ではない |
-/// | `ConnectionFinished` Omron 機 (測定の有無によらず) | ✘ | 上 2 つが記録済み。二重に書かない |
+/// | `ConnectionFinished` 血圧計・非 Omron・**購読できた** | ✔ | `0x2A35` に到達した = 血圧計だと確定。**測定の到着は待たない** |
+/// | `ConnectionFinished` 血圧計・非 Omron・購読前に落ちた | ✘ | 接続できただけ。名前判定が緩く、無関係な機器を載せうる |
+/// | `ConnectionFinished` 体温計 (購読の成否によらず) | ✘ | 血圧計ではない |
+/// | `ConnectionFinished` Omron 機 (購読の成否によらず) | ✘ | 上 2 つが記録済み。二重に書かない |
+///
+/// # なぜ「測定が届くまで待たない」のか
+///
+/// `bp_bonded` は `X-Device-Bp-Bonded` として上流 (`ippoan/rust-alc-api` の
+/// `BpRequiredReason`) まで流れ、**その点呼で血圧の提出を必須にするか**を決める。
+/// 「1 回測るまで記録しない」ままだと、血圧計をペアリング済みなのに
+/// **最初の点呼が血圧を求めず、法定の記録が省かれる** (誰かが 1 回測って初めて
+/// 必須になる)。だから**血圧計だと確定できた時点で記録する**。
+/// Omron 経路は #267 で既にペアリング成功の時点で記録している — 非 Omron だけが
+/// 取り残されていた。**測定を待つ形へ戻さないこと。**
 ///
 /// # Omron 経路を常に `true` に倒してある理由
 ///
@@ -255,8 +279,8 @@ pub fn should_remember_bp_bond(site: BpBondSite) -> bool {
         BpBondSite::ConnectionFinished {
             kind,
             omron,
-            got_data,
-        } => kind == DeviceKind::BloodPressure && omron.is_none() && got_data,
+            bp_subscribed,
+        } => kind == DeviceKind::BloodPressure && omron.is_none() && bp_subscribed,
     }
 }
 
@@ -284,13 +308,13 @@ mod tests {
     ///
     /// enum 化する前の `should_remember_bp_bond(kind, omron, got_data)` は
     /// hub-ble の `:404` 専用だったので、**旧テストの 6 ケースはすべてこの variant**
-    /// に移した。下の `remembers_bp_bond_only_when_bp_data_arrived` の ① 〜 ⑥ が
-    /// その 6 つで、入力も結論も変えていない (⑦ ⑧ は今回足した網羅ぶん)
-    fn finished(kind: DeviceKind, omron: Option<OmronAdv>, got_data: bool) -> BpBondSite {
+    /// に移した。第 3 引数の意味は「測定が届いたか」から
+    /// **「血圧の特性を購読できたか」**へ変わっている (記録の根拠を前倒しした)。
+    fn finished(kind: DeviceKind, omron: Option<OmronAdv>, bp_subscribed: bool) -> BpBondSite {
         BpBondSite::ConnectionFinished {
             kind,
             omron,
-            got_data,
+            bp_subscribed,
         }
     }
 
@@ -356,22 +380,31 @@ mod tests {
         assert!(should_remember_bp_bond(BpBondSite::OmronBondSeen));
     }
 
+    /// **測定を待たずに記録する** (Omron を直した #267 と同じ方針を非 Omron へ)。
+    ///
+    /// ★ ② は**意図的に反転させた**ケース。旧版は「血圧計・非 Omron・測定なし
+    /// → 記録しない」だったが、その形だと血圧計をペアリング済みなのに最初の
+    /// 点呼が血圧を求めず、法定の記録が省かれる (`should_remember_bp_bond` の
+    /// 「なぜ『測定が届くまで待たない』のか」参照)。根拠を「測定が届いた」から
+    /// **「血圧の特性を購読できた」**へ前倒しして、記録も前倒しした。
+    /// **体温計 (③ ④) と Omron (⑤ 〜 ⑧) の期待は変えていない。**
     #[test]
-    fn remembers_bp_bond_only_when_bp_data_arrived() {
-        // ① 血圧計から測定を実際に受け取れた = 「血圧計としてボンドした」と記録する
+    fn remembers_bp_bond_once_the_bp_characteristic_was_subscribed() {
+        // ① 血圧の特性を購読できた = 「血圧計としてボンドした」と記録する。
+        // **測定を 1 件も受け取っていなくてもここに来る**
         assert!(should_remember_bp_bond(finished(
             DeviceKind::BloodPressure,
             None,
             true
         )));
-        // ② 接続はできたがデータなし: 記録しない。名前判定が緩いので、無関係な
-        // 機器を載せると bp=1 を署名してしまう
+        // ② 接続はできたが購読まで到達していない: 記録しない。名前判定が緩いので、
+        // 無関係な機器を載せると bp=1 を署名してしまう
         assert!(!should_remember_bp_bond(finished(
             DeviceKind::BloodPressure,
             None,
             false
         )));
-        // ③ ④ 体温計は測定を受け取れても血圧のボンド記録を書かない
+        // ③ ④ 体温計は血圧の特性に触れないし、触れても血圧のボンド記録は書かない
         assert!(!should_remember_bp_bond(finished(
             DeviceKind::Thermometer,
             None,
@@ -382,9 +415,8 @@ mod tests {
             None,
             false
         )));
-        // ⑤ ⑥ Omron は Pairing / Transfer とも専用の観測点が記録済み — 二重に書かない。
-        // ⑦ ⑧ (got_data = false) は旧テストに無かったぶん — 測定の有無によらず
-        // false であることを固定する
+        // ⑤ 〜 ⑧ Omron は Pairing / Transfer とも専用の観測点が記録済み —
+        // 購読の成否によらず、ここで二重に書かない
         assert!(!should_remember_bp_bond(finished(
             DeviceKind::BloodPressure,
             Some(OmronAdv::Pairing),
