@@ -301,6 +301,77 @@ mod tests {
     }
 
     #[test]
+    fn update_never_returns_the_opposite_of_its_sample() {
+        // [`Latch::update`] は `None` か `Some(渡した値)` しか返さない。
+        // これが「`OFF` なら絶対に出さない」の土台 — 呼び手は `update` が返した
+        // 値をそのまま `set_ext_5v_out` へ渡すので、**サンプルが `false` である
+        // 限り `true` が渡ることは構造上あり得ない**
+        for pre_out in [false, true] {
+            for a in [false, true] {
+                for b in [false, true] {
+                    let mut l = Latch::default();
+                    if pre_out {
+                        l.update(true);
+                        l.update(true);
+                        l.commit(true);
+                    }
+                    for sample in [a, b, a, b, b, b] {
+                        if let Some(desired) = l.update(sample) {
+                            assert_eq!(desired, sample, "update が渡した値と違う値を返した");
+                            l.commit(desired);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn off_can_never_reach_set_ext_5v_out_true() {
+        // ★ オーナー決定「`OFF` なら絶対に M-Bus 5V を出さない」の機械証明。
+        //
+        // hub-ui (`crates/hub-ui/src/lib.rs`) の唯一の呼び出し経路と同じ形で回す:
+        //
+        //     if let Some(sample) = usb5v::bus5v_sample(mode, bus_in, usb) {
+        //         if let Some(desired) = usb5v.update(sample) {
+        //             power::set_ext_5v_out(&mut i2c, desired)   // ← 呼び出しは 1 か所
+        //
+        // `set_ext_5v_out` に渡りうる値は `update` の戻り値だけで、その `update`
+        // に渡るのは `bus5v_sample` の戻り値だけ (門はこの 1 本)。だから
+        // 「`OFF` のとき `desired == true` になる入力が 1 つも無い」ことを、
+        // **Latch の事前状態 (出ている / 出ていない) × `bus_in` × USB ホストの
+        // 有無 × 連続サンプル**で尽くせば、`set_ext_5v_out(true)` への到達が
+        // 無いことの証明になる。USB ホストが列挙されている経路 (`usb = true`)
+        // も含む — #254 の現場はそこで 5V が出ていた
+        for pre_out in [false, true] {
+            let mut l = Latch::default();
+            if pre_out {
+                // `AUTO` で既に出している状態を作ってから `OFF` に変える
+                l.update(true);
+                l.update(true);
+                l.commit(true);
+                assert!(l.out());
+            }
+            for bus_in in [None, Some(true), Some(false)] {
+                for usb in [true, false] {
+                    for _ in 0..4 {
+                        let sample = bus5v_sample(Bus5vMode::Off, bus_in, usb)
+                            .expect("OFF は Latch に必ず『出さない』を渡す");
+                        assert!(!sample, "OFF なのに Latch へ true を渡した");
+                        if let Some(desired) = l.update(sample) {
+                            // ここが `set_ext_5v_out(desired)` へ渡る唯一の値
+                            assert!(!desired, "OFF なのに 5V を出そうとした");
+                            l.commit(desired);
+                        }
+                    }
+                }
+            }
+            // 事前に出していた個体も、最後は必ず「出していない」に落ちている
+            assert!(!l.out());
+        }
+    }
+
+    #[test]
     fn on_always_asks_for_output() {
         // USB 電源アダプタのベンチ (USB ホストとして列挙されない) 向け
         for bus_in in [None, Some(true), Some(false)] {
