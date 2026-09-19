@@ -149,8 +149,15 @@ G5(=G1) / G15(=G13) の二択しかなく **内蔵スピーカー (I2S DOUT=G13 
   両側から駆動することになり、**バッテリーレスの CoreS3 SE は PoE 単独給電で
   起動できない** (USB を挿すと VBUS が支えるので気づけない。「工場出荷ファームは
   PoE で動くのに焼いたファームだけ動かない」の正体。画面がぱちぱち点滅する)。
-  `hub-board/src/power.rs` の `set_ext_5v_out()` は、**起動時の W5500 probe を
-  材料にする `HubStatus::bus_in`** (M-Bus に外から 5V が来ているか) を hub-ui が
+  ★**PoE の常設機は `BUS5V OFF` に設定して固定する** (Refs #254) — 設定
+  (`BUS5V AUTO|ON|OFF`、NVS キー `bus5v`) は #203 で一度廃止したが、**現場は
+  `OFF` で運用していた**ため、読む側だけが消えて NVS の値が無視され、PoE 単独
+  給電で起動しなくなった。設定は復活させてあり、既定は `AUTO` (= #203 以降の
+  固定動作) なので設定したことのない端末の挙動は変わらない。判定は純関数
+  `hub-core/src/usb5v.rs` の `bus5v_sample()` 1 本。
+  `hub-board/src/power.rs` の `set_ext_5v_out()` は渡された値を BUS_EN に書く
+  だけで、`AUTO` のときは **起動時の W5500 probe を材料にする
+  `HubStatus::bus_in`** (M-Bus に外から 5V が来ているか) を hub-ui が
   ゲートに使い、`bus_in == Some(false)` (外部給電でない) のときだけ USB ホスト
   の有無に追随して立てる (Refs #211)。★**probe の 1 回目の失敗では確定しない**
   — PoE スプリッタ → ベース → W5500 の順に電気が回るので起動直後は W5500 が

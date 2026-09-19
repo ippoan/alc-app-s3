@@ -119,13 +119,18 @@ fn main() -> Result<()> {
     // (画面がぱちぱち点滅する)。一方 USB 給電のベンチでは Core が出さないと
     // スタックモジュール (RS232M / LAN 13.2) が無電源になる (Refs #76)。
     //
-    // 設定で両立させようとしたが (#200/#201 の `BUS5V AUTO|ON|OFF`)、電池なしの
-    // CoreS3 では**どの設定値でも両立しない**ため設定ごと廃止した。代わりに
-    // **USB ホスト (PC) が列挙されていて、かつ M-Bus が外部給電でない
-    // (`HubStatus::bus_in == Some(false)`) ときだけ出す** (Refs #211) —
-    // PoE 稼働中に USB を挿しても切り替え自体を起こさない (実機で電源断を確認
-    // 済み)。PC が居て M-Bus も外部給電でないなら VBUS がレールを支えられるし、
-    // PC が落ちれば Core は手を引いて PoE に任せられる。
+    // 既定 (`BUS5V AUTO`) は **USB ホスト (PC) が列挙されていて、かつ M-Bus が
+    // 外部給電でない (`HubStatus::bus_in == Some(false)`) ときだけ出す**
+    // (#202, Refs #211) — PoE 稼働中に USB を挿しても切り替え自体を起こさない
+    // (実機で電源断を確認済み)。PC が居て M-Bus も外部給電でないなら VBUS が
+    // レールを支えられるし、PC が落ちれば Core は手を引いて PoE に任せられる。
+    //
+    // #203 はこの固定動作を「唯一の動作」にして設定 (`BUS5V AUTO|ON|OFF`) ごと
+    // 廃止したが、**PoE の現場は `OFF` で運用していた**。読む側だけが消えて
+    // NVS に残った値が無視され、現場の端末が PoE 単独給電で起動しなくなった
+    // (#254)。設定は復活させてあり、**PoE のベースを履いた常設機は
+    // `BUS5V OFF`** で「絶対に出さない」に固定する。既定は `Auto` のままなので、
+    // 設定したことのない端末の挙動は変わらない。
     //
     // `bus_in` の材料は起動時の W5500 probe (`eth_w5500::wait_for_w5500`) で、
     // **通ったときに `Some(true)` を入れるだけ**。**外部給電でないことの確定と
@@ -153,6 +158,8 @@ fn main() -> Result<()> {
         tenko_bp: settings.tenko_bp(),
         // Omron 血圧計を拾うか (既定 OFF)。`OMRON BP` で NVS ごと更新される
         omron_bp: settings.omron_bp(),
+        // M-Bus 5V の設定 (既定 AUTO)。`BUS5V` で NVS ごと更新される (Refs #254)
+        bus5v_mode: settings.bus5v(),
         reset_history: Some(reset_history),
         ..HubStatus::default()
     }));

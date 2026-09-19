@@ -144,10 +144,17 @@ pub struct HubStatus {
     /// の `bus_in` に載る
     pub bus_in: Option<bool>,
 
-    /// いま M-Bus へ 5V を出しているか (AW9523 BUS_EN)。**設定ではない** —
-    /// `usb_host` の有無に追随して hub-ui の i2c ループが更新する (#202)。
-    /// **`bus_in` が `Some(false)` (M-Bus が外部給電でない) のときだけ更新される**
-    /// — それ以外 (`None`/`Some(true)`) は切り替え自体が起きないので値は変わらない
+    /// M-Bus 5V の設定 (`BUS5V AUTO|ON|OFF`。既定 `Auto` = #203 以降の固定動作)。
+    /// main.rs が起動時に NVS から入れ、`BUS5V` コマンドが NVS ごと更新する。
+    /// hub-ui の i2c ループが 1 秒ごとに読むので**反映は即時** (Refs #254)。
+    /// 判定は `usb5v::bus5v_sample`
+    pub bus5v_mode: alc_hub_core::protocol::Bus5vMode,
+
+    /// いま M-Bus へ 5V を出しているか (AW9523 BUS_EN)。**設定そのものではない** —
+    /// `bus5v_mode` と `usb_host` / `bus_in` から hub-ui の i2c ループが決めて
+    /// 更新する (#202, Refs #254)。既定の `Auto` では **`bus_in` が
+    /// `Some(false)` (M-Bus が外部給電でない) のときだけ更新される** — それ以外
+    /// (`None`/`Some(true)`) は切り替え自体が起きないので値は変わらない
     /// (Refs #211)。起動時は false で、USB ホストが 2 サンプル続けて見えたら出す。
     /// シリアル `BUS5V STATUS` と WS 下り command `bus5v_status` の応答に載る
     pub ext_5v_out: bool,

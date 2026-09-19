@@ -3,6 +3,65 @@
 //! I/O・画面遷移・NVS 保存などの副作用は firmware 側 (host_link.rs) が担い、
 //! ここでは「1 行 → コマンド or エラー応答文字列」の変換のみを行う。
 
+/// M-Bus 5V を Core 側から出すか (`BUS5V AUTO|ON|OFF`。NVS 保存、既定 `Auto`)。
+///
+/// #200/#201 で入れたこの設定は #203 で一度廃止したが、**PoE の現場は `OFF` に
+/// して運用していた**。読む側だけが消えて NVS の値が無視され、固定動作に
+/// 置き換わった結果、現場の端末が PoE 単独給電で起動しなくなった (#254)。
+/// 設定を戻し、**既定は #203 以降の固定動作 (= `Auto`) のまま**にする。
+///
+/// - `Auto` (既定): #203 以降の固定動作。**USB ホスト (PC) が列挙されていて、
+///   かつ M-Bus が外部給電でない (`HubStatus::bus_in == Some(false)`) ときだけ**
+///   出す。PC が居るなら VBUS がレールを支え、PC が落ちれば Core は手を引く
+/// - `On`: 常に出す。**USB 電源アダプタ**で動かすベンチ (PC ではないので USB
+///   ホストとして列挙されず `Auto` では出ない) に RS232M / LAN 13.2 を積む構成
+///   向け (Refs #76)。★**PoE のベースを履いた機では使わないこと** — 同じ 5V
+///   レールを両側から駆動することになり、バッテリーで突入を吸収できない
+///   CoreS3 SE は PoE 単独給電で起動できなくなる。#203 は実機で
+///   「`on` は PC 再起動中に PoE 単独で起動できない」を確認している
+/// - `Off`: 常に出さない。**ベース側 (PoE) から給電する常設機はこれ** (#254)
+///
+/// 判定そのものは [`crate::usb5v::bus5v_sample`] に置く (hub-ui が呼ぶ)。
+///
+/// ★**NVS の保存値 (u8) は #203 以前と同じ対応を保つこと** — 現場が設定した値が
+/// NVS (`bus5v` キー) にまだ残っているため、対応を変えると読み違える
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Bus5vMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl Bus5vMode {
+    /// NVS 保存値 (u8) から復元する。未知の値は既定 (`Auto`)
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::On,
+            2 => Self::Off,
+            _ => Self::Auto,
+        }
+    }
+
+    /// NVS 保存値 (u8)
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::Auto => 0,
+            Self::On => 1,
+            Self::Off => 2,
+        }
+    }
+
+    /// 応答・ログ用のラベル (`BUS5V MODE=auto`)
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
 /// ホスト (Windows PC / Android タブレット) からのコマンド
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostCommand {
@@ -67,8 +126,11 @@ pub enum HostCommand {
     GwUrl { url: String },
     /// GW 接続の状態問い合わせ (`GW CONNECTED=1 URL=...` を応答)
     GwStatus,
+    /// M-Bus 5V を Core 側から出すか (`BUS5V AUTO|ON|OFF`。NVS 保存、既定 AUTO)。
+    /// hub-ui の i2c ループが 1 秒ごとに読むので、**反映は即時** (Refs #254)
+    Bus5v { mode: Bus5vMode },
     /// M-Bus 5V 出力の問い合わせ
-    /// (`BUS5V USB=1 OUT=1 BATTERY=0` を応答)
+    /// (`BUS5V MODE=auto USB=1 OUT=1 BATTERY=0 BUS_IN=0` を応答)
     Bus5vStatus,
     /// 点呼に血圧を含めるか (`TENKO BP ON|OFF`。NVS 保存、既定 OFF = 保留)
     TenkoBp { enabled: bool },
@@ -298,11 +360,20 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
             },
             _ => return Err("ERR GW: URL|STATUS が必要です".into()),
         },
-        // M-Bus 5V 出力の現況照会 (設定は持たない — USB ホストが居る間だけ
-        // hub-ui が出す。power.rs set_ext_5v_out)
+        // M-Bus 5V を Core 側から出すか (power.rs set_ext_5v_out)。
+        // PoE ベースのように自前で 5V を供給するベースでは OFF にする (#254)
         "BUS5V" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
             Some("STATUS") => HostCommand::Bus5vStatus,
-            _ => return Err("ERR BUS5V: STATUS が必要です".into()),
+            Some("AUTO") => HostCommand::Bus5v {
+                mode: Bus5vMode::Auto,
+            },
+            Some("ON") | Some("1") => HostCommand::Bus5v {
+                mode: Bus5vMode::On,
+            },
+            Some("OFF") | Some("0") => HostCommand::Bus5v {
+                mode: Bus5vMode::Off,
+            },
+            _ => return Err("ERR BUS5V: AUTO|ON|OFF|STATUS が必要です".into()),
         },
         // 点呼の構成 (血圧はオプション、tenko.rs)
         "TENKO" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
@@ -838,10 +909,67 @@ mod tests {
     }
 
     #[test]
-    fn tenko_subcommands() {
-        assert_eq!(parse_line("BUS5V STATUS", T), Ok(Some(HostCommand::Bus5vStatus)));
+    fn bus5v_mode_u8_mapping_is_unchanged() {
+        // ★ NVS (`bus5v` キー) には現場が #203 以前に設定した値が残っている。
+        // この対応を変えると残っている設定を読み違える (#254)
+        assert_eq!(Bus5vMode::Auto.to_u8(), 0);
+        assert_eq!(Bus5vMode::On.to_u8(), 1);
+        assert_eq!(Bus5vMode::Off.to_u8(), 2);
+        assert_eq!(Bus5vMode::from_u8(0), Bus5vMode::Auto);
+        assert_eq!(Bus5vMode::from_u8(1), Bus5vMode::On);
+        assert_eq!(Bus5vMode::from_u8(2), Bus5vMode::Off);
+        // 未知の値・未設定は既定 (Auto = #203 以降の固定動作)
+        assert_eq!(Bus5vMode::from_u8(3), Bus5vMode::Auto);
+        assert_eq!(Bus5vMode::from_u8(255), Bus5vMode::Auto);
+        assert_eq!(Bus5vMode::default(), Bus5vMode::Auto);
+        assert_eq!(Bus5vMode::Auto.label(), "auto");
+        assert_eq!(Bus5vMode::On.label(), "on");
+        assert_eq!(Bus5vMode::Off.label(), "off");
+    }
+
+    #[test]
+    fn bus5v_subcommands() {
+        assert_eq!(
+            parse_line("BUS5V STATUS", T),
+            Ok(Some(HostCommand::Bus5vStatus))
+        );
+        assert_eq!(
+            parse_line("BUS5V AUTO", T),
+            Ok(Some(HostCommand::Bus5v {
+                mode: Bus5vMode::Auto
+            }))
+        );
+        assert_eq!(
+            parse_line("BUS5V ON", T),
+            Ok(Some(HostCommand::Bus5v {
+                mode: Bus5vMode::On
+            }))
+        );
+        assert_eq!(
+            parse_line("bus5v off", T),
+            Ok(Some(HostCommand::Bus5v {
+                mode: Bus5vMode::Off
+            }))
+        );
+        // 1/0 も受ける (他のトグル系コマンドと同じ)
+        assert_eq!(
+            parse_line("BUS5V 1", T),
+            Ok(Some(HostCommand::Bus5v {
+                mode: Bus5vMode::On
+            }))
+        );
+        assert_eq!(
+            parse_line("BUS5V 0", T),
+            Ok(Some(HostCommand::Bus5v {
+                mode: Bus5vMode::Off
+            }))
+        );
         assert!(parse_line("BUS5V", T).is_err());
-        assert!(parse_line("BUS5V ON", T).is_err());
+        assert!(parse_line("BUS5V MAYBE", T).is_err());
+    }
+
+    #[test]
+    fn tenko_subcommands() {
         assert_eq!(parse_line("TENKO STATUS", T), Ok(Some(HostCommand::TenkoStatus)));
         assert_eq!(
             parse_line("tenko bp on", T),
