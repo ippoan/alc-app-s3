@@ -221,10 +221,15 @@ fn main() -> Result<()> {
         I2C_PORT_NFC,
         p.pins.gpio2.into(),
         p.pins.gpio1.into(),
-        // 検証機は従来どおり F → A → B (#155 step 4 の B 先行は本番機 atoms3-timecard だけ)
-        nfc::PollOrder::FelicaFirst,
-        // 存在検知ゲートも従来どおり (#175 の AlwaysPoll は本番機 atoms3-timecard だけ)
-        nfc::PresenceGate::Adaptive,
+        // 検証機だった頃の既定 (F → A → B) のまま取り残されていたが、いまは VoiceS3R +
+        // Unit NFC の測定台がこの build を本番で使っている。B 先行 + B 粘着 (#155 step 4)。
+        // atoms3-timecard と同じ組み合わせに揃える。Refs ippoan/alc-app#353
+        nfc::PollOrder::LicenseFirst,
+        // 存在検知ゲートも同じ理由で揃える。本番機 (VoiceS3R + Unit NFC、振幅 34) の実測
+        // (#175): 免許証を上から真っ直ぐ置いて 4.5 秒保持しても 5 回中 1 回しかゲートが
+        // 開かなかった (置き位置・向きによって振幅も位相も動かない置き方がある)。
+        // Adaptive のままだと測定台で 2 人目 (2 枚目) が読めない。Refs ippoan/alc-app#353
+        nfc::PresenceGate::AlwaysPoll,
         Arc::clone(&status),
         move |e: &NfcEvent| notify_event(&led_for_nfc, speaker_tx.as_ref(), e),
     )?;
