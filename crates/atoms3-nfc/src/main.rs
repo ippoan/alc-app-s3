@@ -62,6 +62,7 @@ use std::time::{Duration, Instant};
 use alc_hub_common::control::PairFlag;
 use alc_hub_common::settings::Settings;
 use alc_hub_common::status::{HubStatus, SharedStatus};
+use alc_hub_core::protocol::HostKind;
 use alc_hub_drivers::nfc::{self, NfcEvent};
 #[cfg(feature = "ble")]
 use alc_hub_drivers::recorder;
@@ -199,9 +200,10 @@ fn main() -> Result<()> {
         let pair_flag = alc_hub_common::control::new_pair_flag();
         // 本機は `STATUS` も `OTA` も持たない (ホストリンクが無い) ので機種固有の
         // 分岐がゼロになる。**4 本目の console.rs を作らず**共通の入口を呼ぶ
-        // (hub-drivers/src/console.rs の `start_common`)
+        // (hub-drivers/src/console.rs の `start_common`)。名乗り (`DEVICE`) は
+        // HostKind::BpStation から共通実装が返す (Refs ippoan/alc-app#353)
         console::start_common(
-            "nfc",
+            HostKind::BpStation,
             Arc::clone(&status),
             settings.clone(),
             Arc::clone(&pair_flag),

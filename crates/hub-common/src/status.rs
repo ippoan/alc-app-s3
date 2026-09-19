@@ -26,7 +26,7 @@ pub struct HubStatus {
     pub events: VecDeque<String>,
 
     /// ボード種別 (CoreS3 / CoreS3 SE)。main.rs が起動時に内部 I2C を probe
-    /// して確定する (`STATUS BOARD=` / Log 画面に表示)。SE はバッテリーが無い
+    /// して確定する (`DEVICE … BOARD=` / Log 画面に表示)。SE はバッテリーが無い
     pub board: alc_hub_core::board::BoardKind,
 
     /// OTA (firmware 更新) の実行中フラグ (Refs #116)。

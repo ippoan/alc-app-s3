@@ -25,7 +25,7 @@ use alc_hub_common::{
     settings::Settings,
     status::{epoch_ms, SharedStatus},
 };
-use alc_hub_core::protocol::{parse_line, HostCommand};
+use alc_hub_core::protocol::{parse_line, HostCommand, HostKind};
 use alc_hub_core::uplink::MIN_SYNCED_MS;
 use alc_hub_drivers::console;
 use anyhow::Result;
@@ -48,7 +48,8 @@ fn handle_line(line: &str, status: &SharedStatus, settings: &Settings, pair_flag
 
     // 機種に依らないコマンドは共通実装へ (hub-drivers/src/console.rs)。
     // 捌かれなかったものだけがここへ落ちてくる
-    let Some(command) = console::handle_common(command, status, settings, false) else {
+    let Some(command) = console::handle_common(command, status, settings, HostKind::Timecard)
+    else {
         return;
     };
     // 血圧計 (HEM-6231T) の設定も共通実装へ (CoreS3 の host_link と同じ口)。
@@ -88,7 +89,7 @@ fn handle_line(line: &str, status: &SharedStatus, settings: &Settings, pair_flag
         // 本機で意味を持たないコマンド (画面遷移 / 印刷 / BLE / Wi-Fi / CFG 等)
         other => {
             log::debug!("console: unsupported command: {other:?}");
-            println!("ERR UNSUPPORTED (timecard)");
+            println!("ERR UNSUPPORTED ({})", HostKind::Timecard.label());
         }
     }
 }

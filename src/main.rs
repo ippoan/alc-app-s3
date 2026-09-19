@@ -101,7 +101,7 @@ fn main() -> Result<()> {
     // Ethernet フレーム転送が 64 バイト上限で全滅する (atoms3-print の実機知見)
     board::power::init(&mut i2c)?;
     // ボード種別 (CoreS3 / CoreS3 SE): SE は RTC (0x51) も IMU (0x69) も無い。
-    // 同じバイナリで動くが、バッテリー表示のゲートと STATUS BOARD= の報告に使う
+    // 同じバイナリで動くが、バッテリー表示のゲートと DEVICE … BOARD= の報告に使う
     // (plan/cores3-hub-consolidation.md「次期構成: CoreS3 SE + Base LAN PoE v1.2」)
     let probe = board::board::probe(&mut i2c);
     let board_kind = alc_hub_core::board::BoardKind::from_probe(probe.rtc_present, probe.imu_present);

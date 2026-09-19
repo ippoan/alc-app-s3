@@ -62,6 +62,56 @@ impl Bus5vMode {
     }
 }
 
+/// このホストコンソールを持つ機種 (Refs ippoan/alc-app#353)。
+///
+/// `DEVICE` 応答の名乗り (`DEVICE <label> VER=…`) と `ERR UNSUPPORTED (<label>)`
+/// の両方をここ 1 か所から出す — 別々の文字列がそれぞれの口に散っていたのが
+/// 「新しい機種が名乗りを書き忘れる」穴の根だった。
+///
+/// `label` は auth-worker の `DEVICE_KINDS` の key に揃えてある。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostKind {
+    /// M5Stack CoreS3 / CoreS3 SE (運行者タブ、シリアル署名認証)
+    CoreS3,
+    /// AtomS3 印刷ブリッジ
+    AtomS3Print,
+    /// NFC タイムカード端末
+    Timecard,
+    /// 警告デバイス (VoiceS3R)
+    Alarm,
+    /// 血圧計用 PC の測定台 (`atoms3-nfc` の VoiceS3R build)
+    BpStation,
+}
+
+impl HostKind {
+    /// `DEVICE <label> …` の 2 トークン目、`ERR UNSUPPORTED (<label>)` に使う
+    /// 機械可読ラベル (auth-worker の `DEVICE_KINDS` の key と同じ語彙)
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CoreS3 => "cores3",
+            Self::AtomS3Print => "atoms3-print",
+            Self::Timecard => "timecard",
+            Self::Alarm => "alarm",
+            Self::BpStation => "bp-station",
+        }
+    }
+
+    /// `AUTH TICKET` (ippoan/alc-app-s3#204) を出してよいか。この券は USB で
+    /// 繋がった**運行者 PWA ブラウザ**への受け渡しが前提で、それが繋がるのは
+    /// CoreS3 だけ (`alc-hub-drivers::console::handle_common` 参照)
+    pub fn claim_ticket(self) -> bool {
+        matches!(self, Self::CoreS3)
+    }
+
+    /// `DEVICE` 応答に `BOARD=<label>` を足すか。板種 (CoreS3 / CoreS3 SE) が
+    /// 複数あるのは今のところ CoreS3 だけ ([`crate::board::BoardKind`])。
+    /// 元は `STATUS` に載っていたが、板種は不変なので名乗りの側が筋
+    /// (Refs ippoan/alc-app#353)
+    pub fn has_board(self) -> bool {
+        matches!(self, Self::CoreS3)
+    }
+}
+
 /// ホスト (Windows PC / Android タブレット) からのコマンド
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostCommand {
@@ -76,6 +126,10 @@ pub enum HostCommand {
     Stage(HostStage),
     Rotate(u16),
     Status,
+    /// 機種の名乗り (`DEVICE <kind> VER=<version>` を応答)。**全機種が
+    /// `handle_common` で共通に答える** — `STATUS` と違い機種ごとの実装を
+    /// 持たない (Refs ippoan/alc-app#353)
+    Device,
     /// 設定のエクスポート (`CFG <json>` を応答)
     CfgGet,
     /// 設定のインポート (JSON は cfg::DeviceConfig::from_json で解釈)
@@ -275,6 +329,7 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
             _ => return Err("ERR ROTATE: 0|90|180|270 が必要です".into()),
         },
         "STATUS" => HostCommand::Status,
+        "DEVICE" => HostCommand::Device,
         "HEAP" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
             None => HostCommand::Heap,
             Some("DUMP") => HostCommand::HeapDump,
@@ -602,6 +657,38 @@ mod tests {
     fn reset_and_status() {
         assert_eq!(parse_line("RESET", T), Ok(Some(HostCommand::Reset)));
         assert_eq!(parse_line("STATUS", T), Ok(Some(HostCommand::Status)));
+    }
+
+    #[test]
+    fn device() {
+        assert_eq!(parse_line("DEVICE", T), Ok(Some(HostCommand::Device)));
+    }
+
+    #[test]
+    fn host_kind_labels() {
+        assert_eq!(HostKind::CoreS3.label(), "cores3");
+        assert_eq!(HostKind::AtomS3Print.label(), "atoms3-print");
+        assert_eq!(HostKind::Timecard.label(), "timecard");
+        assert_eq!(HostKind::Alarm.label(), "alarm");
+        assert_eq!(HostKind::BpStation.label(), "bp-station");
+    }
+
+    #[test]
+    fn host_kind_claim_ticket() {
+        assert!(HostKind::CoreS3.claim_ticket());
+        assert!(!HostKind::AtomS3Print.claim_ticket());
+        assert!(!HostKind::Timecard.claim_ticket());
+        assert!(!HostKind::Alarm.claim_ticket());
+        assert!(!HostKind::BpStation.claim_ticket());
+    }
+
+    #[test]
+    fn host_kind_has_board() {
+        assert!(HostKind::CoreS3.has_board());
+        assert!(!HostKind::AtomS3Print.has_board());
+        assert!(!HostKind::Timecard.has_board());
+        assert!(!HostKind::Alarm.has_board());
+        assert!(!HostKind::BpStation.has_board());
     }
 
     #[test]

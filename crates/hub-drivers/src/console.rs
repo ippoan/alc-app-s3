@@ -21,7 +21,7 @@
 //! 解析そのものは `alc_hub_core::protocol::parse_line` (純粋・テスト済み) が持つ。
 //! ここは副作用 (NVS 保存・応答出力) だけを担当する。
 
-use alc_hub_core::protocol::{parse_line, HostCommand};
+use alc_hub_core::protocol::{parse_line, HostCommand, HostKind};
 use anyhow::Result;
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::sys;
@@ -115,27 +115,46 @@ pub fn spawn_reader(
 ///
 /// ここに入れるのは「どの機種でも同じ応答であるべきもの」だけ:
 /// 疎通 (`PING`) / 診断 (`HEAP` / `HEAP DUMP` / `LOG DUMP`) /
-/// device credential (`AUTH *`) / WS 常時接続 (`WS URL` / `WS STATUS`)。
+/// device credential (`AUTH *`) / WS 常時接続 (`WS URL` / `WS STATUS`) /
+/// 機種の名乗り (`DEVICE`)。
 ///
 /// `STATUS` は機種ごとに項目が違うので**含めない**。`OTA` も、LAN 専用機は
 /// リンクアップを待つ必要がある一方で Wi-Fi 機はそうでないため含めない
 /// ([`handle_ota_lan_guarded`] 参照)。
 ///
-/// `claim_ticket_supported` は `AUTH TICKET` (ippoan/alc-app-s3#204) だけの
-/// 例外 — この券は USB で繋がった**運行者 PWA ブラウザ**への受け渡しが前提
-/// (host_link.rs = CoreS3 のみ)。印刷ブリッジ・タイムカード端末・警告デバイス
-/// (VoiceS3R) に USB 越しの PWA は繋がらないため `false` を渡し、
-/// `ERR AUTH TICKET: unsupported` を返させる (VoiceS3R は元々ネットワーク自体
-/// を持たない)。
+/// `kind` は呼び出し元 (機種ごとの `console.rs` / [`start_common`]) が渡す
+/// 自分の機種。`DEVICE` の名乗りと `AUTH TICKET` の可否
+/// ([`HostKind::claim_ticket`]) の両方をここから引く — この券は
+/// USB で繋がった**運行者 PWA ブラウザ**への受け渡しが前提 (host_link.rs =
+/// CoreS3 のみ) なので、それ以外の機種は `ERR AUTH TICKET: unsupported` を
+/// 返す (VoiceS3R は元々ネットワーク自体を持たない)。
 #[must_use]
 pub fn handle_common(
     command: HostCommand,
     status: &SharedStatus,
     settings: &Settings,
-    claim_ticket_supported: bool,
+    kind: HostKind,
 ) -> Option<HostCommand> {
     match command {
         HostCommand::Ping => println!("PONG"),
+        // 機種の名乗り (Refs ippoan/alc-app#353)。ブラウザ側の機種識別は
+        // これ 1 本に集約する — `STATUS` の応答は機種ごとに違うので識別には
+        // 使わない。`BOARD=` (板種) は元 `STATUS` にあったが、板種は不変なので
+        // 名乗りの側が筋 ([`HostKind::has_board`])
+        HostCommand::Device => {
+            let ver = alc_hub_common::config::firmware_version_full();
+            if kind.has_board() {
+                let board = status.lock().map(|s| s.board).unwrap_or_default();
+                println!(
+                    "DEVICE {} VER={} BOARD={}",
+                    kind.label(),
+                    ver,
+                    board.label()
+                );
+            } else {
+                println!("DEVICE {} VER={}", kind.label(), ver);
+            }
+        }
         // ヒープ状態の即時応答 (定期出力 EVT HEAP と同じ計測、heap.rs 参照)
         HostCommand::Heap => {
             let s = crate::heap::stats();
@@ -188,7 +207,7 @@ pub fn handle_common(
         // 自己診断と違い EVT 経由の非同期にはしない — 運行者 PWA は応答行を
         // 待って端末登録するため)。**JWT / secret はホストへ出さない**
         HostCommand::AuthTicket => {
-            if !claim_ticket_supported {
+            if !kind.claim_ticket() {
                 println!("ERR AUTH TICKET: unsupported");
             } else if settings.device_credential().is_none() {
                 println!("ERR AUTH TICKET: not paired");
@@ -337,7 +356,8 @@ pub fn handle_pair(command: HostCommand, pair_flag: &PairFlag) -> Option<HostCom
 /// 機種固有の分岐を**持たない**機のコンソール入口 (Refs ippoan/alc-app#353)。
 ///
 /// [`spawn_reader`] → [`handle_common`] → [`handle_omron`] → [`handle_pair`] を
-/// その順に連結し、どれも捌かなかった行には `ERR UNSUPPORTED (<tag>)` を返す。
+/// その順に連結し、どれも捌かなかった行には `ERR UNSUPPORTED (<kind の label>)`
+/// を返す。名乗り (`DEVICE`) は [`handle_common`] が `kind` から直接返す。
 ///
 /// **4 本目の `console.rs` を作らないため**に在る。`STATUS` / `OTA` はホストリンク
 /// (LAN・版数・更新) を前提とするので [`handle_common`] には入れていないが、
@@ -348,10 +368,8 @@ pub fn handle_pair(command: HostCommand, pair_flag: &PairFlag) -> Option<HostCom
 /// タイムカード端末 / 警告デバイス) は従来どおり自前の `console.rs` で同じ順に
 /// 呼んでから固有分を捌く。**将来それらもこの入口 + 「固有分のクロージャ」へ
 /// 寄せられる**が、本番稼働中のため今回は分けてある。
-///
-/// `tag` は `ERR UNSUPPORTED (…)` に入れる機種名 (現場の切り分け用)。
 pub fn start_common(
-    tag: &'static str,
+    kind: HostKind,
     status: SharedStatus,
     settings: Settings,
     pair_flag: PairFlag,
@@ -365,7 +383,7 @@ pub fn start_common(
                 return;
             }
         };
-        let Some(command) = handle_common(command, &status, &settings, false) else {
+        let Some(command) = handle_common(command, &status, &settings, kind) else {
             return;
         };
         let Some(command) = handle_omron(command, &status, &settings) else {
@@ -375,7 +393,7 @@ pub fn start_common(
             return;
         };
         log::debug!("console: unsupported command: {command:?}");
-        println!("ERR UNSUPPORTED ({tag})");
+        println!("ERR UNSUPPORTED ({})", kind.label());
     })
 }
 

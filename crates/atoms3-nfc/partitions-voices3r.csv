@@ -12,8 +12,8 @@
 # 登録できる機種のレイアウトは揃えておく方が安い。
 #
 # **本機は現時点で OTA 経路を持たない** — ネットワークを持たず、
-# `OTA <url>` も `ERR UNSUPPORTED (nfc)` になる。更新は Pages インストーラ
-# (docs/atoms3-nfc.html) から USB で焼き直す。
+# `OTA <url>` も `ERR UNSUPPORTED (bp-station)` になる。更新は Pages
+# インストーラ (docs/atoms3-nfc.html) から USB で焼き直す。
 #
 # ★ 手焼きでも必ず `--partition-table crates/atoms3-nfc/partitions-voices3r.csv` を
 #   渡すこと。省略すると espflash 既定の factory 1 スロットになる。

@@ -20,7 +20,7 @@
 //! | `AUTH SET/UNPAIR/STATUS/TOKEN/URL` | device credential 管理 (共通実装 `console::handle_common`。/device/setup ページからの provisioning 用) |
 //! | `WS URL <url>` / `WS STATUS` | cf-alc-recorder 常時接続の URL 上書き / 状態 (共通実装) |
 
-use alc_hub_core::protocol::{parse_line, HostCommand};
+use alc_hub_core::protocol::{parse_line, HostCommand, HostKind};
 use anyhow::Result;
 
 use alc_hub_common::{config, settings::Settings, status::SharedStatus};
@@ -44,7 +44,8 @@ fn handle_line(line: &str, status: &SharedStatus, settings: &Settings) {
 
     // 機種に依らないコマンドは共通実装へ (console.rs)。
     // 捌かれなかったものだけがここへ落ちてくる
-    let Some(command) = console::handle_common(command, status, settings, false) else {
+    let Some(command) = console::handle_common(command, status, settings, HostKind::AtomS3Print)
+    else {
         return;
     };
 
@@ -86,7 +87,7 @@ fn handle_line(line: &str, status: &SharedStatus, settings: &Settings) {
         // 本機で意味を持たないコマンド (画面遷移 / BLE / Wi-Fi / CFG 等)
         other => {
             log::debug!("console: unsupported command: {other:?}");
-            println!("ERR UNSUPPORTED (print hub)");
+            println!("ERR UNSUPPORTED ({})", HostKind::AtomS3Print.label());
         }
     }
 }

@@ -14,6 +14,7 @@
 //! | コマンド | 説明 |
 //! |---|---|
 //! | `PING` | 疎通確認。`PONG` を返す |
+//! | `DEVICE` | `DEVICE cores3 VER=<version> BOARD=cores3\|cores3se` を返す (機種識別 + 板種、共通実装 `console::handle_common`) |
 //! | `QR <payload> [timeout_s]` | QR コード画面を表示 (顔認証後のトークン等) |
 //! | `MEASURE` | 測定中画面を表示 |
 //! | `RESULT OK\|NG [value]` | 測定結果画面を表示 (value 例: `0.000`) |
@@ -21,7 +22,7 @@
 //! | `RESET` | 待機画面へ戻す |
 //! | `STAGE NFC\|TEMP\|ALCOHOL\|CARINS\|PC` | PC (運行者タブ) の点呼の段に点呼画面を合わせる (`OK STAGE <label>`。応答はリングにも残る、get_log で読める)。NFC = 待機画面、TEMP / ALCOHOL = その欄を強調、CARINS = 電子車検証をタップするか PC で選ぶ段、PC = PC の画面だけで進む段。結果は `RESULT` |
 //! | `ROTATE <0\|90\|180\|270>` | 画面向きを変更 (NVS 保存、次回起動も維持) |
-//! | `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0 BOARD=cores3 ALARM=idle/none/-/0` を返す (`ALARM=` の 4 番目は `grace=` の猶予の残り ms、猶予外は 0) |
+//! | `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0 ALARM=idle/none/-/0` を返す (`ALARM=` の 4 番目は `grace=` の猶予の残り ms、猶予外は 0。`BOARD=` は `DEVICE` へ移した、Refs ippoan/alc-app#353) |
 //! | `HB OK` / `HB NG <reason>` | 運行者 PWA の heartbeat (3 秒ごと)。末尾に任意で `call=0\|1`、意図した reload の直前は `grace=<秒>` (#192)。沈黙警告の判定器へ渡す。**応答しない** |
 //! | `AUTH SET <id> <secret> <tenant>` | device credential を注入 (USB provisioning) |
 //! | `AUTH UNPAIR` | 保存済み device credential を破棄 (ローカルのみ) |
@@ -64,7 +65,7 @@ use std::sync::mpsc::Sender;
 
 use alc_hub_core::cfg::DeviceConfig;
 use alc_hub_core::improv as improv_proto;
-use alc_hub_core::protocol::{parse_line, HostCommand};
+use alc_hub_core::protocol::{parse_line, HostCommand, HostKind};
 use anyhow::Result;
 use esp_idf_svc::hal::delay::FreeRtos;
 
@@ -206,7 +207,7 @@ fn handle_line(
 
     // 機種に依らないコマンド (PING / HEAP / LOG / AUTH / WS) は共通実装へ。
     // 捌かれなかったものだけがここへ落ちてくる (console.rs 参照)
-    let Some(command) = console::handle_common(command, status, settings, true) else {
+    let Some(command) = console::handle_common(command, status, settings, HostKind::CoreS3) else {
         return;
     };
     // BLE 血圧計の設定 (`OMRON BP` / `OMRON STATUS`) も共通実装へ。
@@ -270,20 +271,21 @@ fn handle_line(
         }
         // ★ 行頭 (`STATUS LAN=…`) は変えないこと。ブラウザ側 (`useCoreS3Serial` の
         //   `classify()`) は行頭 `STATUS alarm` を「警告デバイス = 別機種」と判定して
-        //   **CoreS3 のポートを reject する**。鳴動状態は**行末**に足す (#187)
+        //   **CoreS3 のポートを reject する**。鳴動状態は**行末**に足す (#187)。
+        //   **識別は `DEVICE` (共通実装 `handle_common`) へ移した
+        //   (Refs ippoan/alc-app#353)。この行頭は互換のため残す。**
         HostCommand::Status => {
             let st = status.lock().map(|s| s.clone()).unwrap_or_default();
             // lock できなかったときも行の形は保つ (ブラウザは key=value で読む)
             let mut alarm_field = "ALARM=unknown".to_string();
             crate::alarm::with_monitor(alarm, |m, now| alarm_field = m.status_field(now));
             println!(
-                "STATUS LAN={} RS232={} BLE={} WIFI={} ROT={} BOARD={} {}",
+                "STATUS LAN={} RS232={} BLE={} WIFI={} ROT={} {}",
                 u8::from(st.lan_link),
                 u8::from(st.rs232_active(now_ms(), config::RS232_ACTIVE_WINDOW_MS)),
                 u8::from(st.ble_connected),
                 u8::from(st.wifi_connected),
                 settings.rotation(),
-                st.board.label(),
                 alarm_field,
             );
         }
@@ -421,7 +423,7 @@ fn handle_line(
         // 印刷系は AtomS3 印刷ブリッジ (atoms3-print) 専用 (#38)。CoreS3 は
         // プリンター配線を持たないため未対応と明示する
         HostCommand::Print { .. } | HostCommand::PrinterAddr { .. } | HostCommand::PrinterStatus => {
-            println!("ERR UNSUPPORTED (kiosk hub)");
+            println!("ERR UNSUPPORTED ({})", HostKind::CoreS3.label());
         }
         // console::handle_common が捌いたはずのもの (到達しない)
         other => log::debug!("host_link: handled by console::handle_common: {other:?}"),

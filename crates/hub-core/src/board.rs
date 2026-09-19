@@ -35,7 +35,8 @@ impl BoardKind {
         }
     }
 
-    /// `STATUS BOARD=` に載せる機械可読ラベル
+    /// `DEVICE … BOARD=` に載せる機械可読ラベル (元は `STATUS BOARD=` だったが
+    /// `DEVICE` へ移した、Refs ippoan/alc-app#353)
     pub fn label(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",

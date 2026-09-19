@@ -195,6 +195,9 @@
                 <code>STATUS alarm state=idle cause=none hb_age_ms=1200 VER=…</code>。
                 <strong><code>hb_age_ms</code> が 3000 前後で上下していれば</strong>管理者の画面からの
                 連絡が届いています (増え続けるなら届いていません)</li>
+            <li><code>DEVICE</code> — <code>DEVICE alarm VER=…</code>。
+                ブラウザ側の機種識別はこちらを見ます
+                (<code>STATUS</code> 応答の先頭 2 トークンは互換のため残しています)</li>
             <li><code>HB OK</code> — 手で 1 回ぶんの「正常」を送る (鳴っていれば止まります)</li>
             <li><code>HB NG signaling</code> — 手で「着信を受けられない」を送る (鳴り始めます)</li>
             <li><code>HB OK call=1</code> — 手で「着信」を送る (鳴り始めます)</li>

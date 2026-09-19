@@ -459,7 +459,7 @@ impl AlarmMonitor {
     /// ★ CoreS3 は [`Self::status_line`] を使わないこと — ブラウザ側
     /// (`useCoreS3Serial` の `classify()`) は行頭 `STATUS alarm` と `EVT ALARM` を
     /// 「警告デバイス = 別機種」と判定し、**CoreS3 のポートを reject する**。
-    /// 行頭 `STATUS LAN=… BOARD=cores3 …` のまま末尾に足せば、どちらの判定にも
+    /// 行頭 `STATUS LAN=… …` のまま末尾に足せば、どちらの判定にも
     /// 触らずに鳴動状態を渡せる (issue #187)
     pub fn status_field(&self, now_ms: u64) -> String {
         format!(

@@ -24,15 +24,16 @@
 //! 状態遷移のたび + `alarm::BANNER_MS` ごとに出す (出すのは main の鳴動ループ)。
 //!
 //! ★ **`STATUS` 応答の先頭 2 トークン `STATUS alarm` は変えないこと。**
-//!   ブラウザ側 (alc-app) は**この 2 トークンで機種を識別する** — CoreS3 と
+//!   ブラウザ側 (alc-app) は**この 2 トークンで機種を識別していた** — CoreS3 と
 //!   VoiceS3R は USB の VID/PID が同一 (0x303A:0x1001) で、記述子では
-//!   見分けられない。
+//!   見分けられない。**識別は `DEVICE` (共通実装 `handle_common`) へ移した
+//!   (Refs ippoan/alc-app#353)。この 2 トークンは互換のため残す。**
 
 use alc_hub_common::{config, settings::Settings, status::SharedStatus};
 // 鳴動判定の共有ハンドル (main の鳴動ループと共有) と、lock して現在時刻を
 // 渡す手続きは共通実装。**CoreS3 も同じものを通る** (issue #187)
 use alc_hub_core::alarm::SharedMonitor;
-use alc_hub_core::protocol::{parse_line, HostCommand};
+use alc_hub_core::protocol::{parse_line, HostCommand, HostKind};
 use alc_hub_drivers::{alarm, console};
 use anyhow::Result;
 
@@ -54,7 +55,7 @@ fn handle_line(line: &str, monitor: &SharedMonitor, status: &SharedStatus, setti
 
     // 機種に依らないコマンドは共通実装へ (hub-drivers/src/console.rs)。
     // 捌かれなかったものだけがここへ落ちてくる
-    let Some(command) = console::handle_common(command, status, settings, false) else {
+    let Some(command) = console::handle_common(command, status, settings, HostKind::Alarm) else {
         return;
     };
 
@@ -85,7 +86,7 @@ fn handle_line(line: &str, monitor: &SharedMonitor, status: &SharedStatus, setti
         // 本機で意味を持たないコマンド (画面遷移 / 測定 / BLE / 印刷 / OTA / Wi-Fi)
         other => {
             log::debug!("console: unsupported command: {other:?}");
-            println!("ERR UNSUPPORTED (alarm)");
+            println!("ERR UNSUPPORTED ({})", HostKind::Alarm.label());
         }
     }
 }
