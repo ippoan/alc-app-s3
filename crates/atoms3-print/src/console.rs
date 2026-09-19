@@ -1,7 +1,9 @@
 //! 印刷ブリッジのホストコンソール (USB Serial/JTAG、行指向)。
 //!
-//! 読み出しスレッドと機種非依存のコマンド (PING / HEAP / LOG / AUTH / WS) は
-//! `alc_hub_drivers::console` が持つ。ここに書くのは**印刷ブリッジ固有の分岐だけ**。
+//! 読み出しスレッドと機種非依存のコマンド (PING / DEVICE / HEAP / LOG / AUTH /
+//! WS) は `alc_hub_drivers::console` が持つ (正本は
+//! [`docs/console-protocol.md`](../../../docs/console-protocol.md))。
+//! ここに書くのは**印刷ブリッジ固有の分岐だけ**。
 //! 行解析は alc_hub_core::protocol::parse_line を共有し、本機で意味を持たない
 //! コマンド (QR/MEASURE/BLE 等) は `ERR UNSUPPORTED` を返す。
 //! Improv Wi-Fi Serial は受けない (Wi-Fi 無し・LAN 専用)。

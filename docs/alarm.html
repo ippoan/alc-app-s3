@@ -196,8 +196,7 @@
                 <strong><code>hb_age_ms</code> が 3000 前後で上下していれば</strong>管理者の画面からの
                 連絡が届いています (増え続けるなら届いていません)</li>
             <li><code>DEVICE</code> — <code>DEVICE alarm VER=…</code>。
-                ブラウザ側の機種識別はこちらを見ます
-                (<code>STATUS</code> 応答の先頭 2 トークンは互換のため残しています)</li>
+                ブラウザ側の機種識別はこちら (詳細は下の参照)</li>
             <li><code>HB OK</code> — 手で 1 回ぶんの「正常」を送る (鳴っていれば止まります)</li>
             <li><code>HB NG signaling</code> — 手で「着信を受けられない」を送る (鳴り始めます)</li>
             <li><code>HB OK call=1</code> — 手で「着信」を送る (鳴り始めます)</li>
@@ -207,6 +206,8 @@
         <p>状態が変わるたび、および 5 秒ごとに
            <code>EVT ALARM state=idle|alarming|muted cause=none|silence|ng:&lt;理由&gt;|call</code>
            が出ます。運行管理者の画面表示はこの行を読んでいます。</p>
+        <p>コマンドの一覧・機種識別 (<code>DEVICE</code>) の仕組みの詳細は
+           <a href="https://github.com/ippoan/alc-app-s3/blob/main/docs/console-protocol.md" target="_blank">console-protocol.md</a> を参照してください。</p>
         <div class="warning">
             <h3>この端末は点灯で知らせません — 反応は音だけ</h3>
             <p>Atom VoiceS3R には点灯表示がありません。

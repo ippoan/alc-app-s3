@@ -58,10 +58,14 @@ Idle ─タップ→ Menu                                         自動/タッ�
 
 ## ホストプロトコル (USB CDC, 行指向)
 
+全機種共通の部分 (行の接頭辞・`DEVICE`・`STATUS` の位置づけ・共通コマンド) の
+**正本は [docs/console-protocol.md](docs/console-protocol.md)**。以下は
+CoreS3 固有のコマンドを中心にした一覧。
+
 | ホスト → CoreS3 | 説明 |
 |---|---|
 | `PING` | 疎通確認 (`PONG` 応答) |
-| `DEVICE` | `DEVICE cores3 VER=<version> BOARD=cores3\|cores3se` 応答 (機種識別、全機種共通)。ブラウザ側の機種判定はこれ 1 本 (Refs ippoan/alc-app#353) |
+| `DEVICE` | `DEVICE cores3 VER=<version> BOARD=cores3\|cores3se` 応答 (機種識別、詳細は上記正本) |
 | `QR <payload> [timeout_s]` | QR コード表示 (既定 60 秒で期限切れ) |
 | `MEASURE` | 測定中画面 |
 | `RESULT OK\|NG [value]` | 結果画面 (10 秒で自動クローズ) |
@@ -69,7 +73,7 @@ Idle ─タップ→ Menu                                         自動/タッ�
 | `RESET` | 待機画面へ |
 | `STAGE NFC\|TEMP\|ALCOHOL\|CARINS\|PC` | PC (運行者タブ) の点呼の段に点呼画面を合わせる (`OK STAGE <label>` 応答。応答はリングにも残る、get_log で読める)。`NFC` = 待機画面、`TEMP` / `ALCOHOL` = その欄を強調、`CARINS` = 電子車検証をタップするか PC で選ぶ段 (「車検証をタップか PC で選択」)、`PC` = PC の画面だけで進む段 (「PC の画面で操作してください」)。この点呼は `RESULT` で結果画面へ移り、画面のタップでは抜けない。無操作 180 秒で待機画面 |
 | `ROTATE <0\|90\|180\|270>` | 画面向き変更 (NVS 保存、再起動後も維持) |
-| `STATUS` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0` 応答 (`BOARD` は `DEVICE` へ移した) |
+| `STATUS` | LAN / RS232 / BLE / WIFI / 画面向き / 鳴動状態を key=value で応答。**名乗りではない** — 機種識別は `DEVICE` (応答例は上記正本 §3 参照) |
 | `LOG DUMP` | 直近ログのリング (CoreS3 は PSRAM の `.ext_ram_noinit` に 256 KB、それ以外の機種は `.noinit` に 4 KB、#217) を `LOGDUMP ...` で吸い出す。事象の後から原因を追う用。WS 下り command `{action:"get_log",max_bytes?,offset?}` (`max_bytes` は省略時 3000・上限 3800、`offset` は末尾から遡るバイト数で省略時 0 = 末尾) でも同じリングの窓を行境界で切って `command_result` `{text,bytes,total_bytes,truncated,offset,uptime_ms,pwa_log,pwa_log_error}` で遠隔から取れる (auth-worker MCP `get_device_log`)。1 回で取り切れないときは `offset + bytes` を次の `offset` にして遡る (`offset` は実際に使った値。`total_bytes` に達したら終わり)。reset 履歴を持つ機種 (CoreS3) は直近 8 回の `boot_history` `[{reset_reason,reset_code}]` (新しい順) も足す。リングは電源断以外の reset をまたいで残り、起動ごとに `--- BOOT reset=<name> (<code>) ---` が入る。CoreS3 に USB で運行者 PWA が繋がっていれば、PWA のシリアル診断ログ (`PWALOG`、最大 2 秒待ち・末尾 1200 バイト) を `pwa_log` に足す (`pwa_log_error`: `null` / `"timeout"` / `"no_host"`、#215) |
 | `CFG GET` | 現在の設定を 1 行 JSON でエクスポート |
 | `CFG SET <json>` | 設定 (画面向き + Wi-Fi) を検証して NVS へインポート |
@@ -122,8 +126,10 @@ crates/hub-core/src/improv.rs)。
 | `CFG <json>` | `CFG GET` の応答 |
 | `{"type":"temperature",...}` 等 | BLE 測定データ・状態。[ble-medical-gateway](https://github.com/ippoan/ble-medical-gateway) のシリアル JSON 互換 (alc-app 側 `useBleGateway` を流用可能) |
 
-ESP-IDF のログが同じコンソールに混在するため、ホスト側は既知プレフィックス
-(`OK` `ERR` `PONG` `STATUS` `FC1200` `EVT` `CFG` `{`) の行のみ解釈すること。
+ESP-IDF のログが同じコンソールに混在するため、ホスト側は既知プレフィックスの
+行のみ解釈すること。全機種共通の一覧は
+[docs/console-protocol.md](docs/console-protocol.md) §1 参照 (CoreS3 はこれに
+`FC1200` / `CFG` / `{` が加わる)。
 
 ## ピン割当 (机上調査ベース・実機未検証)
 
@@ -365,12 +371,12 @@ VOICEVOX の利用規約によりクレジット表記が必要 — 本製品を
 | 方向 | 行 | 説明 |
 |---|---|---|
 | 管理者のブラウザ → 端末 | `HB OK` / `HB NG <reason>` | heartbeat。3 秒ごと。末尾に任意で `call=0` / `call=1` (**着信** = 点呼の呼び出し)、意図した reload の直前は `grace=<秒>` (1〜120。**その 1 回だけ**沈黙の猶予を広げる、#192)。reason は `[a-z0-9_]+` (例 `signaling`)。**返信しない** |
-| 管理者のブラウザ → 端末 | `STATUS` | `STATUS alarm state=<idle\|alarming\|muted> cause=<none\|silence\|ng:<reason>\|call> hb_age_ms=<n\|-> [grace_left_ms=<n>] VER=…` (`grace_left_ms` は `grace=` の猶予中のみ。CoreS3 は `ALARM=<state>/<cause>/<hb_age_ms>/<grace_left_ms>`、猶予外は `0`) |
+| 管理者のブラウザ → 端末 | `STATUS` | `STATUS alarm state=<idle\|alarming\|muted> cause=<none\|silence\|ng:<reason>\|call> hb_age_ms=<n\|-> [grace_left_ms=<n>] VER=…` (`grace_left_ms` は `grace=` の猶予中のみ。CoreS3 は `ALARM=<state>/<cause>/<hb_age_ms>/<grace_left_ms>`、猶予外は `0`)。**名乗りではない** |
 | 端末 → 管理者のブラウザ | `EVT ALARM state=… cause=…` | 状態が変わるたび + 5 秒ごと (ブラウザのバナー用) |
 
-`PING` / `HEAP` / `LOG DUMP` は共通実装 (`hub-drivers/src/console.rs`)。
-**`STATUS` 応答の先頭 2 トークン `STATUS alarm` は管理者のブラウザ側の機種識別に使う**ので
-変えないこと — CoreS3 と VoiceS3R は USB の VID/PID が同一で記述子では見分けられない。
+`PING` / `DEVICE` / `HEAP` / `LOG DUMP` は共通実装 (`hub-drivers/src/console.rs`)。
+機種識別は `DEVICE` を見ること — 正本は
+[docs/console-protocol.md](docs/console-protocol.md) §2/§3。
 
 | 値 | 既定 | 意味 |
 |---|---|---|

@@ -1,8 +1,10 @@
 //! タイムカード端末のホストコンソール (USB Serial/JTAG、行指向)。
 //!
-//! 読み出しスレッドと機種非依存のコマンド (PING / HEAP / LOG / AUTH / WS) は
-//! `alc_hub_drivers::console` が持つ。ここに書くのは**本機固有の分岐だけ**
-//! (`STATUS` と `OTA`)。**印刷ブリッジや CoreS3 から丸写ししないこと** —
+//! 読み出しスレッドと機種非依存のコマンド (PING / DEVICE / HEAP / LOG / AUTH /
+//! WS) は `alc_hub_drivers::console` が持つ (正本は
+//! [`docs/console-protocol.md`](../../../docs/console-protocol.md))。
+//! ここに書くのは**本機固有の分岐だけ** (`STATUS` と `OTA`)。
+//! **印刷ブリッジや CoreS3 から丸写ししないこと** —
 //! とくに `AUTH SET` (device credential を NVS へ書く口) を機種ごとに増やすと
 //! provisioning の挙動が割れる。
 //!

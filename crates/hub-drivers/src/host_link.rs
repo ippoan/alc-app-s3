@@ -269,11 +269,9 @@ fn handle_line(
         } => {
             crate::alarm::apply_heartbeat(alarm, ok, reason.as_deref(), call, grace);
         }
-        // ★ 行頭 (`STATUS LAN=…`) は変えないこと。ブラウザ側 (`useCoreS3Serial` の
-        //   `classify()`) は行頭 `STATUS alarm` を「警告デバイス = 別機種」と判定して
-        //   **CoreS3 のポートを reject する**。鳴動状態は**行末**に足す (#187)。
-        //   **識別は `DEVICE` (共通実装 `handle_common`) へ移した
-        //   (Refs ippoan/alc-app#353)。この行頭は互換のため残す。**
+        // ★ 機種識別は `DEVICE` (共通実装 `handle_common`) を見ること — 正本は
+        //   docs/console-protocol.md。行頭 (`STATUS LAN=…`) は互換のため変えない
+        //   こと。鳴動状態は行末に足す (#187、Refs ippoan/alc-app#353)
         HostCommand::Status => {
             let st = status.lock().map(|s| s.clone()).unwrap_or_default();
             // lock できなかったときも行の形は保つ (ブラウザは key=value で読む)

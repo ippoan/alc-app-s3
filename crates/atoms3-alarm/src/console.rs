@@ -23,11 +23,10 @@
 //! `EVT ALARM state=<idle|alarming|muted> cause=<none|silence|ng:<reason>|call>` を
 //! 状態遷移のたび + `alarm::BANNER_MS` ごとに出す (出すのは main の鳴動ループ)。
 //!
-//! ★ **`STATUS` 応答の先頭 2 トークン `STATUS alarm` は変えないこと。**
-//!   ブラウザ側 (alc-app) は**この 2 トークンで機種を識別していた** — CoreS3 と
-//!   VoiceS3R は USB の VID/PID が同一 (0x303A:0x1001) で、記述子では
-//!   見分けられない。**識別は `DEVICE` (共通実装 `handle_common`) へ移した
-//!   (Refs ippoan/alc-app#353)。この 2 トークンは互換のため残す。**
+//! ★ 機種識別は `DEVICE` (共通実装 `handle_common`) を見ること — 正本は
+//!   [`docs/console-protocol.md`](../../../docs/console-protocol.md)。
+//!   `STATUS` 応答の先頭 2 トークン `STATUS alarm` は互換のため変えないこと
+//!   (Refs ippoan/alc-app#353)。
 
 use alc_hub_common::{config, settings::Settings, status::SharedStatus};
 // 鳴動判定の共有ハンドル (main の鳴動ループと共有) と、lock して現在時刻を
