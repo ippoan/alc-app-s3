@@ -130,9 +130,13 @@ pub struct HubStatus {
     pub usb_host: bool,
 
     /// M-Bus に外から (ベースの自前給電、PoE) 5V が来ているか (Refs #211)。
-    /// 既定 `None` = 判定前。`eth_w5500::wait_for_w5500` が起動時の 1 回目の
-    /// probe 結果で確定し (`lan` feature 無効ビルドでは `Some(false)` を
-    /// main.rs が入れる)、以後は起動中 sticky で変えない。
+    /// 既定 `None` = 判定前。`eth_w5500::wait_for_w5500` の probe が
+    /// **Core が 5V を出していない間に通ったときだけ** `Some(true)` を入れる。
+    /// **probe の失敗では確定しない** — 起動直後は W5500 がまだ立ち上がって
+    /// いないことがあり、1 回勝負で `Some(false)` にすると PoE 単独給電で
+    /// 起動できなくなる (Refs #254)。`Some(false)` の確定は hub-ui の i2c
+    /// ループ 1 か所だけで、起動から `usb5v::BUS_IN_GRACE_MS` 経っても
+    /// `None` のままだったときに入れる (`lan` feature 無効ビルドも同じ道)。
     /// `None` か `Some(true)` の間、hub-ui は `ext_5v_out` の切り替えそのもの
     /// (usb5v::Latch への sampling) を起こさない — Some(true)/None は
     /// 「外から来ているかもしれない」なので Core 側からは出さない。

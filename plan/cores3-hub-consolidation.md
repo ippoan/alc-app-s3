@@ -149,10 +149,17 @@ G5(=G1) / G15(=G13) の二択しかなく **内蔵スピーカー (I2S DOUT=G13 
   両側から駆動することになり、**バッテリーレスの CoreS3 SE は PoE 単独給電で
   起動できない** (USB を挿すと VBUS が支えるので気づけない。「工場出荷ファームは
   PoE で動くのに焼いたファームだけ動かない」の正体。画面がぱちぱち点滅する)。
-  `hub-board/src/power.rs` の `set_ext_5v_out()` は、**起動時の W5500 probe で
-  確定する `HubStatus::bus_in`** (M-Bus に外から 5V が来ているか) を hub-ui が
+  `hub-board/src/power.rs` の `set_ext_5v_out()` は、**起動時の W5500 probe を
+  材料にする `HubStatus::bus_in`** (M-Bus に外から 5V が来ているか) を hub-ui が
   ゲートに使い、`bus_in == Some(false)` (外部給電でない) のときだけ USB ホスト
-  の有無に追随して立てる (Refs #211)。battery-present bit による切り替えは
+  の有無に追随して立てる (Refs #211)。★**probe の 1 回目の失敗では確定しない**
+  — PoE スプリッタ → ベース → W5500 の順に電気が回るので起動直後は W5500 が
+  まだ応答しないことがあり、1 回勝負で `Some(false)` に誤確定すると上の
+  「PoE 単独で起動できない」を自分で踏む (現場で再発、#254)。probe は通った
+  ときだけ `Some(true)` を入れ、**起動から `usb5v::BUS_IN_GRACE_MS` (5 秒)
+  経っても未判定なら hub-ui が `Some(false)` に確定する** (`lan` 無効ビルドも
+  同じ 1 か所)。猶予の間は Core が 5V を出さないので、USB 給電のベンチでは
+  スタックモジュールの給電がその秒数だけ遅れる。battery-present bit による切り替えは
   過去の設計 (#129) で、実装は入っていない — 電池付きの個体でも USB 給電の
   ベンチに RS232M/LAN 13.2 を積む構成では同じ規則で出す (Refs #76)。
   ★**board 種別 (rtc/imu probe) では判定しない** — 実機の CoreS3 SE で
