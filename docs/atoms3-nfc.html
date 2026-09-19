@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>alc-hub BP Station - Firmware Writer</title>
+    <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px; margin: 0 auto; padding: 20px;
+            background: #f5f5f5; color: #333;
+        }
+        h1 { color: #1a73e8; border-bottom: 2px solid #1a73e8; padding-bottom: 10px; }
+        .card { background: white; border-radius: 12px; padding: 24px; margin: 20px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .card h2 { margin-top: 0; color: #333; }
+        .requirements { background: #e8f5e9; border-left: 4px solid #4caf50; padding: 16px; margin: 16px 0; }
+        .requirements h3 { margin-top: 0; color: #2e7d32; }
+        .warning { background: #fff3e0; border-left: 4px solid #ff9800; padding: 16px; margin: 16px 0; }
+        .warning h3 { margin-top: 0; color: #e65100; }
+        .install-section {
+            text-align: center; padding: 40px 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 12px; color: white;
+        }
+        .install-section h2 { color: white; margin-bottom: 20px; }
+        esp-web-install-button { --esp-tools-button-color: #4caf50; --esp-tools-button-text-color: white; }
+        .device-info { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-top: 16px; }
+        .device-info div { background: #f8f9fa; padding: 12px; border-radius: 8px; }
+        .device-info strong { display: block; color: #666; font-size: 12px; margin-bottom: 4px; }
+        code { background: #f0f0f0; padding: 2px 6px; border-radius: 4px; }
+        footer { text-align: center; margin-top: 40px; color: #666; font-size: 14px; }
+        footer a { color: #1a73e8; }
+    </style>
+</head>
+<body>
+    <h1>alc-hub BP Station</h1>
+    <p>血圧計用 PC の測定台 ファームウェア書き込みツール —
+       PC に USB で挿しっぱなしにして、<strong>カードの読み取り</strong>と
+       <strong>血圧計 (BLE) の測定値</strong>を PC のブラウザへシリアルで渡す端末です。
+       CoreS3 統合ハブは <a href="index.html">こちら</a>、
+       NFC タイムカード端末は <a href="timecard.html">こちら</a>。</p>
+
+    <div class="card">
+        <h2>対応機器</h2>
+        <div class="device-info">
+            <div><strong>マイコン</strong>M5Stack Atom VoiceS3R (Atom EchoS3R / SKU C126-ECHO、8MB PSRAM)</div>
+            <div><strong>カードリーダー</strong>M5 Unit NFC (SKU U216, ST25R3916) — Grove Port A</div>
+            <div><strong>血圧計</strong>Omron HEM-6231T (BLE、<strong>既定 OFF</strong>)</div>
+            <div><strong>接続</strong>USB-C で PC へ直結 (LAN / PoE は使いません)</div>
+        </div>
+        <div class="warning">
+            <h3>PSRAM 非搭載の AtomS3 系には焼かないでください</h3>
+            <p>ここで配布しているのは <strong>Atom VoiceS3R 専用</strong>のビルドです。
+               PSRAM (Octal 8MB) を前提に sdkconfig を組んでいるため、
+               AtomS3 / AtomS3 Lite などの PSRAM 非搭載機に焼いても
+               <strong>PSRAM 無しのまま静かに起動します</strong> (エラーは出ません)。
+               BLE (血圧計) は PSRAM 上にヒープを取るので、その状態では血圧が動きません。</p>
+        </div>
+        <div class="warning">
+            <h3>この端末はサーバへ直接送りません</h3>
+            <p>ネットワークを持たないので、読んだカードも測った血圧も
+               <strong>USB シリアルに JSON / <code>EVT</code> 行として出すだけ</strong>です。
+               サーバへ届けるのは PC 側の画面 (キオスク) の仕事です。</p>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>書き込み手順</h2>
+        <ol>
+            <li>本体を USB-C ケーブルで PC に接続</li>
+            <li><strong>箱出しの新品は本体ボタンを押しながら挿し直す</strong> —
+                工場出荷ファームは USB オーディオデバイスとして動いており、
+                そのままではシリアルポートが出てきません</li>
+            <li>下の「Install」ボタンをクリックし、シリアルポートを選択</li>
+            <li><strong>書き込みが終わったら、ボタンから指を離して USB を挿し直す</strong> —
+                押したままだと起動のたびにダウンロードモードに入り、
+                <strong>焼けているのにアプリが動きません</strong></li>
+            <li>Unit NFC を Grove に挿して電源を入れ直す</li>
+            <li>シリアルに <code>EVT NFC_READY</code> が出れば読み取り側は疎通完了</li>
+        </ol>
+        <div class="warning">
+            <h3>「焼けたのに動かない」ときに見るところ</h3>
+            <p>シリアルに <code>waiting for download</code> や
+               <code>boot:0x30 (DOWNLOAD(USB/UART0))</code> が出ていたら、
+               <strong>ダウンロードモードに入ったままです</strong>。ボタンから指を離して挿し直してください
+               (書き込みは成功しています)。</p>
+            <p><strong>Unit NFC は電源を入れる前に挿しておいてください。</strong>
+               起動時に挿さっていないと <code>EVT NFC_INIT_NG</code> が出て、
+               <strong>後から挿しても再起動するまで復帰しません</strong> (Refs #152)。</p>
+            <p>コマンドラインで確認する場合、<code>espflash monitor</code> に
+               <strong><code>--no-reset</code> を付けないでください</strong> —
+               付けると端末がフラッシュスタブに留まってアプリが起動せず、
+               「反応が無い」ように見えます。</p>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>血圧計をつなぐ (既定は OFF)</h2>
+        <p>血圧計は<strong>既定で無効</strong>です。BLE を起こすと内蔵 RAM を使うため、
+           使わない台では止めてあります。有効にする手順:</p>
+        <ol>
+            <li>シリアルに <code>OMRON BP ON</code> を送る (<code>OK OMRON BP=1</code> が返る)</li>
+            <li><strong>端末を再起動する</strong> — BLE を立てるかどうかは起動時に決まります
+                (OFF のまま起動したときは <code>EVT BLE_DISABLED omron_bp=0</code> が出ます)</li>
+            <li>血圧計を<strong>ペアリング待ち</strong>にしてから <code>PAIR</code> を送る。
+                <code>EVT PAIR_CLEARED</code> → <code>EVT PAIR_ARMED &lt;秒&gt;</code> →
+                <code>EVT PAIR_OK</code> で成立です
+                (<code>EVT PAIR_ERR</code> / <code>EVT PAIR_TIMEOUT</code> は失敗)</li>
+            <li>測定すると <code>{"type":"blood_pressure",…}</code> がシリアルに出ます</li>
+        </ol>
+        <div class="warning">
+            <h3>ボンドは起動時に消えません</h3>
+            <p>一度ペアリングすれば NVS に残るので、再起動のたびに操作は要りません。
+               消えるのは <code>PAIR</code> を明示的に送ったときだけです。
+               <strong>機器を入れ替えたときは <code>PAIR</code> をやり直してください。</strong></p>
+        </div>
+    </div>
+
+    <div class="requirements">
+        <h3>動作要件</h3>
+        <ul>
+            <li>Chrome / Edge / Opera (Web Serial API 対応ブラウザ)</li>
+            <li>ESP32-S3 は USB Serial/JTAG 内蔵のため追加ドライバ不要</li>
+            <li>シリアルポートが出てこない場合は、<strong>本体ボタンを押したまま USB を挿し直す</strong>
+                (ROM ダウンロードモード)。工場出荷ファームや、書き込んだファームが
+                起動直後に落ちる状態では、これが唯一の入り口です</li>
+        </ul>
+    </div>
+
+    <div class="card install-section">
+        <h2>ファームウェアをインストール</h2>
+        <esp-web-install-button manifest="manifest-nfc.json">
+            <button slot="activate">Install alc-hub BP Station</button>
+            <span slot="unsupported">
+                お使いのブラウザは Web Serial API に対応していません。<br>
+                Chrome, Edge, または Opera をお使いください。
+            </span>
+            <span slot="not-allowed">シリアルポートへのアクセスが許可されていません。</span>
+        </esp-web-install-button>
+    </div>
+
+    <div class="card">
+        <h2>動作確認 (シリアル 115200bps)</h2>
+        <ul>
+            <li><code>PING</code> — <code>PONG</code> 応答 (疎通確認)</li>
+            <li><code>HEAP</code> — <code>FREE_PSRAM</code> が <strong>0 でない</strong>ことを必ず確認。
+                0 なら PSRAM が載っていない機に焼いています (上の警告を参照)</li>
+            <li><code>OMRON STATUS</code> — <code>OMRON BP=1</code> / <code>OMRON BP=0</code></li>
+            <li><code>LOG DUMP</code> — 起動直後のログ (USB 接続前に流れた分も残ります)</li>
+            <li><code>AUTH STATUS</code> — <code>AUTH PAIRED &lt;tenant&gt; &lt;id&gt;</code> / <code>AUTH UNPAIRED</code></li>
+        </ul>
+        <p>カードをかざすと <code>NFC IDm=…</code> / <code>免許証 交付 …</code> が出ます。
+           財布などにカードが 2 枚入っていて両方見えたときは、どちらか決められないので
+           <strong>どちらも採らず</strong>
+           <code>nfc: 確定窓 …ms に 2 枚 — どちらも登録しない</code> の警告だけが出ます
+           (このとき音も鳴りません)。1 枚だけかざし直してください。</p>
+        <div class="warning">
+            <h3><code>STATUS</code> と <code>OTA</code> はこの端末にありません</h3>
+            <p>どちらも <code>ERR UNSUPPORTED (nfc)</code> を返します —
+               ネットワークを持たない端末なので、版数の確認も更新も
+               <strong>この画面から書き直す</strong>のが唯一の手順です。</p>
+        </div>
+        <div class="warning">
+            <h3>読めたら音が鳴ります (点灯はしません)</h3>
+            <p>Atom VoiceS3R には点灯表示がありません。読めたときは内蔵スピーカーが短く鳴ります。
+               <strong>「かざしたのに光らない」は異常ではありません。</strong>
+               音が出ない場合は <code>speaker: 初期化失敗</code> がログに出ていないか確認してください
+               (鳴らなくても読み取りそのものは動きます)。</p>
+        </div>
+    </div>
+
+    <footer>
+        <p><a href="https://github.com/ippoan/alc-app-s3" target="_blank">GitHub Repository</a> ·
+           <a href="index.html">CoreS3 統合ハブ</a> ·
+           <a href="timecard.html">NFC タイムカード端末</a> ·
+           <a href="alarm.html">点呼端末の警告デバイス</a></p>
+    </footer>
+</body>
+</html>

@@ -28,6 +28,25 @@
 //! **打刻は送らない。** WS/HTTP の uplink を持たないベンチ専用機なので、
 //! ここでカードを読んでもサーバには何も届かない。
 //!
+//! # 血圧計用 PC の測定台 (`ATOMS3_NFC_VOICES3R` + `--features ble`、Refs ippoan/alc-app#353)
+//!
+//! Atom VoiceS3R の build は、現場の「血圧計をつないだ PC」に挿しっぱなしにする
+//! **測定台**として配布する (Pages の `docs/atoms3-nfc.html`)。カードの読み取りに
+//! 加えて、`OMRON BP ON` (NVS `omron_bp`、**既定 OFF**) のときだけ BLE central
+//! (`alc_hub_ble`) を起こし、受けた測定値を CoreS3 / タイムカード端末と同じ
+//! `recorder` 経由でホスト (PC のブラウザ) へ JSON で出す。
+//!
+//! **この機はネットワークを持たない**ので、上り (cf-alc-recorder) へは送らない —
+//! サーバへ届けるのは PC 側の画面の仕事。`STATUS` / `OTA` も持たない
+//! (ホストリンクが無いため) ので、コンソールは共通分だけを回す
+//! `alc_hub_drivers::console::start_common` を呼ぶ。
+//!
+//! BLE は**既定の build には入らない** — AtomS3 Lite 向けの `sdkconfig.defaults`
+//! は BT を持たず、esp32-nimble がリンクできない (実測: `esp_idf_sys::ble_*` が
+//! 全滅する)。そのため依存は optional の `ble` feature に入れ、VoiceS3R の
+//! overlay (`sdkconfig.voices3r.defaults`) とセットで有効にする。
+//! **env と feature の食い違いは下の const アサーションがコンパイルエラーにする。**
+//!
 //! 配線: Grove Port A (SDA=G2 / SCL=G1)。nfc_shim 側が I2C バスを自前で
 //! 立てるため、Rust 側で `Peripherals::take()` は LED (RMT + GPIO35) と
 //! ピン番号の受け渡しにのみ使う。
@@ -40,10 +59,14 @@
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use alc_hub_common::control::PairFlag;
+use alc_hub_common::settings::Settings;
 use alc_hub_common::status::{HubStatus, SharedStatus};
 use alc_hub_drivers::nfc::{self, NfcEvent};
+#[cfg(feature = "ble")]
+use alc_hub_drivers::recorder;
 use alc_hub_drivers::speaker::Sound;
-use alc_hub_drivers::{es8311, speaker};
+use alc_hub_drivers::{console, es8311, speaker};
 use anyhow::Result;
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::i2c::{config::Config as I2cConfig, I2cDriver};
@@ -52,6 +75,7 @@ use esp_idf_svc::hal::rmt::{
     config::TransmitConfig, FixedLengthSignal, PinState, Pulse, TxRmtDriver,
 };
 use esp_idf_svc::hal::units::Hertz;
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
 
 /// nfc_shim (C++ 側) に立てさせる I2C ポート。本機は他に I2C を使わないので
 /// I2C_NUM_0 (実機確認済み 2026-07-21)。CoreS3 は内部バスが I2C_NUM_0 を
@@ -72,6 +96,21 @@ const LED_ERR: (u8, u8, u8) = (255, 0, 0);
 /// LED を出さず、代わりに内蔵の ES8311 で読めたときに短いビープを鳴らす。
 /// Grove は同じ SDA=G2 / SCL=G1 なので NFC 側は変えない。既定 (AtomS3 Lite) は従来どおり
 const VOICES3R: bool = option_env!("ATOMS3_NFC_VOICES3R").is_some();
+
+// ★ env (`ATOMS3_NFC_VOICES3R`) と feature (`ble`) は必ずセットで指定する。
+// 片方だけだと「BLE をリンクするのに測定台の配線が無い」/「測定台なのに
+// 血圧計が無い」が**黙って**できてしまい、実機に焼くまで気づけない。
+// どちらも書き込みの現場でしか分からない種類の間違いなのでコンパイルで弾く
+#[cfg(feature = "ble")]
+const _: () = assert!(
+    VOICES3R,
+    "feature \"ble\" は ATOMS3_NFC_VOICES3R=1 の build 専用 (sdkconfig も overlay が要る)"
+);
+#[cfg(not(feature = "ble"))]
+const _: () = assert!(
+    !VOICES3R,
+    "ATOMS3_NFC_VOICES3R=1 の build には --features ble が要る (血圧計が入らない)"
+);
 
 /// 検知色を維持する時間。RF リンクは per-exchange で確率的に落ちるため、
 /// 成功直後の一時的な失敗で表示を戻すと「不安定」に見える (issue #96)
@@ -137,9 +176,40 @@ fn main() -> Result<()> {
         (None, None)
     };
 
-    // 本機は画面もホストリンクも持たないので、push_event の行き先は捨て場。
+    // 本機は画面を持たないので、push_event の行き先は捨て場。
     // それでも `nfc::start` はボード非依存の口として status を要求する
     let status: SharedStatus = Arc::new(Mutex::new(HubStatus::default()));
+
+    // 測定台 (Atom VoiceS3R) だけが持つ口: ホストコンソール (PC のブラウザが話す)
+    // と血圧計。既定 (AtomS3 Lite のベンチ検証機) はどちらも持たず、従来どおり
+    // 読み取りログを出すだけ。
+    //
+    // 起動順は atoms3-timecard と同じ「Settings → console → NFC → BLE」。
+    // console を NFC より先に立てるのは、Unit NFC が挿さっていなくても
+    // PC 側から `PING` / `LOG DUMP` が返るようにするため
+    let station = if VOICES3R {
+        let settings = Settings::new(EspDefaultNvsPartition::take()?)?;
+        // hub-ble はスキャンのたびに status 側の写しを読む
+        // (`console::handle_omron` が切り替え時に更新する)
+        if let Ok(mut st) = status.lock() {
+            st.omron_bp = settings.omron_bp();
+        }
+        // 再ペアリング要求のフラグ。console (`PAIR`) が立て、BLE ループが消費する。
+        // **両方に同じものを渡す** — 別物を渡すと画面のボタンが何も起こさない
+        let pair_flag = alc_hub_common::control::new_pair_flag();
+        // 本機は `STATUS` も `OTA` も持たない (ホストリンクが無い) ので機種固有の
+        // 分岐がゼロになる。**4 本目の console.rs を作らず**共通の入口を呼ぶ
+        // (hub-drivers/src/console.rs の `start_common`)
+        console::start_common(
+            "nfc",
+            Arc::clone(&status),
+            settings.clone(),
+            Arc::clone(&pair_flag),
+        )?;
+        Some((settings, pair_flag))
+    } else {
+        None
+    };
 
     // Unit NFC (ST25R3916): Grove Port A (SDA=G2 / SCL=G1)。読み取りループと
     // 重複抑止 (TapGate) は hub-drivers/src/nfc.rs が持つ。
@@ -168,6 +238,13 @@ fn main() -> Result<()> {
         );
     }
 
+    // 血圧計 (Omron HEM-6231T) — **`OMRON BP ON` のときだけ**。
+    // 起動時の設定で立てるかどうかを決めるので、OFF → ON には再起動が要る
+    // (理由と中身の所在は `start_bp` の doc)
+    if let Some((settings, pair_flag)) = &station {
+        start_bp(&status, settings, pair_flag)?;
+    }
+
     // メインループは LED のラッチ戻しだけ。検知そのもののログは nfc.rs が出す
     loop {
         FreeRtos::delay_ms(50);
@@ -175,6 +252,69 @@ fn main() -> Result<()> {
             led.expire();
         }
     }
+}
+
+/// 血圧計 (Omron HEM-6231T) の配線 — **`ble` feature = 測定台 (VoiceS3R) の
+/// build だけ**に入る。
+///
+/// BLE central の中身 (scan / bond / 鍵登録 / 0x2A35 のデコード) は CoreS3 /
+/// タイムカード端末と同じ `alc_hub_ble`、測定値の JSON 化・重複排除も同じ
+/// `recorder` を通す。**ここに血圧のコードを書かないこと** — 機種で割れると
+/// 「CoreS3 では届くのに測定台では届かない」になる
+/// (`crates/atoms3-timecard/src/main.rs` の同名の節と同型)。
+///
+/// **BLE を起動時の設定で立てるかどうか決めている** ので `OFF → ON` の切り替えには
+/// 再起動が要る (OFF のまま起動したときは `EVT BLE_DISABLED` を出す)。
+/// BT controller は内部RAM を使うため、血圧計を使わない台で常時初期化すると
+/// NFC の読み取りに要る内部RAM を削る。
+#[cfg(feature = "ble")]
+fn start_bp(status: &SharedStatus, settings: &Settings, pair_flag: &PairFlag) -> Result<()> {
+    if !settings.omron_bp() {
+        // 既定。**BT controller ごと起こさない**
+        alc_hub_common::evtlog::emit("EVT BLE_DISABLED omron_bp=0");
+        return Ok(());
+    }
+    let (meas_tx, meas_rx) = mpsc::channel();
+    // `recorder` の送り先は 3 つ (ホストへの JSON / 上り WS / Windows GW) だが、
+    // **本機に残るのはホストへの JSON だけ** — 画面も uplink も GW も持たない
+    // (サーバへ届けるのは PC 側の画面の仕事)。受け側を持たない channel への
+    // 送信は `recorder` も `hub-ble` も `let _ = tx.send(..)` で捨てるので、
+    // ここで受け側を drop する。**保持して読み捨てにしないこと** — 誰も読まない
+    // キューを毎周回す手間が増えるだけで、溜まり続ける方が危ない
+    let (ui_tx, ui_rx) = mpsc::channel();
+    drop(ui_rx);
+    let (ws_tx, ws_rx) = mpsc::channel();
+    drop(ws_rx);
+    // 測定値レコーダ (BLE の notify コールバックを軽量に保つ専用スレッド)
+    recorder::start(
+        meas_rx,
+        ui_tx.clone(),
+        Arc::clone(status),
+        settings.clone(),
+        ws_tx,
+        None,
+    )?;
+    // 本機は Wi-Fi を持たないので電波の取り合いは起きない
+    let coex = Arc::new(alc_hub_core::coex::RadioCoex::new());
+    alc_hub_ble::start(
+        Arc::clone(status),
+        meas_tx,
+        ui_tx,
+        coex,
+        Arc::clone(pair_flag),
+        settings.clone(),
+    )?;
+    alc_hub_common::evtlog::emit("EVT BLE_ENABLED omron_bp");
+    Ok(())
+}
+
+/// 既定 (AtomS3 Lite のベンチ検証機) の build。**BLE そのものが入らない** —
+/// あちらの `sdkconfig.defaults` は BT を持たず esp32-nimble がリンクできない
+/// (ファイル冒頭の「血圧計用 PC の測定台」節)。`VOICES3R` が偽であることは
+/// 冒頭の const アサーションが保証しているので、この関数は呼ばれない
+#[cfg(not(feature = "ble"))]
+fn start_bp(_status: &SharedStatus, _settings: &Settings, _pair_flag: &PairFlag) -> Result<()> {
+    Ok(())
 }
 
 /// 検知結果を LED の色にする。**2 枚見え (#143) と読み取り失敗は赤** —

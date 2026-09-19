@@ -22,7 +22,23 @@ description = "AtomS3 Lite + Unit NFC ベンチ検証機 — 交通系IDm/免許
 name = "alc-hub-atoms3-nfc"
 harness = false
 
+[features]
+# Atom VoiceS3R の測定台 build (`ATOMS3_NFC_VOICES3R`) だけが BLE (血圧計) を積む。
+# **env とこの feature は必ずセットで指定する** — 片方だけだと
+# 「BLE を呼ばないのにリンクだけする」/「VoiceS3R なのに血圧が無い」になるため、
+# src/main.rs の const アサーションが食い違いをコンパイルエラーにする
+ble = ["dep:alc-hub-ble", "dep:alc-hub-core"]
+
 [dependencies]
+# BLE central (Omron 血圧計)。**CoreS3 / atoms3-timecard と同じ crate をそのまま
+# 使う** — scan / bond / 鍵登録 / 0x2A35 のデコードは機種非依存で、ここは配線だけ。
+# **Atom VoiceS3R の build (ATOMS3_NFC_VOICES3R) 専用** — 既定 (AtomS3 Lite) の
+# sdkconfig は BT を持たないため、esp32-nimble がリンクできない。したがって
+# optional にして下の "ble" feature で入れる (feature と env の食い違いは
+# src/main.rs の const アサーションが弾く)
+alc-hub-ble = { path = "../hub-ble", optional = true }
+# alc_hub_core::coex::RadioCoex (BLE と Wi-Fi の電波調停)。BLE と同じ理由で optional
+alc-hub-core = { path = "../hub-core", optional = true }
 # 読み取りループ本体 (issue #146)。**このファームで独自の NFC ループを持たない** —
 # 検証機と本番機 (atoms3-timecard) で重複抑止が違うと、ここで測った挙動が
 # 本番と食い違う (issue #103 のエッジ判定がまさにそれだった)

@@ -148,6 +148,18 @@ jobs:
           - { name: atoms3-nfc,
               cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-nfc cargo check --release --locked -p alc-hub-atoms3-nfc",
               cache_key: build-nfc-lite }
+          # 同じ crate の **Atom VoiceS3R (8MB Octal PSRAM)** 向け build
+          # (血圧計用 PC の測定台、Refs ippoan/alc-app#353)。ソースは上の Lite leg と
+          # 同じだが sdkconfig が違う (PSRAM + NimBLE の overlay を `;` で重ねる) ため
+          # cache_key は**新規**。使い回すと esp-idf-sys が永遠に cold (Refs #63)。
+          # build の leg (下) と**同じキーにすること**。
+          # `ESP_IDF_SDKCONFIG_DEFAULTS` は `;` 区切りのリストで、**環境変数が
+          # Cargo.toml の metadata (esp_idf_sdkconfig_defaults) を上書きする**
+          # (esp-idf-sys 0.37 の build/config.rs)。相対パスはワークスペースルート基準
+          # (plan/standing-devices.md)。**上書きが外れていないことは次の step が検査する**
+          - { name: atoms3-nfc-s3r,
+              cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-nfc ATOMS3_NFC_VOICES3R=1 ESP_IDF_SDKCONFIG_DEFAULTS='crates/atoms3-nfc/sdkconfig.defaults;crates/atoms3-nfc/sdkconfig.voices3r.defaults' cargo check --release --locked -p alc-hub-atoms3-nfc --features ble",
+              cache_key: build-nfc-s3r }
 
     steps:
       - name: Checkout
@@ -289,6 +301,16 @@ jobs:
           ${{ matrix.cmd }}
           sccache --show-stats
 
+      # ★ sdkconfig の上書きが本当に効いたかを機械で確かめる (Refs ippoan/alc-app#353)。
+      # `ESP_IDF_SDKCONFIG_DEFAULTS` が外れると**静かに Lite の sdkconfig**
+      # (PSRAM 無し / BT 無し) でビルドが通ってしまい、**実機に焼くまで気づけない**
+      # (PSRAM は CONFIG_SPIRAM_IGNORE_NOTFOUND で黙って無しのまま起動する)。
+      # build job (下) にも同じ検査がある — あちらは push:main でしか走らないので、
+      # PR の時点で止めるためにここにも置く
+      - name: Verify VoiceS3R sdkconfig (PSRAM OCT / NimBLE)
+        if: matrix.name == 'atoms3-nfc-s3r'
+        run: bash .github/verify-voices3r-sdkconfig.sh
+
   # ------------------------------------------------------------------
   # build: フルビルド + 書き込みイメージ (main のみ)。
   # cores3 (CoreS3 統合ハブ) / atoms3-print (AtomS3 印刷ブリッジ) /
@@ -309,12 +331,14 @@ jobs:
           - name: cores3
             bin: alc-hub-cores3
             build_env: ''
+            cargo_args: ''
             flash_size: 16mb
             partition_table: partitions.csv
             cache_key: build
           - name: atoms3-print
             bin: alc-hub-atoms3-print
             build_env: 'ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-print'
+            cargo_args: ''
             flash_size: 8mb
             partition_table: crates/atoms3-print/partitions.csv
             cache_key: build-atoms3
@@ -330,6 +354,7 @@ jobs:
           - name: atoms3-timecard
             bin: alc-hub-atoms3-timecard
             build_env: 'ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard'
+            cargo_args: ''
             flash_size: 8mb
             partition_table: crates/atoms3-timecard/partitions.csv
             cache_key: build-timecard-s3r
@@ -341,19 +366,39 @@ jobs:
           - name: atoms3-alarm
             bin: alc-hub-atoms3-alarm
             build_env: 'ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-alarm'
+            cargo_args: ''
             flash_size: 8mb
             partition_table: crates/atoms3-alarm/partitions.csv
             cache_key: build-alarm-s3r
           # ベンチ検証機 atoms3-nfc (#149)。**配布しない** — Pages にも manifest にも
           # 載せない (assemble-pages は触らない)。build の leg は check 側の cache を
           # main で warm するためだけに要る (check だけだと永久に cold。Refs #63)。
-          # check の leg (上) と**同じキーにすること**
+          # check の leg (上) と**同じキーにすること**。
+          # **配布するのは下の atoms3-nfc-s3r leg** (同じ crate の VoiceS3R build)
           - name: atoms3-nfc
             bin: alc-hub-atoms3-nfc
             build_env: 'ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-nfc'
+            cargo_args: ''
             flash_size: 8mb
             partition_table: crates/atoms3-nfc/partitions.csv
             cache_key: build-nfc-lite
+          # 同じ crate の **Atom VoiceS3R** build = 血圧計用 PC の測定台
+          # (Refs ippoan/alc-app#353)。**配布するのはこちら** (Pages の
+          # docs/atoms3-nfc.html)。上の Lite leg はベンチ検証機のままで配布しない。
+          # dev チャネルは出さない (dev の実体は mem-hud = 画面の HUD で、画面を
+          # 持たない Atom 系には意味がない — timecard / alarm と同じ判断)。
+          # sdkconfig が違うので cache_key は**新規** (check の leg と同じキー)。
+          # **bin 名は Lite leg と同じ**なので、出力ファイル名だけ後段の step で
+          # `-s3r-` を挟んで分ける (同名のまま artifact を集めると混ざる)
+          - name: atoms3-nfc-s3r
+            bin: alc-hub-atoms3-nfc
+            build_env: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-nfc ATOMS3_NFC_VOICES3R=1 ESP_IDF_SDKCONFIG_DEFAULTS='crates/atoms3-nfc/sdkconfig.defaults;crates/atoms3-nfc/sdkconfig.voices3r.defaults'"
+            cargo_args: '--features ble'
+            flash_size: 8mb
+            # **検証機 (Lite) と別の csv** — 配る機なので OTA 2 スロット構成に
+            # 揃えてある (理由はファイル冒頭)
+            partition_table: crates/atoms3-nfc/partitions-voices3r.csv
+            cache_key: build-nfc-s3r
 
     steps:
       - name: Checkout
@@ -518,8 +563,14 @@ jobs:
           SCCACHE_GHA_ENABLED: 'true'
           RUSTC_WRAPPER: sccache
         run: |
-          env ${{ matrix.build_env }} cargo build --release --locked -p ${{ matrix.bin }}
+          env ${{ matrix.build_env }} cargo build --release --locked -p ${{ matrix.bin }} ${{ matrix.cargo_args }}
           sccache --show-stats
+
+      # ★ sdkconfig の上書きが効いたかの検査 (check job と同じ、Refs ippoan/alc-app#353)。
+      # ここが無いと、上書きが外れた VoiceS3R イメージがそのまま Pages に載る
+      - name: Verify VoiceS3R sdkconfig (PSRAM OCT / NimBLE)
+        if: matrix.name == 'atoms3-nfc-s3r'
+        run: bash .github/verify-voices3r-sdkconfig.sh
 
       # punchq (オフライン送信キュー、#142) の先頭オフセットを partitions.csv から
       # 読む。Web インストーラー用の main 部をここで切ることで、再インストールでも
@@ -607,6 +658,19 @@ jobs:
             tail -c +$((0x10000 + 1)) ${{ matrix.bin }}-dev-merged.bin > ${{ matrix.bin }}-dev-main.bin
           fi
 
+      # VoiceS3R leg は Lite leg と **bin 名が同じ**なので、集約 (download-artifact
+      # の merge-multiple) で上書きし合わないようファイル名を分ける。
+      # **既存 leg の出力名は変えない** — build job は push:main でしか走らず
+      # (check job は PR のみ)、共有の step を触ると本番機の配布が壊れても
+      # マージするまで気づけないため
+      - name: Rename outputs (VoiceS3R leg)
+        if: matrix.name == 'atoms3-nfc-s3r'
+        run: |
+          for f in ${{ matrix.bin }}-*.bin; do
+            mv "$f" "${f/${{ matrix.bin }}-/${{ matrix.bin }}-s3r-}"
+          done
+          ls -la ${{ matrix.bin }}-s3r-*.bin
+
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
@@ -620,7 +684,8 @@ jobs:
   # CoreS3 (index.html + manifest.json) / AtomS3 印刷ブリッジ
   # (atoms3-print.html + manifest-atoms3-print.json) / NFC タイムカード端末
   # (timecard.html + manifest-timecard.json) / 点呼端末の警告デバイス
-  # (alarm.html + manifest-alarm.json) の 4 機種分。
+  # (alarm.html + manifest-alarm.json) / 血圧計用 PC の測定台
+  # (atoms3-nfc.html + manifest-nfc.json) の 5 機種分。
   # manifest の version は auth-worker /device/setup の「最新版」照会
   # (機種別) が突き合わせるため、それぞれの crate version + SHA を刻む
   # ------------------------------------------------------------------
@@ -650,7 +715,9 @@ jobs:
           echo "timecard_version=$TIMECARD_VERSION" >> "$GITHUB_OUTPUT"
           ALARM_VERSION=$(grep '^version' crates/atoms3-alarm/Cargo.toml | head -1 | sed 's/version *= *"\(.*\)"/\1/')
           echo "alarm_version=$ALARM_VERSION" >> "$GITHUB_OUTPUT"
-          echo "cores3: $VERSION / atoms3-print: $ATOMS3_VERSION / timecard: $TIMECARD_VERSION / alarm: $ALARM_VERSION"
+          NFC_VERSION=$(grep '^version' crates/atoms3-nfc/Cargo.toml | head -1 | sed 's/version *= *"\(.*\)"/\1/')
+          echo "nfc_version=$NFC_VERSION" >> "$GITHUB_OUTPUT"
+          echo "cores3: $VERSION / atoms3-print: $ATOMS3_VERSION / timecard: $TIMECARD_VERSION / alarm: $ALARM_VERSION / bp-station: $NFC_VERSION"
 
       - name: Assemble Pages site
         run: |
@@ -659,6 +726,7 @@ jobs:
           cp docs/atoms3-print.html _site/
           cp docs/timecard.html _site/
           cp docs/alarm.html _site/
+          cp docs/atoms3-nfc.html _site/
           # boot/main = Web インストーラー用 (manifest の parts、NVS 温存 #48)。
           # merged = espflash/esptool で offset 0 に一括書き込みする CLI 用
           # (この経路は従来どおり NVS が消える)。app = OTA 用
@@ -682,6 +750,12 @@ jobs:
           cp alc-hub-atoms3-alarm-main.bin _site/firmware/
           cp alc-hub-atoms3-alarm-merged.bin _site/firmware/
           cp alc-hub-atoms3-alarm-app.bin _site/firmware/
+          # 血圧計用 PC の測定台 (Refs ippoan/alc-app#353)。ベンチ検証機 (AtomS3 Lite)
+          # と同じ bin 名なので、build job 側で `-s3r-` を挟んである
+          cp alc-hub-atoms3-nfc-s3r-boot.bin _site/firmware/
+          cp alc-hub-atoms3-nfc-s3r-main.bin _site/firmware/
+          cp alc-hub-atoms3-nfc-s3r-merged.bin _site/firmware/
+          cp alc-hub-atoms3-nfc-s3r-app.bin _site/firmware/
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.version }}+$SHORT_SHA\"/" \
             docs/manifest.json > _site/manifest.json
@@ -701,7 +775,12 @@ jobs:
           # 点呼端末の警告デバイス (#135)。timecard と同じく **dev チャネルは出さない**
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.alarm_version }}+$SHORT_SHA\"/" \
             docs/manifest-alarm.json > _site/manifest-alarm.json
-          cat _site/manifest.json _site/manifest-dev.json _site/manifest-atoms3-print.json _site/manifest-timecard.json _site/manifest-alarm.json
+          # 血圧計用 PC の測定台 (Refs ippoan/alc-app#353)。**timecard の亜種にしない**
+          # (独立機種。亜種にすると auth-worker 側の version 突合が壊れる)。
+          # timecard / alarm と同じく **dev チャネルは出さない**
+          sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.nfc_version }}+$SHORT_SHA\"/" \
+            docs/manifest-nfc.json > _site/manifest-nfc.json
+          cat _site/manifest.json _site/manifest-dev.json _site/manifest-atoms3-print.json _site/manifest-timecard.json _site/manifest-alarm.json _site/manifest-nfc.json
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

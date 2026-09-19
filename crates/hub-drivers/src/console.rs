@@ -13,6 +13,7 @@
 //! | [`install_usb_serial_jtag`] | USB Serial/JTAG ドライバの VFS 接続 (stdin をブロッキング読みにする) |
 //! | [`take_line`] | 受信バッファから 1 行を切り出す (改行待ち + ゴミ捨て) |
 //! | [`spawn_reader`] | stdin を読んで行ごとにコールバックを呼ぶスレッド |
+//! | [`start_common`] | 機種固有の分岐を持たない機の入口 (上記の共通分だけを連結する) |
 //! | [`handle_common`] | 機種に依らないコマンド (PING / HEAP / LOG / AUTH / WS) |
 //! | [`handle_omron`] | `OMRON BP ON\|OFF` / `OMRON STATUS` (BLE 血圧計を積む機だけが呼ぶ) |
 //! | [`handle_ota_lan_guarded`] | LAN 専用機の `OTA <url>` (リンクアップ前を弾く) |
@@ -20,7 +21,7 @@
 //! 解析そのものは `alc_hub_core::protocol::parse_line` (純粋・テスト済み) が持つ。
 //! ここは副作用 (NVS 保存・応答出力) だけを担当する。
 
-use alc_hub_core::protocol::HostCommand;
+use alc_hub_core::protocol::{parse_line, HostCommand};
 use anyhow::Result;
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::sys;
@@ -331,6 +332,51 @@ pub fn handle_pair(command: HostCommand, pair_flag: &PairFlag) -> Option<HostCom
         other => return Some(other),
     }
     None
+}
+
+/// 機種固有の分岐を**持たない**機のコンソール入口 (Refs ippoan/alc-app#353)。
+///
+/// [`spawn_reader`] → [`handle_common`] → [`handle_omron`] → [`handle_pair`] を
+/// その順に連結し、どれも捌かなかった行には `ERR UNSUPPORTED (<tag>)` を返す。
+///
+/// **4 本目の `console.rs` を作らないため**に在る。`STATUS` / `OTA` はホストリンク
+/// (LAN・版数・更新) を前提とするので [`handle_common`] には入れていないが、
+/// それらを持たない機 (血圧計用 PC の測定台 = `atoms3-nfc` の VoiceS3R build) は
+/// 機種固有の分岐が**ゼロ**になり、包むだけの写しができてしまう。
+///
+/// 機種固有の分岐を持つ機 (CoreS3 の [`crate::host_link`] / 印刷ブリッジ /
+/// タイムカード端末 / 警告デバイス) は従来どおり自前の `console.rs` で同じ順に
+/// 呼んでから固有分を捌く。**将来それらもこの入口 + 「固有分のクロージャ」へ
+/// 寄せられる**が、本番稼働中のため今回は分けてある。
+///
+/// `tag` は `ERR UNSUPPORTED (…)` に入れる機種名 (現場の切り分け用)。
+pub fn start_common(
+    tag: &'static str,
+    status: SharedStatus,
+    settings: Settings,
+    pair_flag: PairFlag,
+) -> Result<()> {
+    spawn_reader(c"console", 8 * 1024, move |line| {
+        let command = match parse_line(line, 0) {
+            Ok(Some(command)) => command,
+            Ok(None) => return, // 空行
+            Err(err_response) => {
+                println!("{err_response}");
+                return;
+            }
+        };
+        let Some(command) = handle_common(command, &status, &settings, false) else {
+            return;
+        };
+        let Some(command) = handle_omron(command, &status, &settings) else {
+            return;
+        };
+        let Some(command) = handle_pair(command, &pair_flag) else {
+            return;
+        };
+        log::debug!("console: unsupported command: {command:?}");
+        println!("ERR UNSUPPORTED ({tag})");
+    })
 }
 
 /// LAN (W5500) 専用機の `OTA <url>`。**リンクアップ前に lwip を叩くと assert
