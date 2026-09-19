@@ -50,8 +50,8 @@ use std::time::Duration;
 
 use alc_hub_core::{
     device::{
-        match_device_name, omron_adv, omron_adv_from_mfg, should_remember_bp_bond, DeviceKind,
-        OmronAdv,
+        match_device_name, omron_addr_from_name, omron_adv, omron_adv_from_mfg,
+        should_remember_bp_bond, DeviceKind, OmronAdv,
     },
     ieee11073::{parse_blood_pressure, parse_temperature},
 };
@@ -59,7 +59,8 @@ use anyhow::{Context, Result};
 use esp32_nimble::{
     enums::{AuthReq, SecurityIOCap},
     utilities::BleUuid,
-    uuid128, BLEAddress, BLEAdvertisedData, BLEAdvertisedDevice, BLEClient, BLEDevice, BLEScan,
+    uuid128, BLEAddress, BLEAddressType, BLEAdvertisedData, BLEAdvertisedDevice, BLEClient,
+    BLEDevice, BLEScan,
 };
 use esp_idf_svc::hal::{delay::FreeRtos, task::block_on};
 use esp_idf_svc::timer::EspTaskTimerService;
@@ -97,6 +98,15 @@ const OMRON_SERVICE: BleUuid = uuid128!("ecbe3980-c9a2-11e1-b1bd-0002a5d5c51b");
 /// bond だけで標準 BLS (0x2A35) を流す (Windows で実測)。この service が在るかで
 /// ペアリングの手順を分ける
 const OMRON_SERVICE_16: u16 = 0xFE4A;
+/// 全 0 アドレスで届いた Omron の本体広告の状態と時刻。名前を持つ scan response と
+/// 突き合わせて接続先アドレスを起こすために置く ([`match_target`] を参照)
+static OMRON_ZERO_ADV: Mutex<Option<(u64, OmronAdv)>> = Mutex::new(None);
+/// 上の記憶の有効期間。scan response は同じ広告への SCAN_REQ の応答なので直後に届く
+const OMRON_ZERO_ADV_MS: u64 = 1_000;
+/// 全 0 アドレスの Omron 機の名前から起こした MAC。機器ごとに変わらないので一度覚えれば
+/// 以降は**状態を持つ本体広告 1 つで**接続先が決まる (2 パケットが揃うのを待たない)。
+/// ペアリング待ちは数十秒で終わるので、待ち時間を削るのがそのまま成否に効く
+static OMRON_ZERO_MAC: Mutex<Option<[u8; 6]>> = Mutex::new(None);
 /// RX[0]。購読すると機器が bond (SMP) を始める
 const OMRON_RX0: BleUuid = uuid128!("49123040-aee8-11e1-a74d-0002a5d5c51b");
 /// unlock。書き込みへの応答が notify で返る
@@ -308,25 +318,25 @@ async fn task(
                 // ただしペアリング待ちは通す: HCR-1901T2 は同じ機器の scan response が
                 // 名前だけで「送信」に見え、未ボンドで弾かれて backoff に入る。その間
                 // ユーザーが -P- にした本体広告まで捨てると、ペアリングが永久に始まらない
-                if !matches!(target, Some((_, Some(OmronAdv::Pairing))))
-                    && empty_backoff.iter().any(|(a, _)| *a == dev.addr())
+                if !matches!(target, Some((_, _, Some(OmronAdv::Pairing))))
+                    && target.is_some_and(|(a, _, _)| empty_backoff.iter().any(|(b, _)| *b == a))
                 {
                     return None;
                 }
                 match target {
-                    Some((_, Some(_))) if !omron_enabled => None,
-                    Some((_, Some(OmronAdv::Pairing)))
-                        if paired_backoff.iter().any(|(a, _)| *a == dev.addr()) =>
+                    Some((_, _, Some(_))) if !omron_enabled => None,
+                    Some((addr, _, Some(OmronAdv::Pairing)))
+                        if paired_backoff.iter().any(|(a, _)| *a == addr) =>
                     {
                         None
                     }
-                    target => target.map(|(kind, omron)| (*dev, kind, omron)),
+                    target => target,
                 }
             })
             .await
             .context("BLE スキャン失敗")?;
 
-        let Some((adv, kind, omron)) = target else {
+        let Some((addr, kind, omron)) = target else {
             FreeRtos::delay_ms(SCAN_COOLDOWN_MS);
             continue;
         };
@@ -334,16 +344,16 @@ async fn task(
         // bond の無い Omron 機の送信広告には接続しない。secure_connection がその場で新しく
         // ペアリングしてしまい、機器はその bond には記録を送らない (S3R で実測)
         if omron == Some(OmronAdv::Transfer) {
-            if matches!(omron_find_bond(&adv.addr()), Ok(Some(_))) {
+            if matches!(omron_find_bond(&addr), Ok(Some(_))) {
                 // bond 済みの Omron 機を見た = 血圧計がボンドされている観測点。
                 // このファームより前にペアリングを済ませていた機 (OTA で上がってきた
                 // 現場) は記録を持たないので、ここで書き足す (Refs #249)。
                 // 記録が無いまま bp=0 を署名すると、血圧計が在るのに法定の血圧記録を
                 // 省く側へ倒れてしまう
-                remember_bp_bond(&settings, &adv.addr(), &mut bp_bond_rec);
+                remember_bp_bond(&settings, &addr, &mut bp_bond_rec);
             } else {
                 alc_hub_common::evtlog::emit("EVT OMRON_ENC nobond");
-                empty_backoff.push((adv.addr(), now_ms()));
+                empty_backoff.push((addr, now_ms()));
                 continue;
             }
         }
@@ -360,7 +370,7 @@ async fn task(
         let _ = ui_tx.send(UiCommand::BleAcquiring { device: kind });
 
         let mut client = device.new_client();
-        let result = handle_device(&mut client, &adv, kind, omron, &status, &meas_tx).await;
+        let result = handle_device(&mut client, addr, kind, omron, &status, &meas_tx).await;
         // 測定を受け取れたか / 受け取れずに終わったか (Refs #252)
         if bp_nonomron {
             alc_hub_common::evtlog::emit(match &result {
@@ -373,24 +383,24 @@ async fn task(
         // 非 Omron 機はここまで記録を書く経路が無く、NimBLE のボンド一覧に居ても
         // bp_bonded が永久に false のままだった。判定は hub-core の純粋関数が持つ
         if should_remember_bp_bond(kind, omron, matches!(result, Ok(true))) {
-            remember_bp_bond(&settings, &adv.addr(), &mut bp_bond_rec);
+            remember_bp_bond(&settings, &addr, &mut bp_bond_rec);
         }
         match result {
             // データなし: しばらくこの機器への再接続を控える (機器を空ける)。
             // 接続失敗 (Err) はバックオフしない — 新規測定の広告での一時的な
             // 接続失敗もあり、その場合は即リトライで拾いたい。Omron の送信接続は
             // 失敗でも控える (送信広告に繰り返し接続して機器をふさがない)
-            Ok(false) => empty_backoff.push((adv.addr(), now_ms())),
+            Ok(false) => empty_backoff.push((addr, now_ms())),
             Ok(true) if omron == Some(OmronAdv::Pairing) => {
                 // ペアリング成功。match_target が血圧計と確定させた機なので、
                 // 「血圧計としてボンドした」アドレスとして記録する (Refs #249)
-                remember_bp_bond(&settings, &adv.addr(), &mut bp_bond_rec);
-                paired_backoff.push((adv.addr(), now_ms()));
+                remember_bp_bond(&settings, &addr, &mut bp_bond_rec);
+                paired_backoff.push((addr, now_ms()));
             }
             Ok(true) => {}
             Err(e) => {
                 if omron == Some(OmronAdv::Transfer) {
-                    empty_backoff.push((adv.addr(), now_ms()));
+                    empty_backoff.push((addr, now_ms()));
                 }
                 log::warn!("ble: {} 処理失敗: {e:?}", kind.json_name());
                 println!(
@@ -418,10 +428,17 @@ async fn task(
 fn match_target(
     dev: &BLEAdvertisedDevice,
     data: &BLEAdvertisedData<&[u8]>,
-) -> Option<(DeviceKind, Option<OmronAdv>)> {
+) -> Option<(BLEAddress, DeviceKind, Option<OmronAdv>)> {
     if dev.rssi() < MIN_RSSI {
         return None;
     }
+
+    // HCR-1901T2 のペアリング待ちの広告は S3R の NimBLE では**アドレスが全 0** で届く
+    // (同時刻に Windows は実アドレス F8:B3:… を受けているので、機器は実アドレスで
+    // 広告している)。全 0 では接続できないので、名前 (scan response) に入っている MAC
+    // から起こす。状態 (ペアリング待ち / 送信) は名前の無い本体広告のメーカーデータに
+    // しかないため、直前の本体広告の状態を覚えて突き合わせる
+    let zero_addr = dev.addr().as_le_bytes() == [0u8; 6];
 
     // Omron 機の本体の広告は名前が無く 0x1810 を広告し、名前は別パケットの scan response
     // にだけ載る (S3R の PROBE ADV で実測)。本体の広告を 0x1810 で当てると Omron と
@@ -432,24 +449,58 @@ fn match_target(
     {
         // HCR-1901T2 の状態はメーカーデータの flag だけが持つ。名前 (scan response) は
         // ペアリング待ちでも `BLESmart_` のままで大文字小文字判定が効かない
-        if let Some(adv) = omron_adv_from_mfg(mfg.payload) {
-            return Some((DeviceKind::BloodPressure, Some(adv)));
+        let adv = match omron_adv_from_mfg(mfg.payload) {
+            Some(adv) => adv,
+            None => omron_adv(&String::from_utf8_lossy(data.name()?))?,
+        };
+        if zero_addr {
+            // 本体広告は名前を載せない。MAC を既に覚えていればそのまま接続先にする
+            if let Some(mac) = OMRON_ZERO_MAC.lock().ok().and_then(|mac| *mac) {
+                return Some((
+                    BLEAddress::from_be_bytes(mac, BLEAddressType::Random),
+                    DeviceKind::BloodPressure,
+                    Some(adv),
+                ));
+            }
+            // まだ知らないときは状態だけ覚えて、直後に来る scan response で拾い直す
+            if let Ok(mut slot) = OMRON_ZERO_ADV.lock() {
+                *slot = Some((now_ms(), adv));
+            }
+            return None;
         }
-        let name = String::from_utf8_lossy(data.name()?);
-        return omron_adv(&name).map(|adv| (DeviceKind::BloodPressure, Some(adv)));
+        return Some((dev.addr(), DeviceKind::BloodPressure, Some(adv)));
+    }
+
+    if zero_addr {
+        // 名前だけの scan response。名前の MAC を覚えて以降の本体広告で使い、この場では
+        // 直前の本体広告の状態と結び付いたときだけ接続先にする
+        // (機器は public ではなく random で広告している)
+        let mac = omron_addr_from_name(&String::from_utf8_lossy(data.name()?))?;
+        if let Ok(mut slot) = OMRON_ZERO_MAC.lock() {
+            *slot = Some(mac);
+        }
+        let adv = OMRON_ZERO_ADV.lock().ok().and_then(|slot| {
+            slot.filter(|(at, _)| now_ms().saturating_sub(*at) < OMRON_ZERO_ADV_MS)
+                .map(|(_, adv)| adv)
+        })?;
+        return Some((
+            BLEAddress::from_be_bytes(mac, BLEAddressType::Random),
+            DeviceKind::BloodPressure,
+            Some(adv),
+        ));
     }
 
     if data.is_advertising_service(&BleUuid::from_uuid16(HEALTH_THERMOMETER_SERVICE)) {
-        return Some((DeviceKind::Thermometer, None));
+        return Some((dev.addr(), DeviceKind::Thermometer, None));
     }
     if data.is_advertising_service(&BleUuid::from_uuid16(BLOOD_PRESSURE_SERVICE)) {
-        return Some((DeviceKind::BloodPressure, None));
+        return Some((dev.addr(), DeviceKind::BloodPressure, None));
     }
 
     if let Some(name) = data.name() {
         // name() は生バイト列 (&[u8]) を返す
         let name = String::from_utf8_lossy(name);
-        return match_device_name(&name).map(|kind| (kind, omron_adv(&name)));
+        return match_device_name(&name).map(|kind| (dev.addr(), kind, omron_adv(&name)));
     }
     None
 }
@@ -458,7 +509,7 @@ fn match_target(
 /// (false なら呼び出し側が短いバックオフを掛けて機器を空ける)
 async fn handle_device(
     client: &mut BLEClient,
-    adv: &BLEAdvertisedDevice,
+    addr: BLEAddress,
     kind: DeviceKind,
     omron: Option<OmronAdv>,
     status: &SharedStatus,
@@ -485,7 +536,7 @@ async fn handle_device(
     // secure_connection が新しいペアリングにならず古い鍵での暗号化で終わる (Linux の成功例は
     // 毎回消していた)。delete_bond (ble_gap_unpair) は接続中だと切断するので接続の前に行う
     if omron == Some(OmronAdv::Pairing) {
-        omron_unbond(&adv.addr());
+        omron_unbond(&addr);
     }
 
     // Arduino 版と同様に最大 3 回リトライ
@@ -497,7 +548,6 @@ async fn handle_device(
         disconnected.clear();
         // connect は exchange MTU の完了を待つが、その前に切られると esp32-nimble が
         // 完了を知らせず await が戻らない (S3R で 2 分停止)。切断でも抜ける形で待つ
-        let addr = adv.addr();
         let connect = connect_encrypting(
             client.connect(&addr),
             addr,
@@ -523,15 +573,23 @@ async fn handle_device(
     }
 
     match omron {
-        Some(OmronAdv::Pairing) => {
-            let res = omron_pair(client, &disconnected).await;
-            let _ = client.disconnect();
-            res?;
-            // ペアリングはデータなしでも Ok(true) を返す。Ok(false) だと呼び出し側が
+        Some(OmronAdv::Pairing) => match omron_pair(client, &disconnected).await {
+            // HCR-1901T2 (bls): **同じ接続のまま**購読へ進む。bond だけで切ると機器は
+            // 登録が終わったと見なさず -P- が消えない (実機で確認)
+            Ok(true) => {}
+            // HEM-6231T (legacy): 鍵登録で完結。切って送信広告を待つ。
+            // ペアリングはデータなしでも Ok(true) を返す — Ok(false) だと呼び出し側が
             // EMPTY_BACKOFF_MS の間この機器へ接続しなくなり、ペアリング直後に機器が出す
             // 送信広告 (未送信の記録) を取り逃す
-            return Ok(true);
-        }
+            Ok(false) => {
+                let _ = client.disconnect();
+                return Ok(true);
+            }
+            Err(e) => {
+                let _ = client.disconnect();
+                return Err(e);
+            }
+        },
         Some(OmronAdv::Transfer) => {
             // Omron 機はニプロ機と違い、保存済み bond で先に暗号化しないと 0x2A35 を
             // 送らない (Linux で実測)。時刻 (0x2A2B) は書かない — 書くと記録が独自形式の
@@ -725,8 +783,11 @@ async fn handle_device(
 /// [`OMRON_SERVICE`] の系統 (HEM-6231T) は RX[0] 購読 → bond → unlock 購読 →
 /// プログラムモード → 鍵の登録。各段を `EVT OMRON_PAIR <段> ok|err` で出す。
 /// 登録後の受信は標準 0x2A35 で鍵を使わないので、鍵は毎回乱数で作って保存しない
-/// (値はログに出さない)。切断は呼び出し側
-async fn omron_pair(client: &mut BLEClient, disconnected: &Disconnected) -> Result<()> {
+/// (値はログに出さない)。切断は呼び出し側。
+///
+/// 戻り値は**この接続をそのまま購読に使うか** — bls 系統は `true` (機器は bond だけで
+/// 切られると登録が終わったと見なさず `-P-` が消えない)、legacy 系統は `false`
+async fn omron_pair(client: &mut BLEClient, disconnected: &Disconnected) -> Result<bool> {
     fn step<T, E: core::fmt::Debug>(stage: &str, res: Result<T, E>) -> Result<T> {
         match res {
             Ok(v) => {
@@ -756,21 +817,28 @@ async fn omron_pair(client: &mut BLEClient, disconnected: &Disconnected) -> Resu
     );
     if bls_only {
         alc_hub_common::evtlog::emit("EVT OMRON_PAIR style=bls");
+        // 既定の設定 (`set_auth(AuthReq::Bond)` は sm_sc=0、配布鍵は our=ENC のみ) では
+        // NimBLE 側が bond 成立を返しても機器は -P- を消さない = ボンドと認めない。
+        // Windows が成功した条件 (LE Secure Connections + IRK の配布/受け入れ) に寄せる
+        BLEDevice::take()
+            .security()
+            .set_auth(AuthReq::Bond | AuthReq::Sc)
+            .resolve_rpa();
         // bond だけ張る。RX[0] の購読は bond 前だと Insufficient Authentication で
         // 弾かれるので行わない (機器側からの Security Request も待たず、こちらから張る)
         let res = disconnected
             .until_timeout(client.secure_connection(), OMRON_SECURE_TIMEOUT_MS)
             .await;
         step("bond", res.and_then(|r| Ok(r?)))?;
-        // 鍵登録の系統と同じだけ間を置いてから切る (切断は呼び出し側)。記録は
-        // このあとの送信広告への接続で標準 0x2A35 から受け取る
-        let start = now_ms();
-        while !disconnected.is_set() && now_ms().saturating_sub(start) < OMRON_PAIR_LINGER_MS {
-            FreeRtos::delay_ms(100);
-        }
-        return Ok(());
+        // 切らずに戻る。呼び出し側がこの接続のまま 0x2A35 / 0x2A2B を購読し、機器が
+        // 記録を送って自分で切断したところで登録が完了する (esphome-omron が言う
+        // 「bond して登録して読むまでを 1 セッションで」と同じ)
+        return Ok(true);
     }
     alc_hub_common::evtlog::emit("EVT OMRON_PAIR style=legacy");
+    // HEM-6231T は従来の条件 (legacy pairing / 配布鍵は既定) のまま張る。
+    // bls 経路が広げた設定を持ち越さない
+    BLEDevice::take().security().set_auth(AuthReq::Bond);
 
     // 各段は切断でも抜ける (Disconnected::until)。抜けた段も err として出す
     // 1. RX[0] を購読する (CCCD は Write Request)。これで機器が bond を求めてくる
@@ -885,7 +953,7 @@ async fn omron_pair(client: &mut BLEClient, disconnected: &Disconnected) -> Resu
     while !disconnected.is_set() && now_ms().saturating_sub(start) < OMRON_PAIR_LINGER_MS {
         FreeRtos::delay_ms(100);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// その機器の bond だけを消し、`EVT OMRON_PAIR unbond ok|err|none` を出す

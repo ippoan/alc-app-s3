@@ -79,6 +79,28 @@ pub fn omron_adv_from_mfg(payload: &[u8]) -> Option<OmronAdv> {
     })
 }
 
+/// Omron 機の広告名 (`BLESmart_000000A1F8B3719433A1`) から機器の MAC を起こす。
+///
+/// ペアリング待ちの広告は S3R の NimBLE ではアドレスが全 0 で届く (同時刻の Windows は
+/// `F8:B3:71:94:33:A1` を受けているので、機器は実アドレスで広告している)。接続先が無いと
+/// ペアリングできないので、名前の末尾 12 桁 (= MAC の big endian 表記) から起こす。
+/// 前半の 8 桁は機種コードで、機器ごとに変わらない
+#[must_use]
+pub fn omron_addr_from_name(name: &str) -> Option<[u8; 6]> {
+    let hex = name
+        .strip_prefix("BLESmart_")
+        .or_else(|| name.strip_prefix("BLEsmart_"))?;
+    if hex.len() < 12 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mac = &hex[hex.len() - 12..];
+    let mut out = [0u8; 6];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(mac.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
 /// アドバタイズのデバイス名から種別を判定する (Arduino 版の名前判定を移植。
 /// ニプロ機器が標準サービス UUID を広告しない場合の対策)。
 /// Omron 機器 (独自名) も血圧計として拾う。
@@ -259,6 +281,30 @@ mod tests {
             0x02, 0x21, 0x04, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         assert_eq!(omron_adv_from_mfg(&head), None);
+    }
+
+    /// 広告名の末尾 12 桁が MAC (big endian)
+    #[test]
+    fn omron_addr_from_name_parses_mac() {
+        assert_eq!(
+            omron_addr_from_name("BLESmart_000000A1F8B3719433A1"),
+            Some([0xF8, 0xB3, 0x71, 0x94, 0x33, 0xA1])
+        );
+        // ペアリング待ちの小文字名でも同じ
+        assert_eq!(
+            omron_addr_from_name("BLEsmart_000000A1F8B3719433A1"),
+            Some([0xF8, 0xB3, 0x71, 0x94, 0x33, 0xA1])
+        );
+    }
+
+    #[test]
+    fn omron_addr_from_name_rejects_other_names() {
+        // 接頭辞違い
+        assert_eq!(omron_addr_from_name("NBP-1BLE"), None);
+        // 桁が足りない
+        assert_eq!(omron_addr_from_name("BLESmart_A1F8B3"), None);
+        // 16 進でない文字が混じる
+        assert_eq!(omron_addr_from_name("BLESmart_000000A1F8B37194ZZA1"), None);
     }
 
     #[test]
