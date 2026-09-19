@@ -51,7 +51,7 @@ use std::time::Duration;
 use alc_hub_core::{
     device::{
         match_device_name, omron_addr_from_name, omron_adv, omron_adv_from_mfg,
-        should_remember_bp_bond, DeviceKind, OmronAdv,
+        should_remember_bp_bond, BpBondSite, DeviceKind, OmronAdv,
     },
     ieee11073::{parse_blood_pressure, parse_temperature},
 };
@@ -365,11 +365,10 @@ async fn task(
         if omron == Some(OmronAdv::Transfer) {
             if matches!(omron_find_bond(&addr), Ok(Some(_))) {
                 // bond 済みの Omron 機を見た = 血圧計がボンドされている観測点。
-                // このファームより前にペアリングを済ませていた機 (OTA で上がってきた
-                // 現場) は記録を持たないので、ここで書き足す (Refs #249)。
-                // 記録が無いまま bp=0 を署名すると、血圧計が在るのに法定の血圧記録を
-                // 省く側へ倒れてしまう
-                remember_bp_bond(&settings, &addr, &mut bp_bond_rec);
+                // 記録してよいかの判定は hub-core の述語 1 本が持つ (Refs #266)
+                if should_remember_bp_bond(BpBondSite::OmronBondSeen) {
+                    remember_bp_bond(&settings, &addr, &mut bp_bond_rec);
+                }
             } else {
                 alc_hub_common::evtlog::emit("EVT OMRON_ENC nobond");
                 empty_backoff.push((addr, now_ms()));
@@ -400,8 +399,12 @@ async fn task(
         }
         // 血圧の特性を実際に読めた経路だけ「血圧計としてボンド」に載せる (Refs #252)。
         // 非 Omron 機はここまで記録を書く経路が無く、NimBLE のボンド一覧に居ても
-        // bp_bonded が永久に false のままだった。判定は hub-core の純粋関数が持つ
-        if should_remember_bp_bond(kind, omron, matches!(result, Ok(true))) {
+        // bp_bonded が永久に false のままだった。判定は hub-core の述語 1 本が持つ
+        if should_remember_bp_bond(BpBondSite::ConnectionFinished {
+            kind,
+            omron,
+            got_data: matches!(result, Ok(true)),
+        }) {
             remember_bp_bond(&settings, &addr, &mut bp_bond_rec);
         }
         // ペアリングは 1 回やり切ったら受付を閉じる。失敗は開けたままにして、
@@ -409,7 +412,14 @@ async fn task(
         if omron == Some(OmronAdv::Pairing) {
             if result.is_ok() {
                 pair_until = 0;
-                // bond からその接続での購読・機器側の切断まで通った = ペアリング成立
+                // ペアリング成立。match_target が血圧計と確定させた機なので、
+                // 「血圧計としてボンドした」アドレスとして記録する (Refs #249)。
+                // ★ 記録は EVT PAIR_OK と同じブロックで行う — 別条件に分けると
+                // 「成功と表示したのに BP=0」が作れてしまう (測定 0 件で機器側から
+                // 切断された回に現場が止まった。Refs #266)
+                if should_remember_bp_bond(BpBondSite::OmronPaired) {
+                    remember_bp_bond(&settings, &addr, &mut bp_bond_rec);
+                }
                 alc_hub_common::evtlog::emit("EVT PAIR_OK");
             } else {
                 alc_hub_common::evtlog::emit("EVT PAIR_ERR 接続に失敗");
@@ -421,10 +431,9 @@ async fn task(
             // 接続失敗もあり、その場合は即リトライで拾いたい。Omron の送信接続は
             // 失敗でも控える (送信広告に繰り返し接続して機器をふさがない)
             Ok(false) => empty_backoff.push((addr, now_ms())),
+            // ボンド記録は EVT PAIR_OK と同じブロックで済んでいる (Refs #266)。
+            // ここに残るのは「同じ機にすぐ再接続しない」ためのバックオフだけ
             Ok(true) if omron == Some(OmronAdv::Pairing) => {
-                // ペアリング成功。match_target が血圧計と確定させた機なので、
-                // 「血圧計としてボンドした」アドレスとして記録する (Refs #249)
-                remember_bp_bond(&settings, &addr, &mut bp_bond_rec);
                 paired_backoff.push((addr, now_ms()));
             }
             Ok(true) => {}

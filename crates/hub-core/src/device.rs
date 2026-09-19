@@ -131,22 +131,67 @@ pub fn bp_bonded(recorded: Option<[u8; 6]>, bonded: &[[u8; 6]]) -> bool {
     recorded.is_some_and(|addr| bonded.contains(&addr))
 }
 
-/// この接続結果を「血圧計としてボンドした」と記録してよいか (Refs #252)。
+/// 血圧計のボンド記録を書いてよい瞬間 (Refs #266)。
 ///
-/// 記録は [`bp_bonded`] の片側 — つまり `AUTH SIGNBP` が署名する `bp=1` の根拠に
-/// なるので、**血圧の特性を実際に読めた経路だけ**に限る。[`match_device_name`] の
-/// 名前判定は `BP` / `Blood` を含むだけで血圧計としてしまうほど緩く、接続できた
-/// だけの無関係な機器を載せると、血圧計が無いのに `bp=1` を署名してしまう。
+/// hub-ble がこの判定を呼ぶ 3 点を、そのまま variant にしてある。
+/// **bool を引数に並べない** — 引数が増えると呼び出し側が順序を取り違えても型検査が
+/// 捕まえられず、それが `#249` → `#252` → `#253` → `#266` と同じ穴を 4 世代
+/// 繰り返した原因。観測点を名前で渡せば、取り違えはコンパイルエラーになる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BpBondSite {
+    /// 送信広告を出している Omron 機が、既に NimBLE のボンド一覧に居た。
+    /// このファームより前にペアリングを済ませていた機 (OTA で上がってきた現場) が
+    /// 記録を持たないので、ここで書き足す
+    OmronBondSeen,
+    /// Omron のペアリングが成功した (`EVT PAIR_OK` を出すのと同じ瞬間)
+    OmronPaired,
+    /// 1 回の接続が終わった (Omron / 非 Omron 共通の後始末)
+    ConnectionFinished {
+        /// 広告名から確定した機器種別
+        kind: DeviceKind,
+        /// Omron 機の広告状態 (非 Omron なら `None`)
+        omron: Option<OmronAdv>,
+        /// その接続で測定を実際に受け取れたか
+        got_data: bool,
+    },
+}
+
+/// この観測点で「血圧計としてボンドした」と記録してよいか (Refs #249 / #252 / #266)。
 ///
-/// Omron 機 (`omron` が `Some`) は専用の経路が既に記録しているので `false` を
-/// 返す — 同じ機器を二重に書かない。
+/// 記録は [`bp_bonded`] の片側 — つまり `AUTH SIGNBP` が署名する `bp=1` の根拠になる。
+/// 判定は**この関数だけ**が持つ。以前は hub-ble 側の 3 か所に別々の条件で散っており、
+/// うち 2 つはこの述語を迂回していた。その結果「`EVT PAIR_OK` を出したのに `BP=0`」
+/// という状態が作れてしまい、現場が止まった (#266)。
 ///
-/// * `kind` — 広告名から確定した機器種別
-/// * `omron` — Omron 機の広告状態 (非 Omron なら `None`)
-/// * `got_data` — その接続で測定を実際に受け取れたか
+/// # 真理値表
+///
+/// | 観測点 | 記録する | なぜ |
+/// |---|---|---|
+/// | [`BpBondSite::OmronBondSeen`] | ✔ | ボンド一覧に居る Omron 機 = 血圧計が在る観測 |
+/// | [`BpBondSite::OmronPaired`] | ✔ | `EVT PAIR_OK` と同時に書く。成功表示と記録を一致させる |
+/// | `ConnectionFinished` 血圧計・非 Omron・測定あり | ✔ | 血圧の特性を実際に読めた |
+/// | `ConnectionFinished` 血圧計・非 Omron・測定なし | ✘ | 名前判定が緩く、無関係な機器を載せうる |
+/// | `ConnectionFinished` 体温計 (測定の有無によらず) | ✘ | 血圧計ではない |
+/// | `ConnectionFinished` Omron 機 (測定の有無によらず) | ✘ | 上 2 つが記録済み。二重に書かない |
+///
+/// # Omron 経路を常に `true` に倒してある理由
+///
+/// Omron の 2 点は血圧計である根拠が広告 (company id `0x020E` / 広告名) だけで、
+/// legacy HEM-6231T は購読も `0x1810` の確認もせずペアリング成功を返す。それでも
+/// **`bp=0` に倒す方が危険**で、記録が無いまま `bp=0` を署名すると血圧計が在るのに
+/// 法定の血圧記録を省く側へ倒れてしまう。誤って `bp=1` になった場合 (血圧計でない
+/// Omron 機を `PAIR` した場合) は次の測定で即座に露見し、しかも `PAIR` は現場の人が
+/// 血圧計を目の前にして押す操作なので、**誤ペアリングは検知ではなく操作で防ぐ**。
 #[must_use]
-pub fn should_remember_bp_bond(kind: DeviceKind, omron: Option<OmronAdv>, got_data: bool) -> bool {
-    kind == DeviceKind::BloodPressure && omron.is_none() && got_data
+pub fn should_remember_bp_bond(site: BpBondSite) -> bool {
+    match site {
+        BpBondSite::OmronBondSeen | BpBondSite::OmronPaired => true,
+        BpBondSite::ConnectionFinished {
+            kind,
+            omron,
+            got_data,
+        } => kind == DeviceKind::BloodPressure && omron.is_none() && got_data,
+    }
 }
 
 #[cfg(test)]
@@ -169,43 +214,82 @@ mod tests {
         assert!(!bp_bonded(None, &[OTHER]));
     }
 
+    /// `ConnectionFinished` を組み立てる (真理値表の 4 行目以降)。
+    ///
+    /// enum 化する前の `should_remember_bp_bond(kind, omron, got_data)` は
+    /// hub-ble の `:404` 専用だったので、**旧テストの 6 ケースはすべてこの variant**
+    /// に移した。下の `remembers_bp_bond_only_when_bp_data_arrived` の ① 〜 ⑥ が
+    /// その 6 つで、入力も結論も変えていない (⑦ ⑧ は今回足した網羅ぶん)
+    fn finished(kind: DeviceKind, omron: Option<OmronAdv>, got_data: bool) -> BpBondSite {
+        BpBondSite::ConnectionFinished {
+            kind,
+            omron,
+            got_data,
+        }
+    }
+
+    #[test]
+    fn remembers_bp_bond_when_omron_pairing_succeeds() {
+        // #266: EVT PAIR_OK を出した回は必ず記録する。測定を 1 件も受け取れなくても
+        // (EVT OMRON_END by=peer n=0)、成功表示と記録が食い違ってはいけない
+        assert!(should_remember_bp_bond(BpBondSite::OmronPaired));
+    }
+
+    #[test]
+    fn remembers_bp_bond_when_bonded_omron_seen() {
+        // 既にボンド一覧に居る Omron 機を見た = 血圧計が在る観測点 (Refs #249)
+        assert!(should_remember_bp_bond(BpBondSite::OmronBondSeen));
+    }
+
     #[test]
     fn remembers_bp_bond_only_when_bp_data_arrived() {
-        // 血圧計から測定を実際に受け取れた = 「血圧計としてボンドした」と記録する
-        assert!(should_remember_bp_bond(
+        // ① 血圧計から測定を実際に受け取れた = 「血圧計としてボンドした」と記録する
+        assert!(should_remember_bp_bond(finished(
             DeviceKind::BloodPressure,
             None,
             true
-        ));
-        // 接続はできたがデータなし: 記録しない。名前判定が緩いので、無関係な
+        )));
+        // ② 接続はできたがデータなし: 記録しない。名前判定が緩いので、無関係な
         // 機器を載せると bp=1 を署名してしまう
-        assert!(!should_remember_bp_bond(
+        assert!(!should_remember_bp_bond(finished(
             DeviceKind::BloodPressure,
             None,
             false
-        ));
-        // 体温計は測定を受け取れても血圧のボンド記録を書かない
-        assert!(!should_remember_bp_bond(
+        )));
+        // ③ ④ 体温計は測定を受け取れても血圧のボンド記録を書かない
+        assert!(!should_remember_bp_bond(finished(
             DeviceKind::Thermometer,
             None,
             true
-        ));
-        assert!(!should_remember_bp_bond(
+        )));
+        assert!(!should_remember_bp_bond(finished(
             DeviceKind::Thermometer,
             None,
             false
-        ));
-        // Omron は Pairing / Transfer とも専用経路が記録済み — 二重に書かない
-        assert!(!should_remember_bp_bond(
+        )));
+        // ⑤ ⑥ Omron は Pairing / Transfer とも専用の観測点が記録済み — 二重に書かない。
+        // ⑦ ⑧ (got_data = false) は旧テストに無かったぶん — 測定の有無によらず
+        // false であることを固定する
+        assert!(!should_remember_bp_bond(finished(
             DeviceKind::BloodPressure,
             Some(OmronAdv::Pairing),
             true
-        ));
-        assert!(!should_remember_bp_bond(
+        )));
+        assert!(!should_remember_bp_bond(finished(
             DeviceKind::BloodPressure,
             Some(OmronAdv::Transfer),
             true
-        ));
+        )));
+        assert!(!should_remember_bp_bond(finished(
+            DeviceKind::BloodPressure,
+            Some(OmronAdv::Pairing),
+            false
+        )));
+        assert!(!should_remember_bp_bond(finished(
+            DeviceKind::BloodPressure,
+            Some(OmronAdv::Transfer),
+            false
+        )));
     }
 
     #[test]
