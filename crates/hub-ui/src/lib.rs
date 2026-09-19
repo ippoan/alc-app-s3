@@ -255,13 +255,30 @@ pub fn run(
                 alc_hub_common::evtlog::emit(&format!("EVT USB_HOST={}", u8::from(usb)));
                 prev_usb_host = Some(usb);
             }
-            let bus_in = status
+            // 「M-Bus は外部給電ではない」の確定は**ここ 1 か所**でやる
+            // (Refs #254)。W5500 の probe (hub-drivers) は通ったときに
+            // `Some(true)` を入れるだけで、失敗しても `Some(false)` は入れない
+            // — 起動直後は W5500 がまだ立ち上がっていないことがあり、1 回勝負で
+            // 確定すると PoE 単独給電で起動できなくなるため。猶予
+            // (`usb5v::BUS_IN_GRACE_MS`) を過ぎても未判定のままなら、ここで
+            // 「外部給電ではない」と確定する。**`lan` 無効ビルド (W5500 が無く
+            // probe も走らない) も同じ 1 か所**なので、判定待ちで止まらない
+            let (bus_in, just_confirmed) = status
                 .lock()
                 .map(|mut st| {
                     st.usb_host = usb;
-                    st.bus_in
+                    let just_confirmed =
+                        st.bus_in.is_none() && alc_hub_core::usb5v::bus_in_absent_confirmed(now);
+                    if just_confirmed {
+                        st.bus_in = Some(false);
+                    }
+                    (st.bus_in, just_confirmed)
                 })
-                .unwrap_or(None);
+                .unwrap_or((None, false));
+            if just_confirmed {
+                // 現場の切り分け用 — この 1 行が出た後だけ Core が 5V を出しうる
+                alc_hub_common::evtlog::emit("EVT BUS_IN=0 w5500 無応答のまま猶予切れ");
+            }
             // M-Bus が外部給電でないと確定しているときだけ Latch にサンプルを
             // 渡す。`None`/`Some(true)` は切り替え自体を起こさない (Refs #211)
             if bus_in == Some(false) {

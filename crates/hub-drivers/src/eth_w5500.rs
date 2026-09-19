@@ -49,6 +49,11 @@ const PROBE_BAUDRATE_HZ: u32 = 2_000_000;
 /// W5500 が応答するまでの probe 間隔。上限は設けない — 据置機なので
 /// PoE (= ベースの 5V) が来るまで待ち続ける
 const ETH_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+/// `bus_in` の猶予 (`usb5v::BUS_IN_GRACE_MS`) の内だけ使う probe 間隔。
+/// 遅れて立ち上がる W5500 を猶予の中で何度も試せるよう詰める —
+/// `ETH_PROBE_INTERVAL` (10 秒) のままだと猶予 (5 秒) の中で 1 回しか試せず、
+/// 「1 回勝負で確定しない」ことの意味が無くなる (Refs #254)
+const GRACE_PROBE_INTERVAL_MS: u32 = 500;
 /// VERSIONR (共通レジスタ 0x0039) の読み出しフレーム。アドレス上位 / 下位 /
 /// コントロールバイト (BSB=0 共通レジスタ, RWB=0 read, OM=00 可変長データモード)
 /// に、値を受け取るためのダミー 1 バイトを足した 4 バイトを全二重で往復する
@@ -158,11 +163,19 @@ fn probe_versionr(spi: &'static SpiDriver<'static>, cs_num: PinId) -> Result<u8>
 /// (LCD と共有) が埋まって別の理由で永久に失敗するため。
 /// 失敗ログは理由が変わったときだけ出す (10 秒ごとに同じ行を吐き続けない)
 ///
-/// **1 回目の probe の結果で `HubStatus::bus_in` を確定する** (Refs #211)。
-/// 起動時の BUS_EN は L (`power::init`) なので、1 回目で応答があれば M-Bus に
-/// 外から 5V が来ている (PoE)。失敗した 1 回目でも `Some(false)` を入れる —
-/// この関数は成功するまで戻らないので、戻ってから入れると USB 単独起動が
-/// 判定待ちのまま止まる。2 回目以降の probe では触らない (起動中 sticky)。
+/// **`HubStatus::bus_in` はここでは `Some(true)` しか入れない** (Refs #211, #254)。
+/// 起動時の BUS_EN は L (`power::init`) なので、**Core 自身が 5V を出していない
+/// (`ext_5v_out == false`) 間に probe が通れば、M-Bus に外から 5V が来ている
+/// (PoE)** — そのときだけ `Some(true)` を入れる。
+///
+/// **失敗しても `Some(false)` は入れない。** 起動直後は W5500 がまだ立ち上がって
+/// いないことがあり (PoE スプリッタ → ベース → W5500 の順に電気が回る)、1 回勝負
+/// で確定すると `Some(false)` に誤確定して Core が同じ 5V レールを駆動し、
+/// **PoE 単独給電で起動できなくなる** (#254)。`None` (まだ分からない) のまま置き、
+/// 猶予 (`usb5v::BUS_IN_GRACE_MS`) を過ぎても `None` のままなら hub-ui の i2c
+/// ループが `Some(false)` に確定する — `lan` 無効ビルド (probe が走らない) と
+/// 同じ 1 か所なので、判定待ちで止まることはない。
+/// 猶予の内は probe の間隔を `GRACE_PROBE_INTERVAL_MS` に詰める。
 fn wait_for_w5500(
     spi: &'static SpiDriver<'static>,
     cs_num: PinId,
@@ -174,8 +187,13 @@ fn wait_for_w5500(
         n += 1;
         let reason = match probe_versionr(spi, cs_num) {
             Ok(W5500_VERSION) => {
-                if n == 1 {
-                    if let Ok(mut st) = status.lock() {
+                // probe が通った = M-Bus に 5V が来ている。ただし **Core 自身が
+                // 出している間は外部給電の証拠にならない**ので、そのときだけ
+                // 触らない。猶予切れで `Some(false)` に確定した後でも、まだ
+                // Core が出していなければ上書きしてよい — 遅れて立ち上がった
+                // W5500 でも門を閉じ直せる (Refs #254)
+                if let Ok(mut st) = status.lock() {
+                    if !st.ext_5v_out {
                         st.bus_in = Some(true);
                     }
                 }
@@ -186,19 +204,23 @@ fn wait_for_w5500(
             Ok(v) => format!("versionr=0x{v:02X}"),
             Err(e) => format!("spi_err={e:#}"),
         };
-        if n == 1 {
-            if let Ok(mut st) = status.lock() {
-                st.bus_in = Some(false);
-            }
-        }
+        // 失敗しても `bus_in` は触らない (`None` のまま = まだ分からない)。
+        // 確定は hub-ui の i2c ループが猶予切れで行う (Refs #254)
         if last.as_deref() != Some(reason.as_str()) {
             log::warn!(
-                "eth_w5500: W5500 が応答しない ({reason}) — {ETH_PROBE_INTERVAL:?} ごとに probe する"
+                "eth_w5500: W5500 が応答しない ({reason}) — 応答するまで probe を続ける \
+                 (猶予の内は {GRACE_PROBE_INTERVAL_MS} ms、以後は {ETH_PROBE_INTERVAL:?} ごと)"
             );
             alc_hub_common::evtlog::emit(&format!("EVT ETH NG w5500 not responding {reason}"));
             last = Some(reason);
         }
-        FreeRtos::delay_ms(ETH_PROBE_INTERVAL.as_millis() as u32);
+        // 猶予の内だけ詰めて試す。猶予を過ぎたら据置機らしく 10 秒間隔へ戻す
+        let interval_ms = if alc_hub_core::usb5v::bus_in_absent_confirmed(now_ms()) {
+            ETH_PROBE_INTERVAL.as_millis() as u32
+        } else {
+            GRACE_PROBE_INTERVAL_MS
+        };
+        FreeRtos::delay_ms(interval_ms);
     }
 }
 

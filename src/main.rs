@@ -125,9 +125,12 @@ fn main() -> Result<()> {
     // (`HubStatus::bus_in == Some(false)`) ときだけ出す** (Refs #211) —
     // PoE 稼働中に USB を挿しても切り替え自体を起こさない (実機で電源断を確認
     // 済み)。PC が居て M-Bus も外部給電でないなら VBUS がレールを支えられるし、
-    // PC が落ちれば Core は手を引いて PoE に任せられる。判定は起動時の W5500
-    // probe (`eth_w5500::wait_for_w5500`)、追随は hub-ui の i2c ループ
-    // (1 秒ポーリング、`usb5v::Latch`) が担う。
+    // PC が落ちれば Core は手を引いて PoE に任せられる。
+    //
+    // `bus_in` の材料は起動時の W5500 probe (`eth_w5500::wait_for_w5500`) で、
+    // **通ったときに `Some(true)` を入れるだけ**。**外部給電でないことの確定と
+    // 5V の追随はどちらも hub-ui の i2c ループ** (1 秒ポーリング、
+    // `usb5v::BUS_IN_GRACE_MS` / `usb5v::Latch`) が担う (Refs #254)。
     let rotation = settings.rotation();
     // 起動カウンタを 1 つ進める (点呼セッション ID の前置、Refs #112)。
     // **起動ごとに 1 回だけ** — 再起動をまたいだ session_id の再利用を防ぐ。
@@ -153,13 +156,13 @@ fn main() -> Result<()> {
         reset_history: Some(reset_history),
         ..HubStatus::default()
     }));
-    // `lan` feature 無効ビルドは W5500 が無く `wait_for_w5500` が判定を入れない
-    // ので、起動時に確定させておく (Refs #211)。無いと `bus_in` が `None` の
-    // まま = hub-ui の 5V 切り替えがいつまでも判定待ちで止まる
-    #[cfg(not(feature = "lan"))]
-    if let Ok(mut st) = status.lock() {
-        st.bus_in = Some(false);
-    }
+    // `bus_in` は**ここでは確定させない** (Refs #254)。以前は `lan` 無効ビルド
+    // (W5500 が無く probe が走らない) だけ、ここで即 `Some(false)` を入れて
+    // いたが、probe 側と規則が食い違うと片方のビルドにだけ旧挙動が残る。
+    // いまは **hub-ui の i2c ループ 1 か所**が、起動から
+    // `usb5v::BUS_IN_GRACE_MS` 経っても未判定のままなら `Some(false)` に
+    // 確定する — `lan` 無効ビルドもそこで確定するので判定待ちで止まらない。
+
     // ヒープ監視 (OOM 捕捉 + low-water 継続計測、Refs #27)。Wi-Fi/BLE/TLS の
     // 重いアロケーションより先に登録し、初期化中の OOM も捕まえる
     heap::start(Arc::clone(&status))?;
