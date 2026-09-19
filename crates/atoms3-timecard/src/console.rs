@@ -16,10 +16,12 @@
 //! | `OTA <url>` | オンラインアップデート (`EVT OTA_*`、LAN 確立を待つ) |
 //! | `AUTH SET/UNPAIR/STATUS/TOKEN/URL` | device credential 管理 (共通実装) |
 //! | `WS URL <url>` / `WS STATUS` | cf-alc-recorder 常時接続の URL 上書き / 状態 (共通実装) |
+//! | `PAIR` | 血圧計の再ペアリング (ボンド消去 + 120 秒のペアリング受付、共通実装)。Pages の「血圧計を再ペアリング」から届く |
 //! | `OMRON BP ON\|OFF` / `OMRON STATUS` | 血圧計 (HEM-6231T) を拾うか (共通実装、既定 OFF)。**ON にしたら再起動が要る** — main.rs 冒頭の「血圧計」節 |
 
 use alc_hub_common::{
     config,
+    control::PairFlag,
     settings::Settings,
     status::{epoch_ms, SharedStatus},
 };
@@ -28,13 +30,13 @@ use alc_hub_core::uplink::MIN_SYNCED_MS;
 use alc_hub_drivers::console;
 use anyhow::Result;
 
-pub fn start(status: SharedStatus, settings: Settings) -> Result<()> {
+pub fn start(status: SharedStatus, settings: Settings, pair_flag: PairFlag) -> Result<()> {
     console::spawn_reader(c"console", 8 * 1024, move |line| {
-        handle_line(line, &status, &settings)
+        handle_line(line, &status, &settings, &pair_flag)
     })
 }
 
-fn handle_line(line: &str, status: &SharedStatus, settings: &Settings) {
+fn handle_line(line: &str, status: &SharedStatus, settings: &Settings, pair_flag: &PairFlag) {
     let command = match parse_line(line, 0) {
         Ok(Some(command)) => command,
         Ok(None) => return, // 空行
@@ -53,6 +55,11 @@ fn handle_line(line: &str, status: &SharedStatus, settings: &Settings) {
     // **本機は BLE を起動時の設定で立てる**ので、OFF → ON の反映には再起動が
     // 要る (main.rs 冒頭の「血圧計」節)
     let Some(command) = console::handle_omron(command, status, settings) else {
+        return;
+    };
+    // 血圧計の再ペアリング要求も共通実装へ (Pages の「血圧計を再ペアリング」)。
+    // 本機の BLE が立っていない (`OMRON BP OFF`) ときはフラグが消費されないだけ
+    let Some(command) = console::handle_pair(command, pair_flag) else {
         return;
     };
 

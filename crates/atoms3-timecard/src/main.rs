@@ -144,7 +144,10 @@ fn main() -> Result<()> {
     heap::start(Arc::clone(&status))?;
 
     // ホストコンソール (PING / STATUS / HEAP / OTA / AUTH / WS)
-    console::start(Arc::clone(&status), settings.clone())?;
+    // 再ペアリング要求のフラグ。console (`PAIR`) が立て、BLE ループが消費する。
+    // **両方に同じものを渡す** — 別物を渡すと Pages のボタンが何も起こさない
+    let pair_flag = alc_hub_common::control::new_pair_flag();
+    console::start(Arc::clone(&status), settings.clone(), Arc::clone(&pair_flag))?;
 
     // cf-alc-recorder への WS 常時接続。打刻イベントはここへ積む。
     // 接続には AUTH SET 済み credential と LAN 接続が必要 (未登録の間は
@@ -273,10 +276,9 @@ fn main() -> Result<()> {
             ws_for_bp,
             None,
         )?;
-        // 再ペアリング要求のフラグ。本機は要求する口 (画面のペアリングボタン) を
-        // 持たないので立つことはないが、**起動時にボンドを消さない**ことが大事
-        // (probe bin の作法を持ち込むと毎回ペアリングし直しになる)
-        let pair_flag = alc_hub_common::control::new_pair_flag();
+        // 再ペアリング要求は console の `PAIR` (Pages の「血圧計を再ペアリング」) が
+        // 立てる。**起動時にボンドを消さない**ことが大事 (probe bin の作法を持ち込むと
+        // 毎回ペアリングし直しになる)
         // 本機は Wi-Fi を持たないので電波の取り合いは起きない。OTA 中の一時停止は
         // hub-ble が status.ota_active を見て自前で行う
         let coex = Arc::new(alc_hub_core::coex::RadioCoex::new());
@@ -285,7 +287,7 @@ fn main() -> Result<()> {
             meas_tx,
             ui_tx_for_ble,
             coex,
-            pair_flag,
+            Arc::clone(&pair_flag),
             settings.clone(),
         )?;
         alc_hub_common::evtlog::emit("EVT BLE_ENABLED omron_bp");

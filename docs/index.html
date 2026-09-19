@@ -279,9 +279,11 @@
             <button id="ble-pair" style="padding: 10px 16px; border-radius: 8px; border: none; background: #6a1b9a; color: white; font-size: 15px; cursor: pointer;">血圧計を再ペアリング</button>
         </div>
         <p style="font-size: 13px; color: #666; margin-top: 4px;">
-            血圧計 (NBP-1BLE) は暗号化リンク（ボンディング）が必要です。測定値が画面に出ない時は
-            「血圧計を再ペアリング」を押して本体のボンド情報を消去し、血圧計側もペアリング待ち
-            （ペアリングボタン長押し等）にして測り直してください。
+            血圧計 (ニプロ NBP-1BLE / オムロン HCR-1901T2 等) は暗号化リンク（ボンディング）が必要です。
+            <strong>ペアリングはこのボタンを押した時だけ</strong>行われます（押していない間は、そばで
+            ペアリング待ちの血圧計があっても勝手に組みません）。押すと本体のボンド情報を消去して
+            120 秒の受付を開くので、その間に血圧計をペアリング待ち（オムロンは Bluetooth ボタン長押しで
+            <code>-P-</code> 点滅、ニプロはペアリングボタン長押し）にしてください。結果はこの下に出ます。
         </p>
         <textarea id="cfg-json" rows="7" spellcheck="false"
                   style="width: 100%; font-family: monospace; font-size: 13px; padding: 10px; border-radius: 8px; border: 1px solid #ccc; box-sizing: border-box;"
@@ -440,7 +442,7 @@
         // チップが**リセット**され、起動完了まで 5〜7 秒コマンドに応答できない。
         // そのため 1 回送って待つのではなく、応答があるまで約 2 秒間隔で
         // コマンドを再送しながら全体で timeoutMs (呼び出し側は 15 秒以上推奨) 待つ。
-        async function serialCommand(line, prefixes, timeoutMs) {
+        async function serialCommand(line, prefixes, timeoutMs, onRow) {
             if (!('serial' in navigator)) throw new Error('このブラウザは Web Serial API 非対応 (Chrome/Edge/Opera)');
             const port = await navigator.serial.requestPort();
             await port.open({ baudRate: 115200 });
@@ -454,11 +456,15 @@
                 await send();
                 let lastSend = Date.now();
                 let buf = '';
+                // 1 行でも返ってきたら端末は生きている = 再送しない。
+                // PAIR のように「押すたびにボンドを消す」コマンドを再送すると、
+                // 成立した直後のボンドを消してしまう
+                let sawRow = false;
                 try {
                     while (Date.now() < deadline) {
                         // リセット起動中の取りこぼしに備え、開いてから 10 秒間だけ
                         // 2 秒間隔で再送する (WIFI TEST 等を試験中に連発しないため)
-                        if (Date.now() - opened < 10000 && Date.now() - lastSend >= 2000) {
+                        if (!sawRow && Date.now() - opened < 10000 && Date.now() - lastSend >= 2000) {
                             await send();
                             lastSend = Date.now();
                         }
@@ -469,7 +475,9 @@
                         while ((nl = buf.indexOf('\n')) >= 0) {
                             const row = buf.slice(0, nl).trim();
                             buf = buf.slice(nl + 1);
+                            if (row) { sawRow = true; }
                             if (prefixes.some((p) => row.startsWith(p))) { return row; }
+                            if (onRow && row) { onRow(row); }
                         }
                     }
                 } catch (e) { /* timeout cancel */ }
@@ -534,11 +542,30 @@
         document.getElementById('ble-pair').addEventListener('click', async () => {
             try {
                 cfgOut.textContent = 'ポート選択 → ペアリング情報を消去中...';
-                const row = await serialCommand('PAIR', ['OK PAIR', 'EVT PAIR_CLEARED', 'EVT PAIR_ERR', 'ERR'], 5000);
-                if (row === 'OK PAIR' || row === 'EVT PAIR_CLEARED') {
-                    cfgOut.textContent = 'ボンド情報を消去しました。血圧計をペアリング待ちにして測定してください';
+                // 端末はボンドを消したあと一定時間だけ「ペアリング受付」を開き、
+                // その間に見つけたペアリング待ちの血圧計とだけ組む。
+                // 受付 (EVT PAIR_ARMED) を出してから結果が出るまで待つ
+                const row = await serialCommand(
+                    'PAIR',
+                    ['EVT PAIR_OK', 'EVT PAIR_ERR', 'EVT PAIR_TIMEOUT', 'ERR'],
+                    135000,
+                    (r) => {
+                        if (r.startsWith('EVT PAIR_ARMED')) {
+                            const sec = r.slice('EVT PAIR_ARMED'.length).trim() || '120';
+                            cfgOut.textContent = 'ボンド情報を消去しました。' + sec
+                                + ' 秒以内に血圧計をペアリング待ち (-P- 点滅など) にしてください...';
+                        } else if (r.startsWith('EVT PAIR_CLEARED')) {
+                            cfgOut.textContent = 'ボンド情報を消去しました。血圧計をペアリング待ちにしてください...';
+                        }
+                    });
+                if (!row) {
+                    cfgOut.textContent = '応答なし。ポート・ファーム版を確認してください';
+                } else if (row.startsWith('EVT PAIR_OK')) {
+                    cfgOut.textContent = 'ペアリング成立。測定すると値がこの端末に届きます';
+                } else if (row.startsWith('EVT PAIR_TIMEOUT')) {
+                    cfgOut.textContent = '受付時間内にペアリング待ちの血圧計が見つかりませんでした。もう一度押してください';
                 } else {
-                    cfgOut.textContent = row || 'コマンド送信済み (応答未確認)';
+                    cfgOut.textContent = 'ペアリング失敗: ' + row.replace(/^EVT PAIR_ERR\s*/, '');
                 }
             } catch (e) { cfgOut.textContent = '失敗: ' + e.message; }
         });

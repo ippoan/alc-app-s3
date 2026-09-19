@@ -26,6 +26,7 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::sys;
 use std::io::Read;
 
+use alc_hub_common::control::PairFlag;
 use alc_hub_common::{settings::Settings, status::SharedStatus};
 
 /// 行としてバッファする最大長 (超えたら読み捨て — バイナリノイズ対策)
@@ -310,6 +311,23 @@ pub fn handle_omron(
             }
         },
         HostCommand::OmronStatus => println!("OMRON BP={}", u8::from(settings.omron_bp())),
+        other => return Some(other),
+    }
+    None
+}
+
+/// `PAIR` — 血圧計の再ペアリング要求 (Pages の「血圧計を再ペアリング」)。
+///
+/// ここではフラグを立てるだけで、ボンド消去とペアリング受付の開始は BLE ループ
+/// (hub-ble) が行う (`EVT PAIR_CLEARED` / `EVT PAIR_ARMED <秒>` →
+/// `EVT PAIR_OK` | `EVT PAIR_ERR` | `EVT PAIR_TIMEOUT`)。
+/// **受付を開けている間だけ**機器のペアリング待ちの広告に接続する
+pub fn handle_pair(command: HostCommand, pair_flag: &PairFlag) -> Option<HostCommand> {
+    match command {
+        HostCommand::BlePair => {
+            pair_flag.store(true, core::sync::atomic::Ordering::SeqCst);
+            println!("OK PAIR");
+        }
         other => return Some(other),
     }
     None
