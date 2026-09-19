@@ -96,12 +96,15 @@
            (デバイス登録は <a href="https://auth.ippoan.org/device/setup" target="_blank">auth.ippoan.org/device/setup</a>、
            印刷テストは <a href="https://auth.ippoan.org/device/print-test" target="_blank">/device/print-test</a> からも実行可)。</p>
         <ul>
+            <li><code>DEVICE</code> — <code>DEVICE atoms3-print VER=…</code> (機種識別 + 版数)</li>
             <li><code>PRINTER ADDR 192.168.x.x:9100</code> — プリンター宛先の保存 (NVS)</li>
             <li><code>PRINT https://…/test.pdf</code> — 手動テスト印刷 (進捗は <code>EVT PRINT_*</code>)</li>
             <li><code>AUTH SET &lt;id&gt; &lt;secret&gt; &lt;tenant&gt;</code> → <code>AUTH TOKEN</code> — デバイス登録と疎通確認</li>
             <li><code>WS STATUS</code> — 遠隔管理 (下り print/ota) 接続の確認</li>
             <li><code>OTA &lt;url&gt;</code> — 手動ファームウェア更新</li>
         </ul>
+        <p>コマンドの一覧と詳細は
+           <a href="https://github.com/ippoan/alc-app-s3/blob/main/docs/console-protocol.md" target="_blank">console-protocol.md</a> を参照してください。</p>
     </div>
 
     <footer>

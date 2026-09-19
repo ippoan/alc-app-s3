@@ -1,8 +1,10 @@
 //! タイムカード端末のホストコンソール (USB Serial/JTAG、行指向)。
 //!
-//! 読み出しスレッドと機種非依存のコマンド (PING / HEAP / LOG / AUTH / WS) は
-//! `alc_hub_drivers::console` が持つ。ここに書くのは**本機固有の分岐だけ**
-//! (`STATUS` と `OTA`)。**印刷ブリッジや CoreS3 から丸写ししないこと** —
+//! 読み出しスレッドと機種非依存のコマンド (PING / DEVICE / HEAP / LOG / AUTH /
+//! WS) は `alc_hub_drivers::console` が持つ (正本は
+//! [`docs/console-protocol.md`](../../../docs/console-protocol.md))。
+//! ここに書くのは**本機固有の分岐だけ** (`STATUS` と `OTA`)。
+//! **印刷ブリッジや CoreS3 から丸写ししないこと** —
 //! とくに `AUTH SET` (device credential を NVS へ書く口) を機種ごとに増やすと
 //! provisioning の挙動が割れる。
 //!
@@ -25,7 +27,7 @@ use alc_hub_common::{
     settings::Settings,
     status::{epoch_ms, SharedStatus},
 };
-use alc_hub_core::protocol::{parse_line, HostCommand};
+use alc_hub_core::protocol::{parse_line, HostCommand, HostKind};
 use alc_hub_core::uplink::MIN_SYNCED_MS;
 use alc_hub_drivers::console;
 use anyhow::Result;
@@ -48,7 +50,8 @@ fn handle_line(line: &str, status: &SharedStatus, settings: &Settings, pair_flag
 
     // 機種に依らないコマンドは共通実装へ (hub-drivers/src/console.rs)。
     // 捌かれなかったものだけがここへ落ちてくる
-    let Some(command) = console::handle_common(command, status, settings, false) else {
+    let Some(command) = console::handle_common(command, status, settings, HostKind::Timecard)
+    else {
         return;
     };
     // 血圧計 (HEM-6231T) の設定も共通実装へ (CoreS3 の host_link と同じ口)。
@@ -88,7 +91,7 @@ fn handle_line(line: &str, status: &SharedStatus, settings: &Settings, pair_flag
         // 本機で意味を持たないコマンド (画面遷移 / 印刷 / BLE / Wi-Fi / CFG 等)
         other => {
             log::debug!("console: unsupported command: {other:?}");
-            println!("ERR UNSUPPORTED (timecard)");
+            println!("ERR UNSUPPORTED ({})", HostKind::Timecard.label());
         }
     }
 }

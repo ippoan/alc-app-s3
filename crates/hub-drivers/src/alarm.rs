@@ -16,7 +16,7 @@
 //! VoiceS3R は `EVT ALARM …` をキオスクへ出す (ブラウザのバナー用)。**CoreS3 は
 //! 出さない** — ブラウザ側 (`useCoreS3Serial` の `classify()`) は行頭
 //! `EVT ALARM` / `STATUS alarm` を「警告デバイス = 別機種」と判定し、CoreS3 の
-//! ポートを reject する。CoreS3 は代わりに既存 `STATUS LAN=… BOARD=cores3` 行の
+//! ポートを reject する。CoreS3 は代わりに既存 `STATUS LAN=…` 行の
 //! 末尾へ [`AlarmMonitor::status_field`] を足して伝える (issue #187)。
 
 //!

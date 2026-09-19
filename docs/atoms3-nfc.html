@@ -145,22 +145,27 @@
         <h2>動作確認 (シリアル 115200bps)</h2>
         <ul>
             <li><code>PING</code> — <code>PONG</code> 応答 (疎通確認)</li>
+            <li><code>DEVICE</code> — <code>DEVICE bp-station VER=…</code> (機種識別 + 版数確認)</li>
             <li><code>HEAP</code> — <code>FREE_PSRAM</code> が <strong>0 でない</strong>ことを必ず確認。
                 0 なら PSRAM が載っていない機に焼いています (上の警告を参照)</li>
             <li><code>OMRON STATUS</code> — <code>OMRON BP=1</code> / <code>OMRON BP=0</code></li>
             <li><code>LOG DUMP</code> — 起動直後のログ (USB 接続前に流れた分も残ります)</li>
             <li><code>AUTH STATUS</code> — <code>AUTH PAIRED &lt;tenant&gt; &lt;id&gt;</code> / <code>AUTH UNPAIRED</code></li>
         </ul>
+        <p>コマンドの一覧と詳細は
+           <a href="https://github.com/ippoan/alc-app-s3/blob/main/docs/console-protocol.md" target="_blank">console-protocol.md</a> を参照してください。</p>
         <p>カードをかざすと <code>NFC IDm=…</code> / <code>免許証 交付 …</code> が出ます。
            財布などにカードが 2 枚入っていて両方見えたときは、どちらか決められないので
            <strong>どちらも採らず</strong>
            <code>nfc: 確定窓 …ms に 2 枚 — どちらも登録しない</code> の警告だけが出ます
            (このとき音も鳴りません)。1 枚だけかざし直してください。</p>
         <div class="warning">
-            <h3><code>STATUS</code> と <code>OTA</code> はこの端末にありません</h3>
-            <p>どちらも <code>ERR UNSUPPORTED (nfc)</code> を返します —
-               ネットワークを持たない端末なので、版数の確認も更新も
-               <strong>この画面から書き直す</strong>のが唯一の手順です。</p>
+            <h3><code>STATUS</code> と <code>OTA</code> はこの端末にありません — 版数は <code>DEVICE</code> で確認</h3>
+            <p><code>STATUS</code> / <code>OTA</code> はどちらも
+               <code>ERR UNSUPPORTED (bp-station)</code> を返します —
+               ネットワークを持たない端末なので、更新は
+               <strong>この画面から書き直す</strong>のが唯一の手順です。
+               版数の確認は <code>DEVICE</code> で行えます (上の一覧参照)。</p>
         </div>
         <div class="warning">
             <h3>読めたら音が鳴ります (点灯はしません)</h3>
