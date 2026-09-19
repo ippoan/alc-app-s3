@@ -189,9 +189,12 @@ fn wait_for_w5500(
             Ok(W5500_VERSION) => {
                 // probe が通った = M-Bus に 5V が来ている。ただし **Core 自身が
                 // 出している間は外部給電の証拠にならない**ので、そのときだけ
-                // 触らない。猶予切れで `Some(false)` に確定した後でも、まだ
-                // Core が出していなければ上書きしてよい — 遅れて立ち上がった
-                // W5500 でも門を閉じ直せる (Refs #254)
+                // 触らない。この関数は最初の probe 成功で `return n` して
+                // 終わる一発勝負なので、**上書きが効くのは「probe が通った
+                // 瞬間にまだ Core が出していない」場合だけ** — 猶予切れで
+                // `Some(false)` に確定した後、Core が既に 5V を出し始めて
+                // いれば `!st.ext_5v_out` が false になり、この枝は素通しで
+                // `return n` するだけで門は閉じ直せない (Refs #254)
                 if let Ok(mut st) = status.lock() {
                     if !st.ext_5v_out {
                         st.bus_in = Some(true);
