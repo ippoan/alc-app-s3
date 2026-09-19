@@ -110,17 +110,17 @@
     <div class="card">
         <h2>血圧計をつなぐ (既定は OFF)</h2>
         <p>血圧計は<strong>既定で無効</strong>です。BLE を起こすと内蔵 RAM を使うため、
-           使わない台では止めてあります。有効にするには、下の手順を
-           <strong>1 → 2 → 3 の順に</strong>進めます (1 と 3 はボタンです)。
-           ボタンを押すとシリアルポートの選択が出るので、測定台を選んでください (Chrome / Edge / Opera。ファームウェアの書き込みダイアログは
+           使わない台では止めてあります。有効にするには、下のボタンを
+           <strong>1 → 2 → 3 の順に</strong>押します。押すとシリアルポートの選択が出るので、
+           測定台を選んでください (Chrome / Edge / Opera。ファームウェアの書き込みダイアログは
            閉じてから)。</p>
         <ol class="bp-steps">
             <li><strong>血圧計を使う</strong> — 端末に <code>OMRON BP ON</code> を送ります
                 (<code>OK OMRON BP=1</code> が返れば成功)。
                 <div class="bp-actions"><button id="bp-on" class="bp-btn" type="button">血圧計を使う</button></div></li>
-            <li><strong>端末を再起動する</strong> — <strong>USB ケーブルを抜いて挿し直してください</strong>。
-                BLE を立てるかどうかは起動時に決まるので、再起動が要ります
-                (ボタンはありません。Unit NFC は挿したままで構いません)。</li>
+            <li><strong>再起動</strong> — BLE を立てるかどうかは起動時に決まるので、再起動が要ります。
+                反応が無いときは USB ケーブルを抜いて挿し直してください。
+                <div class="bp-actions"><button id="bp-reboot" class="bp-btn" type="button">再起動</button></div></li>
             <li><strong>血圧計をペアリング</strong> — 先に<strong>血圧計をペアリング待ち</strong>
                 (オムロンは Bluetooth ボタン長押しで <code>-P-</code> 点滅) にしてから押します。
                 <strong>押すたびに本体のボンド情報を消して</strong> 120 秒の受付を開き、
@@ -225,7 +225,8 @@
         // 向こうはそのページのインライン script で共有 JS が無く、このページからは読めないため複製している。
         // 片方を直したらもう片方も直すこと。
         const bpOut = document.getElementById('bp-result');
-        const bpButtons = ['bp-on', 'bp-pair'].map((id) => document.getElementById(id));
+        const bpButtons = ['bp-on', 'bp-reboot', 'bp-pair'].map((id) => document.getElementById(id));
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
         // 1 行コマンドを送り、prefixes のいずれかで始まる応答行を返す (最大 timeoutMs)。
         // ESP-IDF ログが混在するため既知プレフィックスだけを拾う。
@@ -280,7 +281,52 @@
             }
         }
 
-        // 押している間は 2 つとも止める。PAIR は押すたびにボンドを消すので、連打・二重押しをさせない
+        // 端末を再起動する。この端末の USB シリアルには再起動コマンドが無いので、
+        // Web Serial の DTR/RTS でチップをリセットする (espflash がアプリ起動時に振るのと同じ順:
+        // dtr/rts = 00 → 10 → 01 → 11 → 00、各 100ms)。
+        // 最後に必ず両方 false に戻してから close する — DTR だけ先に落として RTS=1 のまま
+        // close すると、その close 自体がもう一度リセットになる。
+        // 起動後 10 秒だけ行を読み、EVT BOOT (再起動した) / EVT BLE_DISABLED (血圧計が OFF のまま
+        // 起動した) が見えたら結果に反映する。起動ログの冒頭は取りこぼすことがあるので、
+        // 見えなくても失敗とは扱わない。
+        async function rebootByDtrRts(onStatus) {
+            if (!('serial' in navigator)) throw new Error('このブラウザは Web Serial API 非対応 (Chrome/Edge/Opera)');
+            const port = await navigator.serial.requestPort();
+            await port.open({ baudRate: 115200 });
+            const seen = { boot: false, bleDisabled: false };
+            try {
+                const reader = port.readable.getReader();
+                const deadline = Date.now() + 10000;
+                const timer = setInterval(() => { if (Date.now() >= deadline) reader.cancel().catch(() => {}); }, 200);
+                try {
+                    for (const [dtr, rts] of [[false, false], [true, false], [false, true], [true, true], [false, false]]) {
+                        await port.setSignals({ dataTerminalReady: dtr, requestToSend: rts });
+                        await sleep(100);
+                    }
+                    onStatus('再起動信号を送りました。起動を待っています (最大 10 秒)...');
+                    let buf = '';
+                    while (Date.now() < deadline) {
+                        const { value, done } = await reader.read();
+                        if (done) break;
+                        buf += new TextDecoder().decode(value);
+                        let nl;
+                        while ((nl = buf.indexOf('\n')) >= 0) {
+                            const row = buf.slice(0, nl).trim();
+                            buf = buf.slice(nl + 1);
+                            if (row.startsWith('EVT BOOT')) seen.boot = true;
+                            if (row.startsWith('EVT BLE_DISABLED')) seen.bleDisabled = true;
+                        }
+                    }
+                } catch (e) { /* timeout cancel */ }
+                finally { clearInterval(timer); reader.releaseLock(); }
+            } finally {
+                try { await port.setSignals({ dataTerminalReady: false, requestToSend: false }); } catch (e) { /* noop */ }
+                try { await port.close(); } catch (e) { /* noop */ }
+            }
+            return seen;
+        }
+
+        // 押している間は 3 つとも止める。PAIR は押すたびにボンドを消すので、連打・二重押しをさせない
         async function bpRun(fn) {
             bpButtons.forEach((b) => { b.disabled = true; });
             try { await fn(); }
@@ -302,9 +348,25 @@
             if (!row) {
                 bpOut.textContent = '応答なし。ポート・ファーム版を確認してください';
             } else if (row.startsWith('OK OMRON BP=1')) {
-                bpOut.textContent = '血圧計を有効にしました (OK OMRON BP=1)。次は USB ケーブルを抜いて挿し直してください';
+                bpOut.textContent = '血圧計を有効にしました (OK OMRON BP=1)。次は「再起動」を押してください';
             } else {
                 bpOut.textContent = '失敗: ' + row;
+            }
+        }));
+
+        // 2. 再起動
+        document.getElementById('bp-reboot').addEventListener('click', () => bpRun(async () => {
+            bpOut.textContent = 'ポート選択 → 再起動中...';
+            const seen = await rebootByDtrRts((msg) => { bpOut.textContent = msg; });
+            if (seen.bleDisabled) {
+                bpOut.textContent = '再起動しましたが、血圧計は無効のまま起動しました (EVT BLE_DISABLED)。'
+                    + '「血圧計を使う」からやり直してください';
+            } else if (seen.boot) {
+                bpOut.textContent = '再起動を確認しました。次は血圧計をペアリング待ちにして「血圧計をペアリング」を押してください';
+            } else {
+                bpOut.textContent = '再起動信号は送りましたが、起動ログを確認できませんでした。'
+                    + '念のため USB ケーブルを抜いて挿し直してください。'
+                    + 'そのあと血圧計をペアリング待ちにして「血圧計をペアリング」を押します';
             }
         }));
 
