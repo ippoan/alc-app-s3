@@ -35,7 +35,8 @@
 //! | `AUTH SIGNBP <nonce>` | キオスク端末の認証 (`/device/alarm-token`) 用 (#249)。血圧計のボンド状態を束縛した ASCII `<nonce>\|bp=<1\|0>` に署名し `AUTH SIGBP <pubkey base64url> <sig base64url> BP=<1\|0>` を返す (エラー応答は `AUTH SIGN` と同じ)。**署名対象の形は `ippoan/auth-worker` の検証側と正本を共有する** — 片側だけ変えないこと。`BP=` は auth-worker が署名対象を組み立て直すための値そのもので、ホストは素通しするだけ。ボンド状態は hub-ble の観測値 (`OMRON BP ON\|OFF` の意思設定とは別物)。**古いファームはこの口を持たず `ERR AUTH: …` を返す** ので、ホストは `AUTH SIGN` へフォールバックする |
 //! | `WS URL <url>` | cf-alc-recorder WS URL を上書き (staging テスト用) |
 //! | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` を返す |
-//! | `BUS5V STATUS` | M-Bus 5V 出力の現況 `BUS5V USB=1 OUT=1 BATTERY=0 BUS_IN=0` を返す。**設定は無い** — USB ホスト (PC) が列挙されていて、かつ M-Bus が外部給電でない (`BUS_IN=0`) 間だけ Core が 5V を出す固定動作で、hub-ui が 1 秒ごとに追随する (#202)。`BUS_IN` は起動時の W5500 probe で確定する M-Bus の外部給電判定 (`1`=PoE 等で外部給電中 `0`=無し `?`=未判定、Refs #211)。WS 下り command `{action:"bus5v_status"}` / `{action:"reboot"}` (auth-worker 端末一覧) でも遠隔で照会・再起動できる |
+//! | `BUS5V AUTO\|ON\|OFF` | M-Bus 5V を Core 側から出すかの設定 (NVS 保存、既定 `AUTO`。Refs #254)。`AUTO` = USB ホスト (PC) が列挙されていて、かつ M-Bus が外部給電でない (`BUS_IN=0`) 間だけ出す (#202 の固定動作)。`OFF` = 絶対に出さない — **PoE のベースを履いた常設機はこれ**。`ON` = 常に出す (USB 電源アダプタのベンチ向け。**PoE の機では使わないこと** — 同じ 5V レールを両側から駆動し PoE 単独で起動できなくなる)。反映は即時 (hub-ui が 1 秒ごとに読む)。遠隔からは WS 下り command `{action:"bus5v","mode":"auto\|on\|off"}` で同じ設定を変えられる |
+//! | `BUS5V STATUS` | M-Bus 5V の設定と現況 `BUS5V MODE=auto USB=1 OUT=1 BATTERY=0 BUS_IN=0` を返す。`BUS_IN` は起動時の W5500 probe で確定する M-Bus の外部給電判定 (`1`=PoE 等で外部給電中 `0`=無し `?`=未判定、Refs #211)。WS 下り command `{action:"bus5v_status"}` / `{action:"reboot"}` (auth-worker 端末一覧) でも遠隔で照会・再起動できる |
 //! | `TENKO BP ON\|OFF` / `TENKO STATUS` | 点呼に血圧を含めるか (NVS、既定 OFF) / `TENKO BP=0` を返す |
 //! | `OMRON BP ON\|OFF` / `OMRON STATUS` | Omron 血圧計を拾うか (NVS、既定 OFF) / `OMRON BP=0` を返す |
 //! | `HEAP` | `HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> TOTAL_INT=<n> TOTAL_PSRAM=<n>` を返す (Refs #27) |
@@ -354,19 +355,43 @@ fn handle_line(
                 if discovered.is_empty() { "NONE".into() } else { discovered },
             );
         }
-        // M-Bus 5V の現況 (設定は無い — USB ホストの有無に hub-ui が追随する、#202)
+        // M-Bus 5V の設定 (Refs #254)。NVS に保存し、HubStatus にも即時反映する
+        // — hub-ui の i2c ループが 1 秒ごとに読むので**再起動は要らない**。
+        // PoE のベースを履いた常設機は `BUS5V OFF` に固定する
+        HostCommand::Bus5v { mode } => match settings.set_bus5v(mode) {
+            Ok(()) => {
+                if let Ok(mut st) = status.lock() {
+                    st.bus5v_mode = mode;
+                }
+                println!("OK BUS5V MODE={}", mode.label());
+            }
+            Err(e) => {
+                log::error!("host_link: BUS5V 保存失敗: {e:?}");
+                println!("ERR BUS5V: 保存に失敗しました");
+            }
+        },
+        // M-Bus 5V の現況 (設定 + 実際の出力、#202/Refs #254)
         HostCommand::Bus5vStatus => {
-            let (usb_host, ext_5v_out, battery_present, bus_in) = status
+            let (mode, usb_host, ext_5v_out, battery_present, bus_in) = status
                 .lock()
-                .map(|st| (st.usb_host, st.ext_5v_out, st.battery_present, st.bus_in))
-                .unwrap_or((false, false, false, None));
+                .map(|st| {
+                    (
+                        st.bus5v_mode,
+                        st.usb_host,
+                        st.ext_5v_out,
+                        st.battery_present,
+                        st.bus_in,
+                    )
+                })
+                .unwrap_or_default();
             let bus_in_str = match bus_in {
                 Some(true) => "1",
                 Some(false) => "0",
                 None => "?",
             };
             println!(
-                "BUS5V USB={} OUT={} BATTERY={} BUS_IN={}",
+                "BUS5V MODE={} USB={} OUT={} BATTERY={} BUS_IN={}",
+                mode.label(),
                 u8::from(usb_host),
                 u8::from(ext_5v_out),
                 u8::from(battery_present),

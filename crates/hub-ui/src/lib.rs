@@ -172,7 +172,8 @@ pub fn run(
     let mut last_usb = 0u64;
     // 直前の USB ホストの有無。変わったときだけ `EVT USB_HOST` を出す (#215)
     let mut prev_usb_host: Option<bool> = None;
-    // M-Bus 5V を USB ホストの有無に追随させるラッチ (#202)。起動時は出さない
+    // M-Bus 5V の出力ラッチ (#202)。起動時は出さない。何をサンプルするかは
+    // 設定込みで `usb5v::bus5v_sample` が決める (Refs #254)
     let mut usb5v = alc_hub_core::usb5v::Latch::default();
     // M-Bus 5V の i2c 書き込みの連続失敗回数。warn は連続失敗の初回だけ出す
     let mut bus5v_fail_streak: u32 = 0;
@@ -237,17 +238,17 @@ pub fn run(
             last_batt = now;
         }
 
-        // M-Bus 5V (AW9523 BUS_EN) を USB ホストの有無に追随させる (#202)。
-        // 設定は持たない — 電池なしの CoreS3 では「USB だけ」と「PoE だけ」を
-        // 設定で両立できないため、**PC が居て、かつ M-Bus が外部給電でない間
-        // だけ Core が出す**を唯一の動作にしている。i2c はこのループが所有
-        // しているのでここで書く。
+        // M-Bus 5V (AW9523 BUS_EN) を設定と USB ホストの有無から決める
+        // (#202, Refs #254)。i2c はこのループが所有しているのでここで書く。
         //
-        // `bus_in` が `None` (未判定) か `Some(true)` (PoE 等で外部給電中) の
-        // 間は、Latch へサンプルを渡すこと自体をしない — `set_ext_5v_out` を
-        // 呼ばなければ BUS_EN は 0 のままで、切り替えの過渡そのものが起きない。
-        // 稼働中に PoE が抜けて USB だけになるケースへの fallback は別途 (Refs
-        // #211、次の PR)。usb_host は判定に関わらず従来どおり毎回更新する。
+        // 出すかどうかの規則は純関数 `usb5v::bus5v_sample` 1 本に畳んである
+        // (既定の `Auto` は「PC が居て、かつ M-Bus が外部給電でない間だけ出す」
+        // = #203 以降の固定動作。PoE の常設機は `BUS5V OFF` で固定する)。
+        // `None` が返る間は Latch へサンプルを渡すこと自体をしない —
+        // `set_ext_5v_out` を呼ばなければ BUS_EN は 0 のままで、切り替えの
+        // 過渡そのものが起きない。稼働中に PoE が抜けて USB だけになる
+        // ケースへの fallback は別途 (Refs #211)。usb_host は判定に
+        // 関わらず従来どおり毎回更新する。
         if now >= USB_POLL_START_MS && now.saturating_sub(last_usb) >= USB_POLL_MS {
             let usb = unsafe { esp_idf_svc::sys::usb_serial_jtag_is_connected() };
             // USB ホスト (PC) の出入り。起動後の初回は今の状態を 1 行残す
@@ -263,7 +264,7 @@ pub fn run(
             // (`usb5v::BUS_IN_GRACE_MS`) を過ぎても未判定のままなら、ここで
             // 「外部給電ではない」と確定する。**`lan` 無効ビルド (W5500 が無く
             // probe も走らない) も同じ 1 か所**なので、判定待ちで止まらない
-            let (bus_in, just_confirmed) = status
+            let (bus_in, mode, just_confirmed) = status
                 .lock()
                 .map(|mut st| {
                     st.usb_host = usb;
@@ -272,19 +273,21 @@ pub fn run(
                     if just_confirmed {
                         st.bus_in = Some(false);
                     }
-                    (st.bus_in, just_confirmed)
+                    (st.bus_in, st.bus5v_mode, just_confirmed)
                 })
-                .unwrap_or((None, false));
+                .unwrap_or((None, alc_hub_core::protocol::Bus5vMode::default(), false));
             if just_confirmed {
                 // 現場の切り分け用 — この 1 行が出た後だけ Core が 5V を出しうる
                 alc_hub_common::evtlog::emit("EVT BUS_IN=0 w5500 無応答のまま猶予切れ");
             }
-            // M-Bus が外部給電でないと確定しているときだけ Latch にサンプルを
-            // 渡す。`None`/`Some(true)` は切り替え自体を起こさない (Refs #211)
-            if bus_in == Some(false) {
+            // 設定 (`BUS5V AUTO|ON|OFF`) と `bus_in` から、そもそも Latch に
+            // サンプルを渡してよいかを決める (Refs #254)。`OFF` は常に「出さない」、
+            // `AUTO` は M-Bus が外部給電でないと確定しているときだけ USB ホストの
+            // 有無を渡す — `None`/`Some(true)` は切り替え自体を起こさない (#211)
+            if let Some(sample) = alc_hub_core::usb5v::bus5v_sample(mode, bus_in, usb) {
                 // 切り替えるときだけ i2c を叩く (status のロックは手放してから)。
                 // 成功したときだけ Latch に確定させる — 失敗なら次の poll で再試行
-                if let Some(desired) = usb5v.update(usb) {
+                if let Some(desired) = usb5v.update(sample) {
                     match alc_hub_board::power::set_ext_5v_out(&mut i2c, desired) {
                         Ok(()) => {
                             usb5v.commit(desired);
@@ -294,9 +297,10 @@ pub fn run(
                             // println + crashlog リング (evtlog)。log::info! は
                             // vprintf hook を通らずリングに残らない (#215)
                             alc_hub_common::evtlog::emit(&format!(
-                                "EVT BUS5V OUT={} usb_host={}",
+                                "EVT BUS5V OUT={} usb_host={} mode={}",
                                 u8::from(desired),
-                                u8::from(usb)
+                                u8::from(usb),
+                                mode.label()
                             ));
                             if bus5v_fail_streak > 0 {
                                 log::info!(

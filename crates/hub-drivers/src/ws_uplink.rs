@@ -35,11 +35,12 @@ use std::net::TcpStream;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
 use alc_hub_core::uplink::{
-    auth_header_line, command_action, command_gw_url, command_log_max_bytes, command_log_offset,
-    command_ota_url, command_print_chunk, command_print_url, command_result_frame, jitter_ms,
-    measurement_frame, ota_guard, parse_downlink, reconnect_backoff, should_wait_for_clock,
-    token_needs_mint, Downlink, DroppedEntry, OtaGuard, UplinkQueue, OTA_VERIFY_TIMEOUT_MS,
-    PING_FRAME, RECONNECT_BACKOFF_MAX_MS, RECONNECT_FAST_MS, RECONNECT_SLOW_MS,
+    auth_header_line, command_action, command_bus5v_mode, command_gw_url, command_log_max_bytes,
+    command_log_offset, command_ota_url, command_print_chunk, command_print_url,
+    command_result_frame, jitter_ms, measurement_frame, ota_guard, parse_downlink,
+    reconnect_backoff, should_wait_for_clock, token_needs_mint, Downlink, DroppedEntry, OtaGuard,
+    UplinkQueue, OTA_VERIFY_TIMEOUT_MS, PING_FRAME, RECONNECT_BACKOFF_MAX_MS, RECONNECT_FAST_MS,
+    RECONNECT_SLOW_MS,
 };
 use anyhow::Result;
 use esp_idf_svc::handle::RawHandle;
@@ -1055,15 +1056,46 @@ fn handle_downlink(
                     );
                     send_command_result(conn, &id, &payload);
                 }
-                // M-Bus 5V の照会 (設定は無い、#202): USB ホストの有無と、
-                // それに追随して hub-ui が実際に出しているか。`power_read` は
+                // M-Bus 5V の遠隔設定 (auth-worker の端末一覧から。Refs #254)。
+                // シリアルの `BUS5V AUTO|ON|OFF` と同じ NVS 保存先で、HubStatus
+                // にも即時反映するので**再起動は要らない** (hub-ui の i2c ループが
+                // 1 秒ごとに読む)。**PoE の現場の端末は手の届かない場所にあり、
+                // `OFF` にするために現地でシリアルを繋ぐ運用は成り立たない**ので、
+                // この遠隔設定がこの機能の主な入口になる
+                Some("bus5v") => match command_bus5v_mode(&payload) {
+                    Some(mode) => match settings.set_bus5v(mode) {
+                        Ok(()) => {
+                            if let Ok(mut st) = status.lock() {
+                                st.bus5v_mode = mode;
+                            }
+                            let payload = format!(r#"{{"ok":true,"mode":"{}"}}"#, mode.label());
+                            send_command_result(conn, &id, &payload);
+                        }
+                        Err(e) => {
+                            log::error!("ws_uplink: BUS5V 保存失敗: {e:?}");
+                            send_command_result(
+                                conn,
+                                &id,
+                                r#"{"ok":false,"message":"save failed"}"#,
+                            );
+                        }
+                    },
+                    None => {
+                        send_command_result(conn, &id, r#"{"ok":false,"message":"invalid mode"}"#)
+                    }
+                },
+                // M-Bus 5V の照会 (#202, Refs #254): 設定 (`mode`) と、USB ホストの
+                // 有無・`bus_in` から hub-ui が実際に出しているか。`power_read` は
                 // AXP2101 を一度でも読めたか — 起動後 10 秒は false のままなので、
-                // UI は battery_present を「不明」と描き分けられる
+                // UI は battery_present を「不明」と描き分けられる。
+                // **`mode` は現場の PoE 機が `off` になっているかの確認用** —
+                // 端末に触らず遠隔で読めるようにしてある
                 Some("bus5v_status") => {
-                    let (usb_host, ext_5v_out, battery_present, power_read, bus_in) = status
+                    let (mode, usb_host, ext_5v_out, battery_present, power_read, bus_in) = status
                         .lock()
                         .map(|st| {
                             (
+                                st.bus5v_mode,
                                 st.usb_host,
                                 st.ext_5v_out,
                                 st.battery_present,
@@ -1071,14 +1103,15 @@ fn handle_downlink(
                                 st.bus_in,
                             )
                         })
-                        .unwrap_or((false, false, false, false, None));
+                        .unwrap_or_default();
                     let bus_in_json = match bus_in {
                         Some(true) => "true",
                         Some(false) => "false",
                         None => "null",
                     };
+                    let mode = mode.label();
                     let payload = format!(
-                        r#"{{"usb_host":{usb_host},"ext_5v_out":{ext_5v_out},"battery_present":{battery_present},"power_read":{power_read},"bus_in":{bus_in_json}}}"#
+                        r#"{{"mode":"{mode}","usb_host":{usb_host},"ext_5v_out":{ext_5v_out},"battery_present":{battery_present},"power_read":{power_read},"bus_in":{bus_in_json}}}"#
                     );
                     send_command_result(conn, &id, &payload);
                 }

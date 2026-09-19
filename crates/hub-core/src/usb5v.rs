@@ -1,11 +1,17 @@
 //! M-Bus 5V 出力を USB ホストの有無に追随させる判定 (純粋部分、#202)。
 //!
 //! CoreS3 は M-Bus へ 5V を出すか (AW9523 BUS_EN) を選べるが、電池なしの個体では
-//! 「USB だけ」と「PoE だけ」を設定で両立できない — 常に出せば PoE 単独給電で
+//! 「USB だけ」と「PoE だけ」を 1 つの値で両立できない — 常に出せば PoE 単独給電で
 //! ブラウンアウトし、出さなければ USB 給電のベンチでスタックモジュールが
-//! 無電源になる。そこで設定を持たず、**USB ホスト (PC) が列挙されている間だけ
-//! 出す**を唯一の動作にした。PC が居るなら VBUS がレールを支え、PC が落ちれば
-//! Core は手を引いてベース側 (PoE) に任せられる。
+//! 無電源になる。既定は **USB ホスト (PC) が列挙されている間だけ出す** 自動動作に
+//! した。PC が居るなら VBUS がレールを支え、PC が落ちれば Core は手を引いて
+//! ベース側 (PoE) に任せられる。
+//!
+//! ただし**自動では足りない現場がある**ので、上書きの設定
+//! ([`Bus5vMode`]、`BUS5V AUTO|ON|OFF`) を残してある — PoE のベースを履いた
+//! 常設機は `Off` で「絶対に出さない」に固定する。#203 でこの設定を廃止したとき、
+//! 現場が `OFF` にしていた NVS の値が無視されて PoE 単独給電で起動しなくなった
+//! (#254)。設定と自動判定を 1 本の純関数 [`bus5v_sample`] に畳んである。
 //!
 //! 実際の i2c 書き込みは hub-ui の i2c ループが行う。ここは「1 秒ごとに読んだ
 //! USB の有無」を受け取り、**切り替えるべきときだけ**新しい出力値を返す。
@@ -13,14 +19,16 @@
 //! ままなら次のサンプルでも同じ値を返し続けるので、それが再試行になる。
 //!
 //! **M-Bus が入力 (PoE) のあいだ Core は出さない** — この判定規則そのものは
-//! 変えていない。呼び手 (hub-ui) が `HubStatus::bus_in` を見て、M-Bus が外部
-//! 給電中と分かっている間は [`Latch::update`] にサンプルを渡すこと自体を止め、
-//! 切り替えの過渡を起こさない (Refs #211)。
+//! 変えていない。呼び手 (hub-ui) は [`bus5v_sample`] が `None` を返す間
+//! [`Latch::update`] にサンプルを渡すこと自体を止め、切り替えの過渡を
+//! 起こさない (Refs #211)。
 //!
 //! その `bus_in` を**いつ確定してよいか**の猶予もここに置く
 //! ([`BUS_IN_GRACE_MS`] / [`bus_in_absent_confirmed`]、Refs #254)。判定の入力は
 //! W5500 の probe (hub-drivers) と起動からの経過時間 (hub-ui) で持ち主が違うが、
 //! **規則は 1 つ**にしておかないとビルドごとに挙動が分かれる。
+
+use crate::protocol::Bus5vMode;
 
 /// USB ホストの有無から M-Bus 5V 出力を決めるラッチ。
 ///
@@ -60,6 +68,31 @@ impl Latch {
     /// いま出力している値
     pub fn out(&self) -> bool {
         self.out
+    }
+}
+
+/// 設定 ([`Bus5vMode`]) と M-Bus の外部給電判定・USB ホストの有無から、
+/// [`Latch::update`] へ渡すサンプルを決める (Refs #254)。
+///
+/// 戻り値の `None` は「**[`Latch`] に触らない**」= その周回では
+/// `power::set_ext_5v_out` を呼ばない、の意味。`Some(v)` は「出力を `v` に
+/// したい」で、実際に i2c を叩くかは [`Latch`] の debounce が決める。
+///
+/// - `Off`: 常に `Some(false)`。**絶対に出さない**。起動時の出力は `false`
+///   なので [`Latch`] は何も返さず i2c は 1 度も叩かれないが、**稼働中に
+///   `BUS5V OFF` へ変えたときだけ 1 回落としに行く** — 設定した現場が
+///   再起動を待たずに「出ていない」を確かめられる
+/// - `On`: 常に `Some(true)`。USB ホストの有無も `bus_in` も見ない
+///   (PoE のベースでは使わないこと。[`Bus5vMode`] の doc 参照)
+/// - `Auto` (既定): `bus_in` が `Some(false)` (= M-Bus は外部給電でないと
+///   確定済み) のときだけ USB ホストの有無を渡す。`None` (未判定) と
+///   `Some(true)` (PoE 等で外部給電中) は `None` を返し、切り替えの過渡
+///   そのものを起こさない (Refs #211) — 未判定の間は fail-closed
+pub fn bus5v_sample(mode: Bus5vMode, bus_in: Option<bool>, usb_host: bool) -> Option<bool> {
+    match mode {
+        Bus5vMode::Off => Some(false),
+        Bus5vMode::On => Some(true),
+        Bus5vMode::Auto => (bus_in == Some(false)).then_some(usb_host),
     }
 }
 
@@ -214,6 +247,75 @@ mod tests {
     fn bus_in_absent_is_confirmed_after_grace() {
         assert!(bus_in_absent_confirmed(BUS_IN_GRACE_MS));
         assert!(bus_in_absent_confirmed(BUS_IN_GRACE_MS * 10));
+    }
+
+    #[test]
+    fn auto_only_samples_when_bus_in_is_confirmed_absent() {
+        // 未判定 / 外部給電中は Latch に触らない = set_ext_5v_out を呼ばない
+        assert_eq!(bus5v_sample(Bus5vMode::Auto, None, true), None);
+        assert_eq!(bus5v_sample(Bus5vMode::Auto, None, false), None);
+        assert_eq!(bus5v_sample(Bus5vMode::Auto, Some(true), true), None);
+        assert_eq!(bus5v_sample(Bus5vMode::Auto, Some(true), false), None);
+        // 外部給電でないと確定して初めて USB ホストの有無に追随する (#203 の固定動作)
+        assert_eq!(bus5v_sample(Bus5vMode::Auto, Some(false), true), Some(true));
+        assert_eq!(
+            bus5v_sample(Bus5vMode::Auto, Some(false), false),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn off_never_asks_for_output() {
+        // PoE の現場の設定。bus_in / usb_host が何であれ「出さない」
+        for bus_in in [None, Some(true), Some(false)] {
+            for usb in [true, false] {
+                assert_eq!(bus5v_sample(Bus5vMode::Off, bus_in, usb), Some(false));
+            }
+        }
+    }
+
+    #[test]
+    fn off_costs_no_i2c_from_boot_but_switches_back_off_when_set_at_runtime() {
+        // 起動時の出力は false なので、OFF のまま回しても Latch は何も返さない
+        let mut l = Latch::default();
+        for _ in 0..5 {
+            assert_eq!(
+                l.update(bus5v_sample(Bus5vMode::Off, None, true).unwrap()),
+                None
+            );
+        }
+        assert!(!l.out());
+        // 既に出ている状態 (AUTO で出した後) から OFF にしたら 1 回落としに行く
+        let mut l = Latch::default();
+        l.update(true);
+        assert_eq!(l.update(true), Some(true));
+        l.commit(true);
+        assert_eq!(
+            l.update(bus5v_sample(Bus5vMode::Off, None, true).unwrap()),
+            None
+        );
+        assert_eq!(
+            l.update(bus5v_sample(Bus5vMode::Off, None, true).unwrap()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn on_always_asks_for_output() {
+        // USB 電源アダプタのベンチ (USB ホストとして列挙されない) 向け
+        for bus_in in [None, Some(true), Some(false)] {
+            for usb in [true, false] {
+                assert_eq!(bus5v_sample(Bus5vMode::On, bus_in, usb), Some(true));
+            }
+        }
+    }
+
+    #[test]
+    fn default_mode_is_the_fixed_behaviour_from_203() {
+        // NVS 未設定の端末は #203 以降の固定動作のまま (挙動を変えない)
+        let mode = Bus5vMode::default();
+        assert_eq!(bus5v_sample(mode, None, true), None);
+        assert_eq!(bus5v_sample(mode, Some(false), true), Some(true));
     }
 
     #[test]

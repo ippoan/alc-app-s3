@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use alc_hub_core::cfg::{DeviceConfig, WifiConfig};
-use alc_hub_core::protocol::valid_rotation;
+use alc_hub_core::protocol::{valid_rotation, Bus5vMode};
 use anyhow::Result;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 
@@ -53,6 +53,11 @@ const KEY_GW_URL: &str = "gw_url";
 const KEY_TENKO_BP: &str = "tenko_bp";
 /// Omron 血圧計 (HEM-6231T) を拾うか (`OMRON BP ON|OFF`)。未設定は false
 const KEY_OMRON_BP: &str = "omron_bp";
+/// M-Bus 5V を Core 側から出すか (`BUS5V AUTO|ON|OFF`。u8 は `Bus5vMode::to_u8`)。
+/// ★**キー名と値の対応を変えないこと** — #203 でこの設定を読む側だけが消えた
+/// あいだも NVS の値は消えていないので、現場が設定した `OFF` (=2) が残っている
+/// 端末がある (#254)
+const KEY_BUS5V: &str = "bus5v";
 /// 血圧計としてボンドした機器のアドレス (NimBLE native の little endian 6 B、
 /// Refs #249)。**真偽値ではない** — 「血圧計がボンドされているか」は、この記録が
 /// NimBLE のボンド一覧にまだ居るかで毎回決める
@@ -408,6 +413,23 @@ impl Settings {
     pub fn set_tenko_bp(&self, enabled: bool) -> Result<()> {
         let nvs = self.nvs.lock().expect("settings nvs lock");
         nvs.set_u8(KEY_TENKO_BP, u8::from(enabled))?;
+        Ok(())
+    }
+
+    /// M-Bus 5V を Core 側から出すか (`BUS5V AUTO|ON|OFF`)。未設定・未知の値は
+    /// `Auto` (= #203 以降の固定動作) なので、設定したことのない端末の挙動は
+    /// 変わらない (#254)
+    pub fn bus5v(&self) -> Bus5vMode {
+        self.nvs
+            .lock()
+            .ok()
+            .and_then(|nvs| nvs.get_u8(KEY_BUS5V).ok().flatten())
+            .map_or(Bus5vMode::Auto, Bus5vMode::from_u8)
+    }
+
+    pub fn set_bus5v(&self, mode: Bus5vMode) -> Result<()> {
+        let nvs = self.nvs.lock().expect("settings nvs lock");
+        nvs.set_u8(KEY_BUS5V, mode.to_u8())?;
         Ok(())
     }
 
