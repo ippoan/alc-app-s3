@@ -1122,12 +1122,20 @@ fn handle_downlink(
                 // `bp_read` は `power_read` (bus5v_status/battery) と同じ役割の
                 // ゲート — スキャンが一度も回っていない (起動直後) / lock 失敗の
                 // 間は「未ボンド」と答えず、`bp_bonded` 自体を省いて
-                // 「まだ確認できていない」と伝える (#322 で踏んだ誤断定を防ぐ)
+                // 「まだ確認できていない」と伝える (#322 で踏んだ誤断定を防ぐ)。
+                //
+                // ★ 判定そのものは `AUTH SIGNBP` (console.rs) と**同じ述語 1 本**
+                // (`alc_hub_common::status::bp_report` → `device::bp_report`) を
+                // 通す (#269)。ここに条件を書き足さないこと — 2 つ目の判定分岐が
+                // 生まれると、次の世代でまた食い違う
                 Some("bp_status") => {
-                    let read = status.lock().map(|st| (st.bp_read, st.bp_bonded));
-                    let payload = match read {
-                        Ok((true, bonded)) => format!(r#"{{"bp_bonded":{bonded},"bp_read":true}}"#),
-                        Ok((false, _)) | Err(_) => r#"{"bp_read":false}"#.to_string(),
+                    let payload = match alc_hub_common::status::bp_report(status) {
+                        alc_hub_core::device::BpReport::Ready { bonded } => {
+                            format!(r#"{{"bp_bonded":{bonded},"bp_read":true}}"#)
+                        }
+                        alc_hub_core::device::BpReport::NotReady => {
+                            r#"{"bp_read":false}"#.to_string()
+                        }
                     };
                     send_command_result(conn, &id, &payload);
                 }

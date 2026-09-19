@@ -171,6 +171,9 @@ fn drain_buffer(
                     console::discard_overlong(acc);
                     return;
                 };
+                // 応答を必ず行頭から出す (#268)。途中で終わっているログ行が
+                // あっても、ホストの行分割がここで切ってくれる
+                alc_hub_common::hostout::begin_line();
                 handle_line(&line, tx, status, settings, wifi, pair_flag, alarm);
             }
         }

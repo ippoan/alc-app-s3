@@ -92,7 +92,13 @@ pub fn spawn_reader(
                         acc.extend_from_slice(&chunk[..n]);
                         loop {
                             match take_line(&mut acc) {
-                                Some(line) => on_line(&line),
+                                Some(line) => {
+                                    // 応答を必ず行頭から出す (#268)。ここに置けば
+                                    // 個々の `println!` を書き換えずに 4 機種
+                                    // (alarm / print / timecard / bp-station) を覆える
+                                    alc_hub_common::hostout::begin_line();
+                                    on_line(&line);
+                                }
                                 None => {
                                     discard_overlong(&mut acc);
                                     break;
@@ -105,6 +111,47 @@ pub fn spawn_reader(
             }
         })?;
     Ok(())
+}
+
+/// `AUTH SIGNBP` が hub-ble の初回スキャンを待つ上限 (Refs #269)。
+///
+/// 待つのは**起動直後の窓だけ** — `bp_read` は hub-ble のループの先頭で
+/// 一度立てば以後ずっと true なので、2 回目以降の問い合わせは待たずに返る。
+/// ホスト (PWA) は `port.open()` でチップをリセットするため、問い合わせは
+/// ほぼ毎回この窓に当たる。
+///
+/// **BLE を起こさない機は 1 ミリ秒も待たない** — `bp_report` が
+/// `ble_running=false` を見て即 `Ready { bonded: false }` を返す
+/// (警告デバイス / 印刷ブリッジ / AtomS3 Lite build / `OMRON BP OFF`)。
+///
+/// 値の根拠: hub-ble のスキャン 1 周 (`SCAN_DURATION_MS` = 5 秒) + 余裕 1 秒。
+/// **有限にすること**が要点で、超えたら `ERR AUTH: bp not ready` を返して
+/// ホストへ返事を渡す (ホスト側の `AUTH SIGNBP` は 10 秒で切り上げるので、
+/// こちらが黙って待ち続けると向こうのタイムアウトに食われる)。
+const BP_READY_WAIT_MS: u32 = 6_000;
+
+/// [`BP_READY_WAIT_MS`] を待つあいだの再読み間隔。
+const BP_READY_POLL_MS: u32 = 100;
+
+/// 血圧計のボンド状態が読めるようになるのを、上限付きで待つ (Refs #269)。
+///
+/// 待っても読めなければ [`alc_hub_core::device::BpReport::NotReady`] を返す
+/// (呼び出し側が `ERR AUTH: bp not ready` を出す)。**窓を無限にしないこと** —
+/// ホストが再試行しないと血圧を永久に測らない端末になる。
+fn wait_bp_report(status: &SharedStatus) -> alc_hub_core::device::BpReport {
+    let mut waited = 0;
+    loop {
+        // ★ **読めていれば 1 ミリ秒も待たない** — 判定が先、`delay_ms` は後。
+        // 2 回目以降の `AUTH SIGNBP` (`bp_read` が既に true) と、BLE を
+        // 起こさない機 (`ble_running` が false) はここで即座に返る。待たせると
+        // 測定台の起動が毎回 6 秒重くなる
+        let report = alc_hub_common::status::bp_report(status);
+        if report != alc_hub_core::device::BpReport::NotReady || waited >= BP_READY_WAIT_MS {
+            return report;
+        }
+        FreeRtos::delay_ms(BP_READY_POLL_MS);
+        waited += BP_READY_POLL_MS;
+    }
 }
 
 /// 機種に依らないコマンドを処理する。
@@ -263,16 +310,18 @@ pub fn handle_common(
         // キオスク端末の認証 (`/device/alarm-token`) 用。署名対象は
         // `<nonce>|bp=<1|0>` で、ブラウザは素通しするだけなので、血圧計の有無が
         // **鍵で裏付けられた端末の申告**になる。値は hub-ble が観測したボンド状態
-        // (HubStatus::bp_bonded) をそのまま使う — `OMRON BP ON|OFF` (意思設定) とは
-        // 別物なので取り違えないこと
+        // (HubStatus::bp_bonded) を使う — `OMRON BP ON|OFF` (意思設定) とは
+        // 別物なので取り違えないこと。
+        //
+        // ★ **観測前 (`bp_read` が false) は署名しない** (#269)。既定値の
+        // `false` を `bp=0` として署名すると、血圧計が繋がっている端末が
+        // 「無い」と鍵付きで申告してしまう。判定は hub-core の述語 1 本
+        // (`device::bp_report` → `alarm_key::auth_sigbp_response`)
         HostCommand::AuthSignBp { nonce } => match settings.alarm_sk() {
-            Some(seed) => {
-                let bp_bonded = status.lock().map(|st| st.bp_bonded).unwrap_or(false);
-                match alc_hub_core::alarm_key::auth_sigbp_line(&seed, &nonce, bp_bonded) {
-                    Ok(line) => println!("{line}"),
-                    Err(_) => println!("ERR AUTH: bad nonce"),
-                }
-            }
+            Some(seed) => println!(
+                "{}",
+                alc_hub_core::alarm_key::auth_sigbp_response(&seed, &nonce, wait_bp_report(status))
+            ),
             None => println!("ERR AUTH: no key"),
         },
         // cf-alc-recorder 常時接続 (ws_uplink.rs)

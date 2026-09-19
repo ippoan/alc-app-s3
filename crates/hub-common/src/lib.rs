@@ -8,6 +8,8 @@ pub mod config;
 pub mod control;
 // `EVT ` 行の出口 (println + crashlog リング)。hub-ui / hub-ble も使う (#215)
 pub mod evtlog;
+// ホストへ出す行を行頭から始める出口 (#268)。evtlog / console / host_link が使う
+pub mod hostout;
 pub mod measurement;
 pub mod settings;
 pub mod status;

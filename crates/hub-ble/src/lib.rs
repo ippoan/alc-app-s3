@@ -193,6 +193,14 @@ pub fn start(
     settings: Settings,
 ) -> Result<()> {
     let meas_tx: MeasTx = Arc::new(Mutex::new(meas_tx));
+    // 血圧計を観測する経路が在ることを記録する (Refs #269)。これが false の機
+    // (BLE を積まない alarm / print、AtomS3 Lite build、`OMRON BP OFF` で
+    // `start` を呼ばない timecard / bp-station) は `bp_bonded` が永久に既定値の
+    // false のままで、それが**正しい観測結果** = 「血圧計なし」。読了ゲート
+    // (`alc_hub_core::device::bp_report`) はその区別にこの旗を使う
+    if let Ok(mut st) = status.lock() {
+        st.ble_running = true;
+    }
     alc_hub_common::task::name_next(c"ble");
     std::thread::Builder::new()
         .name("ble".into())
@@ -397,13 +405,21 @@ async fn task(
                 Err(_) => "EVT BP_RX err",
             });
         }
-        // 血圧の特性を実際に読めた経路だけ「血圧計としてボンド」に載せる (Refs #252)。
-        // 非 Omron 機はここまで記録を書く経路が無く、NimBLE のボンド一覧に居ても
-        // bp_bonded が永久に false のままだった。判定は hub-core の述語 1 本が持つ
+        // 血圧の特性まで到達した経路だけ「血圧計としてボンド」に載せる
+        // (Refs #252 / #269)。非 Omron 機はここまで記録を書く経路が無く、
+        // NimBLE のボンド一覧に居ても bp_bonded が永久に false のままだった。
+        //
+        // ★ 根拠は `Ok(_)` — `handle_device` は `get_service(0x1810)` →
+        // `get_characteristic(0x2A35)` → 購読をすべて `?` で通すので、
+        // **Ok が返った = 血圧の特性を購読できた**。`Ok(true)` (測定が届いた)
+        // まで待たないのは、待つとペアリング済みの血圧計が最初の点呼で
+        // 血圧を求められなくなるため (述語 doc の真理値表の下を参照)。
+        // 「接続できただけ」は `Err` になるのでここには来ない。
+        // 判定そのものは hub-core の述語 1 本が持つ
         if should_remember_bp_bond(BpBondSite::ConnectionFinished {
             kind,
             omron,
-            got_data: matches!(result, Ok(true)),
+            bp_subscribed: result.is_ok(),
         }) {
             remember_bp_bond(&settings, &addr, &mut bp_bond_rec);
         }
