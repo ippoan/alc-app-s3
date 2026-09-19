@@ -1,0 +1,39 @@
+# 血圧計用 PC の測定台 (Atom VoiceS3R / 8MB flash) 用パーティションテーブル
+# — **`ATOMS3_NFC_VOICES3R` build 専用** (Refs ippoan/alc-app#353)。
+# ベンチ検証機 (AtomS3 Lite) の partitions.csv は factory 1 スロットのままで、
+# こちらだけ crates/atoms3-alarm / crates/atoms3-timecard と**同一レイアウト**にする。
+#
+# **なぜ検証機と分けるか**: この機は現地 (営業所の PC) に置いて配る。
+# 後から OTA 経路を足したくなったときに factory 1 スロットだと
+# `esp_ota_ops: not found otadata` で必ず失敗し、**現地の機を全部 USB で
+# 焼き直す**話になる (atoms3-alarm の partitions.csv が同じ理由で
+# 「OTA 経路を持たないがレイアウトは揃えておく」と書いている)。
+# auth-worker の /device/setup が機種ごとに「最新版を配信」を持つため、
+# 登録できる機種のレイアウトは揃えておく方が安い。
+#
+# **本機は現時点で OTA 経路を持たない** — ネットワークを持たず、
+# `OTA <url>` も `ERR UNSUPPORTED (nfc)` になる。更新は Pages インストーラ
+# (docs/atoms3-nfc.html) から USB で焼き直す。
+#
+# ★ 手焼きでも必ず `--partition-table crates/atoms3-nfc/partitions-voices3r.csv` を
+#   渡すこと。省略すると espflash 既定の factory 1 スロットになる。
+#
+# NVS の温存について (Refs #48): Web インストーラーは merged を [0x0,0x9000) と
+# [0x10000,末尾) に分割して書くため nvs/phy_init (血圧計のボンド・device
+# credential・`omron_bp`) は消えない。merged.bin の offset 0 一括書き込み (CLI)
+# は従来どおり消える。nvs=0x9000 / otadata=0x10000 を動かすときは
+# build.yml の Split step も要修正。
+#
+# punchq (オフライン送信キュー、#142) は**本機では使わない** — 打刻の上り
+# (cf-alc-recorder) を持たないため。それでも**行は揃えて入れる**: 後から
+# 切り直さないことがこのレイアウト共有の目的で、行の有無だけで別レイアウトに
+# なってしまうため (alarm も同じ理由で使わないまま持っている)。
+# build.yml の Resolve punchq offset がこの行を読み、Web インストーラー用の
+# main 部を 0x620000 の手前で切る。
+# Name,   Type, SubType, Offset,   Size,   Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+otadata,  data, ota,     0x10000,  0x2000,
+ota_0,    app,  ota_0,   0x20000,  3M,
+ota_1,    app,  ota_1,   0x320000, 3M,
+punchq,   data, nvs,     0x620000, 0x80000,
