@@ -193,6 +193,14 @@ pub fn start(
     settings: Settings,
 ) -> Result<()> {
     let meas_tx: MeasTx = Arc::new(Mutex::new(meas_tx));
+    // 血圧計を観測する経路が在ることを記録する (Refs #269)。これが false の機
+    // (BLE を積まない alarm / print、AtomS3 Lite build、`OMRON BP OFF` で
+    // `start` を呼ばない timecard / bp-station) は `bp_bonded` が永久に既定値の
+    // false のままで、それが**正しい観測結果** = 「血圧計なし」。読了ゲート
+    // (`alc_hub_core::device::bp_report`) はその区別にこの旗を使う
+    if let Ok(mut st) = status.lock() {
+        st.ble_running = true;
+    }
     alc_hub_common::task::name_next(c"ble");
     std::thread::Builder::new()
         .name("ble".into())

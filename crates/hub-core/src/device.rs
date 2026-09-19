@@ -131,6 +131,72 @@ pub fn bp_bonded(recorded: Option<[u8; 6]>, bonded: &[[u8; 6]]) -> bool {
     recorded.is_some_and(|addr| bonded.contains(&addr))
 }
 
+/// `HubStatus` から読んだ血圧計の観測 (Refs #269)。
+///
+/// **bool を引数に並べない** — 引数が増えると呼び出し側が順序を取り違えても
+/// 型検査が捕まえられない ([`should_remember_bp_bond`] と同じ理由)。
+/// フィールド名で渡せば取り違えはコンパイルエラーになる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BpObservation {
+    /// BLE central (hub-ble) がこの機で動いているか (`HubStatus::ble_running`)
+    pub ble_running: bool,
+    /// BLE スキャンが一度でも回って `bonded` を書いたか (`HubStatus::bp_read`)
+    pub read: bool,
+    /// そのスキャンが書いたボンド状態 (`HubStatus::bp_bonded`)
+    pub bonded: bool,
+}
+
+/// 血圧計のボンド状態として**報告してよい値** (Refs #269)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BpReport {
+    /// **まだ確認できていない。**「未ボンド」ではないので、`bp=0` の顔をして
+    /// 外へ出してはいけない
+    NotReady,
+    /// スキャンが回って確定した観測
+    Ready {
+        /// 血圧計がボンドされているか ([`bp_bonded`] の結果)
+        bonded: bool,
+    },
+}
+
+/// 観測から「報告してよい値」を決める (Refs #269)。
+///
+/// `observed` が `None` なのは**状態を読めなかったとき** (`HubStatus` の lock
+/// 失敗) で、未スキャンと同じ「未確認」に倒す。
+///
+/// # 真理値表
+///
+/// | `ble_running` | `read` | 返す値 | なぜ |
+/// |---|---|---|---|
+/// | false | — | `Ready { bonded: false }` | BLE を起こさない機 (警告デバイス / 印刷ブリッジ / Lite build / `OMRON BP OFF`)。既定値の false が**確定した「血圧計なし」** — ここで待つと永久に答えられない |
+/// | true | false | `NotReady` | スキャン前。既定値の false は観測結果ではない |
+/// | true | true | `Ready { bonded }` | 実測 |
+///
+/// # なぜゲートが要るか
+///
+/// `HubStatus::bp_bonded` の既定値は `false` で、hub-ble のスキャンが 1 周して
+/// 初めて実測が入る (`bp_read` が立つのが同じ瞬間)。ホスト (PWA) が
+/// `port.open()` するとチップがリセットされるため、**問い合わせはほぼ毎回
+/// 「スキャン前」の窓に当たる**。そこで `bp_bonded` を生で読むと、血圧計が
+/// 繋がっている端末が `bp=0` を名乗る — 法定の血圧記録を省く側へ倒れてしまう
+/// (`should_remember_bp_bond` の doc と同じ危険)。
+///
+/// 判定を**この関数 1 本**に集める。`AUTH SIGNBP` の署名 (hub-drivers の
+/// console.rs) と `/device/setup` の `bp_status` 照会 (ws_uplink.rs) が別々に
+/// 書くと、`#249` → `#252` → `#253` → `#266` → `#269` と同じ食い違いを繰り返す。
+#[must_use]
+pub fn bp_report(observed: Option<BpObservation>) -> BpReport {
+    match observed {
+        Some(BpObservation {
+            ble_running: false, ..
+        }) => BpReport::Ready { bonded: false },
+        Some(BpObservation {
+            read: true, bonded, ..
+        }) => BpReport::Ready { bonded },
+        Some(BpObservation { read: false, .. }) | None => BpReport::NotReady,
+    }
+}
+
 /// 血圧計のボンド記録を書いてよい瞬間 (Refs #266)。
 ///
 /// hub-ble がこの判定を呼ぶ 3 点を、そのまま variant にしてある。
@@ -226,6 +292,55 @@ mod tests {
             omron,
             got_data,
         }
+    }
+
+    /// `BpObservation` を組み立てる (BLE が動いている機の観測)
+    fn observed(read: bool, bonded: bool) -> Option<BpObservation> {
+        Some(BpObservation {
+            ble_running: true,
+            read,
+            bonded,
+        })
+    }
+
+    /// #269: スキャンが 1 周するまでは「未ボンド」と答えない。
+    /// 起動直後の既定値 `false` を `bp=0` として署名すると、血圧計が在る端末が
+    /// 無いと名乗る
+    #[test]
+    fn bp_report_withholds_bond_state_until_the_scan_ran() {
+        assert_eq!(bp_report(observed(false, false)), BpReport::NotReady);
+        // 未読なら `bonded` が何であれ報告しない (読み取り順の取り違え検知)
+        assert_eq!(bp_report(observed(false, true)), BpReport::NotReady);
+        // 状態そのものを読めなかった (lock 失敗) ときも未確認
+        assert_eq!(bp_report(None), BpReport::NotReady);
+    }
+
+    #[test]
+    fn bp_report_passes_the_observation_through_once_the_scan_ran() {
+        assert_eq!(
+            bp_report(observed(true, false)),
+            BpReport::Ready { bonded: false }
+        );
+        assert_eq!(
+            bp_report(observed(true, true)),
+            BpReport::Ready { bonded: true }
+        );
+    }
+
+    /// BLE を起こさない機 (警告デバイス / 印刷ブリッジ / Lite build /
+    /// `OMRON BP OFF`) は**待たせない** — `bp_read` は永久に立たないので、
+    /// 待つと `AUTH SIGNBP` が一生答えられなくなる。既定値の false が
+    /// そのまま確定した「血圧計なし」
+    #[test]
+    fn bp_report_is_final_when_ble_never_runs() {
+        assert_eq!(
+            bp_report(Some(BpObservation {
+                ble_running: false,
+                read: false,
+                bonded: false,
+            })),
+            BpReport::Ready { bonded: false }
+        );
     }
 
     #[test]

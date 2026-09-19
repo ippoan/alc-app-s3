@@ -19,6 +19,7 @@
 //! `signAlarmDeviceNonce` は 1 本の関数を管理者ログインとキオスクで共有しており、
 //! ファームは行からどちらの用途か判別できない。混ぜると**管理者ログインが 401 になる**。
 
+use crate::device::BpReport;
 use ed25519_dalek::{Signer, SigningKey};
 
 /// `AUTH SIGN <nonce>` の nonce が形式不正 (長さ != 32 / 大文字を含む /
@@ -120,6 +121,36 @@ pub fn auth_sigbp_line(seed: &[u8; 32], nonce: &str, bp_bonded: bool) -> Result<
         sig,
         u8::from(bp_bonded)
     ))
+}
+
+/// nonce の形式が不正だったときの応答行。
+pub const ERR_BAD_NONCE: &str = "ERR AUTH: bad nonce";
+
+/// ボンド状態をまだ確認できておらず、`AUTH SIGNBP` に答えられないときの
+/// 応答行 (Refs #269)。**`AUTH SIGN` (管理者ログイン) では決して返さない。**
+///
+/// ホスト (`ippoan/alc-app` の `useDeviceToken`) は `ERR AUTH` を受けると
+/// `AUTH SIGN` へフォールバックし、`bp_bonded` を**付けずに**上流へ行く —
+/// つまり「未確認」が `bp=0` の顔をして届くことはない。
+pub const ERR_BP_NOT_READY: &str = "ERR AUTH: bp not ready";
+
+/// `AUTH SIGNBP` の応答行を決める (読了ゲート込み、Refs #269)。
+///
+/// [`BpReport::NotReady`] のあいだは**署名しない** — 未確認を `bp=0` として
+/// 署名すると、血圧計が繋がっている端末が「無い」と鍵付きで申告してしまう
+/// ([`crate::device::bp_report`] の doc 参照)。
+///
+/// ★ **`AUTH SIGN` (管理者ログイン) はこのゲートを通さない。** 署名対象に
+/// ボンド状態を持たない別の口で ([`auth_sig_line`])、血圧計の準備を待たせると
+/// 鍵が在るのに管理者がログインできない端末ができる。
+#[must_use]
+pub fn auth_sigbp_response(seed: &[u8; 32], nonce: &str, report: BpReport) -> String {
+    match report {
+        BpReport::NotReady => ERR_BP_NOT_READY.to_string(),
+        BpReport::Ready { bonded } => {
+            auth_sigbp_line(seed, nonce, bonded).unwrap_or_else(|_| ERR_BAD_NONCE.to_string())
+        }
+    }
 }
 
 /// RFC 4648 base64url (padding 無し)。標準 base64 alphabet の `62`/`63` 番目
@@ -354,6 +385,56 @@ mod tests {
     fn auth_sigbp_line_rejects_bad_nonce() {
         let seed = hex_to_bytes32(RFC8032_SEED);
         assert_eq!(auth_sigbp_line(&seed, "short", true), Err(BadNonce));
+    }
+
+    /// #269: スキャンが回るまでは署名しない。**`bp=0` の署名を出さない**のが
+    /// 要点 — 出すと血圧計が在る端末が「無い」と鍵付きで申告してしまう
+    #[test]
+    fn auth_sigbp_response_does_not_sign_before_the_scan_ran() {
+        let seed = hex_to_bytes32(RFC8032_SEED);
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let line = auth_sigbp_response(&seed, nonce, BpReport::NotReady);
+        assert_eq!(line, "ERR AUTH: bp not ready");
+        assert!(!line.contains("BP="));
+        assert_ne!(line, auth_sigbp_line(&seed, nonce, false).unwrap());
+    }
+
+    #[test]
+    fn auth_sigbp_response_signs_the_observed_state_once_the_scan_ran() {
+        let seed = hex_to_bytes32(RFC8032_SEED);
+        let nonce = "0123456789abcdef0123456789abcdef";
+        for bonded in [false, true] {
+            assert_eq!(
+                auth_sigbp_response(&seed, nonce, BpReport::Ready { bonded }),
+                auth_sigbp_line(&seed, nonce, bonded).unwrap()
+            );
+        }
+        // nonce 不正は読了ゲートより後 (ゲートを通っても形式は見る)
+        assert_eq!(
+            auth_sigbp_response(&seed, "short", BpReport::Ready { bonded: true }),
+            "ERR AUTH: bad nonce"
+        );
+    }
+
+    /// ★ **管理者ログインの退行検知 (#269)。** 読了ゲートが `AUTH SIGN` 側へ
+    /// 滲むと、血圧計を積まない機・スキャン前の窓で管理者がログインできなくなる。
+    /// `AUTH SIGN` の応答は seed と nonce だけで決まり、ゲートが返しうる応答
+    /// (`ERR AUTH: bp not ready` / `AUTH SIGBP …`) のどれとも一致しない
+    #[test]
+    fn bp_ready_gate_never_changes_auth_sign() {
+        let seed = hex_to_bytes32(RFC8032_SEED);
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let sign = auth_sig_line(&seed, nonce).unwrap();
+        for report in [
+            BpReport::NotReady,
+            BpReport::Ready { bonded: false },
+            BpReport::Ready { bonded: true },
+        ] {
+            assert_ne!(auth_sigbp_response(&seed, nonce, report), sign);
+        }
+        assert!(sign.starts_with("AUTH SIG "));
+        assert!(!sign.contains("BP="));
+        assert_eq!(sign, auth_sig_line(&seed, nonce).unwrap());
     }
 
     #[test]

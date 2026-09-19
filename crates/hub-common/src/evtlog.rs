@@ -34,9 +34,13 @@ pub fn set_sink(sink: fn(&str)) {
     let _ = SINK.set(sink);
 }
 
-/// `EVT ` 行をホストへ出し (`println!`)、登録済みならリングにも残す。
+/// `EVT ` 行をホストへ出し、登録済みならリングにも残す。
+///
+/// 出力は [`crate::hostout::line`] を通す — `EVT ` 行は**コマンドと無関係に
+/// 非同期で出る**ため、途中で終わっているログ行の尻に連結しうる (#268)。
+/// リングへ渡すのは本文だけ (改行は付けない)。
 pub fn emit(line: &str) {
-    println!("{line}");
+    crate::hostout::line(line);
     if let Some(sink) = SINK.get() {
         sink(line);
     }

@@ -57,6 +57,14 @@ pub struct HubStatus {
     /// 「血圧計なし」で正しい
     pub bp_bonded: bool,
 
+    /// BLE central (hub-ble) がこの機で動いているか (Refs #269)。
+    /// `alc_hub_ble::start` が立てる — **BLE を積まない機** (警告デバイス /
+    /// 印刷ブリッジ / AtomS3 Lite build) と、`OMRON BP OFF` で BLE を起こさない
+    /// 機では false のまま。その場合 `bp_bonded` の既定値 false は「まだ
+    /// 確認できていない」ではなく**確定した「血圧計なし」**で、下の `bp_read` を
+    /// 待つ意味が無い (待つと `AUTH SIGNBP` が永久に答えられなくなる)
+    pub ble_running: bool,
+
     /// BLE スキャンが一度でも回って `bp_bonded` を書いたか (Refs auth-worker#574)。
     /// `power_read` (AXP2101 を一度でも読めたか) と同じ役割のゲート — 起動直後は
     /// `bp_bonded` が既定値 `false` のままなので、これが `false` の間は
@@ -193,6 +201,25 @@ impl HubStatus {
 }
 
 pub type SharedStatus = Arc<Mutex<HubStatus>>;
+
+/// 血圧計のボンド状態として**報告してよい値**を共有状態から読む (Refs #269)。
+///
+/// 読み取りはここ 1 か所、判定は [`alc_hub_core::device::bp_report`] 1 本。
+/// `AUTH SIGNBP` の署名 (hub-drivers の console.rs) と `/device/setup` の
+/// `bp_status` 照会 (ws_uplink.rs) は**必ずこれを通す** — 生の `bp_bonded` を
+/// 読むと、スキャン前の既定値 `false` が「血圧計なし」として外へ出る。
+///
+/// lock できなかったときも判定は述語に任せる (= 未確認扱い)。
+#[must_use]
+pub fn bp_report(status: &SharedStatus) -> alc_hub_core::device::BpReport {
+    alc_hub_core::device::bp_report(status.lock().ok().map(|st| {
+        alc_hub_core::device::BpObservation {
+            ble_running: st.ble_running,
+            read: st.bp_read,
+            bonded: st.bp_bonded,
+        }
+    }))
+}
 
 /// 現在の壁時計 (epoch ms)。NTP 未同期時は 1970 起点の稼働時間になる
 /// (uplink::MIN_SYNCED_MS 未満)。記録側はそのまま保存し、送信側で補正する

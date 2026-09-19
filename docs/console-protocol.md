@@ -28,6 +28,15 @@ CoreS3 (`cores3`) はこれに `FC1200` (RS232 パススルー) / `CFG` (設定
 [ble-medical-gateway](https://github.com/ippoan/ble-medical-gateway) の
 シリアル JSON 互換) が加わる。
 
+★ **ファームは応答行・`EVT ` 行を必ず改行から出す** (Refs ippoan/alc-app-s3#268)。
+起動直後は ESP-IDF のログ行が途中でバイトを落とすことがあり、そこへ応答が
+**連結**して既知の接頭辞から外れていた (実測: `…nfc: 待受開始 port=0` +
+`EVT NFC_READY port=0`)。出口 3 か所 (`console::spawn_reader` /
+`host_link::drain_buffer` / `evtlog::emit`) が
+[`alc_hub_common::hostout`](../crates/hub-common/src/hostout.rs) を通すので、
+ホストの行分割がそこで切ってくれる。**その結果、空行が 1 つ増えることがある** —
+ホスト側は空行を読み飛ばすこと (3 本とも既にそうなっている)。
+
 行の解析そのもの (純粋・ホストでテスト済み) は
 [`crates/hub-core/src/protocol.rs`](../crates/hub-core/src/protocol.rs) の
 `parse_line` が持つ。副作用 (NVS 保存・応答出力) は firmware 側が担う。
@@ -93,6 +102,27 @@ CoreS3 の `STATUS LAN=…` も同様 (行頭は互換のため変えない)。
 | `AUTH TICKET` | 端末登録の一回券。**`cores3` のみ** (運行者 PWA が USB 越しに繋がるのはここだけ)、他は `ERR AUTH TICKET: unsupported` |
 | `AUTH KEYGEN` / `AUTH PUBKEY` / `AUTH SIGN` / `AUTH SIGNBP` | 警告デバイス管理者認証用の ed25519 鍵 (Refs #205, #249) |
 | `WS URL` / `WS STATUS` | cf-alc-recorder 常時接続の URL 上書き / 状態 |
+
+`AUTH SIGN` / `AUTH SIGNBP` の応答 (Refs #205, #249, #269):
+
+| 要求 | 応答 |
+|---|---|
+| `AUTH SIGN <nonce>` | `AUTH SIG <pubkey> <sig>` — 署名対象は `<nonce>` のみ (管理者ログイン)。**血圧計の状態に依らず常に答える** |
+| `AUTH SIGNBP <nonce>` | `AUTH SIGBP <pubkey> <sig> BP=<1\|0>` — 署名対象は `<nonce>\|bp=<1\|0>` (キオスク端末認証) |
+| `AUTH SIGN` / `AUTH SIGNBP` の nonce 不正 | `ERR AUTH: bad nonce` (小文字 hex 32 文字でない) |
+| 鍵が無い | `ERR AUTH: no key` |
+| `AUTH SIGNBP` で**ボンド状態をまだ確認できていない** | `ERR AUTH: bp not ready` (Refs #269) |
+
+★ `ERR AUTH: bp not ready` は「血圧計なし」ではない。BLE スキャンが一度も
+回っていない窓 (ホストが `port.open()` でチップをリセットした直後がこれに当たる)
+では、既定値の `false` を `bp=0` として**署名しない** — 署名すると血圧計が
+繋がっている端末が「無い」と鍵付きで申告し、法定の血圧記録を省く側へ倒れる。
+ファームは上限付き (6 秒) で初回スキャンを待ってから、読めなければこれを返す。
+**BLE を起こさない機 (警告デバイス / 印刷ブリッジ / AtomS3 Lite build /
+`OMRON BP OFF`) は待たずに `BP=0` を返す** — そこでの `false` は未確認ではなく
+確定した「血圧計なし」なので、ゲートに掛けない。
+ホストは `ERR AUTH` を受けたら `AUTH SIGN` へフォールバックし、`bp_bonded` を
+**付けずに**上流へ渡すこと (= 未確認を `bp=0` に潰さない)。
 
 | コマンド | `handle_omron` / `handle_pair` (BLE 血圧計を積む機だけ) |
 |---|---|
