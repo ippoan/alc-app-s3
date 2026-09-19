@@ -159,6 +159,9 @@ const DATA_WAIT_TIMEOUT_MS: u64 = 3_000;
 /// 遅れる (実機で確認)。短いバックオフで機器に空き時間を作る
 const EMPTY_BACKOFF_MS: u64 = 10_000;
 
+/// `PAIR` (Pages の「血圧計を再ペアリング」) で開くペアリング受付の長さ。
+/// Omron 機の `-P-` 点滅は 1〜2 分で切れるので、それを覆う程度に取る
+const PAIR_ARM_MS: u64 = 120_000;
 /// ペアリングを終えた Omron 機へペアリング接続を控える時間。鍵登録の直後も
 /// ペアリング待ちの広告が数秒残り、そこへ再接続すると機器に切られる (S3R で実測)
 const OMRON_PAIRED_BACKOFF_MS: u64 = 30_000;
@@ -235,6 +238,11 @@ async fn task(
     // 「未ボンド」の内訳の直近値 `(記録が在るか, ボンド一覧に居るか)` (Refs #252)。
     // これも変化したときだけ出す — スキャンは 1 周ごとに回るため
     let mut last_bp_diag: Option<(bool, bool)> = None;
+    // ペアリング受付の期限 [ms] (0 = 受け付けていない)。**`PAIR` を押した間だけ**
+    // ペアリング待ちの広告に接続する。押していない間は `-P-` を見ても繋がない —
+    // 見つけ次第ペアリングすると、そばで誰かが `-P-` にしただけで機器のボンド枠を
+    // 黙って奪い、元の相手 (スマホ等) との組が切れる
+    let mut pair_until: u64 = 0;
     loop {
         // 再ペアリング要求: 保存済みボンドを全消去する。壊れた/古いボンドが
         // 血圧計の暗号化接続を妨げている場合の復旧手段 (Pages のペアリングボタン)
@@ -257,7 +265,16 @@ async fn task(
                     alc_hub_common::evtlog::emit("EVT PAIR_ERR ボンド消去に失敗");
                 }
             }
+            // 消去の成否に関わらず受付を開く (要求されたのはペアリングのやり直し)
+            pair_until = now_ms() + PAIR_ARM_MS;
+            alc_hub_common::evtlog::emit(&format!("EVT PAIR_ARMED {}", PAIR_ARM_MS / 1_000));
         }
+        // 受付時間が切れた: 1 回だけ知らせる (Pages が結果表示を終えられるように)
+        if pair_until != 0 && now_ms() >= pair_until {
+            pair_until = 0;
+            alc_hub_common::evtlog::emit("EVT PAIR_TIMEOUT");
+        }
+        let pair_open = pair_until != 0;
 
         // Wi-Fi の接続/スキャン中 + Improv セッション中は BLE スキャンを
         // 止め、コエグジストの電波取り合いで Wi-Fi 側が失敗しないようにする
@@ -325,6 +342,8 @@ async fn task(
                 }
                 match target {
                     Some((_, _, Some(_))) if !omron_enabled => None,
+                    // 受付が開いていないペアリング待ちの広告は見送る (送信広告は拾う)
+                    Some((_, _, Some(OmronAdv::Pairing))) if !pair_open => None,
                     Some((addr, _, Some(OmronAdv::Pairing)))
                         if paired_backoff.iter().any(|(a, _)| *a == addr) =>
                     {
@@ -384,6 +403,17 @@ async fn task(
         // bp_bonded が永久に false のままだった。判定は hub-core の純粋関数が持つ
         if should_remember_bp_bond(kind, omron, matches!(result, Ok(true))) {
             remember_bp_bond(&settings, &addr, &mut bp_bond_rec);
+        }
+        // ペアリングは 1 回やり切ったら受付を閉じる。失敗は開けたままにして、
+        // 機器の `-P-` が続く間の再試行を受け付ける
+        if omron == Some(OmronAdv::Pairing) {
+            if result.is_ok() {
+                pair_until = 0;
+                // bond からその接続での購読・機器側の切断まで通った = ペアリング成立
+                alc_hub_common::evtlog::emit("EVT PAIR_OK");
+            } else {
+                alc_hub_common::evtlog::emit("EVT PAIR_ERR 接続に失敗");
+            }
         }
         match result {
             // データなし: しばらくこの機器への再接続を控える (機器を空ける)。

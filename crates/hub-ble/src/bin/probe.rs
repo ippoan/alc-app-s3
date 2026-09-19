@@ -19,8 +19,43 @@ fn main() -> anyhow::Result<()> {
         ..HubStatus::default()
     }));
     let coex = Arc::new(alc_hub_core::coex::RadioCoex::new());
-    // 起動時に bond は消さない (消すと、ペアリング後の再接続で暗号化できない)
+    // 起動時に bond は消さない (消すと、ペアリング後の再接続で暗号化できない)。
+    // 本番機は hub-drivers の console (`PAIR` → `handle_pair`) が立てるが、この測定用
+    // bin は console を持たないので、シリアルから `PAIR` の 1 行だけ拾う口を置く
     let pair_flag = alc_hub_common::control::new_pair_flag();
+    {
+        use std::io::Read as _;
+        // stdin のブロッキング読み出しに要る (hub-drivers console と同じ)
+        unsafe {
+            let mut cfg = esp_idf_svc::sys::usb_serial_jtag_driver_config_t {
+                tx_buffer_size: 1024,
+                rx_buffer_size: 1024,
+            };
+            esp_idf_svc::sys::usb_serial_jtag_driver_install(&mut cfg);
+            esp_idf_svc::sys::esp_vfs_usb_serial_jtag_use_driver();
+        }
+        let pair_flag = Arc::clone(&pair_flag);
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 32];
+            let mut acc = String::new();
+            loop {
+                match std::io::stdin().lock().read(&mut chunk) {
+                    Ok(0) => esp_idf_svc::hal::delay::FreeRtos::delay_ms(20),
+                    Ok(n) => {
+                        acc.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                        while let Some(nl) = acc.find('\n') {
+                            let line: String = acc.drain(..=nl).collect();
+                            if line.trim().eq_ignore_ascii_case("PAIR") {
+                                pair_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                                println!("OK PAIR");
+                            }
+                        }
+                    }
+                    Err(_) => esp_idf_svc::hal::delay::FreeRtos::delay_ms(100),
+                }
+            }
+        });
+    }
 
     let (meas_tx, meas_rx) = mpsc::channel();
     let (ui_tx, ui_rx) = mpsc::channel();
