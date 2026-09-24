@@ -37,6 +37,13 @@ esp-idf-svc = { version = "0.52", default-features = false, features = [
     "binstart",
 ] }
 
+[features]
+# Vein Station 用 (#272)。LAN なし・USB 1 本で PC につなぐ構成。
+# W5500 (Atomic PoE Base) を起こさず、同じ G7/G8 を FC-1200 の RS232
+# (MAX3232 経由、TX=G7 / RX=G8) に回す。ws_uplink と NTP も起こさない —
+# 測定値と打刻は USB の行 (JSON / `EVT …`) だけで host へ出す
+station = []
+
 [build-dependencies]
 embuild = "0.33"
 
