@@ -132,6 +132,12 @@ jobs:
           - { name: atoms3-timecard,
               cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard cargo check --release --locked -p alc-hub-atoms3-timecard",
               cache_key: build-timecard-s3r }
+          # Vein Station (#272): 上の timecard の `station` feature 版 (LAN なし、
+          # G7/G8 を W5500 ではなく FC-1200 の RS232 に回す)。sdkconfig は同じなので
+          # cache_key も同じ。足さないと cfg の片側を誰もコンパイルしない
+          - { name: atoms3-timecard-station,
+              cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard cargo check --release --locked -p alc-hub-atoms3-timecard --features station",
+              cache_key: build-timecard-s3r }
           # 点呼端末の警告デバイス (#135)。同じ本番機 (Atom VoiceS3R) だが
           # sdkconfig は timecard とも違う (W5500 と NFC の legacy 衝突回避を落とし、
           # 音と PSRAM だけ残した) ため cache_key は**新規**。使い回すと

@@ -79,6 +79,16 @@
 //! (OFF のまま起動したときは `EVT BLE_DISABLED` を出す)。CoreS3 は BLE を常に
 //! 起こすので再起動不要 — 差は「打刻端末では血圧が従」であることから来る。
 //!
+//! # Vein Station (`station` feature、#272)
+//!
+//! LAN なし・USB 1 本で Windows PC につなぐ構成。**W5500 を起こさず**、同じ
+//! G7/G8 を FC-1200 の RS232 (MAX3232 経由、TX=G7 / RX=G8、9600 8N1) に回す。
+//! FC-1200 のドライバは CoreS3 と同じ `rs232` で、測定値は `recorder` が
+//! JSON 行で USB へ出す (血圧計の有無に関わらず常時起動)。**ws_uplink と NTP は
+//! 起こさない** — LAN が無いので送信キューが NVS に溜まり続けるだけになる。
+//! 送信キューの受け側はメインループで読み捨てる。bin 名と `HostKind` は PoE 版と
+//! 同じなので、起動時の `EVT STATION …` で見分ける。
+//!
 //! # 起動順 (変えてはいけない)
 //!
 //! `crashlog::init` → `Settings::new` → `heap::start` → `console::start` →
@@ -97,14 +107,20 @@ use alc_hub_common::{
 use alc_hub_drivers::nfc::NfcEvent;
 use alc_hub_drivers::speaker::Sound;
 use alc_hub_drivers::timecard::Punch;
-use alc_hub_drivers::{crashlog, es8311, eth_w5500, heap, nfc, ntp, recorder, speaker, ws_uplink};
+use alc_hub_drivers::{crashlog, es8311, heap, nfc, recorder, speaker};
+#[cfg(feature = "station")]
+use alc_hub_drivers::rs232;
+#[cfg(not(feature = "station"))]
+use alc_hub_drivers::{eth_w5500, ntp, ws_uplink};
 use anyhow::Result;
+#[cfg(not(feature = "station"))]
 use esp_idf_svc::eventloop::EspSystemEventLoop;
+#[cfg(not(feature = "station"))]
+use esp_idf_svc::hal::spi::{config::DriverConfig as SpiDriverConfig, Dma, SpiDriver};
 use esp_idf_svc::hal::{
     delay::FreeRtos,
     i2c::{config::Config as I2cConfig, I2cDriver},
     peripherals::Peripherals,
-    spi::{config::DriverConfig as SpiDriverConfig, Dma, SpiDriver},
     units::Hertz,
 };
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
@@ -127,6 +143,7 @@ fn main() -> Result<()> {
     );
 
     let p = Peripherals::take()?;
+    #[cfg(not(feature = "station"))]
     let sysloop = EspSystemEventLoop::take()?;
 
     // NVS (device credential 等の永続設定)
@@ -161,15 +178,17 @@ fn main() -> Result<()> {
     let (ui_tx, ui_rx) = mpsc::channel();
     let recorder_ui_tx = ui_tx.clone();
     let ui_tx_for_ble = ui_tx.clone();
+    #[cfg(feature = "station")]
+    let rs232_ui_tx = ui_tx.clone();
     // boot_id は NTP 未同期で記録した測定の時刻補正に使う (ws_uplink.rs)。
     // **打刻は時刻が命**なので、この補正は本機でこそ効く
-    let boot_id = settings.next_boot_id();
+    #[cfg(not(feature = "station"))]
     ws_uplink::start(
         ws_meas_rx,
         ui_tx,
         Arc::clone(&status),
         settings.clone(),
-        boot_id,
+        settings.next_boot_id(),
     )?;
 
     // 前回がクラッシュ由来なら panic 前ログを kind=crash_log で送信キューへ
@@ -180,6 +199,7 @@ fn main() -> Result<()> {
     // W5500 (Atomic PoE Base): SCLK=G5 / MISO=G7 / MOSI=G8 / CS=G6。
     // DMA 必須 — 無効だと SPI 転送が 64 バイト上限になり、Ethernet フレーム
     // (最大 ~1.5KB) の read/write が "spi transmit failed" で全滅する
+    #[cfg(not(feature = "station"))]
     let spi = SpiDriver::new(
         p.spi2,
         p.pins.gpio5,
@@ -188,7 +208,9 @@ fn main() -> Result<()> {
         &SpiDriverConfig::new().dma(Dma::Auto(4096)),
     )?;
     // leak して 'static 参照で渡す (eth_w5500::start の doc コメント参照)
+    #[cfg(not(feature = "station"))]
     let spi: &'static SpiDriver<'static> = Box::leak(Box::new(spi));
+    #[cfg(not(feature = "station"))]
     eth_w5500::start(spi, p.pins.gpio6.into(), None, sysloop, Arc::clone(&status))?;
 
     // 内蔵オーディオ (ES8311 + NS4150B、issue #154)。**打刻音はこの端末で
@@ -264,10 +286,11 @@ fn main() -> Result<()> {
     //
     // 起動時の設定で立てるかどうかを決める理由と、OFF → ON に再起動が要ることは
     // このファイル冒頭の「血圧計」節を参照
-    if omron_bp {
-        let (meas_tx, meas_rx) = mpsc::channel();
-        // 測定値レコーダ (BLE の notify コールバックを軽量に保つ専用スレッド)。
-        // 本機に画面も alc-gw への生中継も無いので UI は捨て、GW は None
+    let (meas_tx, meas_rx) = mpsc::channel();
+    // 測定値レコーダ (BLE の notify コールバックを軽量に保つ専用スレッド)。
+    // 本機に画面も alc-gw への生中継も無いので UI は捨て、GW は None。
+    // station は FC-1200 の測定値もここを通すので血圧計の有無に関わらず起こす
+    if omron_bp || cfg!(feature = "station") {
         recorder::start(
             meas_rx,
             recorder_ui_tx,
@@ -276,6 +299,8 @@ fn main() -> Result<()> {
             ws_for_bp,
             None,
         )?;
+    }
+    if omron_bp {
         // 再ペアリング要求は console の `PAIR` (Pages の「血圧計を再ペアリング」) が
         // 立てる。**起動時にボンドを消さない**ことが大事 (probe bin の作法を持ち込むと
         // 毎回ペアリングし直しになる)
@@ -284,7 +309,7 @@ fn main() -> Result<()> {
         let coex = Arc::new(alc_hub_core::coex::RadioCoex::new());
         alc_hub_ble::start(
             Arc::clone(&status),
-            meas_tx,
+            meas_tx.clone(),
             ui_tx_for_ble,
             coex,
             Arc::clone(&pair_flag),
@@ -297,12 +322,28 @@ fn main() -> Result<()> {
         alc_hub_common::evtlog::emit("EVT BLE_DISABLED omron_bp=0");
     }
 
+    // FC-1200 (RS232、MAX3232 経由): TX=G7 / RX=G8。PoE 版では W5500 の
+    // MISO/MOSI に使っているピン。ドライバは CoreS3 と共有の rs232
+    #[cfg(feature = "station")]
+    {
+        rs232::start(
+            p.uart1,
+            p.pins.gpio7,
+            p.pins.gpio8,
+            Arc::clone(&status),
+            meas_tx,
+            rs232_ui_tx,
+        )?;
+        alc_hub_common::evtlog::emit("EVT STATION RS232 TX=G7 RX=G8 LAN=0");
+    }
+
     // SNTP。**打刻端末では必須** — 起動しないとシステム時刻が 1970 のままで、
     // 打刻の `recorded_at_ms` が 1970 起点で送られる (範囲内なので DB 側で NULL
     // にもならず、静かに 55 年ずれた打刻が入る)。`ws_uplink` の
     // `should_wait_for_clock` は 60 秒待って諦め、`fix_unsynced_times` は
     // 「あとで同期したら補正する」仕組みなので、同期が来なければ永久に発火しない。
     // **ここで即起動してはいけない** — 理由は ntp::start_when_online の doc
+    #[cfg(not(feature = "station"))]
     let mut sntp = None;
 
     // メインループ: SNTP の遅延起動と UiCommand の読み捨てだけ (ホスト向け
@@ -312,6 +353,11 @@ fn main() -> Result<()> {
         // 画面が無いので UiCommand は捨てる。**捨てないと溜まり続ける**
         // (受け側は上のとおり drop できない)
         while ui_rx.try_recv().is_ok() {}
+        // station は ws_uplink を起こさないので送信キューも同じく読み捨てる
+        // (drop すると打刻の送信失敗扱いで打刻音が鳴らなくなる)
+        #[cfg(feature = "station")]
+        while ws_meas_rx.try_recv().is_ok() {}
+        #[cfg(not(feature = "station"))]
         ntp::start_when_online(
             &mut sntp,
             status.lock().map(|s| !s.lan_ip.is_empty()).unwrap_or(false),
