@@ -14,7 +14,8 @@
 //! | コマンド | 説明 |
 //! |---|---|
 //! | `PING` | 疎通確認。`PONG` を返す |
-//! | `DEVICE` | `DEVICE cores3 VER=<version> BOARD=cores3\|cores3se` を返す (機種識別 + 板種、共通実装 `console::handle_common`) |
+//! | `DEVICE` | `DEVICE cores3 VER=<version> BOARD=cores3\|cores3se FLAVOR=cores3\|cores3-wifi` を返す (機種識別 + 板種 + ビルド種別、共通実装 `console::handle_common`) |
+//! | `OTA SERIAL <size> <flavor>` / `OTA CONFIRM` | シリアル OTA (Refs #279)。**CoreS3 は受けない** (`ERR UNSUPPORTED`) — 生バイトの受信と確定待ちの見張りを持つのはタイムカード端末だけ (`console::handle_ota_serial`) |
 //! | `QR <payload> [timeout_s]` | QR コード画面を表示 (顔認証後のトークン等) |
 //! | `MEASURE` | 測定中画面を表示 |
 //! | `RESULT OK\|NG [value]` | 測定結果画面を表示 (value 例: `0.000`) |
@@ -84,8 +85,11 @@ use crate::console;
 /// `EVT IMPROV_UNAVAILABLE` を出したか (Improv を持たないビルドで 1 回だけ出す)
 static IMPROV_UNAVAILABLE_SENT: AtomicBool = AtomicBool::new(false);
 
-/// `wifi` / `improv` は Wi-Fi を起こさないビルド (`lan`、#217) では `None`
+/// `wifi` / `improv` は Wi-Fi を起こさないビルド (`lan`、#217) では `None`。
+/// `flavor` は root crate が決めたビルド種別の語 (`DEVICE … FLAVOR=`、Refs #279)
+#[allow(clippy::too_many_arguments)]
 pub fn start(
+    flavor: &'static str,
     tx: Sender<UiCommand>,
     status: SharedStatus,
     settings: Settings,
@@ -112,6 +116,7 @@ pub fn start(
                     Ok(n) => {
                         acc.extend_from_slice(&chunk[..n]);
                         drain_buffer(
+                            flavor,
                             &mut acc,
                             &tx,
                             &status,
@@ -132,6 +137,7 @@ pub fn start(
 /// バッファ先頭から処理できる単位 (IMPROV フレーム / テキスト行) を消費する
 #[allow(clippy::too_many_arguments)]
 fn drain_buffer(
+    flavor: &'static str,
     acc: &mut Vec<u8>,
     tx: &Sender<UiCommand>,
     status: &SharedStatus,
@@ -174,7 +180,7 @@ fn drain_buffer(
                 // 応答を必ず行頭から出す (#268)。途中で終わっているログ行が
                 // あっても、ホストの行分割がここで切ってくれる
                 alc_hub_common::hostout::begin_line();
-                handle_line(&line, tx, status, settings, wifi, pair_flag, alarm);
+                handle_line(flavor, &line, tx, status, settings, wifi, pair_flag, alarm);
             }
         }
     }
@@ -184,6 +190,7 @@ fn drain_buffer(
 /// 副作用 (画面遷移・NVS 保存・応答出力) はここで行う。
 #[allow(clippy::too_many_arguments)]
 fn handle_line(
+    flavor: &'static str,
     line: &str,
     tx: &Sender<UiCommand>,
     status: &SharedStatus,
@@ -210,7 +217,9 @@ fn handle_line(
 
     // 機種に依らないコマンド (PING / HEAP / LOG / AUTH / WS) は共通実装へ。
     // 捌かれなかったものだけがここへ落ちてくる (console.rs 参照)
-    let Some(command) = console::handle_common(command, status, settings, HostKind::CoreS3) else {
+    let Some(command) =
+        console::handle_common(command, status, settings, HostKind::CoreS3, flavor)
+    else {
         return;
     };
     // BLE 血圧計の設定 (`OMRON BP` / `OMRON STATUS`) も共通実装へ。
@@ -428,6 +437,11 @@ fn handle_line(
         // 印刷系は AtomS3 印刷ブリッジ (atoms3-print) 専用 (#38)。CoreS3 は
         // プリンター配線を持たないため未対応と明示する
         HostCommand::Print { .. } | HostCommand::PrinterAddr { .. } | HostCommand::PrinterStatus => {
+            println!("ERR UNSUPPORTED ({})", HostKind::CoreS3.label());
+        }
+        // シリアル OTA はタイムカード端末専用 (Refs #279)。本機の reader は生バイトの
+        // 受信を持たず、確定待ちの見張りも立てない (console::handle_ota_serial の doc)
+        HostCommand::OtaSerial { .. } | HostCommand::OtaConfirm => {
             println!("ERR UNSUPPORTED ({})", HostKind::CoreS3.label());
         }
         // console::handle_common が捌いたはずのもの (到達しない)

@@ -28,6 +28,8 @@ CoreS3 (`cores3`) はこれに `FC1200` (RS232 パススルー) / `CFG` (設定
 [ble-medical-gateway](https://github.com/ippoan/ble-medical-gateway) の
 シリアル JSON 互換) が加わる。
 
+タイムカード端末 (`timecard`) は `OTA` (シリアル OTA の応答、§6) が加わる。
+
 Vein Station の `vein` build (`timecard`) は `VEIN` (指静脈の特徴量、§4 の
 `VEIN CAPTURE`) が加わる。**この行は 2 千文字を超える** (特徴量 0x448 バイトなら
 2192 文字の 16 進) — ホストは行の長さで切り捨てないこと。
@@ -48,7 +50,7 @@ Vein Station の `vein` build (`timecard`) は `VEIN` (指静脈の特徴量、�
 ## 2. `DEVICE` — 機種の名乗り
 
 ```
-DEVICE <kind> VER=<version> [BOARD=<board>]
+DEVICE <kind> VER=<version> [BOARD=<board>] FLAVOR=<flavor>
 ```
 
 ★ **ブラウザ側 (`ippoan/alc-app`) はこれで機種を識別する。先頭 2 トークン
@@ -68,6 +70,22 @@ DEVICE <kind> VER=<version> [BOARD=<board>]
 `BOARD=` は板種 (`cores3` / `cores3se`) が複数ある機種だけが足す。今のところ
 CoreS3 だけ (`crates/hub-core/src/board.rs`)。板種は起動後に変わらないので、
 状態ではなく名乗りの側に載せる。
+
+`FLAVOR=` はビルド種別 (Refs #279)。**全機種が常に末尾に付ける** — ホストは
+2 語目 (`<kind>`) を読み、それ以降は `KEY=` で拾うこと (語の位置や行末で
+固定しない)。同じ `<kind>` でもビルドによって流し込むイメージが違うので、
+シリアル OTA (§6) のホストはこれで選ぶ。語は各機種の crate が決める:
+
+| `<flavor>` | ビルド |
+|---|---|
+| `cores3` | CoreS3 の LAN 版 (既定 feature。dev の `mem-hud` も同じ) |
+| `cores3-wifi` | CoreS3 の Wi-Fi 版 (`lan` feature 無し) |
+| `atoms3-print` | 印刷ブリッジ |
+| `timecard` | タイムカード端末 (LAN 版) |
+| `timecard-station` | 同 `station` feature (Vein Station、LAN 無し) |
+| `timecard-vein` | 同 `vein` feature (`station` + 指静脈) |
+| `alarm` | 警告デバイス |
+| `bp-station` | 測定台 |
 
 全機種が [`handle_common`](#5-どこに実装が在るか) の共通実装 1 本で答えるので、
 新しい機種を足すときもここに書き足す必要はない。
@@ -93,8 +111,9 @@ CoreS3 の `STATUS LAN=…` も同様 (行頭は互換のため変えない)。
 
 ## 4. 共通コマンド (どの機種が何に答えるか)
 
-行の連結順は `spawn_reader` → `handle_common` → `handle_omron` → `handle_pair`
-→ 機種固有分岐 → 最後まで捌かれなければ `ERR UNSUPPORTED (<kind>)`。
+行の連結順は `spawn_reader` → `handle_common` → (`timecard` だけ `handle_ota_serial`)
+→ `handle_omron` → `handle_pair` → 機種固有分岐 → 最後まで捌かれなければ
+`ERR UNSUPPORTED (<kind>)`。
 
 | コマンド | `handle_common` (全機種共通) |
 |---|---|
@@ -157,14 +176,19 @@ ippoan/vein-match#20)。**モジュールは実機で未確認** — 手順は
 - 印刷ブリッジ: [`crates/atoms3-print/src/console.rs`](../crates/atoms3-print/src/console.rs) の doc
 - タイムカード端末: [`crates/atoms3-timecard/src/console.rs`](../crates/atoms3-timecard/src/console.rs) の doc
 - 警告デバイス: [`crates/atoms3-alarm/src/console.rs`](../crates/atoms3-alarm/src/console.rs) の doc
-- 測定台 (`bp-station`): `OTA` を含め機種固有コマンドを持たない (共通実装のみ)
+- 測定台 (`bp-station`): `OTA` / `OTA SERIAL` を含め機種固有コマンドを持たない (共通実装のみ)
+
+`OTA SERIAL` / `OTA CONFIRM` (§6) に答えるのは `timecard` だけ。他の機種は
+`ERR UNSUPPORTED (<kind>)` を返す (`OTA ` で始まらないので、§6 のホストは
+応答が無いまま時間切れで諦める)。
 
 ## 5. どこに実装が在るか
 
 | | ファイル |
 |---|---|
 | 行解析 (純粋・テスト済み) | [`crates/hub-core/src/protocol.rs`](../crates/hub-core/src/protocol.rs) |
-| 共通実装 (`handle_common` / `handle_omron` / `handle_pair` / `start_common`) | [`crates/hub-drivers/src/console.rs`](../crates/hub-drivers/src/console.rs) |
+| 共通実装 (`handle_common` / `handle_ota_serial` / `handle_omron` / `handle_pair` / `start_common`) | [`crates/hub-drivers/src/console.rs`](../crates/hub-drivers/src/console.rs) |
+| シリアル OTA の書き込み・確定・戻し (§6) | [`crates/hub-drivers/src/ota.rs`](../crates/hub-drivers/src/ota.rs) |
 | 機種の語彙 (`HostKind`: label / `AUTH TICKET` 可否 / `BOARD=` 要否) | [`crates/hub-core/src/protocol.rs`](../crates/hub-core/src/protocol.rs) の `HostKind` |
 | CoreS3 固有分 | [`crates/hub-drivers/src/host_link.rs`](../crates/hub-drivers/src/host_link.rs) |
 | 印刷ブリッジ固有分 | [`crates/atoms3-print/src/console.rs`](../crates/atoms3-print/src/console.rs) |
@@ -175,3 +199,53 @@ ippoan/vein-match#20)。**モジュールは実機で未確認** — 手順は
 **新しい機種のコンソールを丸写しで作らないこと** — とくに `AUTH SET`
 (device credential を NVS へ書く口) や `OMRON BP` の応答文言を機種ごとに
 増やすと、provisioning や `/device/setup` の挙動が機種ごとに割れる。
+
+## 6. シリアル OTA (`OTA SERIAL` / `OTA CONFIRM`)
+
+LAN も Wi-Fi も無い `timecard-station` を、USB でつながった運行者 PC の
+ブラウザ (キオスク PWA、`ippoan/alc-app` の `web/`) から更新する口 (Refs #279)。
+ブラウザが Pages (`https://ippoan.github.io/alc-app-s3/…`) から取った app 単体
+イメージを Web Serial で**動作中の app** に流し込み、app が裏スロットへ書いて
+再起動する。bootloader には入れないので NVS (登録・設定) は残る。
+
+ホスト → 端末の行は `\n` で終わり、端末 → ホストの行は CRLF で終わる。
+`EVT …` やログの行が間に混ざるので、**ホストは `OTA ` で始まる行だけを見る**。
+
+1. ホスト: `OTA SERIAL <size> <flavor>` — `<size>` はイメージのバイト数 (10 進)、
+   `<flavor>` は §2 の語
+2. 端末: 受け入れたら `OTA READY 4096` (数字はチャンク長)。断るときは `OTA ERR <reason>`:
+
+   | `<reason>` | 意味 |
+   |---|---|
+   | `flavor` | 自分のビルドと flavor が違う |
+   | `size` | 256 KiB (`MIN_IMAGE_BYTES`) 未満か、次のスロット長を超える |
+   | `busy` | 別の OTA (HTTP 版の `OTA <url>` / WS の `ota` を含む) が走っている |
+   | `begin` | `esp_ota_begin` に失敗した |
+
+3. ホスト: 生のバイト列を 4096 B ずつ送る (最後は端数)。**`OTA ACK` を受けてから
+   次を送る** (stop-and-wait)
+4. 端末: 1 チャンクを flash に書くたびに `OTA ACK <累計バイト数>`
+   - 書き込みに失敗したら `OTA ERR write`
+   - 10 秒バイトが来なければ `OTA ERR timeout`
+   - どちらもスロットは切り替えず、行モードへ戻る (続けて次の `OTA SERIAL` を送ってよい)
+5. 端末: `size` バイトを受け切ったら esp_image を検証する
+   - 成功: NVS に「確定待ち」の印を立て、`OTA OK` を返し、約 500 ms 後に再起動する
+   - 失敗: `OTA ERR verify` (スロットは切り替えない)
+6. 再起動後: ホストは再接続して `DEVICE` を送る → `DEVICE timecard VER=<ver> FLAVOR=timecard-station`
+7. ホスト: FLAVOR が期待どおりなら `OTA CONFIRM` を送る
+8. 端末: 確定待ちなら確定して印を消し、`OTA CONFIRMED` を返す
+   - 確定待ちでなくても `OTA CONFIRMED` を返す (冪等)
+   - 印があるのに起動から 10 分 (`OTA_VERIFY_TIMEOUT_MS`) 以内に `OTA CONFIRM` が
+     来なければ、前の image へ戻す。戻った先の起動で
+     `EVT OTA_ROLLED_BACK … reason=serial_unconfirmed` が出る
+   - 起動時に確定待ちなら `EVT OTA_SERIAL_PENDING slot=<label> timeout_ms=600000` が出る
+
+- 版 (`VER`) の一致は「更新するか」の判定にだけ使う。確定の条件にはしない
+- 印の無い未確定 (web インストーラ / `espflash` で入れた機) には何もしない
+- `READY` の後のバイトは行に分けずに受けるので、途中に `\r` / `\n` があってもよい
+  (受信は #277 で無変換)
+
+**既知の限界**: 新しい app が起動直後に落ちる (確定の口までたどり着かない) と戻らない —
+web インストーラの bootloader (espflash 同梱の `boot.bin`) は rollback を持たず、
+確定も戻しも app が行うため。USB はつながっているので、web インストーラで焼き直して
+復旧する。

@@ -43,6 +43,10 @@ const KEY_RESET_HIST: &str = "reset_hist";
 /// OTA 直後の image を前の image へ戻したときの証跡 (1 行の文字列、Refs #217)。
 /// 戻す直前に書き、戻った先の起動で ws_uplink::start が EVT に出して消す
 const KEY_OTA_ROLLBACK: &str = "ota_rollback";
+/// シリアル OTA (`OTA SERIAL`) で入れた image が `OTA CONFIRM` を待っている印
+/// (u8、Refs #279)。書いた直後の起動で 10 分以内に確定されなければ前の image に
+/// 戻す (`alc_hub_drivers::ota::spawn_serial_confirm_watch`)
+const KEY_OTA_SERIAL: &str = "ota_serial";
 /// cf-alc-recorder WS URL の上書き (`WS URL` コマンド)
 const KEY_WS_URL: &str = "ws_url";
 /// プリンター宛先 host:port (印刷ブリッジ、`PRINTER ADDR` コマンド。#38)
@@ -326,6 +330,26 @@ impl Settings {
             log::warn!("settings: ota_rollback 削除失敗: {e:?}");
         }
         (!note.is_empty()).then_some(note)
+    }
+
+    /// シリアル OTA の確定待ちの印が立っているか (Refs #279)。未設定は false
+    pub fn ota_serial_pending(&self) -> bool {
+        self.nvs
+            .lock()
+            .ok()
+            .and_then(|nvs| nvs.get_u8(KEY_OTA_SERIAL).ok().flatten())
+            .map_or(false, |v| v != 0)
+    }
+
+    /// シリアル OTA の確定待ちの印を立てる / 消す (Refs #279)
+    pub fn set_ota_serial_pending(&self, pending: bool) -> Result<()> {
+        let nvs = self.nvs.lock().expect("settings nvs lock");
+        if pending {
+            nvs.set_u8(KEY_OTA_SERIAL, 1)?;
+        } else {
+            nvs.remove(KEY_OTA_SERIAL)?;
+        }
+        Ok(())
     }
 
     /// WS 送信の seq 採番カウンタ (未保存は 0)
