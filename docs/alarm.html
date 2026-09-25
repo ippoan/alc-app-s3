@@ -200,6 +200,8 @@
             <li><code>HB OK</code> — 手で 1 回ぶんの「正常」を送る (鳴っていれば止まります)</li>
             <li><code>HB NG signaling</code> — 手で「着信を受けられない」を送る (鳴り始めます)</li>
             <li><code>HB OK call=1</code> — 手で「着信」を送る (鳴り始めます)</li>
+            <li><code>HB OFF</code> — 監視停止。<code>OK HB OFF</code> を返し、次の <code>HB</code> が届くまで鳴りません
+                (電源を入れ直すと、起動から 30 秒で鳴る通常の監視に戻ります)</li>
             <li><code>PING</code> — <code>PONG</code> 応答</li>
             <li><code>LOG DUMP</code> — 起動直後のログ (USB 接続前に流れた分も残ります)</li>
         </ul>

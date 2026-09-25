@@ -302,7 +302,12 @@
             </label>
             <button id="wifi-test" style="padding: 10px 16px; border-radius: 8px; border: none; background: #2e7d32; color: white; font-size: 15px; cursor: pointer;">Wi-Fi 接続テスト</button>
             <button id="ble-pair" style="padding: 10px 16px; border-radius: 8px; border: none; background: #6a1b9a; color: white; font-size: 15px; cursor: pointer;">血圧計を再ペアリング</button>
+            <button id="hb-off" style="padding: 10px 16px; border-radius: 8px; border: none; background: #e65100; color: white; font-size: 15px; cursor: pointer;">警告音を止める（監視停止）</button>
         </div>
+        <p style="font-size: 13px; color: #666; margin-top: 4px;">
+            「警告音を止める」は、運行者 PWA からの連絡が途切れて鳴る沈黙警告を止めます（<code>HB OFF</code>）。
+            次に PWA が連絡してくるまで鳴りません。PWA を繋がずに検証・設置替えをするときに使います。
+        </p>
         <p style="font-size: 13px; color: #666; margin-top: 4px;">
             血圧計 (ニプロ NBP-1BLE / オムロン HCR-1901T2 等) は暗号化リンク（ボンディング）が必要です。
             <strong>ペアリングはこのボタンを押した時だけ</strong>行われます（押していない間は、そばで
@@ -606,6 +611,16 @@
                 } else {
                     cfgOut.textContent = 'ペアリング失敗: ' + row.replace(/^EVT PAIR_ERR\s*/, '');
                 }
+            } catch (e) { cfgOut.textContent = '失敗: ' + e.message; }
+        });
+
+        document.getElementById('hb-off').addEventListener('click', async () => {
+            try {
+                cfgOut.textContent = 'ポート選択 → 監視を止めています...';
+                const row = await serialCommand('HB OFF', ['OK HB OFF', 'ERR'], 3000);
+                cfgOut.textContent = row === 'OK HB OFF'
+                    ? '警告音を止めました (次に運行者 PWA が繋がるまで鳴りません)'
+                    : (row || '応答なし。ポート・ファーム版を確認してください');
             } catch (e) { cfgOut.textContent = '失敗: ' + e.message; }
         });
 

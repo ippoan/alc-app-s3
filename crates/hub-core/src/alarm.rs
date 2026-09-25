@@ -308,6 +308,21 @@ impl AlarmMonitor {
         self.silence_deadline_override = grace.map(|secs| now_ms + u64::from(secs) * 1_000);
     }
 
+    /// 監視停止 (`HB OFF`)。**次の heartbeat まで鳴らない**未武装に戻す —
+    /// [`Self::with_boot_grace(None)`](Self::with_boot_grace) と同じ判定になり、
+    /// 起動猶予も捨てる (VoiceS3R でも猶予切れで鳴り直さない)。鳴動中・黙らせ中でも
+    /// 即 Idle にする。解除の合図音は出さない (人が止めたので「直った」ではない)
+    pub fn disarm(&mut self) {
+        self.state = State::Idle;
+        self.last_hb_at = None;
+        self.boot_grace_ms = None;
+        self.silence_deadline_override = None;
+        self.button_pending = false;
+        self.hb_ok = true;
+        self.hb_reason = None;
+        self.hb_call = false;
+    }
+
     /// 本体ボタン (VoiceS3R は G41) が押された。**トグル** — 鳴動中なら黙らせ、
     /// 黙らせているあいだに押されたら鳴動へ戻す。
     ///
@@ -571,6 +586,44 @@ mod tests {
             m.status_line(BOOT_GRACE_MS),
             "STATUS alarm state=alarming cause=silence hb_age_ms=-"
         );
+    }
+
+    #[test]
+    fn disarm_stops_the_alarm_until_the_next_heartbeat() {
+        let mut m = AlarmMonitor::new();
+        m.on_heartbeat(1_000, true, None, false);
+        let t = 1_000 + SILENCE_MS;
+        assert_eq!(
+            m.tick(t),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+        );
+        // 鳴動中でも即 Idle。解除の合図音は出さない
+        m.disarm();
+        assert_eq!(
+            m.status_line(t),
+            "STATUS alarm state=idle cause=none hb_age_ms=-"
+        );
+        // 起動猶予も捨てるので、いくら待っても鳴らない (出るのはバナーだけ)
+        assert_eq!(m.tick(t + BOOT_GRACE_MS * 10), vec![emit("idle", "none")]);
+        // 次の heartbeat で武装し直し、途切れればまた鳴る
+        let hb = t + BOOT_GRACE_MS * 10;
+        m.on_heartbeat(hb, true, None, false);
+        assert_eq!(
+            m.tick(hb + SILENCE_MS),
+            vec![Action::PlaySilenceTick, emit("alarming", "silence")]
+        );
+    }
+
+    #[test]
+    fn disarm_drops_the_pending_tap() {
+        let mut m = AlarmMonitor::with_boot_grace(None);
+        m.on_heartbeat(0, false, Some("serial"), true);
+        m.tick(0);
+        assert!(m.request_button());
+        m.disarm();
+        // 予約していたタップも捨てる (Idle で on_button が走らない)
+        assert_eq!(m.tick(1), vec![]);
+        assert!(!m.request_button());
     }
 
     #[test]

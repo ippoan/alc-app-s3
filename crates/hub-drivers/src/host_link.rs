@@ -272,6 +272,10 @@ fn handle_line(
         } => {
             crate::alarm::apply_heartbeat(alarm, ok, reason.as_deref(), call, grace);
         }
+        HostCommand::HeartbeatOff => {
+            crate::alarm::disarm(alarm);
+            println!("OK HB OFF");
+        }
         // ★ 機種識別は `DEVICE` (共通実装 `handle_common`) を見ること — 正本は
         //   docs/console-protocol.md。行頭 (`STATUS LAN=…`) は互換のため変えない
         //   こと。鳴動状態は行末に足す (#187、Refs ippoan/alc-app#353)

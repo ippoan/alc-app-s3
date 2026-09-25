@@ -234,6 +234,10 @@ pub enum HostCommand {
         call: bool,
         grace: Option<u16>,
     },
+    /// 監視停止 (`HB OFF`、`OK HB OFF` を返す)。沈黙警告を**次の `HB OK` まで
+    /// 鳴らない**未武装に戻し、USB/JTAG reset を跨いで残す武装フラグも消す
+    /// (検証や設置替えで PWA を繋がないときに鳴り続けるのを止める)
+    HeartbeatOff,
     /// 指静脈モジュールで読み取る (ippoan/vein-match#20)。成功は 1 行の
     /// `VEIN CHARA <hex>`、失敗は `ERR VEIN <reason>` ([`crate::vein`])。
     /// `vein` feature を持たないビルドは `ERR VEIN: unsupported`
@@ -470,7 +474,13 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
             let ok = match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
                 Some("OK") => true,
                 Some("NG") => false,
-                _ => return Err("ERR HB: OK|NG が必要です".into()),
+                Some("OFF") => {
+                    if let Some(tok) = it.next() {
+                        return Err(format!("ERR HB: 余分なトークンです: {tok}"));
+                    }
+                    return Ok(Some(HostCommand::HeartbeatOff));
+                }
+                _ => return Err("ERR HB: OK|NG|OFF が必要です".into()),
             };
             let mut reason: Option<String> = None;
             let mut call = false;
@@ -1237,8 +1247,15 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_off() {
+        assert_eq!(parse_line("HB OFF", T), Ok(Some(HostCommand::HeartbeatOff)));
+        assert_eq!(parse_line("hb off", T), Ok(Some(HostCommand::HeartbeatOff)));
+        assert!(parse_line("HB OFF call=1", T).is_err());
+    }
+
+    #[test]
     fn heartbeat_rejects_bad_tokens() {
-        // OK|NG が要る
+        // OK|NG|OFF が要る
         assert!(parse_line("HB", T).is_err());
         assert!(parse_line("HB MAYBE", T).is_err());
         // reason は EVT ALARM cause=ng:<reason> に素通しで出るので厳しく検査する
