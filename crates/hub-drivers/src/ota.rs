@@ -8,6 +8,8 @@
 //!
 //! イメージは espflash save-image の **app 単体イメージ** (merged ではない)。
 //! CI が GitHub Pages の `firmware/alc-hub-cores3-app.bin` に公開する。
+//! Wi-Fi 版 (`lan` 無し) は [`use_wifi_image`] により、送られてきた URL を
+//! `alc-hub-cores3-wifi-app.bin` へ読み替えて Wi-Fi 経由で取りにいく。
 //!
 //! 安全装置:
 //! - `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` + 初回の WS 接続での
@@ -100,6 +102,14 @@ const PROGRESS_STEP: usize = 64 * 1024;
 /// エラー通知を送れるようにするため (clone して両方に配る)。
 pub type ProgressSink = std::sync::Arc<dyn Fn(String) + Send + Sync>;
 
+static WIFI_IMAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// CoreS3 の Wi-Fi 版 (`lan` 無し) が起動時に呼ぶ。以後の OTA は送られてきた
+/// LAN 版 / dev 版の URL を Wi-Fi 版のイメージへ読み替える (hub-core ota_image)
+pub fn use_wifi_image() {
+    WIFI_IMAGE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// 現在実行中のパーティションラベル ("ota_0" 等)。
 pub fn running_slot() -> String {
     unsafe {
@@ -118,6 +128,11 @@ pub fn running_slot() -> String {
 /// 現行 FW のまま続行する。`progress` は WS 経路での遠隔進捗表示用 (シリアル
 /// 経路では None、進捗は EVT OTA_* のみ)。
 pub fn spawn_update(url: String, status: SharedStatus, progress: Option<ProgressSink>) {
+    let url = if WIFI_IMAGE.load(std::sync::atomic::Ordering::Relaxed) {
+        alc_hub_core::ota_image::wifi_image_url(&url)
+    } else {
+        url
+    };
     // スレッド本体へ move するのは clone の方。起動失敗 (spawn Err) 時に
     // 呼び出し元スコープの `progress` でエラー通知を送るため元を残す
     // (以前は progress を直接 move していたため、スレッド起動自体が失敗すると

@@ -1,0 +1,16 @@
+{
+  "name": "alc-hub CoreS3 (Wi-Fi)",
+  "version": "0.1.0",
+  "home_assistant_domain": "",
+  "funding_url": "",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "firmware/alc-hub-cores3-wifi-boot.bin", "offset": 0 },
+        { "path": "firmware/alc-hub-cores3-wifi-main.bin", "offset": 65536 }
+      ]
+    }
+  ]
+}
