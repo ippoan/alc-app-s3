@@ -71,6 +71,10 @@ fn handle_line(line: &str, monitor: &SharedMonitor, status: &SharedStatus, setti
         } => {
             alarm::apply_heartbeat(monitor, ok, reason.as_deref(), call, grace);
         }
+        HostCommand::HeartbeatOff => {
+            alarm::disarm(monitor);
+            println!("OK HB OFF");
+        }
         // `status_line` は `VER=` を含まない (hub-core からは hub-common が
         // 見えないため)。**呼び出し側で末尾に足す**
         HostCommand::Status => {

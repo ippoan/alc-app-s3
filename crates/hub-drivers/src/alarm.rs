@@ -30,7 +30,7 @@
 //! 起動側 (各 bin の main) が **USB/JTAG 起因の reset かつ magic 一致** のときだけ
 //! [`restore_armed_flag`] で拾って武装済み (`with_boot_grace(Some(SILENCE_MS))`)
 //! で生成する。電源断でゴミになるのは magic 不一致で弾く (crashlog の `RING` と
-//! 同じ自己修復の形)。解除経路は元々無いので、クリアもしない。
+//! 同じ自己修復の形)。解除は `HB OFF` ([`disarm`]) だけがフラグごと消す。
 
 use core::mem::MaybeUninit;
 
@@ -58,8 +58,8 @@ fn armed_ptr() -> *mut ArmedFlag {
 }
 
 /// 武装済みを `.noinit` に記録する。heartbeat のたびに呼ぶ (RAM への代入なので
-/// 毎回でよい)。書き手は heartbeat の受け手 1 スレッドだけで、値も単調
-/// (未武装 → 武装) なので排他は要らない
+/// 毎回でよい)。書き手は heartbeat の受け手 1 スレッドだけ (`HB OFF` の
+/// [`disarm`] も同じコンソールのスレッド) なので排他は要らない
 fn store_armed_flag() {
     unsafe {
         let f = armed_ptr();
@@ -78,6 +78,17 @@ pub fn restore_armed_flag() -> bool {
         let f = armed_ptr();
         (*f).magic == ARMED_MAGIC && (*f).armed == 1
     }
+}
+
+/// 監視停止 (`HB OFF`)。判定器を未武装に戻し、`.noinit` の武装フラグも消す —
+/// 残すと次の USB/JTAG reset で武装済みに復元されて鳴り直す
+pub fn disarm(monitor: &SharedMonitor) {
+    unsafe {
+        let f = armed_ptr();
+        (*f).armed = 0;
+        (*f).magic = 0;
+    }
+    with_monitor(monitor, |m, _| m.disarm());
 }
 
 /// 判定器を lock して現在時刻とともに渡す。

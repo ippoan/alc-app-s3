@@ -140,6 +140,15 @@ impl Wifi {
 
     fn scan_inner(&self) -> Result<Vec<ScanEntry>> {
         let mut wifi = self.inner.lock().expect("wifi lock");
+        // 未設定のまま start すると EspWifi の既定 (softAP) で起動し、scan が
+        // 必ず失敗する (保存済み設定が無い初回の Improv で SSID 一覧が空になる)
+        if !matches!(
+            wifi.get_configuration(),
+            Ok(Configuration::Client(_) | Configuration::Mixed(..))
+        ) {
+            wifi.set_configuration(&Configuration::Client(ClientConfiguration::default()))
+                .context("Wi-Fi を STA にできない")?;
+        }
         if !wifi.is_started().unwrap_or(false) {
             wifi.start().context("Wi-Fi start 失敗")?;
             // ドライバ起動直後のスキャンは失敗しやすい
