@@ -129,9 +129,25 @@ impl Improv {
 }
 
 /// バイナリパケットをホストへ送出 (テキストログと同一ストリーム。
-/// ESP Web Tools 側は IMPROV マジックでフレームを拾う)
+/// ESP Web Tools 側は IMPROV マジックでフレームを拾う)。
+///
+/// stdout (VFS) は LF→CRLF 変換するので、フレーム中の 0x0A (長さ 10 の SSID・
+/// チェックサム等) が 2 バイトに化けて壊れる。溜まったログを flush してから
+/// ドライバへ直接書き、変換を通さない
 fn send(packet: &[u8]) {
-    let mut out = std::io::stdout();
-    let _ = out.write_all(packet);
-    let _ = out.flush();
+    let _ = std::io::stdout().flush();
+    let mut rest = packet;
+    while !rest.is_empty() {
+        let n = unsafe {
+            esp_idf_svc::sys::usb_serial_jtag_write_bytes(
+                rest.as_ptr().cast(),
+                rest.len(),
+                100, // ticks。ホストが読んでいなければ諦める
+            )
+        };
+        if n <= 0 {
+            return;
+        }
+        rest = &rest[n as usize..];
+    }
 }

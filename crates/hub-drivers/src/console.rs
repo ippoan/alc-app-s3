@@ -43,6 +43,12 @@ pub fn install_usb_serial_jtag() {
         };
         sys::usb_serial_jtag_driver_install(&mut cfg);
         sys::esp_vfs_usb_serial_jtag_use_driver();
+        // 受信は無変換にする。既定の CR→LF 変換は Improv のバイナリフレーム中の
+        // 0x0D (13 文字のパスワード長など) を書き換え、チェックサム不一致で黙って
+        // 捨てさせていた。テキスト行は take_line が CR/LF どちらでも切る
+        sys::esp_vfs_dev_usb_serial_jtag_set_rx_line_endings(
+            sys::esp_line_endings_t_ESP_LINE_ENDINGS_LF,
+        );
     }
 }
 
