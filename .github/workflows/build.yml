@@ -370,6 +370,20 @@ jobs:
             flash_size: 8mb
             partition_table: crates/atoms3-timecard/partitions.csv
             cache_key: build-timecard-s3r
+          # Vein Station (#272) の `station` feature 版 (LAN なし、シリアル OTA #279)。
+          # 運行者 PC のブラウザ (alc-app web/) が Pages のこの成果物を取り、USB で
+          # station へ流し込む。check leg (135-140) と同じ features・同じ
+          # cache_key (上の timecard leg と共有)。**bin 名が timecard leg と同じ**
+          # なので、出力ファイル名は後段の Rename outputs step で `-station-` を
+          # 挟んで分ける (前例は atoms3-nfc-s3r leg。bin 名衝突を rename outputs で
+          # 分ける形)
+          - name: atoms3-timecard-station
+            bin: alc-hub-atoms3-timecard
+            build_env: 'ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard'
+            cargo_args: '--features station'
+            flash_size: 8mb
+            partition_table: crates/atoms3-timecard/partitions.csv
+            cache_key: build-timecard-s3r
           # 点呼端末の警告デバイス (#135)。dev チャネルは出さない (dev の実体は
           # mem-hud = 画面の HUD で、画面を持たない Atom 系には意味がない)。
           # **ネットワークを持たない機**なので /device/setup のデバイス登録も
@@ -717,6 +731,16 @@ jobs:
           done
           ls -la ${{ matrix.bin }}-s3r-*.bin
 
+      # station leg は timecard leg と**bin 名が同じ**なので、集約 (download-artifact
+      # の merge-multiple) で上書きし合わないようファイル名を分ける (s3r leg と同じ形)
+      - name: Rename outputs (Vein Station leg)
+        if: matrix.name == 'atoms3-timecard-station'
+        run: |
+          for f in ${{ matrix.bin }}-*.bin; do
+            mv "$f" "${f/${{ matrix.bin }}-/${{ matrix.bin }}-station-}"
+          done
+          ls -la ${{ matrix.bin }}-station-*.bin
+
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
@@ -797,6 +821,12 @@ jobs:
           cp alc-hub-atoms3-timecard-main.bin _site/firmware/
           cp alc-hub-atoms3-timecard-merged.bin _site/firmware/
           cp alc-hub-atoms3-timecard-app.bin _site/firmware/
+          # Vein Station (#272) の `station` feature 版 (シリアル OTA #279)。timecard
+          # leg と同じ bin 名なので、build job 側で `-station-` を挟んである
+          cp alc-hub-atoms3-timecard-station-boot.bin _site/firmware/
+          cp alc-hub-atoms3-timecard-station-main.bin _site/firmware/
+          cp alc-hub-atoms3-timecard-station-merged.bin _site/firmware/
+          cp alc-hub-atoms3-timecard-station-app.bin _site/firmware/
           cp alc-hub-atoms3-alarm-boot.bin _site/firmware/
           cp alc-hub-atoms3-alarm-main.bin _site/firmware/
           cp alc-hub-atoms3-alarm-merged.bin _site/firmware/
@@ -827,6 +857,11 @@ jobs:
           # 実体は mem-hud (hub-ui の画面 HUD) で、画面を持たない Atom 系には意味がない
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.timecard_version }}+$SHORT_SHA\"/" \
             docs/manifest-timecard.json > _site/manifest-timecard.json
+          # Vein Station (#272) の station 版 manifest。timecard と同じ crate なので
+          # version は timecard_version を共有する (シリアル OTA #279、パス固定:
+          # 運行者 PC のブラウザ (alc-app web/) がこの URL を直に読む)
+          sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.timecard_version }}+$SHORT_SHA\"/" \
+            docs/manifest-timecard-station.json > _site/manifest-timecard-station.json
           # 点呼端末の警告デバイス (#135)。timecard と同じく **dev チャネルは出さない**
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.alarm_version }}+$SHORT_SHA\"/" \
             docs/manifest-alarm.json > _site/manifest-alarm.json
@@ -835,7 +870,7 @@ jobs:
           # timecard / alarm と同じく **dev チャネルは出さない**
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.nfc_version }}+$SHORT_SHA\"/" \
             docs/manifest-nfc.json > _site/manifest-nfc.json
-          cat _site/manifest.json _site/manifest-dev.json _site/manifest-wifi.json _site/manifest-atoms3-print.json _site/manifest-timecard.json _site/manifest-alarm.json _site/manifest-nfc.json
+          cat _site/manifest.json _site/manifest-dev.json _site/manifest-wifi.json _site/manifest-atoms3-print.json _site/manifest-timecard.json _site/manifest-timecard-station.json _site/manifest-alarm.json _site/manifest-nfc.json
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
