@@ -341,6 +341,13 @@ pub fn handle_common(
                 st.ws_last_seq,
             );
         }
+        // 指静脈 (ippoan/vein-match#20)。読み取りと案内音声は `vein` feature の
+        // 機 (Vein Station) だけが自前の console で捌く。それ以外の全機種は
+        // ここで同じ文言を返す — ホストはこの行で「この端末では使えない」と分かる
+        #[cfg(not(feature = "vein"))]
+        HostCommand::VeinCapture | HostCommand::VeinSay(_) => {
+            println!("{}", alc_hub_core::vein::UNSUPPORTED_LINE)
+        }
         other => return Some(other),
     }
     None

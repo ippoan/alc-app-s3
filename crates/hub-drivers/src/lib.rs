@@ -60,4 +60,9 @@ pub mod task;
 pub mod es8311;
 #[cfg(feature = "speaker")]
 pub mod speaker;
+// 指静脈モジュールの UART2 ドライバ (Vein Station、ippoan/vein-match#20)。
+// 手順の純粋部分は alc_hub_core::vein (host test 付き)。ここは UART と
+// 読み取りスレッド、`VEIN SAY` の音声への取り次ぎだけ
+#[cfg(feature = "vein")]
+pub mod vein;
 pub mod ws_uplink;

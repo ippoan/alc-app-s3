@@ -28,6 +28,10 @@ CoreS3 (`cores3`) はこれに `FC1200` (RS232 パススルー) / `CFG` (設定
 [ble-medical-gateway](https://github.com/ippoan/ble-medical-gateway) の
 シリアル JSON 互換) が加わる。
 
+Vein Station の `vein` build (`timecard`) は `VEIN` (指静脈の特徴量、§4 の
+`VEIN CAPTURE`) が加わる。**この行は 2 千文字を超える** (特徴量 0x448 バイトなら
+2192 文字の 16 進) — ホストは行の長さで切り捨てないこと。
+
 ★ **ファームは応答行・`EVT ` 行を必ず改行から出す** (Refs ippoan/alc-app-s3#268)。
 起動直後は ESP-IDF のログ行が途中でバイトを落とすことがあり、そこへ応答が
 **連結**して既知の接頭辞から外れていた (実測: `…nfc: 待受開始 port=0` +
@@ -102,6 +106,7 @@ CoreS3 の `STATUS LAN=…` も同様 (行頭は互換のため変えない)。
 | `AUTH TICKET` | 端末登録の一回券。**`cores3` のみ** (運行者 PWA が USB 越しに繋がるのはここだけ)、他は `ERR AUTH TICKET: unsupported` |
 | `AUTH KEYGEN` / `AUTH PUBKEY` / `AUTH SIGN` / `AUTH SIGNBP` | 警告デバイス管理者認証用の ed25519 鍵 (Refs #205, #249) |
 | `WS URL` / `WS STATUS` | cf-alc-recorder 常時接続の URL 上書き / 状態 |
+| `VEIN CAPTURE` / `VEIN SAY <x>` | `ERR VEIN: unsupported` — 指静脈を積む `vein` build だけがここを素通しして自前で答える (下記) |
 
 `AUTH SIGN` / `AUTH SIGNBP` の応答 (Refs #205, #249, #269):
 
@@ -128,6 +133,21 @@ CoreS3 の `STATUS LAN=…` も同様 (行頭は互換のため変えない)。
 |---|---|
 | `OMRON BP ON\|OFF` / `OMRON STATUS` | Omron 血圧計 (HEM-6231T) を拾うか。呼ぶのは `cores3` / `timecard` / `bp-station` |
 | `PAIR` | BLE 全ボンド消去 → 再ペアリング受付。同上 3 機種 |
+
+指静脈 (Vein Station の `vein` build = `timecard` + `--features vein`、
+ippoan/vein-match#20)。**モジュールは実機で未確認** — 手順は
+[`crates/hub-core/src/vein.rs`](../crates/hub-core/src/vein.rs) の doc:
+
+| 要求 | 応答 |
+|---|---|
+| `VEIN CAPTURE` | 成功: **1 行で** `VEIN CHARA <hex>` (モジュールが返した特徴量の大文字 16 進。0x448 バイトなら 2192 文字)。失敗: `ERR VEIN <reason>` |
+| `VEIN SAY PLACE\|AGAIN\|ENROLLED\|FAILED` | 案内音声 (「指を置いてください」/「もう一度置いてください」/「登録完了しました」/「読み取れませんでした」) を鳴らし `OK VEIN SAY <x>`。スピーカーが起きていなければ `ERR VEIN NO_SPEAKER` |
+
+`<reason>`: `NO_MODULE` (接続に応答なし) / `TIMEOUT` (途中で応答が途絶えた) /
+`NO_FINGER` (指が置かれずモジュールが待ちを打ち切った) / `READ_FAIL` (応答の破損・
+読み直しの上限) / `RC=<hex 2 桁>` (モジュールのエラーコード)。`VEIN CAPTURE` は
+指を待つので**応答まで最大 15 秒強かかる** (途中経過 1 つにつき 15 秒)。続けて
+送った分は順に処理する。`VEIN SAY` は読み取り中でもすぐ鳴る。
 
 上記に無いコマンド、または対応しない機種向けのコマンドは
 `ERR UNSUPPORTED (<kind>)` を返す (`<kind>` は §2 の語彙。現場の切り分け用)。

@@ -138,6 +138,12 @@ jobs:
           - { name: atoms3-timecard-station,
               cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard cargo check --release --locked -p alc-hub-atoms3-timecard --features station",
               cache_key: build-timecard-s3r }
+          # Vein Station + 指静脈 (ippoan/vein-match#20): `station` に UART2 の
+          # 指静脈ドライバと案内音声を足した `vein` feature。**Pages の配布には
+          # 足さない** (モジュールと基盤が未着)。sdkconfig は同じなので cache_key も同じ
+          - { name: atoms3-timecard-vein,
+              cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard cargo check --release --locked -p alc-hub-atoms3-timecard --features vein",
+              cache_key: build-timecard-s3r }
           # 点呼端末の警告デバイス (#135)。同じ本番機 (Atom VoiceS3R) だが
           # sdkconfig は timecard とも違う (W5500 と NFC の legacy 衝突回避を落とし、
           # 音と PSRAM だけ残した) ため cache_key は**新規**。使い回すと

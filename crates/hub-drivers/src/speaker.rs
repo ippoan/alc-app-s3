@@ -192,7 +192,29 @@ pub enum Sound {
     /// 着信 / NG の [`Sound::Alert`] (3 連) より弱く、[`Sound::MutedTick`] (単発) と
     /// 聞き分けられるよう 2 連にしてある。3000Hz は実測の共振帯域 (plan §2)
     SilenceTick,
+    /// 「指を置いてください」(Vein Station、`VEIN SAY PLACE`)。音源は
+    /// [`Sound::Registered`] と同じ作り方 (VOICEVOX:四国めたん、24kHz mono s16le)
+    #[cfg(feature = "vein")]
+    VeinPlace,
+    /// 「もう一度置いてください」(`VEIN SAY AGAIN`)
+    #[cfg(feature = "vein")]
+    VeinAgain,
+    /// 「読み取れませんでした」(`VEIN SAY FAILED`)。**登録完了 (`ENROLLED`) は
+    /// 既存の [`Sound::Registered`] を使う**ので、ここには無い
+    #[cfg(feature = "vein")]
+    VeinFailed,
 }
+
+// 指静脈の案内音声 (`vein` feature のときだけ埋め込む — 3 本で ~210KB)。
+// 作り方は play_registered と同じ: VOICEVOX:四国めたん (ノーマル、話速 0.9) を
+// `outputSamplingRate=24000` / `outputStereo=false` で合成し、前後の無音
+// (|s| <= 64) を切るだけ。正規化・ローパスは掛けない (README の再生成手順)
+#[cfg(feature = "vein")]
+const VEIN_PLACE: &[u8] = include_bytes!("../assets/vein_place_24k_s16le.raw");
+#[cfg(feature = "vein")]
+const VEIN_AGAIN: &[u8] = include_bytes!("../assets/vein_again_24k_s16le.raw");
+#[cfg(feature = "vein")]
+const VEIN_FAILED: &[u8] = include_bytes!("../assets/vein_failed_24k_s16le.raw");
 
 /// 再生専用スレッドを立て、送信ハンドルを返す (issue #102)。
 /// I2S の write はブロッキングのため、NFC ポーリング等の呼び出し元スレッドで
@@ -218,6 +240,12 @@ pub fn start_player(mut speaker: Speaker) -> Result<std::sync::mpsc::Sender<Soun
                     Sound::AlertResolved => speaker.beep(1200.0, 150),
                     Sound::MutedTick => speaker.beep(3000.0, 60),
                     Sound::SilenceTick => speaker.beep_train(3000.0, 60, 40, 2),
+                    #[cfg(feature = "vein")]
+                    Sound::VeinPlace => speaker.play_pcm_24k_mono(VEIN_PLACE),
+                    #[cfg(feature = "vein")]
+                    Sound::VeinAgain => speaker.play_pcm_24k_mono(VEIN_AGAIN),
+                    #[cfg(feature = "vein")]
+                    Sound::VeinFailed => speaker.play_pcm_24k_mono(VEIN_FAILED),
                 };
                 if let Err(e) = r {
                     log::warn!("speaker: 再生失敗: {e:#}");

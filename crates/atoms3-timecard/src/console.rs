@@ -3,7 +3,7 @@
 //! 読み出しスレッドと機種非依存のコマンド (PING / DEVICE / HEAP / LOG / AUTH /
 //! WS) は `alc_hub_drivers::console` が持つ (正本は
 //! [`docs/console-protocol.md`](../../../docs/console-protocol.md))。
-//! ここに書くのは**本機固有の分岐だけ** (`STATUS` と `OTA`)。
+//! ここに書くのは**本機固有の分岐だけ** (`STATUS` と `OTA`、`vein` feature の `VEIN`)。
 //! **印刷ブリッジや CoreS3 から丸写ししないこと** —
 //! とくに `AUTH SET` (device credential を NVS へ書く口) を機種ごとに増やすと
 //! provisioning の挙動が割れる。
@@ -20,6 +20,8 @@
 //! | `WS URL <url>` / `WS STATUS` | cf-alc-recorder 常時接続の URL 上書き / 状態 (共通実装) |
 //! | `PAIR` | 血圧計の再ペアリング (ボンド消去 + 120 秒のペアリング受付、共通実装)。Pages の「血圧計を再ペアリング」から届く |
 //! | `OMRON BP ON\|OFF` / `OMRON STATUS` | 血圧計 (HEM-6231T) を拾うか (共通実装、既定 OFF)。**ON にしたら再起動が要る** — main.rs 冒頭の「血圧計」節 |
+//! | `VEIN CAPTURE` | 指静脈を読む (`vein` feature)。`VEIN CHARA <hex>` / `ERR VEIN <reason>`。feature 無しは共通実装が `ERR VEIN: unsupported` |
+//! | `VEIN SAY PLACE\|AGAIN\|ENROLLED\|FAILED` | 案内音声 (`vein` feature)。`OK VEIN SAY <x>` |
 
 use alc_hub_common::{
     config,
@@ -30,15 +32,35 @@ use alc_hub_common::{
 use alc_hub_core::protocol::{parse_line, HostCommand, HostKind};
 use alc_hub_core::uplink::MIN_SYNCED_MS;
 use alc_hub_drivers::console;
+#[cfg(feature = "vein")]
+use alc_hub_drivers::vein;
 use anyhow::Result;
 
-pub fn start(status: SharedStatus, settings: Settings, pair_flag: PairFlag) -> Result<()> {
+pub fn start(
+    status: SharedStatus,
+    settings: Settings,
+    pair_flag: PairFlag,
+    #[cfg(feature = "vein")] vein: vein::Link,
+) -> Result<()> {
     console::spawn_reader(c"console", 8 * 1024, move |line| {
-        handle_line(line, &status, &settings, &pair_flag)
+        handle_line(
+            line,
+            &status,
+            &settings,
+            &pair_flag,
+            #[cfg(feature = "vein")]
+            &vein,
+        )
     })
 }
 
-fn handle_line(line: &str, status: &SharedStatus, settings: &Settings, pair_flag: &PairFlag) {
+fn handle_line(
+    line: &str,
+    status: &SharedStatus,
+    settings: &Settings,
+    pair_flag: &PairFlag,
+    #[cfg(feature = "vein")] vein: &vein::Link,
+) {
     let command = match parse_line(line, 0) {
         Ok(Some(command)) => command,
         Ok(None) => return, // 空行
@@ -88,6 +110,11 @@ fn handle_line(line: &str, status: &SharedStatus, settings: &Settings, pair_flag
         }
         // オンラインアップデート (進捗・結果は EVT OTA_*)
         HostCommand::Ota { url } => console::handle_ota_lan_guarded(url, status),
+        // 指静脈 (Vein Station)。読み取りの結果は vein スレッドが後から 1 行で出す
+        #[cfg(feature = "vein")]
+        HostCommand::VeinCapture => vein.capture(),
+        #[cfg(feature = "vein")]
+        HostCommand::VeinSay(voice) => vein.say(voice),
         // 本機で意味を持たないコマンド (画面遷移 / 印刷 / BLE / Wi-Fi / CFG 等)
         other => {
             log::debug!("console: unsupported command: {other:?}");

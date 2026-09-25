@@ -43,6 +43,11 @@ esp-idf-svc = { version = "0.52", default-features = false, features = [
 # (MAX3232 経由、TX=G7 / RX=G8) に回す。ws_uplink と NTP も起こさない —
 # 測定値と打刻は USB の行 (JSON / `EVT …`) だけで host へ出す
 station = []
+# Vein Station + 指静脈モジュール (ippoan/vein-match#20)。`station` を含む。
+# UART2 (TX=G5 / RX=G6、57600bps) で特徴量を読み、`VEIN CHARA <hex>` で USB へ
+# 出す。登録・照合の案内音声 3 本もこの feature のときだけ埋め込む。
+# **`station` だけのビルドの挙動は変えない** (FC-1200 の実機試験が進行中、#272)
+vein = ["station", "alc-hub-drivers/vein"]
 
 [build-dependencies]
 embuild = "0.33"

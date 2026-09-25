@@ -234,6 +234,12 @@ pub enum HostCommand {
         call: bool,
         grace: Option<u16>,
     },
+    /// 指静脈モジュールで読み取る (ippoan/vein-match#20)。成功は 1 行の
+    /// `VEIN CHARA <hex>`、失敗は `ERR VEIN <reason>` ([`crate::vein`])。
+    /// `vein` feature を持たないビルドは `ERR VEIN: unsupported`
+    VeinCapture,
+    /// 案内音声を鳴らす (`OK VEIN SAY <x>`)。いつ何を鳴らすかはホストが決める
+    VeinSay(crate::vein::VeinVoice),
 }
 
 /// PC (運行者タブ) の点呼の段 (`STAGE NFC|TEMP|ALCOHOL|CARINS|PC`)。
@@ -498,6 +504,17 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                 grace,
             }
         }
+        // 指静脈 (Vein Station の `vein` feature、ippoan/vein-match#20)
+        "VEIN" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+            Some("CAPTURE") => HostCommand::VeinCapture,
+            Some("SAY") => match it.next().and_then(crate::vein::VeinVoice::parse) {
+                Some(v) => HostCommand::VeinSay(v),
+                None => {
+                    return Err("ERR VEIN: SAY には PLACE|AGAIN|ENROLLED|FAILED が必要です".into())
+                }
+            },
+            _ => return Err("ERR VEIN: CAPTURE|SAY が必要です".into()),
+        },
         // `PAIR` または `BLE PAIR`
         "PAIR" => HostCommand::BlePair,
         "BLE" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
@@ -1286,5 +1303,36 @@ mod tests {
         assert!(!valid_hb_reason(""));
         assert!(!valid_hb_reason("Serial"));
         assert!(!valid_hb_reason("se rial"));
+    }
+
+    #[test]
+    fn vein_commands() {
+        use crate::vein::VeinVoice;
+        assert_eq!(
+            parse_line("VEIN CAPTURE", T),
+            Ok(Some(HostCommand::VeinCapture))
+        );
+        assert_eq!(
+            parse_line("vein capture", T),
+            Ok(Some(HostCommand::VeinCapture))
+        );
+        assert_eq!(
+            parse_line("VEIN SAY PLACE", T),
+            Ok(Some(HostCommand::VeinSay(VeinVoice::Place)))
+        );
+        assert_eq!(
+            parse_line("VEIN SAY enrolled", T),
+            Ok(Some(HostCommand::VeinSay(VeinVoice::Enrolled)))
+        );
+        assert_eq!(
+            parse_line("VEIN SAY", T),
+            Err("ERR VEIN: SAY には PLACE|AGAIN|ENROLLED|FAILED が必要です".into())
+        );
+        assert!(parse_line("VEIN SAY HELLO", T).is_err());
+        assert_eq!(
+            parse_line("VEIN", T),
+            Err("ERR VEIN: CAPTURE|SAY が必要です".into())
+        );
+        assert!(parse_line("VEIN ENROLL", T).is_err());
     }
 }

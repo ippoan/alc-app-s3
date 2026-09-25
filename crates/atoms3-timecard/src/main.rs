@@ -89,9 +89,19 @@
 //! 送信キューの受け側はメインループで読み捨てる。bin 名と `HostKind` は PoE 版と
 //! 同じなので、起動時の `EVT STATION …` で見分ける。
 //!
+//! # 指静脈 (`vein` feature、ippoan/vein-match#20)
+//!
+//! `station` に Waveshare Finger Vein Module を足す。**UART2** (FC-1200 が
+//! UART1 を使うため) を TX=G5 / RX=G6、57600bps 8N1 で開き、`VEIN CAPTURE` で
+//! 特徴量を読んで `VEIN CHARA <hex>` の 1 行で USB へ出す (手順は
+//! `alc_hub_core::vein`、UART は `alc_hub_drivers::vein`)。案内音声 (`VEIN SAY`)
+//! はホストが鳴らす。ピンは `main` の `let vein = …` の 1 か所だけで決める —
+//! **中継基板 (vein-base) は未発注で変わりうる**。G5/G6 は PoE 版では W5500 の
+//! SCLK/CS だが、`station` は W5500 を起こさないので空いている。
+//!
 //! # 起動順 (変えてはいけない)
 //!
-//! `crashlog::init` → `Settings::new` → `heap::start` → `console::start` →
+//! `crashlog::init` → `Settings::new` → `heap::start` → (`vein` なら `vein::start`) → `console::start` →
 //! `ws_uplink::start` → LAN → (任意) BLE (OTA の確定は ws_uplink が初回の WS 接続で行う)。**`crashlog::init` は
 //! `heap::start` より前**。配線漏れで `.noinit` のゴミ帳簿に書いて boot loop に
 //! なった実害が 2026-07-14 にある。
@@ -110,6 +120,8 @@ use alc_hub_drivers::timecard::Punch;
 use alc_hub_drivers::{crashlog, es8311, heap, nfc, recorder, speaker};
 #[cfg(feature = "station")]
 use alc_hub_drivers::rs232;
+#[cfg(feature = "vein")]
+use alc_hub_drivers::vein;
 #[cfg(not(feature = "station"))]
 use alc_hub_drivers::{eth_w5500, ntp, ws_uplink};
 use anyhow::Result;
@@ -160,11 +172,38 @@ fn main() -> Result<()> {
     // ヒープ監視 (OOM 捕捉 + low-water 計測) は重いアロケーションより先に登録
     heap::start(Arc::clone(&status))?;
 
+    // 指静脈モジュール (UART2)。console が `VEIN CAPTURE` / `VEIN SAY` を渡すので
+    // console より先に立てる。音の送り口は speaker が立ってから入れる (下)
+    #[cfg(feature = "vein")]
+    let vein = {
+        // ★ 指静脈の UART ピンは**ここ 1 か所**。中継基板 (vein-base、J1-2 = G5 →
+        //   モジュール RXD / J1-3 = G6 ← モジュール TXD) は未発注で変わりうる
+        let (tx, rx) = (p.pins.gpio5, p.pins.gpio6);
+        let pins = {
+            use esp_idf_svc::hal::gpio::Pin;
+            (tx.pin(), rx.pin())
+        };
+        let link = vein::start(p.uart2, tx, rx)?;
+        alc_hub_common::evtlog::emit(&format!(
+            "EVT STATION VEIN TX=G{} RX=G{} BAUD={}",
+            pins.0,
+            pins.1,
+            vein::BAUD
+        ));
+        link
+    };
+
     // ホストコンソール (PING / STATUS / HEAP / OTA / AUTH / WS)
     // 再ペアリング要求のフラグ。console (`PAIR`) が立て、BLE ループが消費する。
     // **両方に同じものを渡す** — 別物を渡すと Pages のボタンが何も起こさない
     let pair_flag = alc_hub_common::control::new_pair_flag();
-    console::start(Arc::clone(&status), settings.clone(), Arc::clone(&pair_flag))?;
+    console::start(
+        Arc::clone(&status),
+        settings.clone(),
+        Arc::clone(&pair_flag),
+        #[cfg(feature = "vein")]
+        vein.clone(),
+    )?;
 
     // cf-alc-recorder への WS 常時接続。打刻イベントはここへ積む。
     // 接続には AUTH SET 済み credential と LAN 接続が必要 (未登録の間は
@@ -257,6 +296,13 @@ fn main() -> Result<()> {
             (None, None)
         }
     };
+
+    // `VEIN SAY` の音はこの再生スレッドで鳴らす (初期化に失敗したら入れない
+    // = `ERR VEIN NO_SPEAKER`)
+    #[cfg(feature = "vein")]
+    if let Some(tx) = &speaker_tx {
+        vein.set_speaker(tx.clone());
+    }
 
     // 血圧の上り経路も打刻と同じ送信キューへ積む。**下の nfc::start が
     // ws_meas_tx 本体を move する**ので、ここで clone を取っておく
