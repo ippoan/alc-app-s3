@@ -102,7 +102,9 @@
 //! # 起動順 (変えてはいけない)
 //!
 //! `crashlog::init` → `Settings::new` → `heap::start` → (`vein` なら `vein::start`) → `console::start` →
-//! `ws_uplink::start` → LAN → (任意) BLE (OTA の確定は ws_uplink が初回の WS 接続で行う)。**`crashlog::init` は
+//! `ota::spawn_serial_confirm_watch` → `ws_uplink::start` → LAN → (任意) BLE (OTA の確定は ws_uplink が
+//! 初回の WS 接続で行う。シリアル OTA (`OTA SERIAL`、Refs #279) で入れた image はホストの
+//! `OTA CONFIRM` で確定し、10 分来なければ見張りが前の image へ戻す)。**`crashlog::init` は
 //! `heap::start` より前**。配線漏れで `.noinit` のゴミ帳簿に書いて boot loop に
 //! なった実害が 2026-07-14 にある。
 
@@ -117,7 +119,7 @@ use alc_hub_common::{
 use alc_hub_drivers::nfc::NfcEvent;
 use alc_hub_drivers::speaker::Sound;
 use alc_hub_drivers::timecard::Punch;
-use alc_hub_drivers::{crashlog, es8311, heap, nfc, recorder, speaker};
+use alc_hub_drivers::{crashlog, es8311, heap, nfc, ota, recorder, speaker};
 #[cfg(feature = "station")]
 use alc_hub_drivers::rs232;
 #[cfg(feature = "vein")]
@@ -161,6 +163,9 @@ fn main() -> Result<()> {
     // NVS (device credential 等の永続設定)
     let nvs_partition = EspDefaultNvsPartition::take()?;
     let settings = Settings::new(nvs_partition)?;
+    // 前の起動で OTA 直後の image を戻していたら、その証跡を出す (Refs #217)。
+    // station は ws_uplink を起こさないので、ここで出す (ws_uplink::start の分は空振り)
+    ota::report_previous_rollback(&settings);
 
     // Omron 血圧計を拾うか (`OMRON BP ON|OFF`、NVS `omron_bp`、**既定 OFF**)。
     // hub-ble はスキャンのたびにこの写しを読む (console::handle_omron が更新する)
@@ -204,6 +209,8 @@ fn main() -> Result<()> {
         #[cfg(feature = "vein")]
         vein.clone(),
     )?;
+    // シリアル OTA で入れた image の確定待ち (Refs #279)。印が無ければ何もしない
+    ota::spawn_serial_confirm_watch(settings.clone());
 
     // cf-alc-recorder への WS 常時接続。打刻イベントはここへ積む。
     // 接続には AUTH SET 済み credential と LAN 接続が必要 (未登録の間は

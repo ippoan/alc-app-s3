@@ -39,8 +39,7 @@ use alc_hub_core::uplink::{
     command_log_offset, command_ota_url, command_print_chunk, command_print_url,
     command_result_frame, jitter_ms, measurement_frame, ota_guard, parse_downlink,
     reconnect_backoff, should_wait_for_clock, token_needs_mint, Downlink, DroppedEntry, OtaGuard,
-    UplinkQueue, OTA_VERIFY_TIMEOUT_MS, PING_FRAME, RECONNECT_BACKOFF_MAX_MS, RECONNECT_FAST_MS,
-    RECONNECT_SLOW_MS,
+    UplinkQueue, PING_FRAME, RECONNECT_BACKOFF_MAX_MS, RECONNECT_FAST_MS, RECONNECT_SLOW_MS,
 };
 use anyhow::Result;
 use esp_idf_svc::handle::RawHandle;
@@ -121,11 +120,8 @@ pub fn start(
     settings: Settings,
     boot_id: u32,
 ) -> Result<()> {
-    // 前の起動で OTA 直後の image を戻していたら、その証跡を出して消す (Refs #217)。
-    // 戻った先がこのコードを持つ image のときだけ読まれる
-    if let Some(note) = settings.take_ota_rollback_note() {
-        alc_hub_common::evtlog::emit(&format!("EVT OTA_ROLLED_BACK {note}"));
-    }
+    // 前の起動で OTA 直後の image を戻していたら、その証跡を出して消す (Refs #217)
+    crate::ota::report_previous_rollback(&settings);
     // TLS ハンドシェイクが呼び出しスレッドのスタックを使うため大きめ
     crate::task::name_next(c"ws_uplink");
     std::thread::Builder::new()
@@ -361,7 +357,9 @@ fn run(
                 // 戻せれば再起動して戻らない。戻ってきたら (戻し先が無い /
                 // 既に確定済み) 再起動ループを避けて確定する
                 OtaGuard::Rollback => {
-                    rollback_ota(&settings, &queue, stall);
+                    crate::ota::rollback_ota(&settings, stall, "WS に繋がらない", || {
+                        settings.set_ws_last_seq(queue.last_seq())
+                    });
                     true
                 }
             };
@@ -593,39 +591,6 @@ fn heap_headroom_ok(now: u64, last_log: &mut u64) -> bool {
         return false;
     }
     true
-}
-
-/// OTA 直後の image を無効にして前の image で再起動する (Refs #217)。
-///
-/// 戻す前に証跡 (内部RAM の空き・最低空き・止まっていた条件) を NVS に 1 行残し、
-/// 戻った先の起動で `start` が `EVT OTA_ROLLED_BACK` として出す。
-/// **戻ってきたら戻していない**: 既に確定済み (シリアル OTA の書き込み前に確定
-/// した等) なら何もせず、戻し先が無ければ証跡を消して `EVT OTA_ROLLBACK_UNAVAILABLE`
-fn rollback_ota(settings: &Settings, queue: &UplinkQueue, stall: &str) {
-    if !crate::ota::running_app_pending() {
-        return;
-    }
-    let (free_int, min_int) = unsafe {
-        let caps = esp_idf_svc::sys::MALLOC_CAP_INTERNAL as _;
-        (
-            esp_idf_svc::sys::heap_caps_get_free_size(caps),
-            esp_idf_svc::sys::heap_caps_get_minimum_free_size(caps),
-        )
-    };
-    let note = format!("free_int={free_int} min_int={min_int} reason={stall}");
-    let line = format!(
-        "ws_uplink: OTA 後 {}分 WS に繋がらないため前の image に戻します ({note})",
-        OTA_VERIFY_TIMEOUT_MS / 60_000
-    );
-    log::warn!("{line}");
-    crate::crashlog::note(&line);
-    settings.set_ota_rollback_note(&note);
-    settings.set_ws_last_seq(queue.last_seq());
-    std::thread::sleep(core::time::Duration::from_millis(300));
-    let err = unsafe { esp_idf_svc::sys::esp_ota_mark_app_invalid_rollback_and_reboot() };
-    log::warn!("ws_uplink: 前の image へ戻せません (err={err})");
-    let _ = settings.take_ota_rollback_note();
-    alc_hub_common::evtlog::emit("EVT OTA_ROLLBACK_UNAVAILABLE");
 }
 
 /// 窓の測定を送り、送れたものに送信済みの印を付ける。

@@ -207,6 +207,16 @@ pub enum HostCommand {
     /// OTA 更新: firmware (app 単体イメージ) の URL からダウンロードして
     /// もう一方の OTA スロットへ書き込み、再起動する (`EVT OTA_* ...` を出力)
     Ota { url: String },
+    /// シリアル OTA の開始 (`OTA SERIAL <size> <flavor>`、Refs #279)。
+    /// 受け入れたら端末は `OTA READY 4096` を返し、以後 `size` バイトを行に分けず
+    /// そのまま受ける (docs/console-protocol.md の「シリアル OTA」)
+    OtaSerial {
+        size: u32,
+        flavor: String,
+    },
+    /// シリアル OTA 後の確定 (`OTA CONFIRM`)。確定待ちでなくても
+    /// `OTA CONFIRMED` を返す (冪等)
+    OtaConfirm,
     /// PDF を URL から取得しプリンター 9100 (raw) へストリーミング印刷
     /// (印刷ブリッジ用。宛先は `PRINTER ADDR` で保存済みのもの。
     /// 進捗・結果は `EVT PRINT_* ...`)
@@ -352,6 +362,21 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
         },
         // OTA 更新 (URL は大文字小文字を保持)
         "OTA" => match it.next() {
+            // シリアル OTA (Refs #279)。URL より先に拾う
+            Some(sub) if sub.eq_ignore_ascii_case("SERIAL") => {
+                let size = it.next().and_then(|s| s.parse::<u32>().ok());
+                match (size, it.next(), it.next()) {
+                    (Some(size), Some(flavor), None) => HostCommand::OtaSerial {
+                        size,
+                        flavor: flavor.to_string(),
+                    },
+                    _ => return Err("ERR OTA: SERIAL には <size> <flavor> が必要です".into()),
+                }
+            }
+            Some(sub) if sub.eq_ignore_ascii_case("CONFIRM") => match it.next() {
+                None => HostCommand::OtaConfirm,
+                Some(tok) => return Err(format!("ERR OTA: 余分なトークンです: {tok}")),
+            },
             Some(url) if url.starts_with("https://") || url.starts_with("http://") => {
                 HostCommand::Ota {
                     url: url.to_string(),
@@ -761,6 +786,48 @@ mod tests {
         assert!(parse_line("OTA", T).is_err());
         assert!(parse_line("OTA ftp://x/app.bin", T).is_err());
         assert!(parse_line("OTA example.com/app.bin", T).is_err());
+    }
+
+    #[test]
+    fn ota_serial() {
+        assert_eq!(
+            parse_line("OTA SERIAL 1048576 timecard-station", T),
+            Ok(Some(HostCommand::OtaSerial {
+                size: 1_048_576,
+                flavor: "timecard-station".into(),
+            }))
+        );
+        // 副語は大小を問わない。flavor はそのまま (照合は端末側)
+        assert_eq!(
+            parse_line("ota serial 300000 Timecard", T),
+            Ok(Some(HostCommand::OtaSerial {
+                size: 300_000,
+                flavor: "Timecard".into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn ota_serial_errors() {
+        let err = Err("ERR OTA: SERIAL には <size> <flavor> が必要です".to_string());
+        assert_eq!(parse_line("OTA SERIAL", T), err);
+        assert_eq!(parse_line("OTA SERIAL 1024", T), err);
+        assert_eq!(parse_line("OTA SERIAL abc timecard", T), err);
+        assert_eq!(parse_line("OTA SERIAL -1 timecard", T), err);
+        assert_eq!(parse_line("OTA SERIAL 1024 timecard extra", T), err);
+    }
+
+    #[test]
+    fn ota_confirm() {
+        assert_eq!(
+            parse_line("OTA CONFIRM", T),
+            Ok(Some(HostCommand::OtaConfirm))
+        );
+        assert_eq!(parse_line("ota confirm", T), Ok(Some(HostCommand::OtaConfirm)));
+        assert_eq!(
+            parse_line("OTA CONFIRM now", T),
+            Err("ERR OTA: 余分なトークンです: now".into())
+        );
     }
 
     #[test]

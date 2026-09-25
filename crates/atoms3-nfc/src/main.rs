@@ -204,6 +204,7 @@ fn main() -> Result<()> {
         // HostKind::BpStation から共通実装が返す (Refs ippoan/alc-app#353)
         console::start_common(
             HostKind::BpStation,
+            HostKind::BpStation.label(),
             Arc::clone(&status),
             settings.clone(),
             Arc::clone(&pair_flag),

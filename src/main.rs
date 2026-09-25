@@ -293,6 +293,13 @@ fn main() -> Result<()> {
     // auth_link::spawn_mint_test で一時スレッド起動する (常駐させない —
     // TLS 用 20KB スタックは診断中だけ確保。credential は AUTH SET で注入)
     host_link::start(
+        // ビルド種別の語 (`DEVICE … FLAVOR=`、Refs #279)。dev の mem-hud も既定の
+        // `lan` を持つので `cores3`
+        if cfg!(feature = "lan") {
+            "cores3"
+        } else {
+            "cores3-wifi"
+        },
         tx.clone(),
         Arc::clone(&status),
         settings.clone(),

@@ -46,8 +46,13 @@ fn handle_line(line: &str, status: &SharedStatus, settings: &Settings) {
 
     // 機種に依らないコマンドは共通実装へ (console.rs)。
     // 捌かれなかったものだけがここへ落ちてくる
-    let Some(command) = console::handle_common(command, status, settings, HostKind::AtomS3Print)
-    else {
+    let Some(command) = console::handle_common(
+        command,
+        status,
+        settings,
+        HostKind::AtomS3Print,
+        HostKind::AtomS3Print.label(),
+    ) else {
         return;
     };
 

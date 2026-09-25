@@ -12,9 +12,10 @@
 //! |---|---|
 //! | [`install_usb_serial_jtag`] | USB Serial/JTAG ドライバの VFS 接続 (stdin をブロッキング読みにする) |
 //! | [`take_line`] | 受信バッファから 1 行を切り出す (改行待ち + ゴミ捨て) |
-//! | [`spawn_reader`] | stdin を読んで行ごとにコールバックを呼ぶスレッド |
+//! | [`spawn_reader`] | stdin を読んで行ごとにコールバックを呼ぶスレッド (`OTA SERIAL` の後は生バイトを OTA へ渡す) |
 //! | [`start_common`] | 機種固有の分岐を持たない機の入口 (上記の共通分だけを連結する) |
-//! | [`handle_common`] | 機種に依らないコマンド (PING / HEAP / LOG / AUTH / WS) |
+//! | [`handle_common`] | 機種に依らないコマンド (PING / DEVICE / HEAP / LOG / AUTH / WS) |
+//! | [`handle_ota_serial`] | `OTA SERIAL` / `OTA CONFIRM` (シリアル OTA。確定待ちを見張る機だけが呼ぶ) |
 //! | [`handle_omron`] | `OMRON BP ON\|OFF` / `OMRON STATUS` (BLE 血圧計を積む機だけが呼ぶ) |
 //! | [`handle_ota_lan_guarded`] | LAN 専用機の `OTA <url>` (リンクアップ前を弾く) |
 //!
@@ -75,6 +76,13 @@ pub fn discard_overlong(acc: &mut Vec<u8>) {
 /// Improv (バイナリフレーム) を混在させる CoreS3 は本関数を使わず
 /// [`crate::host_link`] が自前で振り分ける。
 ///
+/// **シリアル OTA (Refs #279)**: `on_line` が `OTA SERIAL` を受け入れると
+/// ([`crate::ota::serial_begin`])、続く `size` バイトは行に分けず
+/// [`crate::ota::SerialSink`] へそのまま渡す。受け切るか OTA が失敗で終わったら
+/// 行モードへ戻る。コマンドの処理はこのスレッドの上で走るので、受け口は
+/// `on_line` が戻った時点で必ず置かれている (ホストが `OTA READY` を見て
+/// 送り始めたバイトを行として読むことはない)
+///
 /// スタックは**内部RAM から取る** (`name_next`)。`AUTH SET` 等で NVS へ書く
 /// ため、PSRAM スタックにすると flash 書き込み中のキャッシュ無効で落ちる
 /// (`alc_hub_common::task::name_next_psram` の doc 参照)。
@@ -91,12 +99,27 @@ pub fn spawn_reader(
         .spawn(move || {
             let mut chunk = [0u8; 64];
             let mut acc: Vec<u8> = Vec::new();
+            // シリアル OTA の生バイトの受け口 (受信中だけ Some)
+            let mut raw: Option<crate::ota::SerialSink> = None;
             loop {
                 match std::io::stdin().lock().read(&mut chunk) {
                     Ok(0) => FreeRtos::delay_ms(20),
                     Ok(n) => {
                         acc.extend_from_slice(&chunk[..n]);
                         loop {
+                            if let Some(sink) = raw.as_mut() {
+                                // OTA が失敗で終わっていたら (`OTA ERR …` を出し済み)、
+                                // 以後のバイトは行として読む
+                                if !sink.aborted() {
+                                    let used = sink.feed(&acc);
+                                    acc.drain(..used);
+                                    if !sink.received_all() && !sink.aborted() {
+                                        break; // 続きのバイトを待つ
+                                    }
+                                }
+                                raw = None;
+                                continue;
+                            }
                             match take_line(&mut acc) {
                                 Some(line) => {
                                     // 応答を必ず行頭から出す (#268)。ここに置けば
@@ -104,6 +127,7 @@ pub fn spawn_reader(
                                     // (alarm / print / timecard / bp-station) を覆える
                                     alc_hub_common::hostout::begin_line();
                                     on_line(&line);
+                                    raw = crate::ota::take_serial_sink();
                                 }
                                 None => {
                                     discard_overlong(&mut acc);
@@ -175,6 +199,10 @@ fn wait_bp_report(status: &SharedStatus) -> alc_hub_core::device::BpReport {
 /// リンクアップを待つ必要がある一方で Wi-Fi 機はそうでないため含めない
 /// ([`handle_ota_lan_guarded`] 参照)。
 ///
+/// `flavor` は同じく呼び出し元が決めたビルド種別の語 (`timecard-station`・
+/// `cores3-wifi` 等、Refs #279)。`DEVICE` の末尾に ` FLAVOR=<flavor>` で出し、
+/// シリアル OTA のホストはこれで流し込むイメージを選ぶ。
+///
 /// `kind` は呼び出し元 (機種ごとの `console.rs` / [`start_common`]) が渡す
 /// 自分の機種。`DEVICE` の名乗りと `AUTH TICKET` の可否
 /// ([`HostKind::claim_ticket`]) の両方をここから引く — この券は
@@ -187,25 +215,27 @@ pub fn handle_common(
     status: &SharedStatus,
     settings: &Settings,
     kind: HostKind,
+    flavor: &'static str,
 ) -> Option<HostCommand> {
     match command {
         HostCommand::Ping => println!("PONG"),
         // 機種の名乗り (Refs ippoan/alc-app#353)。ブラウザ側の機種識別は
         // これ 1 本に集約する — `STATUS` の応答は機種ごとに違うので識別には
         // 使わない。`BOARD=` (板種) は元 `STATUS` にあったが、板種は不変なので
-        // 名乗りの側が筋 ([`HostKind::has_board`])
+        // 名乗りの側が筋 ([`HostKind::has_board`])。`FLAVOR=` (ビルド種別) は
+        // **常に末尾** — ホストは 2 語目 (kind) を読み、残りは `KEY=` で拾う
         HostCommand::Device => {
             let ver = alc_hub_common::config::firmware_version_full();
             if kind.has_board() {
                 let board = status.lock().map(|s| s.board).unwrap_or_default();
                 println!(
-                    "DEVICE {} VER={} BOARD={}",
+                    "DEVICE {} VER={} BOARD={} FLAVOR={flavor}",
                     kind.label(),
                     ver,
                     board.label()
                 );
             } else {
-                println!("DEVICE {} VER={}", kind.label(), ver);
+                println!("DEVICE {} VER={} FLAVOR={flavor}", kind.label(), ver);
             }
         }
         // ヒープ状態の即時応答 (定期出力 EVT HEAP と同じ計測、heap.rs 参照)
@@ -398,6 +428,34 @@ pub fn handle_omron(
     None
 }
 
+/// シリアル OTA (`OTA SERIAL <size> <flavor>` / `OTA CONFIRM`、Refs #279)。
+///
+/// **[`handle_common`] には入れない** — 受信は [`spawn_reader`] の生バイト
+/// モードが前提で (CoreS3 の [`crate::host_link`] は持たない)、確定待ちの見張り
+/// ([`crate::ota::spawn_serial_confirm_watch`]) を起動で呼ぶ機だけが受けてよい。
+/// 見張りの無い機が受けると、`OTA CONFIRM` が来なかったときに戻らない。
+/// 今呼ぶのはタイムカード端末 (`station` が本命) だけ。
+///
+/// `flavor` は [`handle_common`] に渡すものと同じ語。ホストの `<flavor>` と
+/// 違えば `OTA ERR flavor` で断る。
+/// 戻り値は [`handle_common`] と同じ規約 (処理しなかったコマンドを `Some` で返す)
+#[must_use]
+pub fn handle_ota_serial(
+    command: HostCommand,
+    status: &SharedStatus,
+    settings: &Settings,
+    flavor: &'static str,
+) -> Option<HostCommand> {
+    match command {
+        HostCommand::OtaSerial { size, flavor: want } => {
+            crate::ota::serial_begin(size, &want, flavor, status, settings)
+        }
+        HostCommand::OtaConfirm => crate::ota::confirm_serial(settings),
+        other => return Some(other),
+    }
+    None
+}
+
 /// `PAIR` — 血圧計の再ペアリング要求 (Pages の「血圧計を再ペアリング」)。
 ///
 /// ここではフラグを立てるだけで、ボンド消去とペアリング受付の開始は BLE ループ
@@ -432,6 +490,7 @@ pub fn handle_pair(command: HostCommand, pair_flag: &PairFlag) -> Option<HostCom
 /// 寄せられる**が、本番稼働中のため今回は分けてある。
 pub fn start_common(
     kind: HostKind,
+    flavor: &'static str,
     status: SharedStatus,
     settings: Settings,
     pair_flag: PairFlag,
@@ -445,7 +504,7 @@ pub fn start_common(
                 return;
             }
         };
-        let Some(command) = handle_common(command, &status, &settings, kind) else {
+        let Some(command) = handle_common(command, &status, &settings, kind, flavor) else {
             return;
         };
         let Some(command) = handle_omron(command, &status, &settings) else {

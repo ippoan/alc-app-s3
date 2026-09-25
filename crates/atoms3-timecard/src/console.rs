@@ -16,6 +16,7 @@
 //! | `STATUS` | `STATUS LAN=1 IP=192.168.11.72 VER=0.1.0+abc1234 CLOCK=1 EPOCH=1788533000000` 応答 |
 //! | `HEAP` / `HEAP DUMP` / `LOG DUMP` | ヒープ概況 / 詳細 / 直近ログ (共通実装) |
 //! | `OTA <url>` | オンラインアップデート (`EVT OTA_*`、LAN 確立を待つ) |
+//! | `OTA SERIAL <size> <flavor>` / `OTA CONFIRM` | シリアル OTA (共通実装 `console::handle_ota_serial`、Refs #279)。LAN の無い `station` 向け。確定待ちの見張りは main.rs |
 //! | `AUTH SET/UNPAIR/STATUS/TOKEN/URL` | device credential 管理 (共通実装) |
 //! | `WS URL <url>` / `WS STATUS` | cf-alc-recorder 常時接続の URL 上書き / 状態 (共通実装) |
 //! | `PAIR` | 血圧計の再ペアリング (ボンド消去 + 120 秒のペアリング受付、共通実装)。Pages の「血圧計を再ペアリング」から届く |
@@ -35,6 +36,16 @@ use alc_hub_drivers::console;
 #[cfg(feature = "vein")]
 use alc_hub_drivers::vein;
 use anyhow::Result;
+
+/// ビルド種別の語 (`DEVICE … FLAVOR=<語>`、`OTA SERIAL` の照合、Refs #279)。
+/// `vein` は `station` を含むので先に見る
+pub const FLAVOR: &str = if cfg!(feature = "vein") {
+    "timecard-vein"
+} else if cfg!(feature = "station") {
+    "timecard-station"
+} else {
+    "timecard"
+};
 
 pub fn start(
     status: SharedStatus,
@@ -72,8 +83,14 @@ fn handle_line(
 
     // 機種に依らないコマンドは共通実装へ (hub-drivers/src/console.rs)。
     // 捌かれなかったものだけがここへ落ちてくる
-    let Some(command) = console::handle_common(command, status, settings, HostKind::Timecard)
+    let Some(command) =
+        console::handle_common(command, status, settings, HostKind::Timecard, FLAVOR)
     else {
+        return;
+    };
+    // シリアル OTA (LAN の無い `station` の更新口、Refs #279)。確定待ちの見張りは
+    // main.rs が起動で立てる (`ota::spawn_serial_confirm_watch`)
+    let Some(command) = console::handle_ota_serial(command, status, settings, FLAVOR) else {
         return;
     };
     // 血圧計 (HEM-6231T) の設定も共通実装へ (CoreS3 の host_link と同じ口)。
