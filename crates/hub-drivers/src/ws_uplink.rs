@@ -995,14 +995,16 @@ fn handle_downlink(
                     };
                     send_command_result(conn, &id, &payload);
                 }
-                // バージョン照会: 現在の firmware version + 実行スロットを返す
+                // バージョン照会: 現在の firmware version + 実行スロット + 版
+                // (net = "wifi" | "lan"。/device/setup の一覧に出す) を返す
                 // (web の「更新必要か」判定用、config::firmware_version_full が
                 // manifest.json の version と同形)
                 Some("version") => {
                     let payload = format!(
-                        r#"{{"version":"{}","slot":"{}"}}"#,
+                        r#"{{"version":"{}","slot":"{}","net":"{}"}}"#,
                         alc_hub_common::config::firmware_version_full(),
                         crate::ota::running_slot(),
+                        crate::ota::net_label(),
                     );
                     send_command_result(conn, &id, &payload);
                 }

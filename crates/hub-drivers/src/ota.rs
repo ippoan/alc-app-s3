@@ -110,6 +110,16 @@ pub fn use_wifi_image() {
     WIFI_IMAGE.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// この機が載っているネットワークの版 (`version` 照会の `net`)。
+/// CoreS3 の Wi-Fi 版だけが `"wifi"`、それ以外 (CoreS3 LAN 版・W5500 の Atom 系) は `"lan"`
+pub fn net_label() -> &'static str {
+    if WIFI_IMAGE.load(std::sync::atomic::Ordering::Relaxed) {
+        "wifi"
+    } else {
+        "lan"
+    }
+}
+
 /// 現在実行中のパーティションラベル ("ota_0" 等)。
 pub fn running_slot() -> String {
     unsafe {
