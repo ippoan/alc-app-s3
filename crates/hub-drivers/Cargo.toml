@@ -12,6 +12,10 @@ nfc = []
 # コーデックは CoreS3 = AW88298 (speaker.rs)、Atom VoiceS3R = ES8311 (es8311.rs)。
 # 再生ロジックは両者で共有する
 speaker = []
+# 指静脈モジュール (Vein Station、ippoan/vein-match#20)。UART2 のドライバ (vein.rs) と
+# 登録・照合の案内音声 3 本 (assets/vein_*.raw、計 ~210KB) を足す。**音声はこの
+# feature のときだけ埋め込む** — 他の機の image を大きくしない
+vein = ["speaker"]
 
 [dependencies]
 alc-hub-core = { path = "../hub-core" }

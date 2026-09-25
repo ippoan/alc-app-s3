@@ -33,5 +33,6 @@ pub mod tenko_prompt;
 pub mod timecard;
 pub mod uplink;
 pub mod usb5v;
+pub mod vein;
 pub mod vitals;
 pub mod wdt_gate;
