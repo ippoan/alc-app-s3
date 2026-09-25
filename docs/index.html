@@ -176,8 +176,29 @@
 
     <div class="card install-section">
         <h2>ファームウェアをインストール</h2>
-        <esp-web-install-button manifest="manifest.json">
-            <button slot="activate">Install alc-hub CoreS3</button>
+        <div style="display: flex; gap: 20px; justify-content: center; flex-wrap: wrap; margin-bottom: 20px; color: white;">
+            <label style="cursor: pointer;">
+                <input type="radio" name="variant" value="manifest.json" checked> LAN 版（既定・Base LAN PoE）
+            </label>
+            <label style="cursor: pointer;">
+                <input type="radio" name="variant" value="manifest-wifi.json"> Wi-Fi 版（LAN 配線なしの拠点向け）
+            </label>
+        </div>
+        <p id="variant-note" style="font-size: 13px; color: #eee; margin-top: -8px;">
+            内部 RAM 確保のため、LAN 版は Wi-Fi / Improv を起動しません（下の「Wi-Fi 設定」は Wi-Fi 版のみ動作します）。
+        </p>
+        <esp-web-install-button id="install-lan" manifest="manifest.json">
+            <button slot="activate">Install alc-hub CoreS3 (LAN 版)</button>
+            <span slot="unsupported">
+                お使いのブラウザは Web Serial API に対応していません。<br>
+                Chrome, Edge, または Opera をお使いください。
+            </span>
+            <span slot="not-allowed">
+                シリアルポートへのアクセスが許可されていません。
+            </span>
+        </esp-web-install-button>
+        <esp-web-install-button id="install-wifi" manifest="manifest-wifi.json" style="display: none;">
+            <button slot="activate">Install alc-hub CoreS3 (Wi-Fi 版)</button>
             <span slot="unsupported">
                 お使いのブラウザは Web Serial API に対応していません。<br>
                 Chrome, Edge, または Opera をお使いください。
@@ -190,8 +211,12 @@
 
     <div class="card">
         <h2>Wi-Fi 設定</h2>
+        <p style="color: #e65100; font-weight: bold;">
+            ※ Wi-Fi はインストール時に「Wi-Fi 版」を選んだ場合のみ使えます。既定の「LAN 版」は
+            内部 RAM 確保のため Wi-Fi ドライバごと起動しません（設定しても反応しません）。
+        </p>
         <p>
-            本ファームウェアは <strong>Improv Wi-Fi Serial</strong> に対応しています。
+            Wi-Fi 版ファームウェアは <strong>Improv Wi-Fi Serial</strong> に対応しています。
             設定方法は 2 つ（どちらも結果は同じ。NVS に保存され、以後は起動時に自動接続）:
         </p>
         <ul>
@@ -316,6 +341,19 @@
     </footer>
 
     <script>
+        // ------------------------------------------------------------------
+        // ビルド選択: LAN 版 (既定, manifest.json) / Wi-Fi 版 (manifest-wifi.json)。
+        // esp-web-install-button は manifest 属性を connectedCallback 時にしか
+        // 読まない (属性変更を監視しない) ため、2 個の button を用意して
+        // 表示切り替えだけで済ませる
+        // ------------------------------------------------------------------
+        document.querySelectorAll('input[name="variant"]').forEach((radio) => {
+            radio.addEventListener('change', () => {
+                document.getElementById('install-lan').style.display = radio.value === 'manifest.json' ? '' : 'none';
+                document.getElementById('install-wifi').style.display = radio.value === 'manifest-wifi.json' ? '' : 'none';
+            });
+        });
+
         // ------------------------------------------------------------------
         // Wi-Fi 設定: Web Serial で Improv Wi-Fi Serial プロトコルを直接話す
         // (ファームウェアの src/improv.rs / crates/hub-core/src/improv.rs と対)

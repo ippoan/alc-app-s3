@@ -191,6 +191,7 @@ fn main() -> Result<()> {
     // 起こさなければ sdkconfig の Wi-Fi バッファ設定の変動も内部 RAM に響かない
     #[cfg(not(feature = "lan"))]
     let (wifi, improv, coex) = {
+        alc_hub_drivers::ota::use_wifi_image();
         let wifi = wifi::Wifi::new(p.modem, sysloop.clone(), nvs_partition, Arc::clone(&status))?;
         let coex = wifi.coex_handle();
         let saved_credentials = settings.wifi_credentials();

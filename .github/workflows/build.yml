@@ -670,6 +670,40 @@ jobs:
             tail -c +$((0x10000 + 1)) ${{ matrix.bin }}-dev-merged.bin > ${{ matrix.bin }}-dev-main.bin
           fi
 
+      # Wi-Fi 版バリアント (`lan` feature を外したビルド、cores3 のみ)。
+      # 既定ビルドは `lan` feature が on で #217 により Wi-Fi ドライバ・Improv を
+      # 起こさない (内部 RAM を ws_uplink の TLS ゲートに残すため)。Base LAN PoE の
+      # 配線が無い拠点向けに、Wi-Fi を使うビルドを別成果物として配布する
+      # (README.md 「Wi-Fi 経路」節参照)。nfc-verify は speaker を含むので明示不要
+      - name: Build wifi variant (no lan, cores3 のみ)
+        if: matrix.name == 'cores3'
+        env:
+          SCCACHE_GHA_ENABLED: 'true'
+          RUSTC_WRAPPER: sccache
+        run: |
+          cargo build --release --locked -p ${{ matrix.bin }} --no-default-features --features nfc-verify
+          sccache --show-stats
+
+      - name: Save wifi images (no lan, cores3 のみ)
+        if: matrix.name == 'cores3'
+        run: |
+          espflash save-image --chip esp32s3 --merge \
+            --flash-size ${{ matrix.flash_size }} \
+            --partition-table ${{ matrix.partition_table }} \
+            target/xtensa-esp32s3-espidf/release/${{ matrix.bin }} \
+            ${{ matrix.bin }}-wifi-merged.bin
+          espflash save-image --chip esp32s3 \
+            target/xtensa-esp32s3-espidf/release/${{ matrix.bin }} \
+            ${{ matrix.bin }}-wifi-app.bin
+          # Web インストーラー用 2 分割 (通常ビルドの Split step と同じ、Refs #48)
+          head -c $((0x9000)) ${{ matrix.bin }}-wifi-merged.bin > ${{ matrix.bin }}-wifi-boot.bin
+          if [ -n "$PUNCHQ_OFFSET" ]; then
+            tail -c +$((0x10000 + 1)) ${{ matrix.bin }}-wifi-merged.bin \
+              | head -c $((PUNCHQ_OFFSET - 0x10000)) > ${{ matrix.bin }}-wifi-main.bin
+          else
+            tail -c +$((0x10000 + 1)) ${{ matrix.bin }}-wifi-merged.bin > ${{ matrix.bin }}-wifi-main.bin
+          fi
+
       # VoiceS3R leg は Lite leg と **bin 名が同じ**なので、集約 (download-artifact
       # の merge-multiple) で上書きし合わないようファイル名を分ける。
       # **既存 leg の出力名は変えない** — build job は push:main でしか走らず
@@ -687,17 +721,18 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: firmware-${{ matrix.name }}
-          # cores3 leg は dev バリアント (-dev-merged/-dev-app) も含む
+          # cores3 leg は dev バリアント (-dev-merged/-dev-app) と
+          # wifi バリアント (-wifi-merged/-wifi-app) も含む
           path: ${{ matrix.bin }}-*.bin
           if-no-files-found: error
 
   # ------------------------------------------------------------------
   # assemble-pages: 各 build leg の成果物を集めて Pages サイトを組む。
-  # CoreS3 (index.html + manifest.json) / AtomS3 印刷ブリッジ
-  # (atoms3-print.html + manifest-atoms3-print.json) / NFC タイムカード端末
-  # (timecard.html + manifest-timecard.json) / 点呼端末の警告デバイス
-  # (alarm.html + manifest-alarm.json) / 血圧計用 PC の測定台
-  # (atoms3-nfc.html + manifest-nfc.json) の 5 機種分。
+  # CoreS3 (index.html + manifest.json / manifest-dev.json / manifest-wifi.json) /
+  # AtomS3 印刷ブリッジ (atoms3-print.html + manifest-atoms3-print.json) /
+  # NFC タイムカード端末 (timecard.html + manifest-timecard.json) /
+  # 点呼端末の警告デバイス (alarm.html + manifest-alarm.json) /
+  # 血圧計用 PC の測定台 (atoms3-nfc.html + manifest-nfc.json) の 5 機種分。
   # manifest の version は auth-worker /device/setup の「最新版」照会
   # (機種別) が突き合わせるため、それぞれの crate version + SHA を刻む
   # ------------------------------------------------------------------
@@ -750,6 +785,10 @@ jobs:
           cp alc-hub-cores3-dev-main.bin _site/firmware/
           cp alc-hub-cores3-dev-merged.bin _site/firmware/
           cp alc-hub-cores3-dev-app.bin _site/firmware/
+          cp alc-hub-cores3-wifi-boot.bin _site/firmware/
+          cp alc-hub-cores3-wifi-main.bin _site/firmware/
+          cp alc-hub-cores3-wifi-merged.bin _site/firmware/
+          cp alc-hub-cores3-wifi-app.bin _site/firmware/
           cp alc-hub-atoms3-print-boot.bin _site/firmware/
           cp alc-hub-atoms3-print-main.bin _site/firmware/
           cp alc-hub-atoms3-print-merged.bin _site/firmware/
@@ -778,6 +817,10 @@ jobs:
               -e "s#firmware/alc-hub-cores3-main.bin#firmware/alc-hub-cores3-dev-main.bin#" \
               -e "s/\"name\": \"alc-hub CoreS3\"/\"name\": \"alc-hub CoreS3 (dev mem-hud)\"/" \
             docs/manifest.json > _site/manifest-dev.json
+          # wifi manifest: `lan` feature を外したビルド (Wi-Fi/Improv 有効、
+          # Base LAN PoE 配線なしの拠点向け)。docs/index.html のバリアント選択が使う
+          sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.version }}+$SHORT_SHA\"/" \
+            docs/manifest-wifi.json > _site/manifest-wifi.json
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.atoms3_version }}+$SHORT_SHA\"/" \
             docs/manifest-atoms3-print.json > _site/manifest-atoms3-print.json
           # NFC タイムカード端末 (#134)。**dev チャネルは出さない** — dev バリアントの
@@ -792,7 +835,7 @@ jobs:
           # timecard / alarm と同じく **dev チャネルは出さない**
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.nfc_version }}+$SHORT_SHA\"/" \
             docs/manifest-nfc.json > _site/manifest-nfc.json
-          cat _site/manifest.json _site/manifest-dev.json _site/manifest-atoms3-print.json _site/manifest-timecard.json _site/manifest-alarm.json _site/manifest-nfc.json
+          cat _site/manifest.json _site/manifest-dev.json _site/manifest-wifi.json _site/manifest-atoms3-print.json _site/manifest-timecard.json _site/manifest-alarm.json _site/manifest-nfc.json
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

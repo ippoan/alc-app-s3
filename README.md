@@ -312,7 +312,13 @@ LAN Module 13.2 (PoE) で、Wi-Fi は LAN 配線が無い拠点向けの代替�
 タスクと常駐バッファが内部 RAM を取り、WS 接続のゲートを際まで削るため。
 Improv フレームには `EVT IMPROV_UNAVAILABLE lan` (最初の 1 回だけ)、`WIFI TEST`
 には `EVT WIFI_TEST NG lan` を返し、起動時に `EVT WIFI_DISABLED lan_build` を出す。
-以下は `--no-default-features` で `lan` を外したビルドの動作。
+以下は `--no-default-features --features nfc-verify` で `lan` を外したビルド
+(= Pages の「Wi-Fi 版」、`docs/manifest-wifi.json`) の動作。CI (`build.yml` の
+cores3 leg) が LAN 版と同じ leg で build し、`docs/index.html` のラジオボタンで
+どちらの manifest を書き込むか選べる。**OTA も Wi-Fi 経由**で、送られてきた
+URL が LAN 版 / dev 版 (`alc-hub-cores3-app.bin` / `-dev-app.bin`) でも
+`alc-hub-cores3-wifi-app.bin` へ読み替えて取りにいく (hub-core `ota_image`) —
+/device/setup から OTA しても Wi-Fi 版のまま更新される。
 
 - **自動再接続 (keepalive)**: 切断を検出したら再接続。失敗が続く場合は段階的に
   バックオフ (15 秒→最大 5 分)、接続タイムアウトも短め (8 秒) にして、単一
