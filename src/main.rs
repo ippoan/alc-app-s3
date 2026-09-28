@@ -132,10 +132,10 @@ fn main() -> Result<()> {
     // `BUS5V OFF`** で「絶対に出さない」に固定する。既定は `Auto` のままなので、
     // 設定したことのない端末の挙動は変わらない。
     //
-    // `bus_in` の材料は起動時の W5500 probe (`eth_w5500::wait_for_w5500`) で、
-    // **通ったときに `Some(true)` を入れるだけ**。**外部給電でないことの確定と
-    // 5V の追随はどちらも hub-ui の i2c ループ** (1 秒ポーリング、
-    // `usb5v::BUS_IN_GRACE_MS` / `usb5v::Latch`) が担う (Refs #254)。
+    // `bus_in` (M-Bus に外から 5V が来ているか) の判定と 5V の追随は、どちらも
+    // hub-ui の i2c ループ (1 秒ポーリング) が担う。材料は AXP2101 の TS
+    // (M-Bus 5V の 1:1 分圧、`usb5v::BusInJudge`)。以前の W5500 probe は、
+    // W5500 が Core の 3.3V だけで応答して PoE 無しの機を誤判定した (Refs #254)。
     let rotation = settings.rotation();
     // 起動カウンタを 1 つ進める (点呼セッション ID の前置、Refs #112)。
     // **起動ごとに 1 回だけ** — 再起動をまたいだ session_id の再利用を防ぐ。

@@ -38,7 +38,7 @@
 //! | `WS URL <url>` | cf-alc-recorder WS URL を上書き (staging テスト用) |
 //! | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` を返す |
 //! | `BUS5V AUTO\|ON\|OFF` | M-Bus 5V を Core 側から出すかの設定 (NVS 保存、既定 `AUTO`。Refs #254)。`AUTO` = USB ホスト (PC) が列挙されていて、かつ M-Bus が外部給電でない (`BUS_IN=0`) 間だけ出す (#202 の固定動作)。`OFF` = 絶対に出さない — **PoE のベースを履いた常設機はこれ**。`ON` = 常に出す (USB 電源アダプタのベンチ向け。**PoE の機では使わないこと** — 同じ 5V レールを両側から駆動し PoE 単独で起動できなくなる)。反映は即時 (hub-ui が 1 秒ごとに読む)。遠隔からは WS 下り command `{action:"bus5v","mode":"auto\|on\|off"}` で同じ設定を変えられる |
-//! | `BUS5V STATUS` | M-Bus 5V の設定と現況 `BUS5V MODE=auto USB=1 OUT=1 BATTERY=0 BUS_IN=0` を返す。`BUS_IN` は起動時の W5500 probe で確定する M-Bus の外部給電判定 (`1`=PoE 等で外部給電中 `0`=無し `?`=未判定、Refs #211)。WS 下り command `{action:"bus5v_status"}` / `{action:"reboot"}` (auth-worker 端末一覧) でも遠隔で照会・再起動できる |
+//! | `BUS5V STATUS` | M-Bus 5V の設定と現況 `BUS5V MODE=auto USB=1 OUT=1 BATTERY=0 BUS_IN=0` を返す。`BUS_IN` は AXP2101 の TS (M-Bus 5V の分圧) で決まる M-Bus の外部給電判定 (`1`=PoE 等で外部給電中 `0`=無し `?`=未判定、Refs #211)。WS 下り command `{action:"bus5v_status"}` / `{action:"reboot"}` (auth-worker 端末一覧) でも遠隔で照会・再起動できる |
 //! | `TENKO BP ON\|OFF` / `TENKO STATUS` | 点呼に血圧を含めるか (NVS、既定 OFF) / `TENKO BP=0` を返す |
 //! | `OMRON BP ON\|OFF` / `OMRON STATUS` | Omron 血圧計を拾うか (NVS、既定 OFF) / `OMRON BP=0` を返す |
 //! | `HEAP` | `HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> TOTAL_INT=<n> TOTAL_PSRAM=<n>` を返す (Refs #27) |

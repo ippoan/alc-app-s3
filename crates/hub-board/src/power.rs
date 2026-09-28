@@ -156,6 +156,19 @@ fn read_reg(i2c: &mut I2cDriver, addr: u8, reg: u8) -> Result<u8> {
     Ok(buf[0])
 }
 
+/// AXP2101 の TS ADC 生値 (0x36[5:0] + 0x37、14 bit、0.5 mV/LSB) を読む。
+/// CoreS3 の TS には M-Bus 5V (BUS_OUT) の 1:1 分圧が入っていて、Core が
+/// BUS_EN を立てていない間は**外から M-Bus に 5V が来ているか**を測れる
+/// (m5stack/M5Unified#352 の `_core_s3_ext_output_unsafe` と同じ読み方)。
+/// 解釈は `alc_hub_core::usb5v::ts_bus_5v`。ADC の TS チャネルは init() の
+/// 0x30 = 0x0F で有効化済み
+pub fn read_bus_ts_raw(i2c: &mut I2cDriver) -> Result<u16> {
+    let mut buf = [0u8; 2];
+    i2c.write_read(AXP2101_ADDR, &[0x36], &mut buf, BLOCK)
+        .context("AXP2101 TS (0x36) 読み出し")?;
+    Ok((((buf[0] & 0x3F) as u16) << 8) | buf[1] as u16)
+}
+
 /// AXP2101 の電源/バッテリー状態を読む。レジスタ定義は M5Unified /
 /// XPowersLib の AXP2101 に準拠 (電圧の目盛りは実機で要確認)。
 pub fn read_status(i2c: &mut I2cDriver) -> Result<PowerStatus> {

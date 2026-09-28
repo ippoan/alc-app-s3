@@ -177,6 +177,11 @@ pub fn run(
     let mut usb5v = alc_hub_core::usb5v::Latch::default();
     // M-Bus 5V の i2c 書き込みの連続失敗回数。warn は連続失敗の初回だけ出す
     let mut bus5v_fail_streak: u32 = 0;
+    // M-Bus の外部給電判定 (`HubStatus::bus_in`) を TS の読みから決める
+    // (`usb5v::BusInJudge`)。Core が 5V を止めた時刻は、直後の TS (ADC の遅れで
+    // 自分の出力が残って見える) を読まないために控える
+    let mut bus_in_judge = alc_hub_core::usb5v::BusInJudge::default();
+    let mut bus5v_off_at: Option<u64> = None;
     let mut spin_phase = 0u8;
     let mut last_touch: Option<touch::TouchPoint> = None;
     // BLE で取得中の機器 (点呼画面のラベル横スピナー表示)。
@@ -256,29 +261,42 @@ pub fn run(
                 alc_hub_common::evtlog::emit(&format!("EVT USB_HOST={}", u8::from(usb)));
                 prev_usb_host = Some(usb);
             }
-            // 「M-Bus は外部給電ではない」の確定は**ここ 1 か所**でやる
-            // (Refs #254)。W5500 の probe (hub-drivers) は通ったときに
-            // `Some(true)` を入れるだけで、失敗しても `Some(false)` は入れない
-            // — 起動直後は W5500 がまだ立ち上がっていないことがあり、1 回勝負で
-            // 確定すると PoE 単独給電で起動できなくなるため。猶予
-            // (`usb5v::BUS_IN_GRACE_MS`) を過ぎても未判定のままなら、ここで
-            // 「外部給電ではない」と確定する。**`lan` 無効ビルド (W5500 が無く
-            // probe も走らない) も同じ 1 か所**なので、判定待ちで止まらない
-            let (bus_in, mode, just_confirmed) = status
+            // M-Bus の外部給電判定 (`bus_in`) は**ここ 1 か所**で、AXP2101 の TS
+            // (M-Bus 5V の 1:1 分圧) から決める (`usb5v::BusInJudge`)。以前の
+            // W5500 probe は、W5500 が Core の 3.3V だけで応答して PoE 無しの機を
+            // 「外部給電あり」と誤判定した (2026-09-28 実機)。TS は **Core が
+            // 5V を出していない間だけ**読む — 出している間 / 止めた直後は自分の
+            // 出力を測ってしまう。読めない間は `bus_in` を触らない (fail-closed)。
+            // `lan` の有無に関わらず同じ規則
+            let ext_5v_out = usb5v.out();
+            let settling = bus5v_off_at.is_some_and(|t| {
+                now.saturating_sub(t) < alc_hub_core::usb5v::TS_SETTLE_AFTER_OFF_MS
+            });
+            let ts_raw = if ext_5v_out || settling {
+                None
+            } else {
+                alc_hub_board::power::read_bus_ts_raw(&mut i2c).ok()
+            };
+            let ts = ts_raw.and_then(alc_hub_core::usb5v::ts_bus_5v);
+            let (bus_in, mode, changed) = status
                 .lock()
                 .map(|mut st| {
                     st.usb_host = usb;
-                    let just_confirmed =
-                        st.bus_in.is_none() && alc_hub_core::usb5v::bus_in_absent_confirmed(now);
-                    if just_confirmed {
-                        st.bus_in = Some(false);
+                    let changed = bus_in_judge.update(ts, st.bus_in, now);
+                    if let Some(v) = changed {
+                        st.bus_in = Some(v);
                     }
-                    (st.bus_in, st.bus5v_mode, just_confirmed)
+                    (st.bus_in, st.bus5v_mode, changed)
                 })
-                .unwrap_or((None, alc_hub_core::protocol::Bus5vMode::default(), false));
-            if just_confirmed {
-                // 現場の切り分け用 — この 1 行が出た後だけ Core が 5V を出しうる
-                alc_hub_common::evtlog::emit("EVT BUS_IN=0 w5500 無応答のまま猶予切れ");
+                .unwrap_or((None, alc_hub_core::protocol::Bus5vMode::default(), None));
+            if let Some(v) = changed {
+                // 現場の切り分け用 — `BUS_IN=0` が出た後だけ `AUTO` の Core が 5V を出しうる。
+                // ts_mv は M-Bus 側の電圧の半分 (1:1 分圧)
+                alc_hub_common::evtlog::emit(&format!(
+                    "EVT BUS_IN={} ts_mv={}",
+                    u8::from(v),
+                    ts_raw.map_or(0, |r| u32::from(r) / 2)
+                ));
             }
             // 設定 (`BUS5V AUTO|ON|OFF`) と `bus_in` から、そもそも Latch に
             // サンプルを渡してよいかを決める (Refs #254)。`OFF` は常に「出さない」、
@@ -291,6 +309,7 @@ pub fn run(
                     match alc_hub_board::power::set_ext_5v_out(&mut i2c, desired) {
                         Ok(()) => {
                             usb5v.commit(desired);
+                            bus5v_off_at = (!desired).then_some(now);
                             if let Ok(mut st) = status.lock() {
                                 st.ext_5v_out = desired;
                             }

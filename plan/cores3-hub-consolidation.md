@@ -156,16 +156,16 @@ G5(=G1) / G15(=G13) の二択しかなく **内蔵スピーカー (I2S DOUT=G13 
   固定動作) なので設定したことのない端末の挙動は変わらない。判定は純関数
   `hub-core/src/usb5v.rs` の `bus5v_sample()` 1 本。
   `hub-board/src/power.rs` の `set_ext_5v_out()` は渡された値を BUS_EN に書く
-  だけで、`AUTO` のときは **起動時の W5500 probe を材料にする
-  `HubStatus::bus_in`** (M-Bus に外から 5V が来ているか) を hub-ui が
-  ゲートに使い、`bus_in == Some(false)` (外部給電でない) のときだけ USB ホスト
-  の有無に追随して立てる (Refs #211)。★**probe の 1 回目の失敗では確定しない**
-  — PoE スプリッタ → ベース → W5500 の順に電気が回るので起動直後は W5500 が
-  まだ応答しないことがあり、1 回勝負で `Some(false)` に誤確定すると上の
-  「PoE 単独で起動できない」を自分で踏む (現場で再発、#254)。probe は通った
-  ときだけ `Some(true)` を入れ、**起動から `usb5v::BUS_IN_GRACE_MS` (15 秒)
-  経っても未判定なら hub-ui が `Some(false)` に確定する** (`lan` 無効ビルドも
-  同じ 1 か所)。猶予の間は Core が 5V を出さないので、USB 給電のベンチでは
+  だけで、`AUTO` のときは **`HubStatus::bus_in`** (M-Bus に外から 5V が
+  来ているか) を hub-ui がゲートに使い、`bus_in == Some(false)` (外部給電でない)
+  のときだけ USB ホストの有無に追随して立てる (Refs #211)。`bus_in` の材料は
+  **AXP2101 の TS (M-Bus 5V の 1:1 分圧、m5stack/M5Unified#352)** で、Core が
+  5V を出していない間だけ読む (`usb5v::BusInJudge`)。★以前の材料だった W5500
+  probe は、**W5500 が Core の 3.3V だけで応答する**ため PoE の無い USB 給電の
+  機を外部給電ありと誤判定し、LAN のリンクが張れなかった (2026-09-28 実機)。
+  ★**`Some(false)` は起動から `usb5v::BUS_IN_GRACE_MS` (15 秒) の後にしか
+  入れない** — PoE の給電が Core の起動に間に合わないことがあり、1 回勝負で
+  誤確定すると上の「PoE 単独で起動できない」を自分で踏む (現場で再発、#254)。猶予の間は Core が 5V を出さないので、USB 給電のベンチでは
   スタックモジュールの給電がその秒数だけ遅れる。battery-present bit による切り替えは
   過去の設計 (#129) で、実装は入っていない — 電池付きの個体でも USB 給電の
   ベンチに RS232M/LAN 13.2 を積む構成では同じ規則で出す (Refs #76)。
