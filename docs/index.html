@@ -210,6 +210,33 @@
     </div>
 
     <div class="card">
+        <h2>インストール後の確認（版・LAN・給電）</h2>
+        <p>
+            書き込みが終わったらダイアログを閉じ、USB をつないだまま「本体の状態を確認」を押してください。
+            入っている版（LAN 版 / Wi-Fi 版）、LAN のリンク、Base LAN への 5V 給電をまとめて表示します。
+        </p>
+        <div style="display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px;">
+            <button id="dev-check" style="padding: 10px 16px; border-radius: 8px; border: none; background: #1a73e8; color: white; font-size: 15px; cursor: pointer;">本体の状態を確認</button>
+        </div>
+        <pre id="dev-check-result" style="white-space: pre-wrap; margin: 0 0 12px; font-size: 14px; color: #333;"></pre>
+        <h3 style="font-size: 16px; margin-bottom: 6px;">Base LAN への 5V 給電（BUS5V）</h3>
+        <p style="font-size: 14px; color: #555; margin-top: 0;">
+            PoE を使わないときは、Base LAN（W5500）の電源を CoreS3 本体が M-Bus 5V で出します。電源のつなぎ方で選んでください。
+        </p>
+        <ul style="font-size: 14px; color: #555;">
+            <li><strong>自動（既定）</strong>: PC の USB につないでいる間だけ出す。PC の USB 給電ならこれで LAN が動きます</li>
+            <li><strong>常に出す</strong>: USB の AC アダプタで動かす場合（PC として認識されず、自動では出ないため）。<strong>PoE の機では使わないこと</strong></li>
+            <li><strong>出さない</strong>: PoE で動かす常設機（ベースが自前で給電するため）</li>
+        </ul>
+        <div style="display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px;">
+            <button class="bus5v-set" data-mode="AUTO" style="padding: 10px 16px; border-radius: 8px; border: none; background: #1a73e8; color: white; font-size: 15px; cursor: pointer;">自動（PC の USB）</button>
+            <button class="bus5v-set" data-mode="ON" style="padding: 10px 16px; border-radius: 8px; border: none; background: #2e7d32; color: white; font-size: 15px; cursor: pointer;">常に出す（USB アダプタ）</button>
+            <button class="bus5v-set" data-mode="OFF" style="padding: 10px 16px; border-radius: 8px; border: none; background: #e65100; color: white; font-size: 15px; cursor: pointer;">出さない（PoE）</button>
+        </div>
+        <p id="bus5v-result" style="margin-bottom: 0; color: #666;"></p>
+    </div>
+
+    <div class="card">
         <h2>Wi-Fi 設定</h2>
         <p style="color: #e65100; font-weight: bold;">
             ※ Wi-Fi はインストール時に「Wi-Fi 版」を選んだ場合のみ使えます。既定の「LAN 版」は
@@ -487,49 +514,61 @@
         // そのため 1 回送って待つのではなく、応答があるまで約 2 秒間隔で
         // コマンドを再送しながら全体で timeoutMs (呼び出し側は 15 秒以上推奨) 待つ。
         async function serialCommand(line, prefixes, timeoutMs, onRow) {
+            return withSerialPort((port) => serialExchange(port, line, prefixes, timeoutMs, onRow));
+        }
+
+        // ポート選択を 1 回で済ませ、開いたポートで fn(port) を走らせて閉じる。
+        // 複数コマンドは fn の中で serialExchange を続けて呼ぶ
+        async function withSerialPort(fn) {
             if (!('serial' in navigator)) throw new Error('このブラウザは Web Serial API 非対応 (Chrome/Edge/Opera)');
             const port = await navigator.serial.requestPort();
             await port.open({ baudRate: 115200 });
             try {
-                const writer = port.writable.getWriter();
-                const reader = port.readable.getReader();
-                const deadline = Date.now() + Math.max(timeoutMs, 15000);
-                const timer = setInterval(() => { if (Date.now() >= deadline) reader.cancel().catch(() => {}); }, 200);
-                const send = () => writer.write(new TextEncoder().encode(line + '\n')).catch(() => {});
-                const opened = Date.now();
-                await send();
-                let lastSend = Date.now();
-                let buf = '';
-                // 1 行でも返ってきたら端末は生きている = 再送しない。
-                // PAIR のように「押すたびにボンドを消す」コマンドを再送すると、
-                // 成立した直後のボンドを消してしまう
-                let sawRow = false;
-                try {
-                    while (Date.now() < deadline) {
-                        // リセット起動中の取りこぼしに備え、開いてから 10 秒間だけ
-                        // 2 秒間隔で再送する (WIFI TEST 等を試験中に連発しないため)
-                        if (!sawRow && Date.now() - opened < 10000 && Date.now() - lastSend >= 2000) {
-                            await send();
-                            lastSend = Date.now();
-                        }
-                        const { value, done } = await reader.read();
-                        if (done) break;
-                        buf += new TextDecoder().decode(value);
-                        let nl;
-                        while ((nl = buf.indexOf('\n')) >= 0) {
-                            const row = buf.slice(0, nl).trim();
-                            buf = buf.slice(nl + 1);
-                            if (row) { sawRow = true; }
-                            if (prefixes.some((p) => row.startsWith(p))) { return row; }
-                            if (onRow && row) { onRow(row); }
-                        }
-                    }
-                } catch (e) { /* timeout cancel */ }
-                finally { clearInterval(timer); writer.releaseLock(); reader.releaseLock(); }
-                return null;
+                return await fn(port);
             } finally {
                 try { await port.close(); } catch (e) { /* noop */ }
             }
+        }
+
+        // 開いたポートで 1 行送り、prefixes で始まる応答行を返す (無ければ null)。
+        // warm = 同じポートで既に応答を得た後 (起動待ちが要らない) なら timeoutMs どおりに待つ
+        async function serialExchange(port, line, prefixes, timeoutMs, onRow, warm) {
+            const writer = port.writable.getWriter();
+            const reader = port.readable.getReader();
+            const deadline = Date.now() + (warm ? timeoutMs : Math.max(timeoutMs, 15000));
+            const timer = setInterval(() => { if (Date.now() >= deadline) reader.cancel().catch(() => {}); }, 200);
+            const send = () => writer.write(new TextEncoder().encode(line + '\n')).catch(() => {});
+            const opened = Date.now();
+            await send();
+            let lastSend = Date.now();
+            let buf = '';
+            // 1 行でも返ってきたら端末は生きている = 再送しない。
+            // PAIR のように「押すたびにボンドを消す」コマンドを再送すると、
+            // 成立した直後のボンドを消してしまう
+            let sawRow = false;
+            try {
+                while (Date.now() < deadline) {
+                    // リセット起動中の取りこぼしに備え、開いてから 10 秒間だけ
+                    // 2 秒間隔で再送する (WIFI TEST 等を試験中に連発しないため)
+                    if (!sawRow && Date.now() - opened < 10000 && Date.now() - lastSend >= 2000) {
+                        await send();
+                        lastSend = Date.now();
+                    }
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    buf += new TextDecoder().decode(value);
+                    let nl;
+                    while ((nl = buf.indexOf('\n')) >= 0) {
+                        const row = buf.slice(0, nl).trim();
+                        buf = buf.slice(nl + 1);
+                        if (row) { sawRow = true; }
+                        if (prefixes.some((p) => row.startsWith(p))) { return row; }
+                        if (onRow && row) { onRow(row); }
+                    }
+                }
+            } catch (e) { /* timeout cancel */ }
+            finally { clearInterval(timer); writer.releaseLock(); reader.releaseLock(); }
+            return null;
         }
 
         const cfgOut = document.getElementById('cfg-result');
@@ -623,6 +662,69 @@
                     : (row || '応答なし。ポート・ファーム版を確認してください');
             } catch (e) { cfgOut.textContent = '失敗: ' + e.message; }
         });
+
+        // インストール後の確認: DEVICE (版) / STATUS (LAN) / BUS5V STATUS (給電) を 1 回のポート選択で読む
+        function kv(row) {
+            const o = {};
+            for (const t of (row || '').split(/\s+/)) {
+                const i = t.indexOf('=');
+                if (i > 0) o[t.slice(0, i)] = t.slice(i + 1);
+            }
+            return o;
+        }
+
+        document.getElementById('dev-check').addEventListener('click', async () => {
+            const out = document.getElementById('dev-check-result');
+            try {
+                out.textContent = 'ポート選択 → 読み込み中 (起動直後は 10 秒ほどかかります)...';
+                const rows = await withSerialPort(async (port) => {
+                    const device = await serialExchange(port, 'DEVICE', ['DEVICE ', 'ERR'], 15000);
+                    if (!device) return null;
+                    const status = await serialExchange(port, 'STATUS', ['STATUS ', 'ERR'], 3000, null, true);
+                    const bus5v = await serialExchange(port, 'BUS5V STATUS', ['BUS5V ', 'ERR'], 3000, null, true);
+                    return { device, status, bus5v };
+                });
+                if (!rows) { out.textContent = '応答なし。ポート・ファーム版を確認してください'; return; }
+                const d = kv(rows.device), s = kv(rows.status), b = kv(rows.bus5v);
+                const lines = [];
+                const flavor = d.FLAVOR;
+                lines.push('版: ' + (flavor === 'cores3' ? 'LAN 版' : flavor === 'cores3-wifi' ? 'Wi-Fi 版' : (flavor || '不明 (古いファーム)'))
+                    + (d.VER ? '  (' + d.VER + ')' : ''));
+                lines.push('LAN: ' + (s.LAN === '1' ? 'リンクあり' : s.LAN === '0' ? 'リンクなし' : '不明')
+                    + (s.WIFI !== undefined ? '   Wi-Fi: ' + (s.WIFI === '1' ? '接続' : '未接続') : ''));
+                if (b.MODE) {
+                    lines.push('5V 給電: 設定=' + ({ auto: '自動', on: '常に出す', off: '出さない' }[b.MODE] || b.MODE)
+                        + ' / いま=' + (b.OUT === '1' ? '出している' : '出していない')
+                        + ' / PC の USB=' + (b.USB === '1' ? '認識' : 'なし')
+                        + ' / PoE 等の外部給電=' + (b.BUS_IN === '1' ? 'あり' : b.BUS_IN === '0' ? 'なし' : '判定中'));
+                } else {
+                    lines.push('5V 給電: ' + (rows.bus5v || '応答なし (BUS5V 非対応のファーム)'));
+                }
+                // 見立て
+                if (flavor === 'cores3-wifi') {
+                    lines.push('→ Wi-Fi 版です。LAN で使うには上で「LAN 版」を選んで入れ直してください (設定は消えません)');
+                } else if (s.LAN === '1') {
+                    lines.push('→ LAN はつながっています。端末一覧が未接続のままなら、ネットワーク側 (DNS・社内の制限) を確認してください');
+                } else if (b.MODE && b.OUT !== '1' && b.BUS_IN !== '1') {
+                    lines.push('→ Base LAN に電源が来ていません。PC の USB なら「自動」、USB アダプタなら「常に出す」にしてください');
+                } else if (s.LAN === '0') {
+                    lines.push('→ 給電はあります。LAN ケーブル・ハブ・Base LAN の装着を確認してください');
+                }
+                out.textContent = lines.join('\n');
+            } catch (e) { out.textContent = '失敗: ' + e.message; }
+        });
+
+        document.querySelectorAll('.bus5v-set').forEach((btn) => btn.addEventListener('click', async () => {
+            const out = document.getElementById('bus5v-result');
+            const mode = btn.dataset.mode;
+            try {
+                out.textContent = 'ポート選択 → 設定中...';
+                const row = await serialCommand('BUS5V ' + mode, ['OK BUS5V', 'ERR'], 3000);
+                out.textContent = row && row.startsWith('OK BUS5V')
+                    ? '設定しました (' + row.slice(3) + ')。すぐ反映され、再起動は要りません'
+                    : (row || '応答なし。ポート・ファーム版を確認してください');
+            } catch (e) { out.textContent = '失敗: ' + e.message; }
+        }));
 
         document.getElementById('wifi-test').addEventListener('click', async () => {
             try {
