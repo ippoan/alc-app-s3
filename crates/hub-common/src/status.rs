@@ -138,13 +138,14 @@ pub struct HubStatus {
     pub usb_host: bool,
 
     /// M-Bus に外から (ベースの自前給電、PoE) 5V が来ているか (Refs #211)。
-    /// 既定 `None` = 判定前。`eth_w5500::wait_for_w5500` の probe が
-    /// **Core が 5V を出していない間に通ったときだけ** `Some(true)` を入れる。
-    /// **probe の失敗では確定しない** — 起動直後は W5500 がまだ立ち上がって
-    /// いないことがあり、1 回勝負で `Some(false)` にすると PoE 単独給電で
-    /// 起動できなくなる (Refs #254)。`Some(false)` の確定は hub-ui の i2c
-    /// ループ 1 か所だけで、起動から `usb5v::BUS_IN_GRACE_MS` 経っても
-    /// `None` のままだったときに入れる (`lan` feature 無効ビルドも同じ道)。
+    /// 既定 `None` = 判定前。決めるのは hub-ui の i2c ループ 1 か所だけで、材料は
+    /// AXP2101 の TS (M-Bus 5V の 1:1 分圧) を **Core が 5V を出していない間に**
+    /// 読んだ値 (`usb5v::BusInJudge`、同じ読みが 2 回続いたら動かす)。
+    /// **`Some(false)` は起動から `usb5v::BUS_IN_GRACE_MS` の後にしか入れない** —
+    /// PoE の給電が Core の起動に間に合わないことがあり、1 回勝負で `Some(false)`
+    /// にすると PoE 単独給電で起動できなくなる (Refs #254)。TS が読めない間は
+    /// 触らない (fail-closed)。以前の材料だった W5500 probe は、W5500 が Core の
+    /// 3.3V だけで応答して PoE の無い機を `Some(true)` に誤判定した (2026-09-28)。
     /// `None` か `Some(true)` の間、hub-ui は `ext_5v_out` の切り替えそのもの
     /// (usb5v::Latch への sampling) を起こさない — Some(true)/None は
     /// 「外から来ているかもしれない」なので Core 側からは出さない。

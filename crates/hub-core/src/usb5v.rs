@@ -24,9 +24,10 @@
 //! 起こさない (Refs #211)。
 //!
 //! その `bus_in` を**いつ確定してよいか**の猶予もここに置く
-//! ([`BUS_IN_GRACE_MS`] / [`bus_in_absent_confirmed`]、Refs #254)。判定の入力は
-//! W5500 の probe (hub-drivers) と起動からの経過時間 (hub-ui) で持ち主が違うが、
-//! **規則は 1 つ**にしておかないとビルドごとに挙動が分かれる。
+//! ([`BUS_IN_GRACE_MS`] / [`bus_in_absent_confirmed`]、Refs #254) と、判定そのもの
+//! ([`BusInJudge`]、材料は AXP2101 の TS = M-Bus 5V の分圧) もここに置く。
+//! W5500 の probe 周期 (hub-drivers) も同じ猶予を見るので、**規則は 1 つ**に
+//! しておかないとビルドごとに挙動が分かれる。
 
 use crate::protocol::Bus5vMode;
 
@@ -99,10 +100,10 @@ pub fn bus5v_sample(mode: Bus5vMode, bus_in: Option<bool>, usb_host: bool) -> Op
 /// 「M-Bus は外部給電ではない」(`HubStatus::bus_in = Some(false)`) と確定する
 /// までの猶予 [ms] (Refs #254)。
 ///
-/// 起動直後の W5500 probe が 1 回失敗しただけで確定すると、**PoE 単独給電で
-/// 起動できなくなる** — PoE スプリッタ → ベース → W5500 の順に電気が回るので
-/// Core の boot に W5500 が間に合わないことがあり、そこで誤確定すると Core が
-/// 同じ 5V レールを両側から駆動してブラウンアウトする (#254 の現場症状)。
+/// 起動直後に「5V が来ていない」と 1 回読んだだけで確定すると、**PoE 単独給電で
+/// 起動できなくなる** — PoE スプリッタ → ベースの順に電気が回るので Core の boot に
+/// 間に合わないことがあり、そこで誤確定すると Core が同じ 5V レールを両側から
+/// 駆動してブラウンアウトする (#254 の現場症状。当時の判定材料は W5500 probe)。
 /// だから**猶予の間は `None` (まだ分からない) のまま置く**。
 ///
 /// 値の決め方 (5 秒→15 秒、実機ログから改定、Refs #254) — `#256` (猶予 5 秒)
@@ -125,6 +126,70 @@ pub const BUS_IN_GRACE_MS: u64 = 15_000;
 /// fail-closed (5V を出さない側) に倒れる。
 pub fn bus_in_absent_confirmed(uptime_ms: u64) -> bool {
     uptime_ms >= BUS_IN_GRACE_MS
+}
+
+/// AXP2101 の TS ADC (0x36/0x37、14 bit、0.5 mV/LSB) の生値のうち、測れていない
+/// (ADC 無効) とみなす下限。M5Unified `_core_s3_ext_output_unsafe` と同じ
+/// `0x3FFF - 32`
+pub const TS_RAW_INVALID: u16 = 0x3FFF - 32;
+
+/// TS がこれを超えたら M-Bus に 5V が来ている (生値。4000 = 2.0 V)。
+/// CoreS3 の TS には BUS_OUT (M-Bus 5V) の 1:1 分圧が入っている
+/// (m5stack/M5Unified#352)。5 V なら約 2.5 V、無ければ 0 V 近く
+pub const TS_RAW_BUS_5V: u16 = 4000;
+
+/// Core が自分の 5V 出力を止めた直後、TS を信じずに待つ時間 [ms]。
+/// TS の ADC は実電圧に最大 0.7 s ほど遅れる (M5Unified#352 の実測) ので、
+/// 止めた直後に読むと自分の出していた 5V を「外部給電」と読み違える
+pub const TS_SETTLE_AFTER_OFF_MS: u64 = 1_500;
+
+/// TS の生値を「M-Bus に 5V が来ているか」に読み替える。
+/// **Core 自身が 5V を出していない (BUS_EN = 0) ときだけ意味がある** —
+/// 出している間の TS は自分の出力を測っているだけ。
+/// 測れていない値 ([`TS_RAW_INVALID`] 以上) は `None`
+pub fn ts_bus_5v(raw: u16) -> Option<bool> {
+    (raw < TS_RAW_INVALID).then_some(raw > TS_RAW_BUS_5V)
+}
+
+/// M-Bus の外部給電判定 (`HubStatus::bus_in`) を TS の読みから決める (Refs #211, #254)。
+///
+/// 以前は起動時の W5500 probe が通ったら「外部給電あり」としていたが、**W5500 は
+/// Core の 3.3 V だけでも SPI に応答する**ことがあり、PoE も外部電源も無い USB
+/// 給電の機で `Some(true)` に誤判定 → `AUTO` が 5V を出さず Base LAN のリンクが
+/// 張れなかった (2026-09-28 実機)。TS は M-Bus 5V そのものを測るので、
+/// 応答の有無に左右されない。
+///
+/// 規則:
+/// - 同じ読みが **2 回連続**したときだけ動かす (1 秒ポーリングのばたつき除け)
+/// - 5V あり → `Some(true)`。いつでも (猶予の内でも) 入れる
+/// - 5V なし → `Some(false)`。**猶予 ([`BUS_IN_GRACE_MS`]) の内は入れない** —
+///   PoE の給電が Core の起動に間に合わないことがあるため (#254)。猶予の後は、
+///   稼働中に外部給電が抜けた場合にも `Some(true)` から `Some(false)` へ戻す
+/// - 読めない (`ts == None`: Core が出している最中・出し止めた直後・i2c 失敗・
+///   ADC 無効) は連続の数え直しにして `bus_in` を触らない。**読めないまま
+///   `Some(false)` にはしない** (fail-closed。M5Unified も読めなければ危険側)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BusInJudge {
+    last: Option<bool>,
+}
+
+impl BusInJudge {
+    /// TS の読み `ts` ([`ts_bus_5v`] の結果、読めなければ `None`) と今の
+    /// `bus_in`、起動からの経過時間を与え、`bus_in` を変えるべきときだけ
+    /// `Some(新しい値)` を返す。それ以外は `None` (= そのまま)
+    pub fn update(
+        &mut self,
+        ts: Option<bool>,
+        current: Option<bool>,
+        uptime_ms: u64,
+    ) -> Option<bool> {
+        let prev = std::mem::replace(&mut self.last, ts);
+        let v = ts?;
+        if prev != Some(v) || current == Some(v) {
+            return None;
+        }
+        (v || bus_in_absent_confirmed(uptime_ms)).then_some(v)
+    }
 }
 
 #[cfg(test)]
@@ -395,5 +460,109 @@ mod tests {
         // 続いて初めて出す = 最短 4 秒。そこまでは未判定のままでなければ、
         // 5V を出す門が開いたまま誤確定する隙が残る
         assert!(!bus_in_absent_confirmed(4_000));
+    }
+
+    #[test]
+    fn ts_reads_bus_5v_above_2v() {
+        // 5V の 1:1 分圧 ≒ 2.5V = 5000
+        assert_eq!(ts_bus_5v(5000), Some(true));
+        assert_eq!(ts_bus_5v(TS_RAW_BUS_5V + 1), Some(true));
+        // 閾値ちょうどと 0V 近くは「来ていない」
+        assert_eq!(ts_bus_5v(TS_RAW_BUS_5V), Some(false));
+        assert_eq!(ts_bus_5v(0), Some(false));
+    }
+
+    #[test]
+    fn ts_invalid_adc_is_unknown() {
+        assert_eq!(ts_bus_5v(TS_RAW_INVALID - 1), Some(true));
+        assert_eq!(ts_bus_5v(TS_RAW_INVALID), None);
+        assert_eq!(ts_bus_5v(0x3FFF), None);
+    }
+
+    const AFTER: u64 = BUS_IN_GRACE_MS;
+
+    #[test]
+    fn judge_needs_two_consecutive_reads() {
+        let mut j = BusInJudge::default();
+        assert_eq!(j.update(Some(true), None, 1_000), None);
+        assert_eq!(j.update(Some(true), None, 2_000), Some(true));
+    }
+
+    #[test]
+    fn judge_alternating_reads_never_decide() {
+        let mut j = BusInJudge::default();
+        for (i, v) in [true, false, true, false].into_iter().enumerate() {
+            assert_eq!(j.update(Some(v), None, AFTER + i as u64), None);
+        }
+    }
+
+    #[test]
+    fn judge_external_5v_is_taken_even_within_grace() {
+        // PoE で起動した機は猶予を待たずに「外部給電あり」へ
+        let mut j = BusInJudge::default();
+        j.update(Some(true), None, 3_000);
+        assert_eq!(j.update(Some(true), None, 4_000), Some(true));
+    }
+
+    #[test]
+    fn judge_absent_waits_for_grace() {
+        let mut j = BusInJudge::default();
+        j.update(Some(false), None, 3_000);
+        assert_eq!(j.update(Some(false), None, 4_000), None);
+        assert_eq!(j.update(Some(false), None, AFTER - 1), None);
+        assert_eq!(j.update(Some(false), None, AFTER), Some(false));
+    }
+
+    #[test]
+    fn judge_w5500_answering_on_3v3_no_longer_matters() {
+        // 2026-09-28 の現場: USB 給電のみ、TS は 0V 近く。猶予の後に Some(false)
+        // へ確定し、AUTO が 5V を出せるようになる
+        let mut j = BusInJudge::default();
+        let mut got = None;
+        for t in (3_000..=AFTER + 1_000).step_by(1_000) {
+            if let Some(v) = j.update(ts_bus_5v(20), got, t) {
+                got = Some(v);
+            }
+        }
+        assert_eq!(got, Some(false));
+    }
+
+    #[test]
+    fn judge_unreadable_never_confirms_absent() {
+        let mut j = BusInJudge::default();
+        for t in (3_000..AFTER * 3).step_by(1_000) {
+            assert_eq!(j.update(None, None, t), None);
+        }
+    }
+
+    #[test]
+    fn judge_unreadable_resets_the_streak() {
+        let mut j = BusInJudge::default();
+        j.update(Some(false), None, AFTER);
+        j.update(None, None, AFTER + 1_000);
+        assert_eq!(j.update(Some(false), None, AFTER + 2_000), None);
+        assert_eq!(j.update(Some(false), None, AFTER + 3_000), Some(false));
+    }
+
+    #[test]
+    fn judge_does_not_repeat_current_value() {
+        let mut j = BusInJudge::default();
+        j.update(Some(true), Some(true), 1_000);
+        assert_eq!(j.update(Some(true), Some(true), 2_000), None);
+        j.update(Some(false), Some(false), AFTER);
+        assert_eq!(j.update(Some(false), Some(false), AFTER + 1_000), None);
+    }
+
+    #[test]
+    fn judge_follows_external_power_removed_and_restored() {
+        // 稼働中に Base の外部電源が抜けた → 戻った
+        let mut j = BusInJudge::default();
+        j.update(Some(false), Some(true), AFTER);
+        assert_eq!(
+            j.update(Some(false), Some(true), AFTER + 1_000),
+            Some(false)
+        );
+        j.update(Some(true), Some(false), AFTER + 2_000);
+        assert_eq!(j.update(Some(true), Some(false), AFTER + 3_000), Some(true));
     }
 }

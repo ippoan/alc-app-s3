@@ -98,7 +98,7 @@ pub fn start(
             // 同じ番号を reset_gpio_num で取り直すので、二重取得を避ける
             let rst_drv = rst_num.and_then(pulse_reset);
 
-            let n = wait_for_w5500(spi, cs_num, &status);
+            let n = wait_for_w5500(spi, cs_num);
             drop(rst_drv);
             alc_hub_common::evtlog::emit(&format!("EVT ETH_PROBE_OK n={n}"));
 
@@ -163,52 +163,26 @@ fn probe_versionr(spi: &'static SpiDriver<'static>, cs_num: PinId) -> Result<u8>
 /// (LCD と共有) が埋まって別の理由で永久に失敗するため。
 /// 失敗ログは理由が変わったときだけ出す (10 秒ごとに同じ行を吐き続けない)
 ///
-/// **`HubStatus::bus_in` はここでは `Some(true)` しか入れない** (Refs #211, #254)。
-/// 起動時の BUS_EN は L (`power::init`) なので、**Core 自身が 5V を出していない
-/// (`ext_5v_out == false`) 間に probe が通れば、M-Bus に外から 5V が来ている
-/// (PoE)** — そのときだけ `Some(true)` を入れる。
-///
-/// **失敗しても `Some(false)` は入れない。** 起動直後は W5500 がまだ立ち上がって
-/// いないことがあり (PoE スプリッタ → ベース → W5500 の順に電気が回る)、1 回勝負
-/// で確定すると `Some(false)` に誤確定して Core が同じ 5V レールを駆動し、
-/// **PoE 単独給電で起動できなくなる** (#254)。`None` (まだ分からない) のまま置き、
-/// 猶予 (`usb5v::BUS_IN_GRACE_MS`) を過ぎても `None` のままなら hub-ui の i2c
-/// ループが `Some(false)` に確定する — `lan` 無効ビルド (probe が走らない) と
-/// 同じ 1 か所なので、判定待ちで止まることはない。
-/// 猶予の内は probe の間隔を `GRACE_PROBE_INTERVAL_MS` に詰める。
-fn wait_for_w5500(
-    spi: &'static SpiDriver<'static>,
-    cs_num: PinId,
-    status: &SharedStatus,
-) -> u32 {
+/// **`HubStatus::bus_in` (M-Bus の外部給電判定) には触らない** (Refs #211, #254)。
+/// 以前は「Core が 5V を出していない間に probe が通った = 外部 5V (PoE)」として
+/// `Some(true)` を入れていたが、W5500 は Core の 3.3V だけでも応答することがあり、
+/// PoE も外部電源も無い USB 給電の機を外部給電ありと誤判定して `AUTO` が 5V を
+/// 出さなくなった (2026-09-28 実機)。判定は hub-ui が AXP2101 の TS (M-Bus 5V の
+/// 分圧) から行う (`usb5v::BusInJudge`)。
+/// 猶予 (`usb5v::BUS_IN_GRACE_MS`) の内は probe の間隔を `GRACE_PROBE_INTERVAL_MS`
+/// に詰める — PoE の給電が回ってくるのを早く拾うため。
+fn wait_for_w5500(spi: &'static SpiDriver<'static>, cs_num: PinId) -> u32 {
     let mut n: u32 = 0;
     let mut last: Option<String> = None;
     loop {
         n += 1;
         let reason = match probe_versionr(spi, cs_num) {
-            Ok(W5500_VERSION) => {
-                // probe が通った = M-Bus に 5V が来ている。ただし **Core 自身が
-                // 出している間は外部給電の証拠にならない**ので、そのときだけ
-                // 触らない。この関数は最初の probe 成功で `return n` して
-                // 終わる一発勝負なので、**上書きが効くのは「probe が通った
-                // 瞬間にまだ Core が出していない」場合だけ** — 猶予切れで
-                // `Some(false)` に確定した後、Core が既に 5V を出し始めて
-                // いれば `!st.ext_5v_out` が false になり、この枝は素通しで
-                // `return n` するだけで門は閉じ直せない (Refs #254)
-                if let Ok(mut st) = status.lock() {
-                    if !st.ext_5v_out {
-                        st.bus_in = Some(true);
-                    }
-                }
-                return n;
-            }
+            Ok(W5500_VERSION) => return n,
             // 0x00 / 0xFF はベースに 5V が無い (PoE 未接続) か未接続。
             // それ以外の値は配線か SPI モードを疑う
             Ok(v) => format!("versionr=0x{v:02X}"),
             Err(e) => format!("spi_err={e:#}"),
         };
-        // 失敗しても `bus_in` は触らない (`None` のまま = まだ分からない)。
-        // 確定は hub-ui の i2c ループが猶予切れで行う (Refs #254)
         if last.as_deref() != Some(reason.as_str()) {
             log::warn!(
                 "eth_w5500: W5500 が応答しない ({reason}) — 応答するまで probe を続ける \
