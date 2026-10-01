@@ -7,8 +7,9 @@ description = "ホストリンク (USB CDC 行プロトコル + Improv 振り分
 [features]
 # Unit NFC (ST25R3916) 読み取り (issue #84)。ルート components/nfc_shim の extern "C" を呼ぶ
 nfc = []
-# 音 (I2S + codec)。**nfc とは独立** — 音だけ欲しい機 (点呼端末の警告デバイス) が
-# ビルドできるように分けてある (plan/standing-devices.md §2.3)。
+# 音 (I2S + codec)。**nfc とは独立** — 音だけ欲しい機がビルドできるように
+# 分けてある (plan/standing-devices.md §2.3。当初の例だった点呼端末の警告デバイスは
+# ippoan/alc-app#387 から nfc も使う)。
 # コーデックは CoreS3 = AW88298 (speaker.rs)、Atom VoiceS3R = ES8311 (es8311.rs)。
 # 再生ロジックは両者で共有する
 speaker = []

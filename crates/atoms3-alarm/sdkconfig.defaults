@@ -2,9 +2,9 @@
 #
 # 対象は **Atom VoiceS3R** (M5Stack Atom EchoS3R, SKU C126-ECHO /
 # ESP32-S3-PICO-1-N8R8 = 8MB Flash + **8MB Octal PSRAM**)。
-# crates/atoms3-timecard と同じ本番機で、**音 (ES8311) だけを使う**構成:
-# ネットワーク (W5500 / Wi-Fi) も NFC も積まないので、あちらから
-# Ethernet と Unit NFC 由来の設定は落としてある。
+# crates/atoms3-timecard と同じ本番機で、**音 (ES8311) と Unit NFC を使う**構成:
+# ネットワーク (W5500 / Wi-Fi) は積まないので、あちらから Ethernet 由来の
+# 設定は落としてある。Unit NFC 由来の設定は下の「Unit NFC」節 (あちらと同値)。
 
 # ホストリンク (キオスクからの heartbeat / STATUS) は Atom ネイティブ USB-C の
 # USB Serial/JTAG コンソール経由。**この機の入出力はここだけ**
@@ -24,6 +24,26 @@ CONFIG_FREERTOS_HZ=1000
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 # heap.rs の uxTaskGetSystemState (HEAP DUMP のタスク別スタック余裕)
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+
+# ---- Unit NFC (atoms3-timecard と同値、Refs ippoan/alc-app#387) ----
+#
+# **Unit NFC を付けていない機体でもこの節は全部要る** — 同じファームを焼くので、
+# C++ (M5UnitUnified + nfc_shim) は常にリンクされ、読み取りスレッドも常に立つ。
+
+# M5UnitUnified の vendor コード (pin.cpp 等) が旧 driver/i2c.h のシンボルを
+# 参照しており、nfc_shim (新 driver/i2c_master.h) と同一バイナリにリンクされると
+# ESP-IDF 起動直後の __attribute__((constructor)) チェックで即 abort する
+# ("CONFLICT! driver_ng is not allowed to be used with this old driver"、
+#  実機で確認 2026-07-20)。**入れ忘れると警告デバイスが起動直後に落ち続ける。**
+# 経緯は crates/atoms3-timecard/sdkconfig.defaults
+CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
+
+# ST25R3916 ドライバの detect() 内部ポーリングはタイトなビジーウェイトで、
+# NFC スレッドが載った CPU の IDLE タスクを飢餓させる。IDLE の WDT 監視だけを外す。
+# **タスク WDT 自体は生かす** (ウェッジ検出は残す)。
+# main の鳴動ループが飢えない理由は main.rs の `MAIN_TASK_PRIO`
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
 
 # ---- PSRAM (機種固有) ----
 #
@@ -50,7 +70,7 @@ CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 # 4KB 未満の割当 (頻繁アクセスの小物・ドライバ周り) は内蔵 SRAM に残す。
-# 値は atoms3-timecard と同値 — 本機は TLS も NFC も無いので余裕はあるが、
+# 値は atoms3-timecard と同値 — 本機は TLS が無いので余裕はあるが、
 # 揃えておく方が「あちらで測った内部RAM の数字」がそのまま参考になる
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
 # DMA / 内蔵必須の割当 (I2S DMA を含む) が枯渇しないよう内蔵側に 64KB 予約
