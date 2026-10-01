@@ -152,6 +152,7 @@ CoreS3 の `STATUS LAN=…` も同様 (行頭は互換のため変えない)。
 |---|---|
 | `OMRON BP ON\|OFF` / `OMRON STATUS` | Omron 血圧計 (HEM-6231T) を拾うか。呼ぶのは `cores3` / `timecard` / `bp-station` |
 | `PAIR` | BLE 全ボンド消去 → 再ペアリング受付。同上 3 機種 |
+| `BP UNBOND` | 血圧計として記録した 1 台分のボンドだけを外す依頼 (Refs ippoan/alc-app#401)。応答は `OK BP UNBOND` (受理 = BLE ループへ依頼を出した) / `ERR BP UNBOND: busy` (OTA 中・点呼中で断った)。結果は `EVT BP_UNBOND ok\|none\|err` で**非同期に**出る (BLE ループの次の周で処理するので `OK` の直後とは限らない)。`PAIR` との違い = 他の機器のボンドは残し、ペアリング受付も開かない。**`cores3` だけ** (CoreS3 固有分 `host_link.rs` が捌く。他機は `ERR UNSUPPORTED (<kind>)`) |
 
 指静脈 (Vein Station の `vein` build = `timecard` + `--features vein`、
 ippoan/vein-match#20)。**モジュールは実機で未確認** — 手順は
