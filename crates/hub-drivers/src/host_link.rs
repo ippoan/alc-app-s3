@@ -16,7 +16,7 @@
 //! | コマンド | 説明 |
 //! |---|---|
 //! | `PING` | 疎通確認。`PONG` を返す |
-//! | `DEVICE` | `DEVICE cores3 VER=<version> BOARD=cores3\|cores3se FLAVOR=cores3\|cores3-wifi` を返す (機種識別 + 板種 + ビルド種別、共通実装 `console::handle_common`) |
+//! | `DEVICE` | `DEVICE cores3 VER=<version> BOARD=cores3\|cores3se FLAVOR=cores3\|cores3-wifi\|cores3-dev` を返す (機種識別 + 板種 + ビルド種別、共通実装 `console::handle_common`) |
 //! | `OTA SERIAL <size> <flavor>` / `OTA CONFIRM` | シリアル OTA (Refs #279、ippoan/alc-app#403)。USB で繋がった PC のブラウザが app 単体イメージを流し込む (共通実装 `console::handle_ota_serial`、手順は docs/console-protocol.md §6)。`<flavor>` は `DEVICE` の `FLAVOR=` と同じ語。**点呼中の `OTA SERIAL` は `OTA ERR busy` で断る** (`OTA CONFIRM` は点呼中でも受ける)。`OTA READY` の後は `size` バイトを受け切るか中止されるまで、受信バイトを行にも Improv フレームにも解釈しない。確定待ちの見張りは src/main.rs |
 //! | `QR <payload> [timeout_s]` | QR コード画面を表示 (顔認証後のトークン等) |
 //! | `MEASURE` | 測定中画面を表示 |

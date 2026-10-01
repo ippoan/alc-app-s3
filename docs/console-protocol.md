@@ -79,14 +79,19 @@ CoreS3 だけ (`crates/hub-core/src/board.rs`)。板種は起動後に変わら�
 
 | `<flavor>` | ビルド |
 |---|---|
-| `cores3` | CoreS3 の LAN 版 (既定 feature。dev の `mem-hud` も同じ) |
+| `cores3` | CoreS3 の LAN 版 (既定 feature) |
 | `cores3-wifi` | CoreS3 の Wi-Fi 版 (`lan` feature 無し) |
+| `cores3-dev` | CoreS3 の開発用 (LAN 版 + `mem-hud`。メモリ表示つき) |
 | `atoms3-print` | 印刷ブリッジ |
 | `timecard` | タイムカード端末 (LAN 版) |
 | `timecard-station` | 同 `station` feature (Vein Station、LAN 無し) |
 | `timecard-vein` | 同 `vein` feature (`station` + 指静脈) |
 | `alarm` | 警告デバイス |
 | `bp-station` | 測定台 |
+
+`cores3-dev` は `lan` と `mem-hud` の両方を持つビルドだけが名乗る (`mem-hud` で `lan` 無しは
+`cores3-wifi`)。**この語が入る前の開発用ビルドが入っている機体は、新しい版を入れるまで
+`cores3` を名乗り続ける** (機体側では直せない)。
 
 全機種が [`handle_common`](#5-どこに実装が在るか) の共通実装 1 本で答えるので、
 新しい機種を足すときもここに書き足す必要はない。
@@ -210,7 +215,7 @@ ippoan/vein-match#20)。**モジュールは実機で未確認** — 手順は
 ## 6. シリアル OTA (`OTA SERIAL` / `OTA CONFIRM`)
 
 LAN も Wi-Fi も無い `timecard-station` と、キオスクの PC に USB でつながる CoreS3
-(`cores3` / `cores3-wifi`、Refs ippoan/alc-app#403) を、運行者 PC の
+(`cores3` / `cores3-wifi` / `cores3-dev`、Refs ippoan/alc-app#403) を、運行者 PC の
 ブラウザ (キオスク PWA、`ippoan/alc-app` の `web/`) から更新する口 (Refs #279)。
 ブラウザが Pages (`https://ippoan.github.io/alc-app-s3/…`) から取った app 単体
 イメージを Web Serial で**動作中の app** に流し込み、app が裏スロットへ書いて
@@ -261,8 +266,10 @@ LAN も Wi-Fi も無い `timecard-station` と、キオスクの PC に USB で�
 - WS の常時接続 (`ws_uplink`) も、繋がった時点 (未登録の機は起動直後) で image を
   確定する (Refs #217)。LAN / Wi-Fi のある CoreS3 では `OTA CONFIRM` より先にそちらで
   確定することがあるが、そのあとの `OTA CONFIRM` にも `OTA CONFIRMED` を返す (冪等)
-- Pages の app 単体イメージ: `cores3` = `firmware/alc-hub-cores3-app.bin`、
-  `cores3-wifi` = `firmware/alc-hub-cores3-wifi-app.bin`、`timecard-station` =
+- ホストは FLAVOR に対応する bin を送る (機体は flavor が自分と完全一致しなければ
+  `OTA ERR flavor` で断る)。Pages の app 単体イメージ: `cores3` =
+  `firmware/alc-hub-cores3-app.bin`、`cores3-wifi` = `firmware/alc-hub-cores3-wifi-app.bin`、
+  `cores3-dev` = `firmware/alc-hub-cores3-dev-app.bin`、`timecard-station` =
   `firmware/alc-hub-atoms3-timecard-station-app.bin`。版は同じ階層の manifest
   (`manifest.json` / `manifest-wifi.json` / `manifest-timecard-station.json`) の `version`
 
