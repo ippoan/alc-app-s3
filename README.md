@@ -87,7 +87,7 @@ CoreS3 固有のコマンドを中心にした一覧。
 | `AUTH TICKET` | 端末登録の一回券を auth-worker から取得 (`AUTH TICKET <ticket> EXPIRES=<秒>` / `ERR AUTH TICKET: <理由>`)。運行者 PWA の端末登録用、**CoreS3 のみ**対応 |
 | `AUTH KEYGEN [FORCE]` / `AUTH PUBKEY` | 警告デバイス (VoiceS3R) 管理者認証用の ed25519 鍵対を機体内で生成 (`AUTH PUBKEY <base64url>` を返す。既に在れば `ERR AUTH: key exists`、`FORCE` で作り直し) / 生成済み公開鍵の再提示 (無ければ `ERR AUTH: no key`)。秘密鍵は NVS のみに留まり USB には出ない (Refs #205) |
 | `AUTH SIGN <nonce>` | サーバの nonce (小文字 hex 32 文字の ASCII、その 32 バイトそのものに署名) に署名し `AUTH SIG <pubkey base64url> <sig base64url>` を返す (鍵無しは `ERR AUTH: no key`、nonce の形式不正は `ERR AUTH: bad nonce`)。管理者ログインが使う |
-| `AUTH SIGNBP <nonce>` | キオスク端末の認証用 (#249)。血圧計のボンド状態を束縛した ASCII `<nonce>\|bp=<1\|0>` に署名し `AUTH SIGBP <pubkey base64url> <sig base64url> BP=<1\|0>` を返す。ブラウザは素通しするだけなので、血圧計の有無が鍵で裏付けられた端末の申告になる。古いファームはこの口を持たないので、ホストは `AUTH SIGN` へフォールバックする |
+| `AUTH SIGNBP <nonce>` | キオスク端末の認証用 (#249)。血圧計のボンド状態を束縛した ASCII `<nonce>\|bp=<1\|0>` に署名し `AUTH SIGBP <pubkey base64url> <sig base64url> BP=<1\|0>` を返す。ブラウザは素通しするだけなので、血圧計の有無が鍵で裏付けられた端末の申告になる。古いファームはこの口を持たないので、ホストは `AUTH SIGN` へフォールバックする。BLE ループが一定時間 (約 5 分) 先頭に戻っていないときは、ボンド状態を確認できていないと答える (`ERR AUTH: bp not ready`。WS 下り command `{action:"bp_status"}` は `{"bp_read":false}`)。scan や GATT の待ちが戻らなくなる止まり方そのものは直していない — 止まったことがこの応答で分かるだけ (Refs ippoan/alc-app#401) |
 | `AUTH URL <url>` / `WS URL <url>` | auth-worker / cf-alc-recorder の URL 上書き (staging テスト用、NVS 保存) |
 | `WS STATUS` | `WS CONNECTED=1 QUEUE=3 SEQ=42` 応答 (測定データ WS 送信の状態) |
 | `TENKO BP ON\|OFF` / `TENKO STATUS` | 点呼に血圧を含めるか (NVS 保存、**既定 OFF** = 体温 + アルコールの 2 段)。`TENKO BP=0` 応答 |
@@ -115,6 +115,7 @@ crates/hub-core/src/improv.rs)。
 | `EVT WIFI_TEST OK\|NG <詳細>` | `WIFI TEST` の結果 (NG は原因を切り分け) |
 | `EVT PAIR_CLEARED` | BLE ボンド消去完了 |
 | `EVT BP_UNBOND ok\|none\|err` | WS 下り command `{action:"bp_unbond"}` (応答 `{ok:true}` = 受理 / OTA 中・点呼中は `{ok:false,error:"busy"}`) またはシリアルの `BP UNBOND` を BLE ループが処理した結果。血圧計として記録した 1 台のボンドと NVS の記録 (`bp_bond`) だけを消す — 他の機器のボンドは残し、ペアリング受付も開かない (`PAIR` との違い)。`ok`=消した `none`=記録が無かった `err`=削除に失敗。外れたかは `{action:"bp_status"}` で見る (Refs ippoan/alc-app#401) |
+| `EVT BLE_SCAN_ERR rc=<n>` / `EVT BLE_SCAN_OK` | BLE の scan を始められなかった (`rc` = NimBLE の戻り値) / また始められるようになった。**変わり目で 1 回ずつ**しか出ない。失敗している間も BLE ループは止まらず、数秒おきにやり直す (Refs ippoan/alc-app#401) |
 | `EVT WS_CONNECTED` / `EVT WS_DISCONNECTED` | cf-alc-recorder への WS 接続状態 |
 | `EVT GW_CONNECTED` / `EVT GW_DISCONNECTED` | Windows GW (alc-gw) への WS 接続状態 |
 | `EVT WS_COMMAND <id> <payload>` | サーバからの下り command (MEASURE 指示 / timecard 等) |

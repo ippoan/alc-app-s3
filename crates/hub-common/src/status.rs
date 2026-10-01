@@ -71,6 +71,12 @@ pub struct HubStatus {
     /// 「未ボンド」ではなく「まだ確認できていない」と描き分ける
     pub bp_read: bool,
 
+    /// BLE ループ (hub-ble) が最後に先頭を通った時刻 [ms] (Refs ippoan/alc-app#401)。
+    /// None = まだ一度も通っていない。`bp_bonded` / `bp_read` はループの先頭でしか
+    /// 書き換わらないので、これが古ければ 2 つは古い観測のまま残っている。
+    /// `ble_running` (起動したか) とは別 — あちらはループが止まっても true のまま
+    pub ble_loop_beat_ms: Option<u64>,
+
     /// 進行中の点呼セッションの識別子 (Refs #112)。点呼画面 (Measuring) に
     /// いる間だけ Some で、待機画面へ戻ると None に戻る。**発番と更新は UI
     /// スレッドだけが行い、recorder は読むだけ** — 点呼の開始/終了を知って
@@ -218,6 +224,7 @@ pub fn bp_report(status: &SharedStatus) -> alc_hub_core::device::BpReport {
             ble_running: st.ble_running,
             read: st.bp_read,
             bonded: st.bp_bonded,
+            beat_age_ms: st.ble_loop_beat_ms.map(|t| now_ms().saturating_sub(t)),
         }
     }))
 }

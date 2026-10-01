@@ -139,6 +139,14 @@ const SCAN_DURATION_MS: i32 = 5_000;
 const SCAN_COOLDOWN_MS: u32 = 0;
 const MIN_RSSI: i8 = -80;
 const CONNECT_RETRIES: u32 = 3;
+/// 接続リトライの間に置く待ち
+const CONNECT_RETRY_DELAY_MS: u32 = 500;
+/// 1 回の接続の上限。esp32-nimble の既定値 (`BLEClient::new` の `connect_timeout_ms`) の
+/// 写しで、ここでは設定していない — 下の [`LOOP_MAX_MS`] の足し上げにだけ使う
+const CONNECT_TIMEOUT_MS: u64 = 30_000;
+/// scan の開始に失敗したあと、次の周までに置く待ち。失敗は待ちに入る前に同期で返るので、
+/// 待たずに回すとループが空転する
+const SCAN_RETRY_DELAY_MS: u32 = 3_000;
 /// データ受信後、続報が「途切れた」とみなして切断・転送するまでの静穏時間。
 /// 体温計は 1 件のみなので短く、血圧計は過去分ダンプの間隔を見込んで長めに取る
 fn data_quiet_ms(kind: DeviceKind) -> u64 {
@@ -169,6 +177,24 @@ const OMRON_PAIRED_BACKOFF_MS: u64 = 30_000;
 /// つながっていないと記録を送信済みにせず、S3R から切った回は次の接続で同じ記録を再送した
 /// (Linux で記録が届いた接続は、indication のあと約 8 秒で機器が切断していた)
 const OMRON_SESSION_TIMEOUT_MS: u64 = 20_000;
+
+/// 正常な BLE ループ 1 周の最長 (Refs ippoan/alc-app#401)。経路は排他だが、短く
+/// 見積もらないよう全部足す: scan + 接続 (リトライと間の待ち) + 暗号化 + サービス探索の
+/// settle (上限は暗号化と同じ定数) + セッション + ペアリング (プログラムモード・鍵登録・後始末)。
+/// 上限の無い待ち (scan / GATT の await) は入れていない — そこで止まった周は
+/// `bp_report` が拍の古さで「確認できていない」に倒す
+const LOOP_MAX_MS: u64 = SCAN_DURATION_MS as u64
+    + CONNECT_RETRIES as u64 * CONNECT_TIMEOUT_MS
+    + (CONNECT_RETRIES as u64 - 1) * CONNECT_RETRY_DELAY_MS as u64
+    + OMRON_SECURE_TIMEOUT_MS
+    + OMRON_SECURE_TIMEOUT_MS
+    + OMRON_SESSION_TIMEOUT_MS
+    + OMRON_PROGRAM_MODE_TRIES as u64 * OMRON_PROGRAM_MODE_WAIT_MS
+    + OMRON_SET_KEY_WAIT_MS
+    + OMRON_PAIR_LINGER_MS;
+// 拍のしきい値は 1 周の最長の 2 倍以上を保つ。上の定数を伸ばしたら
+// hub-core の `BLE_BEAT_STALE_MS` も伸ばす (測定中の正常な機を止まった扱いにしない)
+const _: () = assert!(LOOP_MAX_MS * 2 <= alc_hub_core::device::BLE_BEAT_STALE_MS);
 
 fn service_uuid(kind: DeviceKind) -> BleUuid {
     match kind {
@@ -261,7 +287,66 @@ async fn task(
     // 見つけ次第ペアリングすると、そばで誰かが `-P-` にしただけで機器のボンド枠を
     // 黙って奪い、元の相手 (スマホ等) との組が切れる
     let mut pair_until: u64 = 0;
+    // 直近の scan が始められなかったか (変わり目でだけ EVT を出す)
+    let mut scan_failed = false;
     loop {
+        // ループがここへ戻ってきた印 (Refs ippoan/alc-app#401)。下の依頼の消費も
+        // `bp_bonded` / `bp_read` の更新もこの先頭でしか起きないので、これが古ければ
+        // `bp_report` は残っている値を答えない
+        let ota_active = status
+            .lock()
+            .map(|mut st| {
+                st.ble_loop_beat_ms = Some(now_ms());
+                st.ota_active
+            })
+            .unwrap_or(false);
+
+        // 血圧計 1 台分のボンドを外す要求 (WS 下り command `bp_unbond`、Refs ippoan/alc-app#401)。
+        // `PAIR` と違い、他の機器のボンドは残し、ペアリング受付も開かない。
+        // ここは接続の外 (前の周の接続は切れている) なので delete_bond で切断は起きない。
+        // Wi-Fi 待ちの間も受ける。OTA 中は依頼を立てたまま残し、終わった周で処理する
+        if !ota_active && bp_unbond_flag.swap(false, Ordering::SeqCst) {
+            let result = bp_unbond(&settings, &mut bp_bond_rec);
+            alc_hub_common::evtlog::emit(&format!("EVT BP_UNBOND {result}"));
+        }
+
+        // 血圧計がボンドされているか (`AUTH SIGNBP` の署名対象に載る、Refs #249)。
+        // 真偽を NVS には持たず、記録したアドレスがボンド一覧にまだ居るかで毎回決める。
+        // 下の pause より前に置く — 後ろだと、pause の間に外したボンドが
+        // `HubStatus` に「ボンド済み」のまま残る
+        let (bp_rec, bp) = bp_bond_parts(bp_bond_rec);
+        if let Ok(mut st) = status.lock() {
+            st.bp_bonded = bp;
+            st.bp_read = true;
+        }
+        if last_bp != Some(bp) {
+            last_bp = Some(bp);
+            println!("{{\"type\":\"bp_bond\",\"bonded\":{bp}}}");
+        }
+        // 「未ボンド」に見えるときの内訳 (Refs #252)。記録が無い (`rec=0`) のか、
+        // 記録はあるが NimBLE のボンド一覧に居ない (`rec=1 listed=0`) のかで原因が
+        // 違う — 前者は記録漏れ (測定がまだ一度も届いていない)、後者は機器が
+        // ボンドを張っていない。アドレスは端末の識別子になりうるので出さない
+        // ([`remember_bp_bond`] と同じ方針) — 真偽だけにする
+        if !bp && last_bp_diag != Some((bp_rec, bp)) {
+            alc_hub_common::evtlog::emit(&format!(
+                "EVT BP_BOND none rec={} listed={}",
+                u8::from(bp_rec),
+                u8::from(bp)
+            ));
+        }
+        last_bp_diag = Some((bp_rec, bp));
+
+        // Wi-Fi の接続/スキャン中 + Improv セッション中は BLE スキャンを
+        // 止め、コエグジストの電波取り合いで Wi-Fi 側が失敗しないようにする
+        // OTA 中は scan を止めて内部RAM を譲る (Refs #116)。coex の pause と
+        // 同じ止め方で、OTA が終われば (成功なら再起動で) 自然に再開する。
+        // 止めている間もループの先頭へ戻り、上の拍と依頼の消費を続ける
+        if coex.ble_should_pause(now_ms()) || ota_active {
+            FreeRtos::delay_ms(200);
+            continue;
+        }
+
         // 再ペアリング要求: 保存済みボンドを全消去する。壊れた/古いボンドが
         // 血圧計の暗号化接続を妨げている場合の復旧手段 (Pages のペアリングボタン)
         if pair_flag.swap(false, Ordering::SeqCst) {
@@ -287,29 +372,12 @@ async fn task(
             pair_until = now_ms() + PAIR_ARM_MS;
             alc_hub_common::evtlog::emit(&format!("EVT PAIR_ARMED {}", PAIR_ARM_MS / 1_000));
         }
-        // 血圧計 1 台分のボンドを外す要求 (WS 下り command `bp_unbond`、Refs ippoan/alc-app#401)。
-        // `PAIR` と違い、他の機器のボンドは残し、ペアリング受付も開かない。
-        // ここは接続の外 (前の周の接続は切れている) なので delete_bond で切断は起きない
-        if bp_unbond_flag.swap(false, Ordering::SeqCst) {
-            let result = bp_unbond(&settings, &mut bp_bond_rec);
-            alc_hub_common::evtlog::emit(&format!("EVT BP_UNBOND {result}"));
-        }
         // 受付時間が切れた: 1 回だけ知らせる (Pages が結果表示を終えられるように)
         if pair_until != 0 && now_ms() >= pair_until {
             pair_until = 0;
             alc_hub_common::evtlog::emit("EVT PAIR_TIMEOUT");
         }
         let pair_open = pair_until != 0;
-
-        // Wi-Fi の接続/スキャン中 + Improv セッション中は BLE スキャンを
-        // 止め、コエグジストの電波取り合いで Wi-Fi 側が失敗しないようにする
-        // OTA 中は scan を止めて内部RAM を譲る (Refs #116)。coex の pause と
-        // 同じ止め方で、OTA が終われば (成功なら再起動で) 自然に再開する。
-        while coex.ble_should_pause(now_ms())
-            || status.lock().map(|st| st.ota_active).unwrap_or(false)
-        {
-            FreeRtos::delay_ms(200);
-        }
 
         // バックオフ期限切れの機器を解放
         empty_backoff.retain(|(_, at)| now_ms().saturating_sub(*at) < EMPTY_BACKOFF_MS);
@@ -319,36 +387,11 @@ async fn task(
         // スキャンの callback は広告 1 件ごとに呼ばれるため、その中で lock しない
         let omron_enabled = status.lock().map(|st| st.omron_bp).unwrap_or(false);
 
-        // 血圧計がボンドされているか (`AUTH SIGNBP` の署名対象に載る、Refs #249)。
-        // 真偽を NVS には持たず、記録したアドレスがボンド一覧にまだ居るかで毎回決める
-        let (bp_rec, bp) = bp_bond_parts(bp_bond_rec);
-        if let Ok(mut st) = status.lock() {
-            st.bp_bonded = bp;
-            st.bp_read = true;
-        }
-        if last_bp != Some(bp) {
-            last_bp = Some(bp);
-            println!("{{\"type\":\"bp_bond\",\"bonded\":{bp}}}");
-        }
-        // 「未ボンド」に見えるときの内訳 (Refs #252)。記録が無い (`rec=0`) のか、
-        // 記録はあるが NimBLE のボンド一覧に居ない (`rec=1 listed=0`) のかで原因が
-        // 違う — 前者は記録漏れ (測定がまだ一度も届いていない)、後者は機器が
-        // ボンドを張っていない。アドレスは端末の識別子になりうるので出さない
-        // ([`remember_bp_bond`] と同じ方針) — 真偽だけにする
-        if !bp && last_bp_diag != Some((bp_rec, bp)) {
-            alc_hub_common::evtlog::emit(&format!(
-                "EVT BP_BOND none rec={} listed={}",
-                u8::from(bp_rec),
-                u8::from(bp)
-            ));
-        }
-        last_bp_diag = Some((bp_rec, bp));
-
         // ニプロ機器は測定時にアドバタイズを開始するため、短いスキャンを
         // 繰り返して発見次第すぐ接続する (Arduino 版 loop() と同じ運用)。
         // 送信済み機器の広告にも接続する — 一度届いた測定は再送されず
         // 数秒の空接続で終わり、万一の再送は recorder の重複排除が破棄する
-        let target = scan
+        let scanned = scan
             .active_scan(true)
             .interval(100)
             .window(99)
@@ -377,8 +420,27 @@ async fn task(
                     target => target,
                 }
             })
-            .await
-            .context("BLE スキャン失敗")?;
+            .await;
+        // scan を始められなかった周はタスクを終わらせず、少し待って次の周へ
+        // (Refs ippoan/alc-app#401)。EVT は変わり目だけ — 毎周出すとリングを押し流す
+        let target = match scanned {
+            Ok(target) => {
+                if scan_failed {
+                    scan_failed = false;
+                    alc_hub_common::evtlog::emit("EVT BLE_SCAN_OK");
+                }
+                target
+            }
+            Err(e) => {
+                if !scan_failed {
+                    scan_failed = true;
+                    log::warn!("ble: スキャン失敗: {e:?}");
+                    alc_hub_common::evtlog::emit(&format!("EVT BLE_SCAN_ERR rc={}", e.code()));
+                }
+                FreeRtos::delay_ms(SCAN_RETRY_DELAY_MS);
+                continue;
+            }
+        };
 
         let Some((addr, kind, omron)) = target else {
             FreeRtos::delay_ms(SCAN_COOLDOWN_MS);
@@ -633,12 +695,12 @@ async fn handle_device(
             Ok(Ok(())) => break,
             Ok(Err(e)) if attempt < CONNECT_RETRIES => {
                 log::warn!("ble: 接続リトライ {attempt}/{CONNECT_RETRIES}: {e:?}");
-                FreeRtos::delay_ms(500);
+                FreeRtos::delay_ms(CONNECT_RETRY_DELAY_MS);
             }
             Ok(Err(e)) => return Err(e).context("接続失敗 (リトライ上限)"),
             Err(e) if attempt < CONNECT_RETRIES => {
                 log::warn!("ble: 接続リトライ {attempt}/{CONNECT_RETRIES}: {e:?}");
-                FreeRtos::delay_ms(500);
+                FreeRtos::delay_ms(CONNECT_RETRY_DELAY_MS);
             }
             Err(e) => return Err(e).context("接続失敗 (リトライ上限)"),
         }
