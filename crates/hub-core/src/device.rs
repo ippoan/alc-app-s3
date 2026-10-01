@@ -144,7 +144,37 @@ pub struct BpObservation {
     pub read: bool,
     /// そのスキャンが書いたボンド状態 (`HubStatus::bp_bonded`)
     pub bonded: bool,
+    /// BLE ループが最後に先頭を通ってからの経過 [ms] (`HubStatus::ble_loop_beat_ms`
+    /// から読む側が引く)。`None` = まだ一度も通っていない (起動直後)
+    pub beat_age_ms: Option<u64>,
 }
+
+/// BLE ループの拍がこれより古ければ、ループは止まっているとみなす [ms]
+/// (Refs ippoan/alc-app#401)。
+///
+/// `bp_bonded` / `bp_read` は BLE ループの先頭を通った周でしか書き換わらない。
+/// ループが先頭へ戻らなくなると、最後に書いた値がそのまま残る。
+///
+/// 値は**正常な 1 周の最長の 2 倍**。1 周の最長は hub-ble の定数の足し上げ
+/// (経路は排他だが、短く見積もらないよう全部足す):
+///
+/// | 段 | hub-ble の定数 | [ms] |
+/// |---|---|---|
+/// | scan | `SCAN_DURATION_MS` | 5_000 |
+/// | 接続 | `CONNECT_RETRIES` (3) × `CONNECT_TIMEOUT_MS` (esp32-nimble の既定 30_000) | 90_000 |
+/// | 接続リトライ間の待ち | (`CONNECT_RETRIES` − 1) × `CONNECT_RETRY_DELAY_MS` (500) | 1_000 |
+/// | 暗号化 | `OMRON_SECURE_TIMEOUT_MS` | 10_000 |
+/// | サービス探索の settle | `OMRON_SECURE_TIMEOUT_MS` (上限に流用) | 10_000 |
+/// | セッション | `OMRON_SESSION_TIMEOUT_MS` | 20_000 |
+/// | ペアリング (プログラムモード) | `OMRON_PROGRAM_MODE_TRIES` (10) × `OMRON_PROGRAM_MODE_WAIT_MS` (1_000) | 10_000 |
+/// | ペアリング (鍵登録) | `OMRON_SET_KEY_WAIT_MS` | 3_000 |
+/// | ペアリング (後始末) | `OMRON_PAIR_LINGER_MS` | 3_000 |
+/// | 合計 | | 152_000 |
+///
+/// hub-ble 側の定数を伸ばしてこの半分を超えると、hub-ble がコンパイルエラーになる
+/// (`LOOP_MAX_MS` の `const` assert)。**短くしないこと** — 測定中の正常な機が
+/// `NotReady` になり、`AUTH SIGNBP` が答えず自動点呼が止まる。
+pub const BLE_BEAT_STALE_MS: u64 = 304_000;
 
 /// 血圧計のボンド状態として**報告してよい値** (Refs #269)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,7 +200,11 @@ pub enum BpReport {
 /// |---|---|---|---|
 /// | false | — | `Ready { bonded: false }` | BLE を起こさない機 (警告デバイス / 印刷ブリッジ / Lite build / `OMRON BP OFF`)。既定値の false が**確定した「血圧計なし」** — ここで待つと永久に答えられない |
 /// | true | false | `NotReady` | スキャン前。既定値の false は観測結果ではない |
-/// | true | true | `Ready { bonded }` | 実測 |
+/// | true | true | `Ready { bonded }` | 実測 (拍がまだ無い / [`BLE_BEAT_STALE_MS`] 以内) |
+/// | true | true、拍が [`BLE_BEAT_STALE_MS`] より古い | `NotReady` | BLE ループが止まっている。残っている値は古い観測で、今の状態ではない (Refs ippoan/alc-app#401) |
+///
+/// 拍を見るのは `ble_running=true` の枝だけ。`ble_running=false` の機は拍を
+/// 打たないので、見ると 1 行目の担保が壊れる。
 ///
 /// `ble_running=false` を**確定した観測**として扱えるのは、`HubStatus::bp_bonded`
 /// の doc が「BLE を積まない機・`OMRON BP OFF` で BLE を起こさない機では false の
@@ -195,6 +229,11 @@ pub fn bp_report(observed: Option<BpObservation>) -> BpReport {
         Some(BpObservation {
             ble_running: false, ..
         }) => BpReport::Ready { bonded: false },
+        Some(BpObservation {
+            read: true,
+            beat_age_ms: Some(age),
+            ..
+        }) if age > BLE_BEAT_STALE_MS => BpReport::NotReady,
         Some(BpObservation {
             read: true, bonded, ..
         }) => BpReport::Ready { bonded },
@@ -318,12 +357,18 @@ mod tests {
         }
     }
 
-    /// `BpObservation` を組み立てる (BLE が動いている機の観測)
+    /// `BpObservation` を組み立てる (BLE が動いている機の観測。拍は打ったばかり)
     fn observed(read: bool, bonded: bool) -> Option<BpObservation> {
+        observed_at(read, bonded, Some(0))
+    }
+
+    /// 拍の古さを指定して `BpObservation` を組み立てる (BLE が動いている機の観測)
+    fn observed_at(read: bool, bonded: bool, beat_age_ms: Option<u64>) -> Option<BpObservation> {
         Some(BpObservation {
             ble_running: true,
             read,
             bonded,
+            beat_age_ms,
         })
     }
 
@@ -362,8 +407,65 @@ mod tests {
                 ble_running: false,
                 read: false,
                 bonded: false,
+                beat_age_ms: None,
             })),
             BpReport::Ready { bonded: false }
+        );
+        // 拍は見ない — 古い拍が残っていても (ありえない組だが) 待たせない
+        assert_eq!(
+            bp_report(Some(BpObservation {
+                ble_running: false,
+                read: true,
+                bonded: true,
+                beat_age_ms: Some(BLE_BEAT_STALE_MS + 1),
+            })),
+            BpReport::Ready { bonded: false }
+        );
+    }
+
+    /// 起動直後で拍がまだ無いときは、今までどおり `read` だけで決まる
+    #[test]
+    fn bp_report_without_a_beat_follows_read() {
+        assert_eq!(bp_report(observed_at(false, false, None)), BpReport::NotReady);
+        assert_eq!(
+            bp_report(observed_at(true, true, None)),
+            BpReport::Ready { bonded: true }
+        );
+    }
+
+    /// 拍が新しい間と、しきい値ちょうどまでは観測をそのまま返す
+    #[test]
+    fn bp_report_passes_the_observation_through_while_the_beat_is_fresh() {
+        assert_eq!(
+            bp_report(observed_at(true, true, Some(0))),
+            BpReport::Ready { bonded: true }
+        );
+        assert_eq!(
+            bp_report(observed_at(true, true, Some(BLE_BEAT_STALE_MS))),
+            BpReport::Ready { bonded: true }
+        );
+        assert_eq!(
+            bp_report(observed_at(true, false, Some(BLE_BEAT_STALE_MS))),
+            BpReport::Ready { bonded: false }
+        );
+    }
+
+    /// ippoan/alc-app#401: BLE ループが止まった後、最後に書いた「ボンド済み」を
+    /// 答え続けない。「未ボンド」の側も同じく古い観測なので答えない
+    #[test]
+    fn bp_report_withholds_bond_state_once_the_beat_is_stale() {
+        assert_eq!(
+            bp_report(observed_at(true, true, Some(BLE_BEAT_STALE_MS + 1))),
+            BpReport::NotReady
+        );
+        assert_eq!(
+            bp_report(observed_at(true, false, Some(u64::MAX))),
+            BpReport::NotReady
+        );
+        // 未読で拍だけ古い (ありえない組) も未確認のまま
+        assert_eq!(
+            bp_report(observed_at(false, false, Some(BLE_BEAT_STALE_MS + 1))),
+            BpReport::NotReady
         );
     }
 

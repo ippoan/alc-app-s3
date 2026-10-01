@@ -196,6 +196,12 @@ fn wait_bp_report(status: &SharedStatus) -> alc_hub_core::device::BpReport {
         if report != alc_hub_core::device::BpReport::NotReady || waited >= BP_READY_WAIT_MS {
             return report;
         }
+        // 一度読めた後の `NotReady` は、BLE ループの拍が古い (止まっている) とき
+        // だけ。待っても変わらないので、止まっている間の問い合わせを毎回 6 秒
+        // 待たせない (Refs ippoan/alc-app#401)。待つのは起動直後の窓だけのまま
+        if status.lock().map(|st| st.bp_read).unwrap_or(false) {
+            return report;
+        }
         FreeRtos::delay_ms(BP_READY_POLL_MS);
         waited += BP_READY_POLL_MS;
     }
