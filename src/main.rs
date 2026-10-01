@@ -226,12 +226,22 @@ fn main() -> Result<()> {
 
     // BLE 再ペアリング要求フラグ (host_link の PAIR → ble タスクがボンド消去)
     let pair_flag = alc_hub_common::control::new_pair_flag();
+    // 血圧計 1 台分のボンドを外す要求フラグ (WS 下り command `bp_unbond` → ble タスク)。
+    // **ws_uplink と ble に同じものを渡す**
+    let bp_unbond_flag = alc_hub_common::control::new_bp_unbond_flag();
 
     // 測定データの WS 送信 (cf-alc-recorder)。recorder が fan-out した測定を
     // NVS 永続キュー経由で送る (未ペアリング・圏外でも測定は失わない)
     let (ws_tx, ws_rx) = mpsc::channel();
     // boot_id は NTP 未同期で記録した測定の時刻補正にも使う (同じ起動の分だけ直す)
-    ws_uplink::start(ws_rx, tx.clone(), Arc::clone(&status), settings.clone(), boot_id)?;
+    ws_uplink::start(
+        ws_rx,
+        tx.clone(),
+        Arc::clone(&status),
+        settings.clone(),
+        boot_id,
+        Arc::clone(&bp_unbond_flag),
+    )?;
 
     // 前回がクラッシュ由来のリセットだったら、panic 前ログ + reset reason を
     // kind="crash_log" として送信キューへ積む (NVS 永続なので圏外でも失わない)
@@ -540,7 +550,15 @@ fn main() -> Result<()> {
     // Wi-Fi 接続/Improv セッション中は BLE スキャンを一時停止する (RadioCoex)
     // UI も Measurement を送る (点呼開始時の免許証 kind=license、#125)
     let ui_meas_tx = meas_tx.clone();
-    ble::start(Arc::clone(&status), meas_tx, tx, coex, pair_flag, settings)?;
+    ble::start(
+        Arc::clone(&status),
+        meas_tx,
+        tx,
+        coex,
+        pair_flag,
+        bp_unbond_flag,
+        settings,
+    )?;
 
     // UI ループ (メインタスクを占有, 戻らない)。alarm_monitor は**鳴動中の**
     // 画面タップで黙らせるためだけに渡す — 鳴らすのは上の専用スレッド

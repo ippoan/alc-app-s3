@@ -66,7 +66,17 @@ fn main() -> anyhow::Result<()> {
     let settings = Settings::new(esp_idf_svc::nvs::EspDefaultNvsPartition::take()?)?;
 
     println!("PROBE START");
-    alc_hub_ble::start(status, meas_tx, ui_tx, coex, pair_flag, settings)?;
+    // この bin は上り WS を持たないので、`bp_unbond` を立てる口は無い
+    let bp_unbond_flag = alc_hub_common::control::new_bp_unbond_flag();
+    alc_hub_ble::start(
+        status,
+        meas_tx,
+        ui_tx,
+        coex,
+        pair_flag,
+        bp_unbond_flag,
+        settings,
+    )?;
 
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));

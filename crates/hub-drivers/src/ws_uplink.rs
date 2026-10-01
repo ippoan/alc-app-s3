@@ -48,6 +48,7 @@ use esp_idf_svc::ws::client::{
 };
 
 use alc_hub_common::{
+    control::BpUnbondFlag,
     measurement::UplinkRecord,
     settings::Settings,
     status::{epoch_ms, now_ms, SharedStatus},
@@ -119,6 +120,7 @@ pub fn start(
     status: SharedStatus,
     settings: Settings,
     boot_id: u32,
+    bp_unbond_flag: BpUnbondFlag,
 ) -> Result<()> {
     // 前の起動で OTA 直後の image を戻していたら、その証跡を出して消す (Refs #217)
     crate::ota::report_previous_rollback(&settings);
@@ -127,7 +129,7 @@ pub fn start(
     std::thread::Builder::new()
         .name("ws_uplink".into())
         .stack_size(20 * 1024)
-        .spawn(move || run(rx, ui_tx, status, settings, boot_id))?;
+        .spawn(move || run(rx, ui_tx, status, settings, boot_id, bp_unbond_flag))?;
     Ok(())
 }
 
@@ -184,6 +186,7 @@ fn run(
     status: SharedStatus,
     settings: Settings,
     boot_id: u32,
+    bp_unbond_flag: BpUnbondFlag,
 ) {
     // 保存先は専用 NVS パーティション punchq。無い機 (OTA だけで更新した機) は
     // 既定 nvs の文字列へフォールバックする (punchq::open_store)
@@ -314,6 +317,7 @@ fn run(
                         &ui_tx,
                         &status,
                         &ev_tx,
+                        &bp_unbond_flag,
                     ) {
                         send_unsent = true;
                     }
@@ -775,6 +779,7 @@ fn handle_downlink(
     ui_tx: &Sender<UiCommand>,
     status: &SharedStatus,
     ev_tx: &mpsc::Sender<WsEvent>,
+    bp_unbond_flag: &BpUnbondFlag,
 ) -> bool {
     match parse_downlink(text) {
         Ok(Downlink::Ack { seq }) => {
@@ -1105,6 +1110,21 @@ fn handle_downlink(
                         }
                     };
                     send_command_result(conn, &id, &payload);
+                }
+                // 血圧計 1 台分のボンドを外す (Refs ippoan/alc-app#401)。ここでは BLE ループへ
+                // 依頼を出すだけで、`ok:true` は「受理した」の意味 — 実際に外れたかは
+                // `EVT BP_UNBOND ok|none|err` と上の `bp_status` で見る。OTA 中と点呼中は
+                // 断る (reboot と同じ判定。点呼の途中で血圧計の扱いを変えない)
+                Some("bp_unbond") => {
+                    let busy = status
+                        .lock()
+                        .map_or(false, |st| st.ota_active || st.session_id.is_some());
+                    if busy {
+                        send_command_result(conn, &id, r#"{"ok":false,"error":"busy"}"#);
+                    } else {
+                        bp_unbond_flag.store(true, core::sync::atomic::Ordering::SeqCst);
+                        send_command_result(conn, &id, r#"{"ok":true}"#);
+                    }
                 }
                 // 遠隔再起動。OTA 中と点呼中は断る —
                 // OTA は書き込み途中で切ると起動不能になり、点呼中の再起動は

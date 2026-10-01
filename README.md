@@ -112,6 +112,7 @@ crates/hub-core/src/improv.rs)。
 | `EVT TENKO_SESSION <id>` | 点呼セッション ID を発番した (この点呼で採れた測定に載る、Refs #112) |
 | `EVT WIFI_TEST OK\|NG <詳細>` | `WIFI TEST` の結果 (NG は原因を切り分け) |
 | `EVT PAIR_CLEARED` | BLE ボンド消去完了 |
+| `EVT BP_UNBOND ok\|none\|err` | WS 下り command `{action:"bp_unbond"}` (応答 `{ok:true}` = 受理 / OTA 中・点呼中は `{ok:false,error:"busy"}`) を BLE ループが処理した結果。血圧計として記録した 1 台のボンドと NVS の記録 (`bp_bond`) だけを消す — 他の機器のボンドは残し、ペアリング受付も開かない (`PAIR` との違い)。`ok`=消した `none`=記録が無かった `err`=削除に失敗。外れたかは `{action:"bp_status"}` で見る (Refs ippoan/alc-app#401) |
 | `EVT WS_CONNECTED` / `EVT WS_DISCONNECTED` | cf-alc-recorder への WS 接続状態 |
 | `EVT GW_CONNECTED` / `EVT GW_DISCONNECTED` | Windows GW (alc-gw) への WS 接続状態 |
 | `EVT WS_COMMAND <id> <payload>` | サーバからの下り command (MEASURE 指示 / timecard 等) |
