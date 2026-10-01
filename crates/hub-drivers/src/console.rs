@@ -13,6 +13,7 @@
 //! | [`install_usb_serial_jtag`] | USB Serial/JTAG ドライバの VFS 接続 (stdin をブロッキング読みにする) |
 //! | [`take_line`] | 受信バッファから 1 行を切り出す (改行待ち + ゴミ捨て) |
 //! | [`spawn_reader`] | stdin を読んで行ごとにコールバックを呼ぶスレッド (`OTA SERIAL` の後は生バイトを OTA へ渡す) |
+//! | [`feed_serial_ota`] | `OTA SERIAL` の後の生バイトを OTA へ渡す (reader が行を切り出す前に呼ぶ。[`spawn_reader`] と CoreS3 の [`crate::host_link`] が共有) |
 //! | [`start_common`] | 機種固有の分岐を持たない機の入口 (上記の共通分だけを連結する) |
 //! | [`handle_common`] | 機種に依らないコマンド (PING / DEVICE / HEAP / LOG / AUTH / WS) |
 //! | [`handle_ota_serial`] | `OTA SERIAL` / `OTA CONFIRM` (シリアル OTA。確定待ちを見張る機だけが呼ぶ) |
@@ -72,9 +73,35 @@ pub fn discard_overlong(acc: &mut Vec<u8>) {
     }
 }
 
+/// シリアル OTA の受信中 (`raw` が `Some`) なら、`acc` の先頭から受け取れるだけ
+/// 生のまま OTA へ渡す (Refs #279)。reader ([`spawn_reader`] と CoreS3 の
+/// [`crate::host_link`]) が、行 (や Improv フレーム) を切り出す**前に**毎回呼ぶ。
+///
+/// 戻り値が `true` なら**まだ受信中** — `acc` は使い切ってあるので、呼び出し側は
+/// 何も解釈せずに続きのバイトを待つ。`false` なら生バイトの受信は無い / 終わった
+/// (`raw` は `None` に戻してある) ので、`acc` の残りを行として読む。
+///
+/// OTA が失敗・時間切れで終わっていたら (書き込みスレッドが `OTA ERR …` を出し済み)、
+/// 次に届いたバイトから行として読む — 送り手が止まっても reader は固まらない
+pub fn feed_serial_ota(raw: &mut Option<crate::ota::SerialSink>, acc: &mut Vec<u8>) -> bool {
+    let Some(sink) = raw.as_mut() else {
+        return false;
+    };
+    if !sink.aborted() {
+        let used = sink.feed(acc);
+        acc.drain(..used);
+        if !sink.received_all() && !sink.aborted() {
+            return true;
+        }
+    }
+    *raw = None;
+    false
+}
+
 /// stdin を読み、完成した行ごとに `on_line` を呼ぶスレッドを起動する。
 /// Improv (バイナリフレーム) を混在させる CoreS3 は本関数を使わず
-/// [`crate::host_link`] が自前で振り分ける。
+/// [`crate::host_link`] が自前で振り分ける (生バイトの受け渡しは同じ
+/// [`feed_serial_ota`] を呼ぶ)。
 ///
 /// **シリアル OTA (Refs #279)**: `on_line` が `OTA SERIAL` を受け入れると
 /// ([`crate::ota::serial_begin`])、続く `size` バイトは行に分けず
@@ -107,18 +134,8 @@ pub fn spawn_reader(
                     Ok(n) => {
                         acc.extend_from_slice(&chunk[..n]);
                         loop {
-                            if let Some(sink) = raw.as_mut() {
-                                // OTA が失敗で終わっていたら (`OTA ERR …` を出し済み)、
-                                // 以後のバイトは行として読む
-                                if !sink.aborted() {
-                                    let used = sink.feed(&acc);
-                                    acc.drain(..used);
-                                    if !sink.received_all() && !sink.aborted() {
-                                        break; // 続きのバイトを待つ
-                                    }
-                                }
-                                raw = None;
-                                continue;
+                            if feed_serial_ota(&mut raw, &mut acc) {
+                                break; // 続きのバイトを待つ
                             }
                             match take_line(&mut acc) {
                                 Some(line) => {
@@ -430,11 +447,12 @@ pub fn handle_omron(
 
 /// シリアル OTA (`OTA SERIAL <size> <flavor>` / `OTA CONFIRM`、Refs #279)。
 ///
-/// **[`handle_common`] には入れない** — 受信は [`spawn_reader`] の生バイト
-/// モードが前提で (CoreS3 の [`crate::host_link`] は持たない)、確定待ちの見張り
-/// ([`crate::ota::spawn_serial_confirm_watch`]) を起動で呼ぶ機だけが受けてよい。
-/// 見張りの無い機が受けると、`OTA CONFIRM` が来なかったときに戻らない。
-/// 今呼ぶのはタイムカード端末 (`station` が本命) だけ。
+/// **[`handle_common`] には入れない** — 受信は reader の生バイトモード
+/// ([`feed_serial_ota`]。[`spawn_reader`] と CoreS3 の [`crate::host_link`] が持つ) が
+/// 前提で、確定待ちの見張り ([`crate::ota::spawn_serial_confirm_watch`]) を起動で
+/// 呼ぶ機だけが受けてよい。見張りの無い機が受けると、`OTA CONFIRM` が来なかった
+/// ときに戻らない。今呼ぶのはタイムカード端末 (`station` が本命) と CoreS3
+/// (Refs ippoan/alc-app#403) だけ。
 ///
 /// `flavor` は [`handle_common`] に渡すものと同じ語。ホストの `<flavor>` と
 /// 違えば `OTA ERR flavor` で断る。

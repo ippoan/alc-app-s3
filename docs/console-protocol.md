@@ -28,7 +28,8 @@ CoreS3 (`cores3`) はこれに `FC1200` (RS232 パススルー) / `CFG` (設定
 [ble-medical-gateway](https://github.com/ippoan/ble-medical-gateway) の
 シリアル JSON 互換) が加わる。
 
-タイムカード端末 (`timecard`) は `OTA` (シリアル OTA の応答、§6) が加わる。
+タイムカード端末 (`timecard`) と CoreS3 (`cores3`) は `OTA` (シリアル OTA の応答、
+§6) が加わる。
 
 Vein Station の `vein` build (`timecard`) は `VEIN` (指静脈の特徴量、§4 の
 `VEIN CAPTURE`) が加わる。**この行は 2 千文字を超える** (特徴量 0x448 バイトなら
@@ -111,9 +112,11 @@ CoreS3 の `STATUS LAN=…` も同様 (行頭は互換のため変えない)。
 
 ## 4. 共通コマンド (どの機種が何に答えるか)
 
-行の連結順は `spawn_reader` → `handle_common` → (`timecard` だけ `handle_ota_serial`)
-→ `handle_omron` → `handle_pair` → 機種固有分岐 → 最後まで捌かれなければ
-`ERR UNSUPPORTED (<kind>)`。
+行の連結順は `spawn_reader` → `handle_common` → (`timecard` と `cores3` だけ
+`handle_ota_serial`) → `handle_omron` → `handle_pair` → 機種固有分岐 → 最後まで
+捌かれなければ `ERR UNSUPPORTED (<kind>)`。CoreS3 は Improv のバイナリフレームを
+混ぜるので `spawn_reader` の代わりに自前の reader (`host_link.rs`) を持つが、
+以降の連結は同じ。
 
 | コマンド | `handle_common` (全機種共通) |
 |---|---|
@@ -179,16 +182,19 @@ ippoan/vein-match#20)。**モジュールは実機で未確認** — 手順は
 - 警告デバイス: [`crates/atoms3-alarm/src/console.rs`](../crates/atoms3-alarm/src/console.rs) の doc
 - 測定台 (`bp-station`): `OTA` / `OTA SERIAL` を含め機種固有コマンドを持たない (共通実装のみ)
 
-`OTA SERIAL` / `OTA CONFIRM` (§6) に答えるのは `timecard` だけ。他の機種は
-`ERR UNSUPPORTED (<kind>)` を返す (`OTA ` で始まらないので、§6 のホストは
-応答が無いまま時間切れで諦める)。
+`OTA SERIAL` / `OTA CONFIRM` (§6) に答えるのは `timecard` と `cores3`
+(Refs ippoan/alc-app#403) だけ。他の機種は `ERR UNSUPPORTED (<kind>)` を返す
+(`OTA ` で始まらないので、§6 のホストは応答が無いまま時間切れで諦める)。
+**この対応より前の版の CoreS3 も `ERR UNSUPPORTED (cores3)` を返す** — その機は
+一度 web インストーラか `OTA <url>` / WS の `ota` で上げてからでないと、§6 では
+更新できない。
 
 ## 5. どこに実装が在るか
 
 | | ファイル |
 |---|---|
 | 行解析 (純粋・テスト済み) | [`crates/hub-core/src/protocol.rs`](../crates/hub-core/src/protocol.rs) |
-| 共通実装 (`handle_common` / `handle_ota_serial` / `handle_omron` / `handle_pair` / `start_common`) | [`crates/hub-drivers/src/console.rs`](../crates/hub-drivers/src/console.rs) |
+| 共通実装 (`handle_common` / `handle_ota_serial` / `feed_serial_ota` / `handle_omron` / `handle_pair` / `start_common`) | [`crates/hub-drivers/src/console.rs`](../crates/hub-drivers/src/console.rs) |
 | シリアル OTA の書き込み・確定・戻し (§6) | [`crates/hub-drivers/src/ota.rs`](../crates/hub-drivers/src/ota.rs) |
 | 機種の語彙 (`HostKind`: label / `AUTH TICKET` 可否 / `BOARD=` 要否) | [`crates/hub-core/src/protocol.rs`](../crates/hub-core/src/protocol.rs) の `HostKind` |
 | CoreS3 固有分 | [`crates/hub-drivers/src/host_link.rs`](../crates/hub-drivers/src/host_link.rs) |
@@ -203,7 +209,8 @@ ippoan/vein-match#20)。**モジュールは実機で未確認** — 手順は
 
 ## 6. シリアル OTA (`OTA SERIAL` / `OTA CONFIRM`)
 
-LAN も Wi-Fi も無い `timecard-station` を、USB でつながった運行者 PC の
+LAN も Wi-Fi も無い `timecard-station` と、キオスクの PC に USB でつながる CoreS3
+(`cores3` / `cores3-wifi`、Refs ippoan/alc-app#403) を、運行者 PC の
 ブラウザ (キオスク PWA、`ippoan/alc-app` の `web/`) から更新する口 (Refs #279)。
 ブラウザが Pages (`https://ippoan.github.io/alc-app-s3/…`) から取った app 単体
 イメージを Web Serial で**動作中の app** に流し込み、app が裏スロットへ書いて
@@ -220,7 +227,7 @@ LAN も Wi-Fi も無い `timecard-station` を、USB でつながった運行者
    |---|---|
    | `flavor` | 自分のビルドと flavor が違う |
    | `size` | 256 KiB (`MIN_IMAGE_BYTES`) 未満か、次のスロット長を超える |
-   | `busy` | 別の OTA (HTTP 版の `OTA <url>` / WS の `ota` を含む) が走っている |
+   | `busy` | 別の OTA (HTTP 版の `OTA <url>` / WS の `ota` を含む) が走っている。**CoreS3 は点呼中もこれで断る** (書き込みは始めない。点呼が終わってから送り直す) |
    | `begin` | `esp_ota_begin` に失敗した |
 
 3. ホスト: 生のバイト列を 4096 B ずつ送る (最後は端数)。**`OTA ACK` を受けてから
@@ -233,6 +240,7 @@ LAN も Wi-Fi も無い `timecard-station` を、USB でつながった運行者
    - 成功: NVS に「確定待ち」の印を立て、`OTA OK` を返し、約 500 ms 後に再起動する
    - 失敗: `OTA ERR verify` (スロットは切り替えない)
 6. 再起動後: ホストは再接続して `DEVICE` を送る → `DEVICE timecard VER=<ver> FLAVOR=timecard-station`
+   (CoreS3 は `DEVICE cores3 VER=<ver> BOARD=<board> FLAVOR=cores3` — `FLAVOR=` は `KEY=` で拾う)
 7. ホスト: FLAVOR が期待どおりなら `OTA CONFIRM` を送る
 8. 端末: 確定待ちなら確定して印を消し、`OTA CONFIRMED` を返す
    - 確定待ちでなくても `OTA CONFIRMED` を返す (冪等)
@@ -244,7 +252,19 @@ LAN も Wi-Fi も無い `timecard-station` を、USB でつながった運行者
 - 版 (`VER`) の一致は「更新するか」の判定にだけ使う。確定の条件にはしない
 - 印の無い未確定 (web インストーラ / `espflash` で入れた機) には何もしない
 - `READY` の後のバイトは行に分けずに受けるので、途中に `\r` / `\n` があってもよい
-  (受信は #277 で無変換)
+  (受信は #277 で無変換)。CoreS3 は受信中だけ Improv フレームの振り分けも止める
+  (イメージの中身が IMPROV マジックに当たりうる)。受け切る・`OTA ERR write|timeout|verify`
+  のどれで終わっても、次のバイトから行と Improv の振り分けに戻る
+- **受信中はホストが他の行を送れない** (`HB OK` も生バイトとして読まれる)。CoreS3 の
+  沈黙警告は heartbeat が 10 秒途切れると鳴るので、ホストは `OTA SERIAL` の前に
+  `HB OFF` で監視を止める (または `HB OK grace=<秒>` で締切を延ばす) こと
+- WS の常時接続 (`ws_uplink`) も、繋がった時点 (未登録の機は起動直後) で image を
+  確定する (Refs #217)。LAN / Wi-Fi のある CoreS3 では `OTA CONFIRM` より先にそちらで
+  確定することがあるが、そのあとの `OTA CONFIRM` にも `OTA CONFIRMED` を返す (冪等)
+- Pages の app 単体イメージ: `cores3` = `firmware/alc-hub-cores3-app.bin`、
+  `cores3-wifi` = `firmware/alc-hub-cores3-wifi-app.bin`、`timecard-station` =
+  `firmware/alc-hub-atoms3-timecard-station-app.bin`。版は同じ階層の manifest
+  (`manifest.json` / `manifest-wifi.json` / `manifest-timecard-station.json`) の `version`
 
 **既知の限界**: 新しい app が起動直後に落ちる (確定の口までたどり着かない) と戻らない —
 web インストーラの bootloader (espflash 同梱の `boot.bin`) は rollback を持たず、

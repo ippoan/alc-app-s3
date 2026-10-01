@@ -5,6 +5,8 @@
 //! 2. Improv Wi-Fi Serial のバイナリフレーム (ESP Web Tools の Wi-Fi 設定)
 //!
 //! 受信バイト列は IMPROV マジックで振り分け、それ以外を行として解釈する。
+//! シリアル OTA (`OTA SERIAL`) の受信中だけは振り分けを止め、生のまま OTA へ渡す
+//! (イメージの中身が IMPROV マジックや改行に当たりうるため)。
 //! Wi-Fi を起こさないビルド (`lan` feature、#217) では `Wifi` / `Improv` が
 //! 無く、Improv フレームは読み捨てて `EVT IMPROV_UNAVAILABLE lan` を最初の
 //! 1 回だけ、`WIFI TEST` には `EVT WIFI_TEST NG lan` を返す。
@@ -15,7 +17,7 @@
 //! |---|---|
 //! | `PING` | 疎通確認。`PONG` を返す |
 //! | `DEVICE` | `DEVICE cores3 VER=<version> BOARD=cores3\|cores3se FLAVOR=cores3\|cores3-wifi` を返す (機種識別 + 板種 + ビルド種別、共通実装 `console::handle_common`) |
-//! | `OTA SERIAL <size> <flavor>` / `OTA CONFIRM` | シリアル OTA (Refs #279)。**CoreS3 は受けない** (`ERR UNSUPPORTED`) — 生バイトの受信と確定待ちの見張りを持つのはタイムカード端末だけ (`console::handle_ota_serial`) |
+//! | `OTA SERIAL <size> <flavor>` / `OTA CONFIRM` | シリアル OTA (Refs #279、ippoan/alc-app#403)。USB で繋がった PC のブラウザが app 単体イメージを流し込む (共通実装 `console::handle_ota_serial`、手順は docs/console-protocol.md §6)。`<flavor>` は `DEVICE` の `FLAVOR=` と同じ語。**点呼中の `OTA SERIAL` は `OTA ERR busy` で断る** (`OTA CONFIRM` は点呼中でも受ける)。`OTA READY` の後は `size` バイトを受け切るか中止されるまで、受信バイトを行にも Improv フレームにも解釈しない。確定待ちの見張りは src/main.rs |
 //! | `QR <payload> [timeout_s]` | QR コード画面を表示 (顔認証後のトークン等) |
 //! | `MEASURE` | 測定中画面を表示 |
 //! | `RESULT OK\|NG [value]` | 測定結果画面を表示 (value 例: `0.000`) |
@@ -102,7 +104,8 @@ pub fn start(
 ) -> Result<()> {
     // stdin のブロッキング読み出しを可能にする (console.rs と同じ設置)。
     // 本 crate は Improv (バイナリフレーム) を混ぜるため console::spawn_reader は
-    // 使わず、行の切り出しだけ console::take_line を共有する
+    // 使わず、行の切り出し (console::take_line) とシリアル OTA の生バイトの
+    // 受け渡し (console::feed_serial_ota) を共有する
     crate::console::install_usb_serial_jtag();
 
     crate::task::name_next(c"host_link");
@@ -112,6 +115,8 @@ pub fn start(
         .spawn(move || {
             let mut chunk = [0u8; 64];
             let mut acc: Vec<u8> = Vec::new();
+            // シリアル OTA の生バイトの受け口 (受信中だけ Some)
+            let mut raw: Option<crate::ota::SerialSink> = None;
             loop {
                 match std::io::stdin().lock().read(&mut chunk) {
                     Ok(0) => FreeRtos::delay_ms(20),
@@ -120,6 +125,7 @@ pub fn start(
                         drain_buffer(
                             flavor,
                             &mut acc,
+                            &mut raw,
                             &tx,
                             &status,
                             &settings,
@@ -137,11 +143,17 @@ pub fn start(
     Ok(())
 }
 
-/// バッファ先頭から処理できる単位 (IMPROV フレーム / テキスト行) を消費する
+/// バッファ先頭から処理できる単位 (IMPROV フレーム / テキスト行) を消費する。
+///
+/// シリアル OTA の受信中 (`raw` が `Some`) は、**IMPROV の振り分けより先に**
+/// 生バイトとして OTA へ渡す (Refs ippoan/alc-app#403)。受け切る・失敗する・
+/// 時間切れになる、のどれで終わっても `console::feed_serial_ota` が `raw` を
+/// `None` に戻すので、振り分けはそこから元どおり働く
 #[allow(clippy::too_many_arguments)]
 fn drain_buffer(
     flavor: &'static str,
     acc: &mut Vec<u8>,
+    raw: &mut Option<crate::ota::SerialSink>,
     tx: &Sender<UiCommand>,
     status: &SharedStatus,
     settings: &Settings,
@@ -152,6 +164,9 @@ fn drain_buffer(
     alarm: &SharedMonitor,
 ) {
     loop {
+        if console::feed_serial_ota(raw, acc) {
+            return; // 続きのバイトを待つ
+        }
         if acc.is_empty() {
             return;
         }
@@ -195,6 +210,9 @@ fn drain_buffer(
                     bp_unbond_flag,
                     alarm,
                 );
+                // いまの行が `OTA SERIAL` を受け入れていれば、続きは生バイト
+                // (コマンドはこのスレッドの上で捌くので、受け口は必ず置かれている)
+                *raw = crate::ota::take_serial_sink();
             }
         }
     }
@@ -235,6 +253,21 @@ fn handle_line(
     let Some(command) =
         console::handle_common(command, status, settings, HostKind::CoreS3, flavor)
     else {
+        return;
+    };
+    // シリアル OTA (Refs #279、ippoan/alc-app#403)。受信・書き込み・確定はタイムカード
+    // 端末と同じ共通実装で、確定待ちの見張りは src/main.rs が起動で立てる
+    // (`ota::spawn_serial_confirm_watch`)。**点呼中は始めない** — 書き込みの
+    // スレッドを立てる前にここで断るので、flash には 1 バイトも書かない。
+    // 別の OTA との重複と flavor の不一致は `ota::serial_begin` が断る。
+    // `OTA CONFIRM` は再起動直後の確定なので点呼中でも通す
+    if matches!(command, HostCommand::OtaSerial { .. })
+        && status.lock().map_or(false, |st| st.session_id.is_some())
+    {
+        println!("OTA ERR busy");
+        return;
+    }
+    let Some(command) = console::handle_ota_serial(command, status, settings, flavor) else {
         return;
     };
     // BLE 血圧計の設定 (`OMRON BP` / `OMRON STATUS`) も共通実装へ。
@@ -467,11 +500,6 @@ fn handle_line(
         // 印刷系は AtomS3 印刷ブリッジ (atoms3-print) 専用 (#38)。CoreS3 は
         // プリンター配線を持たないため未対応と明示する
         HostCommand::Print { .. } | HostCommand::PrinterAddr { .. } | HostCommand::PrinterStatus => {
-            println!("ERR UNSUPPORTED ({})", HostKind::CoreS3.label());
-        }
-        // シリアル OTA はタイムカード端末専用 (Refs #279)。本機の reader は生バイトの
-        // 受信を持たず、確定待ちの見張りも立てない (console::handle_ota_serial の doc)
-        HostCommand::OtaSerial { .. } | HostCommand::OtaConfirm => {
             println!("ERR UNSUPPORTED ({})", HostKind::CoreS3.label());
         }
         // console::handle_common が捌いたはずのもの (到達しない)

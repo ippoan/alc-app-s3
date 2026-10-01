@@ -230,6 +230,12 @@ fn main() -> Result<()> {
     // **ws_uplink と ble に同じものを渡す**
     let bp_unbond_flag = alc_hub_common::control::new_bp_unbond_flag();
 
+    // シリアル OTA (`OTA SERIAL`、Refs ippoan/alc-app#403) で入れた image の確定待ち。
+    // 印が無ければ何もしない。**host_link::start より前に、条件を付けずに呼ぶ** —
+    // 見張りの無いまま `OTA SERIAL` を受けると、`OTA CONFIRM` が来なかったときに
+    // 前の image へ戻らない (console::handle_ota_serial の doc)
+    alc_hub_drivers::ota::spawn_serial_confirm_watch(settings.clone());
+
     // 測定データの WS 送信 (cf-alc-recorder)。recorder が fan-out した測定を
     // NVS 永続キュー経由で送る (未ペアリング・圏外でも測定は失わない)
     let (ws_tx, ws_rx) = mpsc::channel();
