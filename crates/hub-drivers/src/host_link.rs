@@ -40,6 +40,7 @@
 //! | `BUS5V AUTO\|ON\|OFF` | M-Bus 5V を Core 側から出すかの設定 (NVS 保存、既定 `AUTO`。Refs #254)。`AUTO` = USB ホスト (PC) が列挙されていて、かつ M-Bus が外部給電でない (`BUS_IN=0`) 間だけ出す (#202 の固定動作)。`OFF` = 絶対に出さない — **PoE のベースを履いた常設機はこれ**。`ON` = 常に出す (USB 電源アダプタのベンチ向け。**PoE の機では使わないこと** — 同じ 5V レールを両側から駆動し PoE 単独で起動できなくなる)。反映は即時 (hub-ui が 1 秒ごとに読む)。遠隔からは WS 下り command `{action:"bus5v","mode":"auto\|on\|off"}` で同じ設定を変えられる |
 //! | `BUS5V STATUS` | M-Bus 5V の設定と現況 `BUS5V MODE=auto USB=1 OUT=1 BATTERY=0 BUS_IN=0` を返す。`BUS_IN` は AXP2101 の TS (M-Bus 5V の分圧) で決まる M-Bus の外部給電判定 (`1`=PoE 等で外部給電中 `0`=無し `?`=未判定、Refs #211)。WS 下り command `{action:"bus5v_status"}` / `{action:"reboot"}` (auth-worker 端末一覧) でも遠隔で照会・再起動できる |
 //! | `TENKO BP ON\|OFF` / `TENKO STATUS` | 点呼に血圧を含めるか (NVS、既定 OFF) / `TENKO BP=0` を返す |
+//! | `BP UNBOND` | 血圧計として記録した 1 台分のボンドだけを外す依頼 (Refs ippoan/alc-app#401)。WS 下り command `{action:"bp_unbond"}` と同じ依頼の USB の口。`OK BP UNBOND` = 受理 (BLE ループへ依頼を出した) / `ERR BP UNBOND: busy` = OTA 中・点呼中で断った。実際に外れたかは `EVT BP_UNBOND ok\|none\|err`。他の機器のボンドは残し、ペアリング受付も開かない (`PAIR` との違い)。**CoreS3 のみ**、他機は `ERR UNSUPPORTED` |
 //! | `OMRON BP ON\|OFF` / `OMRON STATUS` | Omron 血圧計を拾うか (NVS、既定 OFF) / `OMRON BP=0` を返す |
 //! | `HEAP` | `HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> TOTAL_INT=<n> TOTAL_PSRAM=<n>` を返す (Refs #27) |
 //! | `HEAP DUMP` | `HEAPDUMP ...` 複数行 (ヒープブロック概況 + タスク別スタック余裕) |
@@ -70,7 +71,7 @@ use alc_hub_core::protocol::{parse_line, HostCommand, HostKind};
 use anyhow::Result;
 use esp_idf_svc::hal::delay::FreeRtos;
 
-use alc_hub_common::control::PairFlag;
+use alc_hub_common::control::{BpUnbondFlag, PairFlag};
 use alc_hub_common::{
     config,
     settings::Settings,
@@ -95,6 +96,7 @@ pub fn start(
     settings: Settings,
     wifi: Option<Wifi>,
     pair_flag: PairFlag,
+    bp_unbond_flag: BpUnbondFlag,
     mut improv: Option<Improv>,
     alarm: SharedMonitor,
 ) -> Result<()> {
@@ -123,6 +125,7 @@ pub fn start(
                             &settings,
                             wifi.as_ref(),
                             &pair_flag,
+                            &bp_unbond_flag,
                             &mut improv,
                             &alarm,
                         );
@@ -144,6 +147,7 @@ fn drain_buffer(
     settings: &Settings,
     wifi: Option<&Wifi>,
     pair_flag: &PairFlag,
+    bp_unbond_flag: &BpUnbondFlag,
     improv: &mut Option<Improv>,
     alarm: &SharedMonitor,
 ) {
@@ -180,7 +184,17 @@ fn drain_buffer(
                 // 応答を必ず行頭から出す (#268)。途中で終わっているログ行が
                 // あっても、ホストの行分割がここで切ってくれる
                 alc_hub_common::hostout::begin_line();
-                handle_line(flavor, &line, tx, status, settings, wifi, pair_flag, alarm);
+                handle_line(
+                    flavor,
+                    &line,
+                    tx,
+                    status,
+                    settings,
+                    wifi,
+                    pair_flag,
+                    bp_unbond_flag,
+                    alarm,
+                );
             }
         }
     }
@@ -197,6 +211,7 @@ fn handle_line(
     settings: &Settings,
     wifi: Option<&Wifi>,
     pair_flag: &PairFlag,
+    bp_unbond_flag: &BpUnbondFlag,
     alarm: &SharedMonitor,
 ) {
     // キオスク PWA の診断ログの返事 (`PWALOG <id> …`、#215)。get_log の応答へ
@@ -350,6 +365,21 @@ fn handle_line(
         HostCommand::BlePair => {
             pair_flag.store(true, core::sync::atomic::Ordering::SeqCst);
             println!("OK PAIR");
+        }
+        // 血圧計 1 台分のボンドを外す (Refs ippoan/alc-app#401)。WS 下り command
+        // `bp_unbond` (ws_uplink.rs) と同じ依頼の USB の口 — **同じフラグ**を立てるだけで、
+        // `OK` は「受理した」の意味。実際に外れたかは ble タスクの `EVT BP_UNBOND
+        // ok|none|err` で見る。OTA 中と点呼中は断る (WS の腕と同じ判定)
+        HostCommand::BpUnbond => {
+            let busy = status
+                .lock()
+                .map_or(false, |st| st.ota_active || st.session_id.is_some());
+            if busy {
+                println!("ERR BP UNBOND: busy");
+            } else {
+                bp_unbond_flag.store(true, core::sync::atomic::Ordering::SeqCst);
+                println!("OK BP UNBOND");
+            }
         }
         // Windows GW (alc-gw) 連携 (gw_link.rs)
         HostCommand::GwUrl { url } => match settings.set_gw_url(&url) {
