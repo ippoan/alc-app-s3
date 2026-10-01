@@ -119,6 +119,7 @@ crates/hub-core/src/improv.rs)。
 | `EVT WS_DROPPED <seq> <kind>` | 送信キューの保存先が一杯で最古の未送信測定を破棄 (kind = 測定種別。打刻は `timecard`) |
 | `EVT WS_TOKEN_ROTATED` | 期限が近づいた device JWT を、WS を保ったまま差し替えた (Refs ippoan/rust-alc-api#644)。TTL は 1 時間なので通常 50 分ごとに 1 回出る |
 | `EVT WS_TOKEN_STALE fails=<n>` | 同 差し替えが n 回 (1 分間隔) 続けて失敗している。**このまま期限が切れると再接続が 401 で失敗し、5 分後に `WS_STALE_RESTART` で再起動する** |
+| `EVT AUTH_CHANGED` | `AUTH SET` / `AUTH UNPAIR` で鍵 (credential) の device_id が変わった / 消えたのを WS 送信ループが見つけ (500ms 周期)、持っていた device JWT を捨てて WS を畳んだ。続けて新しい鍵で JWT を取り直して繋ぎ直す (接続中だったら `EVT WS_DISCONNECTED` → `EVT WS_CONNECTED` が続く。鍵が消えた場合は未ペアリングの待ちに入る)。再起動はしない。未送信の測定は捨てず、繋ぎ直した接続で送る (Refs ippoan/alc-app#387) |
 | `EVT PUNCHQ <mode> count=<n>` | 送信キューの保存先 (`nvs` = 専用パーティション punchq / `legacy` = 既定 nvs にフォールバック) と未送信件数 |
 | `EVT PUNCHQ migrated <n>` | 旧形式 (既定 nvs の文字列) に残っていた n 件を punchq へ移した |
 | `EVT WS_CLOCK_WAIT` | WS は繋がったが時計が未同期で、補正できる測定があるため送信を最大 60 秒待っている (NTP 同期後に補正して送る) |

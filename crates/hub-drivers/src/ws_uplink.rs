@@ -26,6 +26,7 @@
 //! | `EVT WS_DROPPED <seq> <kind>` | 保存先が一杯で最古の未送信測定を破棄 |
 //! | `EVT WS_TOKEN_ROTATED` | 期限が近づいた device JWT を、接続を保ったまま差し替えた (Refs ippoan/rust-alc-api#644) |
 //! | `EVT WS_TOKEN_STALE fails=<n>` | 同 差し替えが n 回続けて失敗している。**このまま期限が切れると再接続が 401 で失敗する** |
+//! | `EVT AUTH_CHANGED` | 鍵 (credential) が書き換わった / 消えたのを見つけ、device JWT を捨てて WS を畳んだ。新しい鍵で繋ぎ直す (Refs ippoan/alc-app#387) |
 //! | `EVT PUNCHQ <mode> count=<n>` | 送信キューの保存先と未送信件数 (punchq.rs) |
 //! | `EVT OTA_ROLLED_BACK free_int=<n> min_int=<n> reason=<語>` | 前の起動で OTA 直後の image を戻した (戻った先の起動で出る。Refs #217) |
 //! | `EVT OTA_ROLLBACK_UNAVAILABLE` | 戻そうとしたが戻し先が無い — この image を確定して続ける |
@@ -37,9 +38,10 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use alc_hub_core::uplink::{
     auth_header_line, command_action, command_bus5v_mode, command_gw_url, command_log_max_bytes,
     command_log_offset, command_ota_url, command_print_chunk, command_print_url,
-    command_result_frame, jitter_ms, measurement_frame, ota_guard, parse_downlink,
-    reconnect_backoff, should_wait_for_clock, token_needs_mint, Downlink, DroppedEntry, OtaGuard,
-    UplinkQueue, PING_FRAME, RECONNECT_BACKOFF_MAX_MS, RECONNECT_FAST_MS, RECONNECT_SLOW_MS,
+    command_result_frame, credential_changed, jitter_ms, measurement_frame, ota_guard,
+    parse_downlink, reconnect_backoff, should_wait_for_clock, token_needs_mint, Downlink,
+    DroppedEntry, OtaGuard, UplinkQueue, PING_FRAME, RECONNECT_BACKOFF_MAX_MS, RECONNECT_FAST_MS,
+    RECONNECT_SLOW_MS,
 };
 use anyhow::Result;
 use esp_idf_svc::handle::RawHandle;
@@ -146,6 +148,16 @@ struct Conn {
     connected_at: Option<u64>,
 }
 
+/// device JWT と、それを取ったときの状態
+struct Token {
+    jwt: String,
+    /// 失効時刻 (稼働 ms)
+    expires_at: u64,
+    /// mint に使った credential の device_id。鍵 (credential) が書き換わったことを
+    /// これと今の credential の比較で見分ける (Refs ippoan/alc-app#387)
+    device_id: String,
+}
+
 /// WS push 印刷 (#38) の TcpStream 書き込みタイムアウト。fetch_and_send と同値
 const PRINT_IO_TIMEOUT_S: u64 = 30;
 
@@ -213,8 +225,8 @@ fn run(
     let mut reconnect_fast = false;
     // ハンドシェイク失敗の連鎖回数 (逓増バックオフ用)
     let mut reconnect_fails: u32 = 0;
-    // device JWT と失効時刻 (稼働 ms)
-    let mut token: Option<(String, u64)> = None;
+    // device JWT と失効時刻 (稼働 ms)、mint に使った credential の device_id
+    let mut token: Option<Token> = None;
     // **transport に今載っているトークン**の失効時刻 (稼働 ms)。
     //
     // `token` の失効時刻とは**別に持つ**。一緒にすると「再 mint に成功して
@@ -373,6 +385,43 @@ fn run(
             }
         }
 
+        // --- 鍵 (credential) の書き換え (Refs ippoan/alc-app#387) ---
+        // `AUTH SET` / `AUTH UNPAIR` は NVS を書くだけで、ここには何も知らせない。
+        // サーバは接続時の JWT で端末を固定するので、放っておくと JWT が切れるまで
+        // (最長 1 時間) 前の鍵の端末として測定・打刻を送り続ける。JWT を取ったときの
+        // device_id と今の credential を比べ、違う (または消えた) なら JWT を捨てて
+        // 接続を畳む — 下の `conn.is_none()` の分岐が `connect` から入り直し、
+        // 新しい credential で mint する (credential が無ければ「未ペアリング」の待ち)。
+        //
+        // **`mark_disconnected` では足りない** — C 側の自動再接続は client 生成時の
+        // ヘッダ (= 前の鍵の JWT) を送り続けるので、client ごと畳む。
+        // JWT を持っていない間 (未ペアリングの待ち) は credential を読まない
+        let auth_changed = token.as_ref().is_some_and(|t| {
+            let current = settings.device_credential().map(|(id, _)| id);
+            credential_changed(Some(&t.device_id), current.as_deref())
+        });
+        if auth_changed {
+            // **device_id は載せない** — 残すのは事実だけ
+            log::warn!("ws_uplink: 鍵が書き換わったため device JWT を捨てて繋ぎ直します");
+            alc_hub_common::evtlog::emit("EVT AUTH_CHANGED");
+            token = None;
+            header_expires_at = 0;
+            let was_connected = conn.as_ref().is_some_and(|c| c.connected);
+            discard_conn(&mut conn);
+            if was_connected {
+                alc_hub_common::evtlog::emit("EVT WS_DISCONNECTED");
+            }
+            // 畳んだ client が残したイベントを捨てる。残すと次の client が繋がる前に
+            // 古い `Connected` を拾い、繋がったことにしてしまう (destroy は WS task の
+            // 終了を待って戻るので、これ以降に古い client のイベントは増えない)
+            while ev_rx.try_recv().is_ok() {}
+            // 印刷中なら未完なので破棄 (切断時と同じ)
+            print_session = None;
+            // 新しい client は SLOW から始まる (`connect`)
+            reconnect_fast = false;
+            publish_status(&status, &queue, false);
+        }
+
         // --- 3. 接続管理 ---
         // キューが空でも接続を張り、下り command (timecard / 遠隔 MEASURE /
         // 印刷ブリッジの print・ota) を待ち受ける常時接続 (Refs #25。PSRAM
@@ -443,7 +492,7 @@ fn run(
                     Ok(c) => {
                         conn = Some(c);
                         // このハンドシェイクに載せたトークンが transport に残る
-                        header_expires_at = token.as_ref().map_or(0, |(_, at)| *at);
+                        header_expires_at = token.as_ref().map_or(0, |t| t.expires_at);
                         token_swap_fails = 0;
                         token_swap_alerted = false;
                         // 接続を始めた。Connected が来なければここで止まっている
@@ -683,6 +732,32 @@ fn note_disconnect(fails: &mut u32, backoff_until: &mut u64, held_ms: Option<u64
     *fails = next;
     // delay == 0 (サーバ都合の切断) は jitter_ms も 0 のまま = 待たない
     *backoff_until = now + jitter_ms(delay, rand_u32());
+}
+
+/// client を畳んで `conn` を空にする (Refs ippoan/alc-app#387)。**接続中でも
+/// 切断中でも呼べる。**
+///
+/// `*conn = None` (= `Drop`) では畳まない — `Drop` は
+/// `esp_websocket_client_close(..).unwrap()` から入り、切断中の client では
+/// panic する ([`mark_disconnected`] の注記)。`esp_websocket_client_destroy` は
+/// 状態を問わず WS task を止めてから資源を返す (止まるまで待つ: 接続中は受信
+/// poll の 1 秒、ハンドシェイク中は最長でその timeout) ので、それを直接呼び、
+/// `Drop` が走らないよう client を forget する。
+///
+/// forget で残るのは event callback の箱 1 つ (`ev_tx` の clone を持つだけ)。
+/// 呼ぶのは鍵が書き換わったときだけなので積もらない
+fn discard_conn(conn: &mut Option<Conn>) {
+    let Some(c) = conn.take() else {
+        return;
+    };
+    // SAFETY: handle は生きている client のもの。destroy は WS task の終了を待って
+    // から戻るので、以後 callback は呼ばれず handle も使わない (この thread は
+    // WS task ではないので、自分自身を待つことも無い)
+    let err = unsafe { esp_idf_svc::sys::esp_websocket_client_destroy(c.client.handle()) };
+    if err != esp_idf_svc::sys::ESP_OK {
+        log::warn!("ws_uplink: client を畳めません (err={err})");
+    }
+    core::mem::forget(c.client);
 }
 
 /// WS の接続を「切れた」状態にする。**client は drop しない。**
@@ -1179,19 +1254,31 @@ fn send_command_result(conn: &mut Option<Conn>, id: &str, payload: &str) {
 /// `heap_headroom_ok` と `ble_busy` のゲートを通してから呼ぶこと**
 fn auth_header(
     settings: &Settings,
-    token: &mut Option<(String, u64)>,
+    token: &mut Option<Token>,
     now: u64,
     margin_s: u64,
 ) -> Result<String, String> {
-    if token_needs_mint(now, token.as_ref().map(|(_, at)| *at), margin_s) {
+    if token_needs_mint(now, token.as_ref().map(|t| t.expires_at), margin_s) {
         let (id, secret) = settings
             .device_credential()
             .ok_or("未ペアリング (AUTH PAIR で登録してください)")?;
+        // 持っている JWT と別の鍵では mint しない (Refs ippoan/alc-app#387)。
+        // 接続を保ったままの差し替えがここを通ると、**前の鍵で張った接続に
+        // 新しい鍵の JWT を載せてしまい**、以後は書き換えを見分けられなくなる。
+        // run ループが次の周で JWT を捨てて繋ぎ直す (`connect` は run ループが
+        // JWT を捨てた後に来るので、新しい鍵での mint はここに掛からない)
+        if credential_changed(token.as_ref().map(|t| t.device_id.as_str()), Some(&id)) {
+            return Err("鍵が書き換わった (繋ぎ直しを待つ)".into());
+        }
         let t = auth_link::mint_token(&settings.auth_url(), &id, &secret)?;
-        *token = Some((t.access_token, now + t.expires_in_s * 1000));
+        *token = Some(Token {
+            jwt: t.access_token,
+            expires_at: now + t.expires_in_s * 1000,
+            device_id: id,
+        });
     }
     Ok(auth_header_line(
-        &token.as_ref().expect("token minted above").0,
+        &token.as_ref().expect("token minted above").jwt,
     ))
 }
 
@@ -1204,13 +1291,13 @@ fn auth_header(
 /// 「transport に載っているトークン」を更新すること
 fn swap_auth_header(
     settings: &Settings,
-    token: &mut Option<(String, u64)>,
+    token: &mut Option<Token>,
     conn: &Option<Conn>,
     now: u64,
 ) -> Result<u64, String> {
     let c = conn.as_ref().ok_or("接続がない")?;
     let headers = auth_header(settings, token, now, TOKEN_HEADER_SWAP_MARGIN_S)?;
-    let expires_at = token.as_ref().map_or(0, |(_, at)| *at);
+    let expires_at = token.as_ref().map_or(0, |t| t.expires_at);
     let line =
         std::ffi::CString::new(headers).map_err(|_| "ヘッダに NUL が混じった".to_string())?;
     // SAFETY: handle は生きている client のもので、line は呼び出しの間だけ生存
@@ -1227,7 +1314,7 @@ fn swap_auth_header(
 /// device JWT を確保し (期限切れ間近なら再 mint)、WSS 接続を開始する
 fn connect(
     settings: &Settings,
-    token: &mut Option<(String, u64)>,
+    token: &mut Option<Token>,
     ev_tx: mpsc::Sender<WsEvent>,
     now: u64,
 ) -> Result<Conn, String> {
