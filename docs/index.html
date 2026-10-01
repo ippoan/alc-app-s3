@@ -688,7 +688,7 @@
                 const d = kv(rows.device), s = kv(rows.status), b = kv(rows.bus5v);
                 const lines = [];
                 const flavor = d.FLAVOR;
-                lines.push('版: ' + (flavor === 'cores3' ? 'LAN 版' : flavor === 'cores3-wifi' ? 'Wi-Fi 版' : (flavor || '不明 (古いファーム)'))
+                lines.push('版: ' + (flavor === 'cores3' ? 'LAN 版' : flavor === 'cores3-wifi' ? 'Wi-Fi 版' : flavor === 'cores3-dev' ? '開発用 (LAN 版)' : (flavor || '不明 (古いファーム)'))
                     + (d.VER ? '  (' + d.VER + ')' : ''));
                 lines.push('LAN: ' + (s.LAN === '1' ? 'リンクあり' : s.LAN === '0' ? 'リンクなし' : '不明')
                     + (s.WIFI !== undefined ? '   Wi-Fi: ' + (s.WIFI === '1' ? '接続' : '未接続') : ''));
