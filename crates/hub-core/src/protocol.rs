@@ -138,6 +138,10 @@ pub enum HostCommand {
     WifiTest,
     /// BLE の全ボンド消去 → 次接続で再ペアリング (血圧計の暗号化接続復旧)
     BlePair,
+    /// 血圧計として記録した 1 台分のボンドだけを外す (`BP UNBOND`、Refs ippoan/alc-app#401)。
+    /// WS 下り command `bp_unbond` と同じ依頼の USB の口 — 他の機器のボンドは残し、
+    /// ペアリング受付も開かない (`PAIR` との違い)。**CoreS3 だけが受ける**
+    BpUnbond,
     /// device credential の直接注入 (USB 前提の provisioning — ホストが
     /// auth-worker `/device/pair` 系で取得した credential をシリアルで渡す)
     AuthSet {
@@ -556,6 +560,11 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
             Some("PAIR") => HostCommand::BlePair,
             _ => return Err("ERR BLE: PAIR が必要です".into()),
         },
+        // 血圧計 1 台分のボンドを外す (Refs ippoan/alc-app#401)
+        "BP" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+            Some("UNBOND") => HostCommand::BpUnbond,
+            _ => return Err("ERR BP: UNBOND が必要です".into()),
+        },
         // auth-worker デバイス登録 (BLE の PAIR とは別系統)
         "AUTH" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
             Some("SET") => match (it.next(), it.next(), it.next()) {
@@ -939,6 +948,20 @@ mod tests {
         assert_eq!(parse_line("ble pair", T), Ok(Some(HostCommand::BlePair)));
         assert!(parse_line("BLE", T).is_err());
         assert!(parse_line("BLE SCAN", T).is_err());
+    }
+
+    #[test]
+    fn bp_unbond() {
+        assert_eq!(parse_line("BP UNBOND", T), Ok(Some(HostCommand::BpUnbond)));
+        assert_eq!(parse_line("bp unbond", T), Ok(Some(HostCommand::BpUnbond)));
+        assert_eq!(
+            parse_line("  BP   UNBOND  ", T),
+            Ok(Some(HostCommand::BpUnbond))
+        );
+        assert_eq!(parse_line("BP", T), Err("ERR BP: UNBOND が必要です".into()));
+        assert!(parse_line("BP STATUS", T).is_err());
+        // `PAIR` (全ボンド消去 + 受付) とは別のコマンド
+        assert_ne!(parse_line("PAIR", T), Ok(Some(HostCommand::BpUnbond)));
     }
 
     #[test]

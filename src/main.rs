@@ -315,6 +315,7 @@ fn main() -> Result<()> {
         settings.clone(),
         wifi,
         pair_flag.clone(),
+        Arc::clone(&bp_unbond_flag),
         improv,
         Arc::clone(&alarm_monitor),
     )?;

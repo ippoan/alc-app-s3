@@ -79,6 +79,7 @@ CoreS3 固有のコマンドを中心にした一覧。
 | `CFG SET <json>` | 設定 (画面向き + Wi-Fi) を検証して NVS へインポート |
 | `WIFI TEST` | 保存済み Wi-Fi 設定で接続テスト (失敗時は原因を切り分け) |
 | `PAIR` / `BLE PAIR` | BLE の全ボンド消去 → 次接続で再ペアリング |
+| `BP UNBOND` | 血圧計として記録した 1 台分のボンドだけを外す依頼 (`OK BP UNBOND` = 受理 / OTA 中・点呼中は `ERR BP UNBOND: busy`。結果は `EVT BP_UNBOND ok\|none\|err`)。`PAIR` との違い = 他の機器のボンドは残し、ペアリング受付も開かない。**CoreS3 のみ**対応 (他機は `ERR UNSUPPORTED`)。WS 下り command `{action:"bp_unbond"}` と同じ依頼の USB の口 (Refs ippoan/alc-app#401) |
 | `AUTH SET <id> <secret> <tenant>` | device credential を注入 (USB provisioning。ホストが auth-worker `/device/pair` 系で取得した値) |
 | `AUTH UNPAIR` / `AUTH STATUS` | credential の破棄 / 状態確認 (`AUTH PAIRED <tenant> <id>` or `AUTH UNPAIRED`) |
 | `AUTH TOKEN` | device JWT 取得の自己診断 (`EVT AUTH_TOKEN OK\|NG ...`) |
@@ -112,7 +113,7 @@ crates/hub-core/src/improv.rs)。
 | `EVT TENKO_SESSION <id>` | 点呼セッション ID を発番した (この点呼で採れた測定に載る、Refs #112) |
 | `EVT WIFI_TEST OK\|NG <詳細>` | `WIFI TEST` の結果 (NG は原因を切り分け) |
 | `EVT PAIR_CLEARED` | BLE ボンド消去完了 |
-| `EVT BP_UNBOND ok\|none\|err` | WS 下り command `{action:"bp_unbond"}` (応答 `{ok:true}` = 受理 / OTA 中・点呼中は `{ok:false,error:"busy"}`) を BLE ループが処理した結果。血圧計として記録した 1 台のボンドと NVS の記録 (`bp_bond`) だけを消す — 他の機器のボンドは残し、ペアリング受付も開かない (`PAIR` との違い)。`ok`=消した `none`=記録が無かった `err`=削除に失敗。外れたかは `{action:"bp_status"}` で見る (Refs ippoan/alc-app#401) |
+| `EVT BP_UNBOND ok\|none\|err` | WS 下り command `{action:"bp_unbond"}` (応答 `{ok:true}` = 受理 / OTA 中・点呼中は `{ok:false,error:"busy"}`) またはシリアルの `BP UNBOND` を BLE ループが処理した結果。血圧計として記録した 1 台のボンドと NVS の記録 (`bp_bond`) だけを消す — 他の機器のボンドは残し、ペアリング受付も開かない (`PAIR` との違い)。`ok`=消した `none`=記録が無かった `err`=削除に失敗。外れたかは `{action:"bp_status"}` で見る (Refs ippoan/alc-app#401) |
 | `EVT WS_CONNECTED` / `EVT WS_DISCONNECTED` | cf-alc-recorder への WS 接続状態 |
 | `EVT GW_CONNECTED` / `EVT GW_DISCONNECTED` | Windows GW (alc-gw) への WS 接続状態 |
 | `EVT WS_COMMAND <id> <payload>` | サーバからの下り command (MEASURE 指示 / timecard 等) |
