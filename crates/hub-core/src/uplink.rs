@@ -85,6 +85,23 @@ pub fn token_needs_mint(now_ms: u64, expires_at_ms: Option<u64>, margin_s: u64) 
     }
 }
 
+/// 持っている device JWT を捨てて繋ぎ直すべきか (Refs ippoan/alc-app#387)。
+///
+/// `minted_device_id` は JWT を mint したときの credential の device_id で、
+/// JWT を持っていなければ `None`。`current_device_id` は今 NVS にある
+/// credential の device_id で、未登録 (`AUTH UNPAIR` 後) なら `None`。
+///
+/// サーバは接続時の JWT で端末を固定するので、**鍵が書き換わった後も古い JWT の
+/// 接続が残ると、記録は前の鍵の端末として保存され続ける**。JWT を持っていない
+/// 間は捨てるものが無いので false (未登録で待っている周を毎回「変わった」に
+/// しない)
+pub fn credential_changed(minted_device_id: Option<&str>, current_device_id: Option<&str>) -> bool {
+    match minted_device_id {
+        Some(minted) => current_device_id != Some(minted),
+        None => false,
+    }
+}
+
 /// WSS ハンドシェイクに載せる Authorization ヘッダ 1 行 (末尾 CRLF 込み)。
 /// esp_websocket_client の `headers` はこの綴りをそのまま追加のヘッダ行として
 /// 送るので、**CRLF を落とすと後続のヘッダと結合して壊れる**
@@ -1886,6 +1903,19 @@ mod tests {
         let expires_at = Some(3_600_000);
         assert!(!token_needs_mint(now, expires_at, 120));
         assert!(token_needs_mint(now, expires_at, 10 * 60));
+    }
+
+    #[test]
+    fn credential_changed_only_when_a_token_is_held_and_the_id_differs() {
+        // 同じ鍵のまま = 通常の周。何もしない
+        assert!(!credential_changed(Some("dev-a"), Some("dev-a")));
+        // 別の鍵に書き換わった
+        assert!(credential_changed(Some("dev-a"), Some("dev-b")));
+        // 鍵が消えた (AUTH UNPAIR)
+        assert!(credential_changed(Some("dev-a"), None));
+        // JWT を持っていない間は、鍵が在っても無くても捨てるものが無い
+        assert!(!credential_changed(None, Some("dev-a")));
+        assert!(!credential_changed(None, None));
     }
 
     #[test]
