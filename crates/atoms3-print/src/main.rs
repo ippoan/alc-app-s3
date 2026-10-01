@@ -69,7 +69,15 @@ fn main() -> Result<()> {
     // boot_id は NTP 未同期で記録した測定の時刻補正に使う (ws_uplink.rs)。
     // この機は crash_log しか積まないが、CoreS3 と同じ口なので同じ値を渡す
     let boot_id = settings.next_boot_id();
-    ws_uplink::start(ws_meas_rx, ui_tx, Arc::clone(&status), settings.clone(), boot_id)?;
+    // 本機は BLE を持たないので `bp_unbond` のフラグは誰も消費しない (CoreS3 と同じ口なので渡す)
+    ws_uplink::start(
+        ws_meas_rx,
+        ui_tx,
+        Arc::clone(&status),
+        settings.clone(),
+        boot_id,
+        alc_hub_common::control::new_bp_unbond_flag(),
+    )?;
 
     // 前回がクラッシュ由来なら panic 前ログを kind=crash_log で送信キューへ
     // (CoreS3 と同じ。ws_meas_tx は main が保持し続けるので channel も閉じない)

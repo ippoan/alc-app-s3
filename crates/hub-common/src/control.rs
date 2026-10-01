@@ -13,3 +13,12 @@ pub type PairFlag = Arc<AtomicBool>;
 pub fn new_pair_flag() -> PairFlag {
     Arc::new(AtomicBool::new(false))
 }
+
+/// 「次のスキャン前に血圧計 1 台分のボンドを外す」要求フラグ (Refs ippoan/alc-app#401)。
+/// ws_uplink (hub-drivers) の下り command `bp_unbond` がセットし、BLE ループ (hub-ble) が
+/// 消費する。片方向 — 結果は `EVT BP_UNBOND` と `bp_status` で見る
+pub type BpUnbondFlag = Arc<AtomicBool>;
+
+pub fn new_bp_unbond_flag() -> BpUnbondFlag {
+    Arc::new(AtomicBool::new(false))
+}

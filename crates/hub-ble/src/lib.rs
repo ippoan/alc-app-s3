@@ -65,7 +65,7 @@ use esp32_nimble::{
 use esp_idf_svc::hal::{delay::FreeRtos, task::block_on};
 use esp_idf_svc::timer::EspTaskTimerService;
 
-use alc_hub_common::control::PairFlag;
+use alc_hub_common::control::{BpUnbondFlag, PairFlag};
 use alc_hub_common::measurement::Measurement;
 use alc_hub_common::settings::Settings;
 use alc_hub_common::status::{now_ms, SharedStatus};
@@ -190,6 +190,7 @@ pub fn start(
     ui_tx: Sender<UiCommand>,
     coex: Arc<RadioCoex>,
     pair_flag: PairFlag,
+    bp_unbond_flag: BpUnbondFlag,
     settings: Settings,
 ) -> Result<()> {
     let meas_tx: MeasTx = Arc::new(Mutex::new(meas_tx));
@@ -206,7 +207,15 @@ pub fn start(
         .name("ble".into())
         .stack_size(16 * 1024)
         .spawn(move || {
-            if let Err(e) = block_on(task(status, meas_tx, ui_tx, coex, pair_flag, settings)) {
+            if let Err(e) = block_on(task(
+                status,
+                meas_tx,
+                ui_tx,
+                coex,
+                pair_flag,
+                bp_unbond_flag,
+                settings,
+            )) {
                 log::error!("ble: タスク異常終了: {e:?}");
                 println!("{{\"type\":\"error\",\"message\":\"BLE task terminated\"}}");
             }
@@ -220,6 +229,7 @@ async fn task(
     ui_tx: Sender<UiCommand>,
     coex: Arc<RadioCoex>,
     pair_flag: PairFlag,
+    bp_unbond_flag: BpUnbondFlag,
     settings: Settings,
 ) -> Result<()> {
     let device = BLEDevice::take();
@@ -276,6 +286,13 @@ async fn task(
             // 消去の成否に関わらず受付を開く (要求されたのはペアリングのやり直し)
             pair_until = now_ms() + PAIR_ARM_MS;
             alc_hub_common::evtlog::emit(&format!("EVT PAIR_ARMED {}", PAIR_ARM_MS / 1_000));
+        }
+        // 血圧計 1 台分のボンドを外す要求 (WS 下り command `bp_unbond`、Refs ippoan/alc-app#401)。
+        // `PAIR` と違い、他の機器のボンドは残し、ペアリング受付も開かない。
+        // ここは接続の外 (前の周の接続は切れている) なので delete_bond で切断は起きない
+        if bp_unbond_flag.swap(false, Ordering::SeqCst) {
+            let result = bp_unbond(&settings, &mut bp_bond_rec);
+            alc_hub_common::evtlog::emit(&format!("EVT BP_UNBOND {result}"));
         }
         // 受付時間が切れた: 1 回だけ知らせる (Pages が結果表示を終えられるように)
         if pair_until != 0 && now_ms() >= pair_until {
@@ -1014,11 +1031,44 @@ async fn omron_pair(client: &mut BLEClient, disconnected: &Disconnected) -> Resu
 /// その機器の bond だけを消し、`EVT OMRON_PAIR unbond ok|err|none` を出す
 /// (全消去はニプロ機の bond を巻き込むので使わない)
 fn omron_unbond(addr: &BLEAddress) {
-    let result = match omron_find_bond(addr) {
+    let result = delete_found_bond(omron_find_bond(addr));
+    alc_hub_common::evtlog::emit(&format!("EVT OMRON_PAIR unbond {result}"));
+}
+
+/// 血圧計として記録した 1 台のボンドを外し、NVS の記録も消す。結果を
+/// `"ok"` (消した) / `"none"` (記録が無かった) / `"err"` (削除に失敗) で返す
+/// (Refs ippoan/alc-app#401)。記録が無ければ NimBLE のボンドには触らない。
+/// 記録は残すと、ボンドが残っている機器を見たときに書き戻されるので一緒に消す —
+/// ボンド一覧にその機器が居なかったときも消す。ボンドの削除に失敗したときだけは
+/// 記録を残す (消すと、やり直しのときに外す相手が分からなくなる)
+fn bp_unbond(settings: &Settings, recorded: &mut Option<[u8; 6]>) -> &'static str {
+    let Some(rec) = settings.bp_bond_addr() else {
+        return "none";
+    };
+    if delete_found_bond(find_bond(|a| a.as_le_bytes() == rec)) == "err" {
+        return "err";
+    }
+    match settings.clear_bp_bond_addr() {
+        Ok(()) => {
+            *recorded = None;
+            "ok"
+        }
+        Err(e) => {
+            log::warn!("ble: bp_bond 消去失敗: {e:?}");
+            "err"
+        }
+    }
+}
+
+/// 探し当てた bond 1 件だけを消す (全消去は他の機器の bond を巻き込むので使わない)。
+/// `"ok"` (消した) / `"none"` (保存済みの bond に居なかった) / `"err"` を返す。
+/// delete_bond (ble_gap_unpair) は接続中だと切断するので、接続の外で呼ぶ
+fn delete_found_bond(found: Result<Option<BLEAddress>>) -> &'static str {
+    match found {
         Ok(Some(bonded)) => match BLEDevice::take().delete_bond(&bonded) {
             Ok(()) => "ok",
             Err(e) => {
-                log::warn!("ble: Omron bond 消去失敗: {e:?}");
+                log::warn!("ble: bond 消去失敗: {e:?}");
                 "err"
             }
         },
@@ -1027,8 +1077,7 @@ fn omron_unbond(addr: &BLEAddress) {
             log::warn!("ble: {e:?}");
             "err"
         }
-    };
-    alc_hub_common::evtlog::emit(&format!("EVT OMRON_PAIR unbond {result}"));
+    }
 }
 
 /// 血圧計としてボンドした機器のアドレスを NVS へ記録する (同じ値なら書かない)。
@@ -1070,10 +1119,16 @@ fn bonded_addrs() -> Vec<[u8; 6]> {
 /// 保存済みの bond からその機器のアドレスを探す。BLEAddress の == は 6 byte だけを比べるので、
 /// 返すのは保存側のアドレス (型付き。delete_bond にはこちらを渡す)
 fn omron_find_bond(addr: &BLEAddress) -> Result<Option<BLEAddress>> {
+    find_bond(|a| a == addr)
+}
+
+/// 保存済みの bond から条件に合う 1 件を探す。返すのは保存側のアドレス
+/// (型付き。delete_bond にはこちらを渡す)
+fn find_bond(matches: impl Fn(&BLEAddress) -> bool) -> Result<Option<BLEAddress>> {
     let addrs = BLEDevice::take()
         .bonded_addresses()
         .context("bond 一覧の取得失敗")?;
-    Ok(addrs.into_iter().find(|a| a == addr))
+    Ok(addrs.into_iter().find(|a| matches(a)))
 }
 
 /// `connect` を待ちながら、`encrypt` なら接続ができた瞬間に暗号化を始める (MTU 交換を待たない。

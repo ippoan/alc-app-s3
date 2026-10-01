@@ -310,6 +310,8 @@ fn start_bp(status: &SharedStatus, settings: &Settings, pair_flag: &PairFlag) ->
         ui_tx,
         coex,
         Arc::clone(pair_flag),
+        // 本機は上り WS を持たないので、`bp_unbond` を立てる口は無い
+        alc_hub_common::control::new_bp_unbond_flag(),
         settings.clone(),
     )?;
     alc_hub_common::evtlog::emit("EVT BLE_ENABLED omron_bp");

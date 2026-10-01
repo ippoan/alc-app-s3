@@ -202,6 +202,9 @@ fn main() -> Result<()> {
     // 再ペアリング要求のフラグ。console (`PAIR`) が立て、BLE ループが消費する。
     // **両方に同じものを渡す** — 別物を渡すと Pages のボタンが何も起こさない
     let pair_flag = alc_hub_common::control::new_pair_flag();
+    // 血圧計 1 台分のボンドを外す要求のフラグ。ws_uplink (`bp_unbond`) が立て、
+    // BLE ループが消費する。こちらも**両方に同じものを渡す**
+    let bp_unbond_flag = alc_hub_common::control::new_bp_unbond_flag();
     console::start(
         Arc::clone(&status),
         settings.clone(),
@@ -235,6 +238,7 @@ fn main() -> Result<()> {
         Arc::clone(&status),
         settings.clone(),
         settings.next_boot_id(),
+        Arc::clone(&bp_unbond_flag),
     )?;
 
     // 前回がクラッシュ由来なら panic 前ログを kind=crash_log で送信キューへ
@@ -366,6 +370,7 @@ fn main() -> Result<()> {
             ui_tx_for_ble,
             coex,
             Arc::clone(&pair_flag),
+            bp_unbond_flag,
             settings.clone(),
         )?;
         alc_hub_common::evtlog::emit("EVT BLE_ENABLED omron_bp");
