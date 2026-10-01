@@ -161,6 +161,7 @@ CoreS3 の `STATUS LAN=…` も同様 (行頭は互換のため変えない)。
 | `OMRON BP ON\|OFF` / `OMRON STATUS` | Omron 血圧計 (HEM-6231T) を拾うか。呼ぶのは `cores3` / `timecard` / `bp-station` |
 | `PAIR` | BLE 全ボンド消去 → 再ペアリング受付。同上 3 機種 |
 | `BP UNBOND` | 血圧計として記録した 1 台分のボンドだけを外す依頼 (Refs ippoan/alc-app#401)。応答は `OK BP UNBOND` (受理 = BLE ループへ依頼を出した) / `ERR BP UNBOND: busy` (OTA 中・点呼中で断った)。結果は `EVT BP_UNBOND ok\|none\|err` で**非同期に**出る (BLE ループの次の周で処理するので `OK` の直後とは限らない)。`PAIR` との違い = 他の機器のボンドは残し、ペアリング受付も開かない。**`cores3` だけ** (CoreS3 固有分 `host_link.rs` が捌く。他機は `ERR UNSUPPORTED (<kind>)`) |
+| `CRASH TEST abort\|fault` | **開発用ビルド (`FLAVOR=cores3-dev`) の `cores3` だけ**が受ける試験の口 (Refs ippoan/alc-app#403)。`OK CRASH TEST <種類>` を返してから、C の `abort()` を呼ぶ (`abort`) / 不正な番地へ書き込んで CPU 例外を起こし (`fault`)、**わざと落ちて再起動する**。次の起動で `EVT BOOT reset=panic` の前後に `EVT CRASH_INFO …` (README の送信イベントの表) が出ることを確かめるためのもの。ほかの引数は `ERR CRASH TEST`。ほかのビルド・機種はこの口を持たず、今までどおり `ERR 不明なコマンド: CRASH` |
 
 指静脈 (Vein Station の `vein` build = `timecard` + `--features vein`、
 ippoan/vein-match#20)。**モジュールは実機で未確認** — 手順は

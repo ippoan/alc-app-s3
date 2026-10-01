@@ -319,6 +319,102 @@ pub fn crash_payload(
     .to_string()
 }
 
+/// [`PanicRecord::magic`] の値 ("PNIC")。記録が有効なときだけ立つ。
+pub const PANIC_RECORD_MAGIC: u32 = 0x504e_4943;
+/// [`PanicRecord::reason`] の長さ (バイト)。
+pub const PANIC_REASON_CAP: usize = 32;
+/// [`PanicRecord::detail`] の長さ (バイト)。
+pub const PANIC_DETAIL_CAP: usize = 80;
+
+/// ESP-IDF の panic handler に入った時点の要点 (C 側の異常 = CPU 例外 /
+/// `abort()` / assert / スタック溢れ / watchdog。Refs ippoan/alc-app#403)。
+///
+/// 書くのは panic の最中 (CoreS3 の `src/panic_capture.rs`)、読むのは次の起動
+/// (hub-drivers の `crashlog::init`)。置き場は内部 RAM の `.noinit` で、
+/// 電源投入直後はゴミ — 欄はどれも「どのビット列でも有効な型」だけにし、
+/// 信頼性は [`PANIC_RECORD_MAGIC`] で判定する。**書く側は magic を最後に書く**
+/// (途中で落ちたら記録なしになる)。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanicRecord {
+    pub magic: u32,
+    /// 落ちたコア (`panic_info_t.core`)
+    pub core: u32,
+    /// `panic_exception_t` の値 ([`panic_exception_name`])
+    pub exception: u32,
+    /// 1 = abort 系 (`g_panic_abort` が真だった)
+    pub abort: u32,
+    /// `XtExcFrame.exccause`
+    pub exccause: u32,
+    /// `XtExcFrame.pc`
+    pub pc: u32,
+    /// `XtExcFrame.a0` (戻り番地)
+    pub a0: u32,
+    /// `XtExcFrame.a1` (スタックポインタ)
+    pub a1: u32,
+    /// `XtExcFrame.excvaddr` (読み書きしようとした番地)
+    pub excvaddr: u32,
+    /// `panic_info_t.reason` の先頭 (NUL 終端、長ければ切る)
+    pub reason: [u8; PANIC_REASON_CAP],
+    /// `g_panic_abort_details` の先頭 (abort 系のときだけ。NUL 終端、長ければ切る)
+    pub detail: [u8; PANIC_DETAIL_CAP],
+}
+
+/// `panic_exception_t` (ESP-IDF v5.5.3 `esp_private/panic_internal.h`) の値 →
+/// 短い名前。`abort` が真なら値によらず `abort` — panic handler の入口では
+/// abort 系でも値は FAULT のままで、ABORT への書き換えは記録を取った後に
+/// 起きるため。
+pub fn panic_exception_name(exception: u32, abort: bool) -> &'static str {
+    if abort {
+        return "abort";
+    }
+    match exception {
+        0 => "debug",
+        1 => "int_wdt",
+        2 => "task_wdt",
+        3 => "abort",
+        4 => "fault",
+        _ => "unknown",
+    }
+}
+
+/// 記録の中の固定長の文字列を 1 行に載せられる形にする。最初の NUL まで
+/// (無ければ全部) を取り、末尾の改行を落とし、印字できる ASCII 以外と `"` を
+/// `?` に置き換える (値を `"` で囲んで 1 行に並べるため)。
+pub fn panic_text(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let mut text = &bytes[..end];
+    while let Some((&(b'\n' | b'\r'), rest)) = text.split_last() {
+        text = rest;
+    }
+    text.iter()
+        .map(|&b| match b {
+            b'"' => '?',
+            0x20..=0x7e => b as char,
+            _ => '?',
+        })
+        .collect()
+}
+
+/// 前の起動が C 側の異常で落ちたときの要点の 1 行 (`EVT CRASH_INFO`、
+/// Refs ippoan/alc-app#403)。番地は 16 進 8 桁のゼロ埋め。`pc` / `a0` を
+/// 関数名に戻すには、その版の ELF が要る。
+pub fn crash_info_line(rec: &PanicRecord) -> String {
+    format!(
+        "EVT CRASH_INFO core={} exc={} cause={} pc=0x{:08x} a0=0x{:08x} a1=0x{:08x} \
+         vaddr=0x{:08x} reason=\"{}\" detail=\"{}\"",
+        rec.core,
+        panic_exception_name(rec.exception, rec.abort != 0),
+        rec.exccause,
+        rec.pc,
+        rec.a0,
+        rec.a1,
+        rec.excvaddr,
+        panic_text(&rec.reason),
+        panic_text(&rec.detail),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,5 +835,119 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&p).unwrap();
         assert_eq!(v["truncated"], true);
         assert_eq!(v["log"].as_str().unwrap().len(), 100);
+    }
+
+    fn panic_record(reason: &[u8], detail: &[u8]) -> PanicRecord {
+        let mut rec = PanicRecord {
+            magic: PANIC_RECORD_MAGIC,
+            core: 0,
+            exception: 4,
+            abort: 0,
+            exccause: 0,
+            pc: 0,
+            a0: 0,
+            a1: 0,
+            excvaddr: 0,
+            reason: [0; PANIC_REASON_CAP],
+            detail: [0; PANIC_DETAIL_CAP],
+        };
+        rec.reason[..reason.len()].copy_from_slice(reason);
+        rec.detail[..detail.len()].copy_from_slice(detail);
+        rec
+    }
+
+    #[test]
+    fn panic_exception_names_cover_all_values() {
+        let expected = [
+            (0, "debug"),
+            (1, "int_wdt"),
+            (2, "task_wdt"),
+            (3, "abort"),
+            (4, "fault"),
+            (5, "unknown"),
+            (u32::MAX, "unknown"),
+        ];
+        for (value, name) in expected {
+            assert_eq!(panic_exception_name(value, false), name);
+            // abort 系は値によらず abort (入口では FAULT のまま)
+            assert_eq!(panic_exception_name(value, true), "abort");
+        }
+    }
+
+    #[test]
+    fn panic_text_stops_at_nul_and_replaces_unprintable() {
+        assert_eq!(panic_text(b""), "");
+        assert_eq!(panic_text(b"\0garbage"), "");
+        assert_eq!(panic_text(b"StoreProhibited\0\xff\xff"), "StoreProhibited");
+        // NUL が無ければ全部
+        assert_eq!(panic_text(b"abc"), "abc");
+        // `"`・途中の改行・制御文字・非 ASCII は `?`
+        assert_eq!(panic_text(b"a\"b\nc\td\xe3\x81\x82\x7f"), "a?b?c?d????");
+        // 末尾の改行は落とす (`\r\n` も)
+        assert_eq!(panic_text(b"overflow detected.\r\n\0"), "overflow detected.");
+        assert_eq!(panic_text(b"\n\n"), "");
+    }
+
+    #[test]
+    fn crash_info_line_fault() {
+        let mut rec = panic_record(b"StoreProhibited", b"");
+        rec.core = 1;
+        rec.exccause = 29;
+        rec.pc = 0x4200_1a2c;
+        rec.a0 = 0x8200_1b00;
+        rec.a1 = 0x3fca_1230;
+        rec.excvaddr = 4;
+        assert_eq!(
+            crash_info_line(&rec),
+            "EVT CRASH_INFO core=1 exc=fault cause=29 pc=0x42001a2c a0=0x82001b00 \
+             a1=0x3fca1230 vaddr=0x00000004 reason=\"StoreProhibited\" detail=\"\""
+        );
+    }
+
+    #[test]
+    fn crash_info_line_abort_carries_detail() {
+        let mut rec = panic_record(
+            b"IllegalInstruction",
+            b"***ERROR*** A stack overflow in task main has been detected.",
+        );
+        rec.abort = 1;
+        rec.pc = 0x4037_5d2d;
+        assert_eq!(
+            crash_info_line(&rec),
+            "EVT CRASH_INFO core=0 exc=abort cause=0 pc=0x40375d2d a0=0x00000000 \
+             a1=0x00000000 vaddr=0x00000000 reason=\"IllegalInstruction\" \
+             detail=\"***ERROR*** A stack overflow in task main has been detected.\""
+        );
+    }
+
+    #[test]
+    fn crash_info_line_full_width_fields_without_nul() {
+        // 切り詰めで NUL が入らなかった記録と、ゴミの値
+        let mut rec = panic_record(&[b'r'; PANIC_REASON_CAP], &[b'd'; PANIC_DETAIL_CAP]);
+        rec.core = u32::MAX;
+        rec.exception = 99;
+        rec.exccause = u32::MAX;
+        rec.pc = u32::MAX;
+        rec.a0 = u32::MAX;
+        rec.a1 = u32::MAX;
+        rec.excvaddr = u32::MAX;
+        assert_eq!(
+            crash_info_line(&rec),
+            format!(
+                "EVT CRASH_INFO core=4294967295 exc=unknown cause=4294967295 pc=0xffffffff \
+                 a0=0xffffffff a1=0xffffffff vaddr=0xffffffff reason=\"{}\" detail=\"{}\"",
+                "r".repeat(PANIC_REASON_CAP),
+                "d".repeat(PANIC_DETAIL_CAP)
+            )
+        );
+    }
+
+    #[test]
+    fn panic_record_layout_has_no_padding() {
+        // 書く側 (生のポインタで 1 欄ずつ) と読む側が同じ並びを見る
+        assert_eq!(
+            core::mem::size_of::<PanicRecord>(),
+            9 * 4 + PANIC_REASON_CAP + PANIC_DETAIL_CAP
+        );
     }
 }

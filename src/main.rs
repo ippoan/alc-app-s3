@@ -15,6 +15,8 @@
 //! 本クレート = main の配線のみ (ほぼ変更されない)
 //! ```
 
+mod panic_capture;
+
 use std::sync::{mpsc, Arc, Mutex};
 
 use alc_hub_ble as ble;
