@@ -112,3 +112,57 @@ fn timecard_evt_line_is_wired_spelled_once_and_never_emitted() {
     // CoreS3 + VoiceS3R (atoms3-timecard) の 2 バイナリは必ず対象
     assert!(punching >= 2, "検査対象が {punching} 個しかない (パス解決が壊れている?)");
 }
+
+/// 警告デバイスの `EVT NFC_LOGIN` 行の配線規約 (Refs ippoan/alc-app#387)。
+///
+/// 1. **警告デバイス (`crates/atoms3-alarm`) が行を出している** — 席のブラウザは
+///    この行でかざした人を知る
+/// 2. **行の綴りを firmware 側に直書きしない** — 綴りは
+///    `alc_hub_core::nfc_login::evt_line` の 1 か所 (host test で固定)
+/// 3. **`evtlog::emit` に渡さない** — `card_id` は人を特定できる値
+///    (理由は上の打刻の行と同じ)
+/// 4. **警告デバイスは打刻の経路を持たない** — 席でかざしたカードが打刻に
+///    なってはいけない。`EVT TIMECARD` (alc-app が打刻として拾う行) も
+///    送信キュー (`ws_uplink`) も配線しない
+#[test]
+fn nfc_login_evt_line_is_wired_spelled_once_and_never_a_punch() {
+    let alarm = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/atoms3-alarm/src/main.rs");
+    let mut alarm_wired = false;
+    for main in firmware_mains() {
+        let raw = fs::read_to_string(&main).unwrap_or_else(|e| panic!("{main:?} 読めない: {e}"));
+        // コメント行は走査対象外 (規約の説明文そのもので誤検知しないため)
+        let src: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !src.contains("\"EVT NFC_LOGIN"),
+            "{main:?}: `EVT NFC_LOGIN` の綴りを直書きしないこと \
+             (alc_hub_core::nfc_login::evt_line を使う)"
+        );
+        for emit in ["emit(&alc_hub_core::nfc_login::evt_line", "emit(&line"] {
+            assert!(
+                !src.contains(emit),
+                "{main:?}: カードの行を evtlog::emit に渡さないこと — card_id が \
+                 .noinit リングに残り LOG DUMP で読める。println! で出す"
+            );
+        }
+        if main != alarm {
+            continue;
+        }
+        alarm_wired = src.contains("nfc_login::evt_line");
+        for punch in ["timecard::evt_line", "ws_uplink", ".record("] {
+            assert!(
+                !src.contains(punch),
+                "{main:?}: 警告デバイスに打刻の経路 (`{punch}`) を配線しないこと — \
+                 席でかざしたカードは運行管理者の登録であって打刻ではない (#387)"
+            );
+        }
+    }
+    assert!(
+        alarm_wired,
+        "警告デバイス (crates/atoms3-alarm) が EVT NFC_LOGIN を出していない \
+         (パス解決が壊れているか、nfc_login::evt_line の呼び出しが消えた)"
+    );
+}

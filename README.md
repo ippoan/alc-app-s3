@@ -391,6 +391,8 @@ VOICEVOX の利用規約によりクレジット表記が必要 — 本製品を
 | 人 / Pages → 端末 | `HB OFF` | 監視停止。`OK HB OFF` を返し、**次の `HB` まで鳴らない**未武装に戻す (起動猶予も捨てる)。USB/JTAG reset を跨ぐ武装フラグ (#194) も消す。CoreS3 と VoiceS3R の両方。CoreS3 は Pages の「警告音を止める」ボタン |
 | 管理者のブラウザ → 端末 | `STATUS` | `STATUS alarm state=<idle\|alarming\|muted> cause=<none\|silence\|ng:<reason>\|call> hb_age_ms=<n\|-> [grace_left_ms=<n>] VER=…` (`grace_left_ms` は `grace=` の猶予中のみ。CoreS3 は `ALARM=<state>/<cause>/<hb_age_ms>/<grace_left_ms>`、猶予外は `0`)。**名乗りではない** |
 | 端末 → 管理者のブラウザ | `EVT ALARM state=… cause=…` | 状態が変わるたび + 5 秒ごと (ブラウザのバナー用) |
+| 端末 → 管理者のブラウザ | `EVT NFC_LOGIN card_id=<生値> card_kind=felica_idm\|nfca_uid` | Unit NFC で IC カード (FeliCa IDm / NFC-A UID) を読んだ (Refs ippoan/alc-app#387)。**打刻ではない** — ブラウザがその人を「この席の運行管理者」に登録するための合図で、端末はサーバへ何も送らない。免許証では出さない (下の `EVT NFC_LICENSE` が出る)。行の形は `alc_hub_core::nfc_login::evt_line`。シリアルのみでログのリングには残らない |
+| 端末 → 管理者のブラウザ | `EVT NFC_LICENSE issue=YYYYMMDD expiry=YYYYMMDD` | Unit NFC で運転免許証 (IC) を読んだ。CoreS3 / タイムカード端末と同じ行 (読み取りの正本 `hub-drivers/src/nfc.rs` が出す) |
 
 `PING` / `DEVICE` / `HEAP` / `LOG DUMP` は共通実装 (`hub-drivers/src/console.rs`)。
 機種識別は `DEVICE` を見ること — 正本は
@@ -424,6 +426,13 @@ VOICEVOX の利用規約によりクレジット表記が必要 — 本製品を
 焼いたあとは**運行管理者タブ → デバイス管理 → 警告デバイスを接続**でブラウザと繋ぐ。
 **USB 給電なので運行管理者 PC の電源が落ちるとブザーも止まる** — 承知の上の割り切り
 (plan §4.1 の「許容する穴」)。
+
+**Unit NFC (ST25R3916) は任意。** Grove (SDA=G2 / SCL=G1) に挿せば上の 2 行が出る
+(配線と読み取りループは `crates/atoms3-timecard` と同じ)。**無い機体にも同じファームを
+焼く** — 読み取りスレッドが 5 秒おきに初期化を試すだけで、警告の動きは変わらない
+(`EVT NFC_INIT_NG rc=…` が起動後に 1 回出る)。**既知の挙動**: ユニットが無い機体では、
+M5 のライブラリの行 (`Not detected ST25R3916 …` 等。`EVT` で始まらない) が 5 秒ごとに
+USB シリアルへ流れ続ける (警告の動きには影響しない)。
 
 ## 設定インポート/エクスポート
 

@@ -22,11 +22,12 @@ harness = false
 alc-hub-common = { path = "../hub-common" }
 # 鳴動判定 (alarm.rs) は hub-core の純粋ロジック。**この crate に判定を書かない**
 alc-hub-core = { path = "../hub-core" }
-# speaker のみ。**nfc は付けない** — 本機はカードを読まないので、
-# components/ の C++ (M5Unit-NFC + nfc_shim) を取り込む理由が無い。
-# 取り込むとビルド時間と flash を払うだけで、legacy I2C 衝突回避の
-# sdkconfig まで抱える羽目になる (plan/standing-devices.md §2.3)
-alc-hub-drivers = { path = "../hub-drivers", features = ["speaker"] }
+# speaker = 警告音 (ES8311) / nfc = Unit NFC の読み取り (Refs ippoan/alc-app#387)。
+# 運行管理者が席でカードをかざすと `EVT NFC_LOGIN` を USB へ出す (**打刻ではない**)。
+# Unit NFC は**付いていれば読む**任意の部品で、無い機体も同じファームで動く
+# (main.rs の「Unit NFC」節)。nfc を付けたぶん components/ の C++
+# (M5Unit-NFC + nfc_shim) と legacy I2C 衝突回避の sdkconfig を抱える
+alc-hub-drivers = { path = "../hub-drivers", features = ["nfc", "speaker"] }
 anyhow = "1"
 log = "0.4"
 esp-idf-svc = { version = "0.52", default-features = false, features = [
@@ -50,3 +51,8 @@ esp_idf_sdkconfig_defaults = "crates/atoms3-alarm/sdkconfig.defaults"
 # 揃えること (components_esp32s3.lock 共有)
 [[package.metadata.esp-idf-sys.extra_components]]
 remote_component = { name = "espressif/esp_websocket_client", version = "^1.5" }
+
+# NFC: components/ 配下に vendor した M5Unit-NFC 系4ライブラリ + nfc_shim。
+# パスは crate 相対 (atoms3-timecard と同じ書き方 — ルートの "components" とは違う)
+[[package.metadata.esp-idf-sys.extra_components]]
+component_dirs = ["../../components"]

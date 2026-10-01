@@ -145,13 +145,16 @@ jobs:
               cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard cargo check --release --locked -p alc-hub-atoms3-timecard --features vein",
               cache_key: build-timecard-s3r }
           # 点呼端末の警告デバイス (#135)。同じ本番機 (Atom VoiceS3R) だが
-          # sdkconfig は timecard とも違う (W5500 と NFC の legacy 衝突回避を落とし、
-          # 音と PSRAM だけ残した) ため cache_key は**新規**。使い回すと
-          # esp-idf-sys が永遠に cold (Refs #63)。
+          # sdkconfig は timecard とも違う (W5500 と BLE を持たず、音・PSRAM・
+          # Unit NFC の legacy 衝突回避だけ) ため cache_key は timecard と**別**。
+          # 使い回すと esp-idf-sys が永遠に cold (Refs #63)。
+          # キーの末尾 `-nfc` は Unit NFC を足したとき (ippoan/alc-app#387) に切り替えた印:
+          # NFC 抜きで作った esp-idf-sys の成果物が古いキーの cache から復元されると
+          # `undefined reference to nfc_shim_*` でリンクが落ちる (#163 の前例)。
           # build の leg (下) と**同じキーにすること** — 別々だと同じ成果物を 2 回作る
           - { name: atoms3-alarm,
               cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-alarm cargo check --release --locked -p alc-hub-atoms3-alarm",
-              cache_key: build-alarm-s3r }
+              cache_key: build-alarm-s3r-nfc }
           # ベンチ検証機 atoms3-nfc (AtomS3 Lite + Unit NFC、#149)。sdkconfig は
           # print / timecard / alarm のどれとも違う (#146 で esp_websocket_client と
           # CERTIFICATE_BUNDLE / TRACE_FACILITY を足した) ため cache_key は**新規**。
@@ -395,7 +398,7 @@ jobs:
             cargo_args: ''
             flash_size: 8mb
             partition_table: crates/atoms3-alarm/partitions.csv
-            cache_key: build-alarm-s3r
+            cache_key: build-alarm-s3r-nfc
           # ベンチ検証機 atoms3-nfc (#149)。**配布しない** — Pages にも manifest にも
           # 載せない (assemble-pages は触らない)。build の leg は check 側の cache を
           # main で warm するためだけに要る (check だけだと永久に cold。Refs #63)。
