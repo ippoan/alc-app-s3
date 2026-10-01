@@ -43,6 +43,7 @@
 //! | `BUS5V STATUS` | M-Bus 5V の設定と現況 `BUS5V MODE=auto USB=1 OUT=1 BATTERY=0 BUS_IN=0` を返す。`BUS_IN` は AXP2101 の TS (M-Bus 5V の分圧) で決まる M-Bus の外部給電判定 (`1`=PoE 等で外部給電中 `0`=無し `?`=未判定、Refs #211)。WS 下り command `{action:"bus5v_status"}` / `{action:"reboot"}` (auth-worker 端末一覧) でも遠隔で照会・再起動できる |
 //! | `TENKO BP ON\|OFF` / `TENKO STATUS` | 点呼に血圧を含めるか (NVS、既定 OFF) / `TENKO BP=0` を返す |
 //! | `BP UNBOND` | 血圧計として記録した 1 台分のボンドだけを外す依頼 (Refs ippoan/alc-app#401)。WS 下り command `{action:"bp_unbond"}` と同じ依頼の USB の口。`OK BP UNBOND` = 受理 (BLE ループへ依頼を出した) / `ERR BP UNBOND: busy` = OTA 中・点呼中で断った。実際に外れたかは `EVT BP_UNBOND ok\|none\|err`。他の機器のボンドは残し、ペアリング受付も開かない (`PAIR` との違い)。**CoreS3 のみ**、他機は `ERR UNSUPPORTED` |
+//! | `CRASH TEST abort\|fault` | **開発用ビルド (`FLAVOR=cores3-dev`) だけ**が受ける試験の口 (Refs ippoan/alc-app#403)。`OK CRASH TEST <種類>` を返してから、C の `abort()` を呼ぶ / 不正な番地へ書き込んで、わざと落ちる。次の起動で `EVT CRASH_INFO` が出ることを確かめるためのもの。ほかの引数は `ERR CRASH TEST`。ほかのビルドは今までどおり `ERR 不明なコマンド: CRASH` |
 //! | `OMRON BP ON\|OFF` / `OMRON STATUS` | Omron 血圧計を拾うか (NVS、既定 OFF) / `OMRON BP=0` を返す |
 //! | `HEAP` | `HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> TOTAL_INT=<n> TOTAL_PSRAM=<n>` を返す (Refs #27) |
 //! | `HEAP DUMP` | `HEAPDUMP ...` 複数行 (ヒープブロック概況 + タスク別スタック余裕) |
@@ -69,7 +70,7 @@ use std::sync::mpsc::Sender;
 
 use alc_hub_core::cfg::DeviceConfig;
 use alc_hub_core::improv as improv_proto;
-use alc_hub_core::protocol::{parse_line, HostCommand, HostKind};
+use alc_hub_core::protocol::{parse_crash_test, parse_line, CrashTest, HostCommand, HostKind};
 use anyhow::Result;
 use esp_idf_svc::hal::delay::FreeRtos;
 
@@ -218,6 +219,24 @@ fn drain_buffer(
     }
 }
 
+/// `CRASH TEST` の本体。応答を返してから、わざと落ちる (戻らない)。
+fn crash_test(kind: CrashTest) -> ! {
+    match kind {
+        CrashTest::Abort => println!("OK CRASH TEST abort"),
+        CrashTest::Fault => println!("OK CRASH TEST fault"),
+    }
+    // 応答が USB へ出切るのを待つ
+    FreeRtos::delay_ms(200);
+    match kind {
+        CrashTest::Abort => unsafe { esp_idf_svc::sys::abort() },
+        CrashTest::Fault => loop {
+            // 番地 4 には何も写像されていない (StoreProhibited)。volatile なので
+            // 最適化で消えない
+            unsafe { core::ptr::write_volatile(4 as *mut u32, 0) };
+        },
+    }
+}
+
 /// 1 行を処理する。解析は alc-hub-core::protocol (純粋・テスト済み)、
 /// 副作用 (画面遷移・NVS 保存・応答出力) はここで行う。
 #[allow(clippy::too_many_arguments)]
@@ -238,6 +257,18 @@ fn handle_line(
     if alc_hub_core::pwalog::parse(line).is_some() {
         crate::pwalog::offer(line);
         return;
+    }
+    // C 側の異常の記録 (`EVT CRASH_INFO`) を実機で確かめる試験の口 (Refs
+    // ippoan/alc-app#403)。**開発用ビルドだけ** — ほかのビルドはここを通らず、
+    // 下の parse_line が今までどおり「不明なコマンド」を返す
+    if flavor == "cores3-dev" {
+        if let Some(parsed) = parse_crash_test(line) {
+            match parsed {
+                Ok(kind) => crash_test(kind),
+                Err(err_response) => println!("{err_response}"),
+            }
+            return;
+        }
     }
     let command = match parse_line(line, config::QR_DEFAULT_TIMEOUT_MS) {
         Ok(Some(command)) => command,

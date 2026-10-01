@@ -15,6 +15,12 @@
 //!    - `println!` 系の重要行 (vprintf hook を通らないため `note()` で明示追記。
 //!      `EVT ` 行は `alc_hub_common::evtlog::emit` 経由 (init が登録する)、
 //!      ほかに heap.rs の `EVT HEAP` (60 秒ごと) と起動の区切り行、#215)
+//!    - C 側の異常 (CPU 例外 / `abort()` / assert / スタック溢れ / watchdog) の
+//!      要点 — ESP-IDF の panic handler は USB のコンソールへ直接出すので
+//!      リングに入らない。**CoreS3 だけ**、panic handler の入口で要点を内部 RAM の
+//!      `.noinit` ([`PANIC_RECORD`]) に書き (root crate の `src/panic_capture.rs`)、
+//!      次の起動の [`init`] が `EVT CRASH_INFO` の 1 行にしてリングへ移す
+//!      (Refs ippoan/alc-app#403)
 //!    を蓄積する。`.noinit` はソフトリセット (panic / WDT / esp_restart / USB
 //!    reset) で内容が保持され、電源断では失われる (magic + 帳簿検証で判定)。
 //!    保持されていれば**どの reset 理由でも引き継ぐ** — 起動ごとに
@@ -103,6 +109,38 @@ const _: () = assert!(core::mem::offset_of!(Ring, magic) >= 32);
     link_section = ".noinit"
 )]
 static mut RING: MaybeUninit<Ring> = MaybeUninit::uninit();
+
+/// C 側の異常で落ちたときの要点の置き場 (モジュール doc、Refs ippoan/alc-app#403)。
+///
+/// リングと違って**常に内部 RAM** (`.noinit`) — 書くのは panic の最中で、PSRAM
+/// (cache 越し) には触らない。書く側が居るのは CoreS3 のバイナリだけで、ほかの
+/// 機種では magic が立たないので [`take_panic_record`] は常に `None`
+#[link_section = ".noinit"]
+static mut PANIC_RECORD: MaybeUninit<pure::PanicRecord> = MaybeUninit::uninit();
+
+/// [`PANIC_RECORD`] の番地。**panic handler の中から呼ばれる** (CoreS3 の
+/// `src/panic_capture.rs`) ので、番地を返す以外のことをしない
+#[inline(always)]
+pub fn panic_record_ptr() -> *mut pure::PanicRecord {
+    // MaybeUninit<PanicRecord> は PanicRecord と同一レイアウト。欄は u32 / [u8; N]
+    // だけで全ビットパターンが有効なため、電源断後のゴミも「読める」— 信頼性は
+    // magic で判定する
+    core::ptr::addr_of_mut!(PANIC_RECORD) as *mut pure::PanicRecord
+}
+
+/// 前の起動が残した記録を取り出して消す。magic が違えば (電源投入直後のゴミ・
+/// 書く側の居ない機種・落ちていない) `None`。**先に magic を消す** — 次の起動で
+/// 同じ記録をもう一度出さない
+fn take_panic_record() -> Option<pure::PanicRecord> {
+    unsafe {
+        let p = panic_record_ptr();
+        if (*p).magic != pure::PANIC_RECORD_MAGIC {
+            return None;
+        }
+        (*p).magic = 0;
+        Some(*p)
+    }
+}
 
 /// リングへの排他。vprintf hook は複数タスクから同時に呼ばれ得る。
 /// panic 中の再入で毒化しても書き込みは続行する (into_inner)。
@@ -327,7 +365,8 @@ extern "C" {
 
 /// 起動直後 (他モジュールの初期化より前) に呼ぶ。
 ///
-/// 前回リセットの解析 → リングの引き継ぎ (壊れていれば初期化) → 区切り行 →
+/// 前回リセットの解析 → リングの引き継ぎ (壊れていれば初期化) → 前の起動が
+/// C 側の異常で残した要点 (`EVT CRASH_INFO`) → snapshot → 区切り行 →
 /// `EVT ` 行の出口の登録 → `EVT BOOT` → hook 設置の順。戻り値は
 /// `(reset_code, snapshot)`:
 ///
@@ -339,6 +378,9 @@ extern "C" {
 pub fn init() -> (i32, Option<CrashSnapshot>) {
     let reset_code = unsafe { sys::esp_reset_reason() } as i32;
     let mut snapshot = None;
+    // 前の起動が C 側の異常で落ちていれば、その要点 (Refs ippoan/alc-app#403)。
+    // リングより先に読む — 下の snapshot に載せるため
+    let crash_info = take_panic_record().map(|rec| pure::crash_info_line(&rec));
     // #226 の切り分け (PSRAM 版だけ): preserved を決める前の生の帳簿と、リング・
     // noinit 区間の番地を、EVT BOOT の後に `EVT RING_BOOT` として出す
     #[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
@@ -360,16 +402,6 @@ pub fn init() -> (i32, Option<CrashSnapshot>) {
                 core::ptr::addr_of!(_ext_ram_noinit_start) as usize as u32,
             );
         }
-        if pure::is_crash_reset(reset_code) {
-            let log = if preserved {
-                let raw = pure::ring_snapshot(&(*r).data, (*r).pos, (*r).len);
-                pure::sanitize_log(&raw)
-            } else {
-                // 電源異常等で RAM が保持されなかった。reset reason だけ送る
-                String::new()
-            };
-            snapshot = Some(CrashSnapshot { reset_code, log });
-        }
         // 帳簿が有効なら**どの reset 理由でも**中身を残す (#215)。usb / sw の
         // 起動のたびに消していると、reset の前に何が起きたかを遠隔 (get_log) で
         // 読めない。電源断で壊れていれば今までどおり空から始める
@@ -377,6 +409,23 @@ pub fn init() -> (i32, Option<CrashSnapshot>) {
             (*r).magic = MAGIC;
             (*r).pos = 0;
             (*r).len = 0;
+        }
+        // `EVT CRASH_INFO` は「落ちた起動の末尾」(区切り行より前) に、**snapshot より
+        // 前に**書く — `report` が送るのは snapshot の末尾だけなので、後に書いた行は
+        // crash_log に載らない。evtlog の出口はまだ付いていない (下で登録する) ので
+        // リングへ直接書く。USB へは EVT BOOT の後で出す
+        if let Some(line) = &crash_info {
+            note(line);
+        }
+        if pure::is_crash_reset(reset_code) {
+            let log = if preserved || crash_info.is_some() {
+                let raw = pure::ring_snapshot(&(*r).data, (*r).pos, (*r).len);
+                pure::sanitize_log(&raw)
+            } else {
+                // 電源異常等で RAM が保持されなかった。reset reason だけ送る
+                String::new()
+            };
+            snapshot = Some(CrashSnapshot { reset_code, log });
         }
     }
     // 前の起動の行と今回の行の境目
@@ -395,6 +444,10 @@ pub fn init() -> (i32, Option<CrashSnapshot>) {
     ));
     #[cfg(esp_idf_spiram_allow_noinit_seg_external_memory)]
     alc_hub_common::evtlog::emit(&ring_boot);
+    // リングには上で書いた。ここは USB のコンソールにだけ出す (二重に書かない)
+    if let Some(line) = &crash_info {
+        println!("{line}");
+    }
 
     // Rust panic のメッセージ + 位置をリングへ。hook から戻った後は既定どおり
     // abort → ESP panic handler → リセットに進む

@@ -621,6 +621,38 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
     Ok(Some(command))
 }
 
+/// 開発用ビルドの CoreS3 だけが受ける試験のコマンド `CRASH TEST abort|fault`
+/// の種類 (Refs ippoan/alc-app#403)。C 側の異常で落ちたときの記録
+/// (`EVT CRASH_INFO`) を、本番の最初の異常より前に実機で確かめるための口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashTest {
+    /// C の `abort()` を呼ぶ
+    Abort,
+    /// 不正な番地へ書き込む (CPU 例外)
+    Fault,
+}
+
+/// `CRASH …` の行を解析する。[`parse_line`] には足さない — 足すと、この口を
+/// 持たない機種とビルドの「不明なコマンド」の応答が変わる。開発用ビルドの
+/// CoreS3 の口だけが、[`parse_line`] より前にこれを呼ぶ。
+///
+/// - 先頭の語が `CRASH` でない → `None` (呼び元は今までどおり [`parse_line`] へ)
+/// - `CRASH TEST abort|fault` → `Some(Ok(_))`
+/// - それ以外の `CRASH …` → `Some(Err(ホストへ返す応答行))`
+pub fn parse_crash_test(line: &str) -> Option<Result<CrashTest, &'static str>> {
+    let mut it = line.split_whitespace();
+    if !it.next()?.eq_ignore_ascii_case("CRASH") {
+        return None;
+    }
+    let sub = it.next().map(|s| s.to_ascii_uppercase());
+    let kind = it.next().map(|s| s.to_ascii_uppercase());
+    Some(match (sub.as_deref(), kind.as_deref(), it.next()) {
+        (Some("TEST"), Some("ABORT"), None) => Ok(CrashTest::Abort),
+        (Some("TEST"), Some("FAULT"), None) => Ok(CrashTest::Fault),
+        _ => Err("ERR CRASH TEST"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1441,5 +1473,38 @@ mod tests {
             Err("ERR VEIN: CAPTURE|SAY が必要です".into())
         );
         assert!(parse_line("VEIN ENROLL", T).is_err());
+    }
+
+    #[test]
+    fn crash_test_parses_abort_and_fault() {
+        assert_eq!(parse_crash_test("CRASH TEST abort"), Some(Ok(CrashTest::Abort)));
+        assert_eq!(parse_crash_test("CRASH TEST fault"), Some(Ok(CrashTest::Fault)));
+        assert_eq!(
+            parse_crash_test("  crash   test   ABORT  "),
+            Some(Ok(CrashTest::Abort))
+        );
+    }
+
+    #[test]
+    fn crash_test_rejects_other_arguments() {
+        let err = Some(Err("ERR CRASH TEST"));
+        assert_eq!(parse_crash_test("CRASH"), err);
+        assert_eq!(parse_crash_test("CRASH TEST"), err);
+        assert_eq!(parse_crash_test("CRASH TEST wdt"), err);
+        assert_eq!(parse_crash_test("CRASH abort"), err);
+        assert_eq!(parse_crash_test("CRASH TEST abort now"), err);
+    }
+
+    #[test]
+    fn crash_test_ignores_other_lines() {
+        assert_eq!(parse_crash_test(""), None);
+        assert_eq!(parse_crash_test("   "), None);
+        assert_eq!(parse_crash_test("PING"), None);
+        assert_eq!(parse_crash_test("CRASHTEST abort"), None);
+        // この口を通らない機種・ビルドは今までどおり「不明なコマンド」
+        assert_eq!(
+            parse_line("CRASH TEST abort", T),
+            Err("ERR 不明なコマンド: CRASH".to_string())
+        );
     }
 }

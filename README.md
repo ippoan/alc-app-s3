@@ -127,6 +127,7 @@ crates/hub-core/src/improv.rs)。
 | `EVT WS_CLOCK_WAIT` | WS は繋がったが時計が未同期で、補正できる測定があるため送信を最大 60 秒待っている (NTP 同期後に補正して送る) |
 | `EVT WS_TIME_FIXED <n>` | NTP 未同期 (ネットワーク無し) で記録した測定 n 件の `recorded_at_ms` を、送信時に稼働時間の差で実時刻へ補正した (同じ起動の分だけ。再起動をまたいだ分は 1970 起点のまま送る) |
 | `EVT CRASH <reason> log_bytes=<n>` | 前回リセットがクラッシュ由来 (panic/WDT/brownout 等)。panic 前ログを kind=crash_log で自動送信 |
+| `EVT CRASH_INFO core=<n> exc=<種類> cause=<exccause> pc=0x… a0=0x… a1=0x… vaddr=0x… reason="…" detail="…"` | 前の起動が **C 側の異常** (CPU 例外 / `abort()` / assert / スタック溢れ / watchdog) で落ちたときの要点 (Refs ippoan/alc-app#403)。ESP-IDF の panic handler の入口で内部 RAM の `.noinit` に書き残し (`src/panic_capture.rs`)、次の起動で 1 回だけ出す — リング上では落ちた起動の末尾 (`--- BOOT … ---` の前) に入り、crash_log にも載る。`exc` = `fault` (CPU 例外。`reason` に種類、`pc` が落ちた命令、`vaddr` が触ろうとした番地) / `abort` (`detail` に assert の文言・スタック溢れのメッセージ等。`pc` は手掛かりにならない) / `int_wdt` / `task_wdt` / `debug`。Rust の panic も最後は `abort()` なので、`PANIC:` の行に加えて `exc=abort` で出る。**`pc` / `a0` を関数名に戻すには、その版の ELF が要る** (いまの CI は ELF を保存していない)。**CoreS3 のみ** |
 | `CFG <json>` | `CFG GET` の応答 |
 | `{"type":"temperature",...}` 等 | BLE 測定データ・状態。[ble-medical-gateway](https://github.com/ippoan/ble-medical-gateway) のシリアル JSON 互換 (alc-app 側 `useBleGateway` を流用可能) |
 
