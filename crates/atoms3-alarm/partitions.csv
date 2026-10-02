@@ -2,14 +2,15 @@
 # crates/atoms3-timecard/partitions.csv と**同一レイアウト** (8MB Flash 機で共通)。
 # nvs/phy_init のオフセットは ESP-IDF 既定互換 + OTA 2 スロット構成。
 #
-# **本機は OTA 経路を持たない** (ネットワークなし。更新は Pages インストーラ
-# docs/alarm.html から USB で焼き直す) が、**レイアウトは他機と揃えておく**:
+# **OTA 2 スロットは本機も使う** — ネットワークは無いが、USB のシリアル OTA
+# (`OTA SERIAL`、Refs ippoan/alc-app#425) が空いている側のスロットへ書き、
+# 確定が来なければ元のスロットへ戻す。レイアウトを他機と揃えてあるのは、
 # 案 A (Wi-Fi + WS 常時接続、plan/standing-devices.md §4.2) へ進むときに
-# パーティションを切り直すと、現地の機を全部消して再登録する話になる。
+# パーティションを切り直すと、現地の機を全部消して再登録する話になるため。
 #
 # ★ 手焼きでも必ず `--partition-table crates/atoms3-alarm/partitions.csv` を
 #   渡すこと。省略すると espflash 既定の factory 1 スロットになり、
-#   後から OTA を足したときに `esp_ota_ops: not found otadata` で必ず失敗する
+#   シリアル OTA が `esp_ota_ops: not found otadata` で必ず失敗する
 #   (2026-09-04 に atoms3-timecard の実機で踏んだ、issue #134 のコメント)。
 #
 # NVS の温存について (Refs #48): Web インストーラーは merged を [0x0,0x9000) と

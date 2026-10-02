@@ -193,11 +193,14 @@ ippoan/vein-match#20)。**モジュールは実機で未確認** — 手順は
 - 測定台 (`bp-station`): `OTA` / `OTA SERIAL` を含め機種固有コマンドを持たない (共通実装のみ)
 
 `OTA SERIAL` / `OTA CONFIRM` (§6) に答えるのは `timecard` と `cores3`
-(Refs ippoan/alc-app#403) だけ。他の機種は `ERR UNSUPPORTED (<kind>)` を返す
+(Refs ippoan/alc-app#403) と `alarm` (Refs ippoan/alc-app#425) だけ。他の機種は
+`ERR UNSUPPORTED (<kind>)` を返す
 (`OTA ` で始まらないので、§6 のホストは応答が無いまま時間切れで諦める)。
 **この対応より前の版の CoreS3 も `ERR UNSUPPORTED (cores3)` を返す** — その機は
 一度 web インストーラか `OTA <url>` / WS の `ota` で上げてからでないと、§6 では
-更新できない。
+更新できない。**この対応より前の版の警告デバイスも `ERR UNSUPPORTED (alarm)` を返す** —
+ネットワークを持たないので、一度 web インストーラ (docs/alarm.html) で焼き直してから
+でないと、§6 では更新できない。
 
 ## 5. どこに実装が在るか
 
@@ -220,7 +223,8 @@ ippoan/vein-match#20)。**モジュールは実機で未確認** — 手順は
 ## 6. シリアル OTA (`OTA SERIAL` / `OTA CONFIRM`)
 
 LAN も Wi-Fi も無い `timecard-station` と、キオスクの PC に USB でつながる CoreS3
-(`cores3` / `cores3-wifi` / `cores3-dev`、Refs ippoan/alc-app#403) を、運行者 PC の
+(`cores3` / `cores3-wifi` / `cores3-dev`、Refs ippoan/alc-app#403)、運行管理者の PC に
+USB でつながる警告デバイス (`alarm`、Refs ippoan/alc-app#425) を、その PC の
 ブラウザ (キオスク PWA、`ippoan/alc-app` の `web/`) から更新する口 (Refs #279)。
 ブラウザが Pages (`https://ippoan.github.io/alc-app-s3/…`) から取った app 単体
 イメージを Web Serial で**動作中の app** に流し込み、app が裏スロットへ書いて
@@ -250,7 +254,8 @@ LAN も Wi-Fi も無い `timecard-station` と、キオスクの PC に USB で�
    - 成功: NVS に「確定待ち」の印を立て、`OTA OK` を返し、約 500 ms 後に再起動する
    - 失敗: `OTA ERR verify` (スロットは切り替えない)
 6. 再起動後: ホストは再接続して `DEVICE` を送る → `DEVICE timecard VER=<ver> FLAVOR=timecard-station`
-   (CoreS3 は `DEVICE cores3 VER=<ver> BOARD=<board> FLAVOR=cores3` — `FLAVOR=` は `KEY=` で拾う)
+   (CoreS3 は `DEVICE cores3 VER=<ver> BOARD=<board> FLAVOR=cores3` — `FLAVOR=` は `KEY=` で拾う。
+   警告デバイスは `DEVICE alarm VER=<ver> FLAVOR=alarm`)
 7. ホスト: FLAVOR が期待どおりなら `OTA CONFIRM` を送る
 8. 端末: 確定待ちなら確定して印を消し、`OTA CONFIRMED` を返す
    - 確定待ちでなくても `OTA CONFIRMED` を返す (冪等)
@@ -268,6 +273,10 @@ LAN も Wi-Fi も無い `timecard-station` と、キオスクの PC に USB で�
 - **受信中はホストが他の行を送れない** (`HB OK` も生バイトとして読まれる)。CoreS3 の
   沈黙警告は heartbeat が 10 秒途切れると鳴るので、ホストは `OTA SERIAL` の前に
   `HB OFF` で監視を止める (または `HB OK grace=<秒>` で締切を延ばす) こと
+- **警告デバイス (`alarm`) も同じ**: ホストは `OTA SERIAL` の前に heartbeat の見張りを
+  休ませる (`HB OFF` か `HB OK grace=<秒>`)。休ませないと、受信中は `HB OK` が届かず
+  10 秒でブザーが鳴る。警告デバイスは `ws_uplink` を持たないので、確定の口は
+  `OTA CONFIRM` だけ (来なければ 10 分で前の image へ戻る)
 - WS の常時接続 (`ws_uplink`) も、繋がった時点 (未登録の機は起動直後) で image を
   確定する (Refs #217)。LAN / Wi-Fi のある CoreS3 では `OTA CONFIRM` より先にそちらで
   確定することがあるが、そのあとの `OTA CONFIRM` にも `OTA CONFIRMED` を返す (冪等)
@@ -275,8 +284,10 @@ LAN も Wi-Fi も無い `timecard-station` と、キオスクの PC に USB で�
   `OTA ERR flavor` で断る)。Pages の app 単体イメージ: `cores3` =
   `firmware/alc-hub-cores3-app.bin`、`cores3-wifi` = `firmware/alc-hub-cores3-wifi-app.bin`、
   `cores3-dev` = `firmware/alc-hub-cores3-dev-app.bin`、`timecard-station` =
-  `firmware/alc-hub-atoms3-timecard-station-app.bin`。版は同じ階層の manifest
-  (`manifest.json` / `manifest-wifi.json` / `manifest-timecard-station.json`) の `version`
+  `firmware/alc-hub-atoms3-timecard-station-app.bin`、`alarm` =
+  `firmware/alc-hub-atoms3-alarm-app.bin`。版は同じ階層の manifest
+  (`manifest.json` / `manifest-wifi.json` / `manifest-timecard-station.json` /
+  `manifest-alarm.json`) の `version`
 
 **既知の限界**: 新しい app が起動直後に落ちる (確定の口までたどり着かない) と戻らない —
 web インストーラの bootloader (espflash 同梱の `boot.bin`) は rollback を持たず、

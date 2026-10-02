@@ -16,14 +16,20 @@ CONFIG_FREERTOS_HZ=1000
 
 # ---- hub-drivers 由来 ----
 #
-# 本機は uplink も OTA も printer も使わないが、alc-hub-drivers は 1 クレートなので
-# ws_uplink / auth_link / printer / ota / heap もコンパイル対象に入る。
+# 本機は uplink も printer も使わないが、alc-hub-drivers は 1 クレートなので
+# ws_uplink / auth_link / printer / heap もコンパイル対象に入る。
 # 使わなくても宣言だけは要る (atoms3-nfc と同じ 2 行)。
 
 # auth_link / printer / ws_uplink の esp_crt_bundle_attach
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 # heap.rs の uxTaskGetSystemState (HEAP DUMP のタスク別スタック余裕)
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+
+# シリアル OTA (ota.rs、Refs ippoan/alc-app#425): web インストーラの boot.bin は
+# espflash 同梱の bootloader で rollback を持たないため、この設定は bootloader
+# 自体には効かず、app 側の API (NEW を書く) にだけ効く。確定と戻しは app が行う
+# (ota.rs running_app_pending)。atoms3-timecard と同じ行
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # ---- Unit NFC (atoms3-timecard と同値、Refs ippoan/alc-app#387) ----
 #

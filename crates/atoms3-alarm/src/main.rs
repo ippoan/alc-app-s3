@@ -13,7 +13,12 @@
 //! plan §6 のマイルストーン (2)-2。**Wi-Fi / WS 常時接続 (案 A) と音声メッセージは
 //! 入れていない**。点呼の呼び出しは heartbeat 相乗り (`HB OK call=1`、案 B) で受ける。
 //! したがって本 crate は `alc-hub-drivers` の `speaker` と `nfc` feature だけを使い、
-//! LAN / WS uplink / OTA / Wi-Fi はどれも配線しない。
+//! LAN / WS uplink / Wi-Fi はどれも配線しない。
+//!
+//! 更新だけは USB で受ける (シリアル OTA、Refs ippoan/alc-app#425): 席のブラウザが
+//! `OTA SERIAL` でイメージを流し込み、再起動後に `OTA CONFIRM` で確定する。
+//! 受け口は [`console`]、確定が来なかったときに前の版へ戻す見張りは
+//! `ota::spawn_serial_confirm_watch` (どちらも共通実装。ここには書かない)。
 //!
 //! # Unit NFC — 付いていれば読む (Refs ippoan/alc-app#387)
 //!
@@ -72,8 +77,8 @@
 //!
 //! # 起動順 (変えてはいけない)
 //!
-//! `crashlog::init` → `Settings::new` → `heap::start` → `console::start` → 音の初期化
-//! → `nfc::start`。
+//! `crashlog::init` → `Settings::new` → `ota::report_previous_rollback` → `heap::start`
+//! → `console::start` → `ota::spawn_serial_confirm_watch` → 音の初期化 → `nfc::start`。
 //! **`crashlog::init` は `heap::start` より前** (配線漏れで `.noinit` のゴミ帳簿に
 //! 書いて boot loop になった実害が 2026-07-14 にある)。
 //!
@@ -104,7 +109,7 @@ use alc_hub_core::alarm::AlarmMonitor;
 use alc_hub_drivers::nfc::NfcEvent;
 use alc_hub_drivers::speaker::Sound;
 use alc_hub_drivers::timecard::Punch;
-use alc_hub_drivers::{alarm, crashlog, es8311, heap, nfc, speaker};
+use alc_hub_drivers::{alarm, crashlog, es8311, heap, nfc, ota, speaker};
 use anyhow::Result;
 use esp_idf_svc::hal::{
     delay::FreeRtos,
@@ -169,9 +174,12 @@ fn main() -> Result<()> {
     let p = Peripherals::take()?;
 
     // NVS。本機に登録するものは無いが、共通コンソール (AUTH / WS 等) が
-    // Settings を要求するため用意する
+    // Settings を要求するため用意する。シリアル OTA の確定待ちの印もここに置く
     let nvs_partition = EspDefaultNvsPartition::take()?;
     let settings = Settings::new(nvs_partition)?;
+    // 前の起動でシリアル OTA 直後の image を戻していたら、その証跡を出す
+    // (本機は ws_uplink を起こさないので、ここで出す。atoms3-timecard と同じ位置)
+    ota::report_previous_rollback(&settings);
 
     let status: SharedStatus = Arc::new(Mutex::new(HubStatus::default()));
     // ヒープ監視 (OOM 捕捉 + low-water 計測) は重いアロケーションより先に登録
@@ -192,8 +200,12 @@ fn main() -> Result<()> {
         },
     ));
 
-    // ホストコンソール (HB / STATUS / PING / HEAP / LOG)
+    // ホストコンソール (HB / STATUS / PING / HEAP / LOG / OTA SERIAL)
     console::start(Arc::clone(&monitor), Arc::clone(&status), settings.clone())?;
+    // シリアル OTA で入れた image の確定待ち (Refs ippoan/alc-app#425)。印が無ければ
+    // 何もしない。**外さないこと** — 見張りを置かずに `OTA SERIAL` を受けると、
+    // `OTA CONFIRM` が来なかったときに前の版へ戻らない
+    ota::spawn_serial_confirm_watch(settings.clone());
 
     // 内蔵オーディオ (ES8311 + NS4150B)。I2C は内蔵バス (SDA=G45 / SCL=G0)
     let mut audio_i2c = I2cDriver::new(
