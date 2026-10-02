@@ -13,10 +13,16 @@
 //! | `STATUS` | `STATUS alarm state=… cause=… hb_age_ms=… [grace_left_ms=…] VER=…` 応答 (`grace_left_ms` は猶予中のみ) |
 //! | `PING` | 疎通確認 (`PONG` 応答、共通実装) |
 //! | `HEAP` / `HEAP DUMP` / `LOG DUMP` | ヒープ概況 / 詳細 / 直近ログ (共通実装) |
+//! | `OTA SERIAL <size> alarm` / `OTA CONFIRM` | シリアル OTA (共通実装 `handle_ota_serial`、Refs ippoan/alc-app#425)。`<flavor>` は `DEVICE` の `FLAVOR=` と同じ `alarm` |
 //!
-//! 本機で意味を持たないもの (QR / MEASURE / BLE / 印刷 / OTA / Wi-Fi) は
-//! `ERR UNSUPPORTED (alarm)` を返す。**OTA も無い** — 更新は Pages インストーラ
-//! (docs/alarm.html) から USB で焼き直す。
+//! 本機で意味を持たないもの (QR / MEASURE / BLE / 印刷 / `OTA <url>` / Wi-Fi) は
+//! `ERR UNSUPPORTED (alarm)` を返す。ネットワークを持たないので、更新は USB の
+//! シリアル OTA か、Pages インストーラ (docs/alarm.html) からの焼き直し。
+//!
+//! ★ **ホストは `OTA SERIAL` の前に heartbeat の見張りを休ませること**
+//!   (`HB OFF` か `HB OK grace=<秒>`)。受信中は reader が生バイトモードで
+//!   `HB OK` を行として読めず、休ませないと 10 秒でブザーが鳴る
+//!   (正本は docs/console-protocol.md の「シリアル OTA」)。
 //!
 //! # 端末 → キオスク
 //!
@@ -63,6 +69,14 @@ fn handle_line(line: &str, monitor: &SharedMonitor, status: &SharedStatus, setti
     ) else {
         return;
     };
+    // シリアル OTA (焼き直さずに更新する口、Refs ippoan/alc-app#425)。確定待ちの見張りは
+    // main.rs が起動で立てる (`ota::spawn_serial_confirm_watch`)。flavor は
+    // `DEVICE` で名乗っている語をそのまま渡す (ビルドの種類が 1 つだけ)
+    let Some(command) =
+        console::handle_ota_serial(command, status, settings, HostKind::Alarm.label())
+    else {
+        return;
+    };
 
     match command {
         // heartbeat。**応答を返さない** — 3 秒ごとに来るので返すとログが埋まる。
@@ -92,7 +106,7 @@ fn handle_line(line: &str, monitor: &SharedMonitor, status: &SharedStatus, setti
                 );
             });
         }
-        // 本機で意味を持たないコマンド (画面遷移 / 測定 / BLE / 印刷 / OTA / Wi-Fi)
+        // 本機で意味を持たないコマンド (画面遷移 / 測定 / BLE / 印刷 / `OTA <url>` / Wi-Fi)
         other => {
             log::debug!("console: unsupported command: {other:?}");
             println!("ERR UNSUPPORTED ({})", HostKind::Alarm.label());
