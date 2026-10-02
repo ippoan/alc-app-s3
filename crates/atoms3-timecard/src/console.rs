@@ -53,7 +53,10 @@ pub fn start(
     pair_flag: PairFlag,
     #[cfg(feature = "vein")] vein: vein::Link,
 ) -> Result<()> {
-    console::spawn_reader(c"console", 8 * 1024, move |line| {
+    // シリアル OTA を受けるので、USB の受信リングは広い方 (チャンクを丸ごと受ける。
+    // Refs ippoan/alc-app#425)
+    let rx = console::USB_RX_BUFFER_SERIAL_OTA_BYTES;
+    console::spawn_reader_rx(c"console", 8 * 1024, rx, move |line| {
         handle_line(
             line,
             &status,

@@ -452,8 +452,11 @@ impl<'a> SlotWriter<'a> {
     }
 }
 
-/// シリアル OTA のチャンク長 (`OTA READY <n>` で伝える)。ホストは 1 チャンクごとに
-/// `OTA ACK` を待つ (stop-and-wait)
+/// シリアル OTA のチャンク長 (`OTA READY <n> RX=<受信リング>` の `<n>` で伝える)。
+/// ホストは 1 チャンクごとに `OTA ACK` を待つ (stop-and-wait)。`RX=` は
+/// [`crate::console::usb_rx_buffer_bytes`] (実際に取れた大きさ) — ホストは `RX=` がチャンク長以上の機にだけ
+/// `OTA SERIAL` を送り、1 チャンクを 1 回の書き込みで送る (docs/console-protocol.md §6。
+/// 同じ欄を `OTA CONFIRMED` にも載せる — [`confirm_serial`])
 const SERIAL_CHUNK: usize = 4096;
 
 /// シリアル OTA で、これだけバイトが来なければ中止する (`OTA ERR timeout`)
@@ -532,7 +535,8 @@ fn next_slot_len() -> usize {
 /// 受け入れたら `OTA READY` を返す前に受け口を置くので、ホストが READY を見て
 /// 送り始めたバイトは必ず生のまま受ける。
 ///
-/// 応答は `OTA READY <SERIAL_CHUNK>` か `OTA ERR flavor|size|busy|begin`。
+/// 応答は `OTA READY <SERIAL_CHUNK> RX=<受信リングの大きさ>` か
+/// `OTA ERR flavor|size|busy|begin`。
 /// flash への書き込みは専用スレッド (内部RAM スタック) が行い、1 チャンクごとに
 /// `OTA ACK <累計>`、最後に `OTA OK` (再起動) か `OTA ERR write|timeout|verify` を出す
 pub fn serial_begin(
@@ -603,7 +607,10 @@ pub fn serial_begin(
                     aborted,
                 });
             }
-            println!("OTA READY {SERIAL_CHUNK}");
+            println!(
+                "OTA READY {SERIAL_CHUNK} RX={}",
+                crate::console::usb_rx_buffer_bytes()
+            );
         }
         _ => println!("OTA ERR begin"),
     }
@@ -704,7 +711,12 @@ fn serial_receive(
 }
 
 /// `OTA CONFIRM` を捌く (Refs #279)。確定待ちなら確定して印を消す。
-/// 確定待ちでなくても `OTA CONFIRMED` を返す (冪等)
+/// 確定待ちでなくても `OTA CONFIRMED RX=<受信リングの大きさ>` を返す (冪等)。
+///
+/// `RX=` は実際に取れた受信リングの大きさ ([`crate::console::usb_rx_buffer_bytes`]。
+/// シリアル OTA を受ける機種は 8192)。ホストは
+/// `OTA SERIAL` を送る前にこの行で大きさを知り、チャンクを一気に送れる機かを
+/// 見分ける (docs/console-protocol.md §6)
 pub fn confirm_serial(settings: &Settings) {
     confirm_running_app_if_pending();
     if settings.ota_serial_pending() {
@@ -712,7 +724,7 @@ pub fn confirm_serial(settings: &Settings) {
             log::warn!("ota: 確定待ちの印を消せません: {e:?}");
         }
     }
-    println!("OTA CONFIRMED");
+    println!("OTA CONFIRMED RX={}", crate::console::usb_rx_buffer_bytes());
 }
 
 /// シリアル OTA の確定待ちを見張る (Refs #279)。起動時に 1 回呼ぶ。

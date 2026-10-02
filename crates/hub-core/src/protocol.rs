@@ -212,14 +212,15 @@ pub enum HostCommand {
     /// もう一方の OTA スロットへ書き込み、再起動する (`EVT OTA_* ...` を出力)
     Ota { url: String },
     /// シリアル OTA の開始 (`OTA SERIAL <size> <flavor>`、Refs #279)。
-    /// 受け入れたら端末は `OTA READY 4096` を返し、以後 `size` バイトを行に分けず
-    /// そのまま受ける (docs/console-protocol.md の「シリアル OTA」)
+    /// 受け入れたら端末は `OTA READY 4096 RX=8192` (チャンク長と、その機の受信リングの大きさ) を
+    /// 返し、以後 `size` バイトを行に分けずそのまま受ける
+    /// (docs/console-protocol.md の「シリアル OTA」)
     OtaSerial {
         size: u32,
         flavor: String,
     },
     /// シリアル OTA 後の確定 (`OTA CONFIRM`)。確定待ちでなくても
-    /// `OTA CONFIRMED` を返す (冪等)
+    /// `OTA CONFIRMED RX=8192` (`RX=` は受信リングの大きさ) を返す (冪等)
     OtaConfirm,
     /// PDF を URL から取得しプリンター 9100 (raw) へストリーミング印刷
     /// (印刷ブリッジ用。宛先は `PRINTER ADDR` で保存済みのもの。
