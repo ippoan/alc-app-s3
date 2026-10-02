@@ -18,12 +18,17 @@
 //! # Unit NFC — 付いていれば読む (Refs ippoan/alc-app#387)
 //!
 //! 運行管理者が席でカードをかざすと、席のブラウザがその人を「この席の運行管理者」に
-//! 登録する。本機の役目は**読んだカードを USB の 1 行でブラウザへ渡すこと**だけ:
+//! 登録する。本機の役目は**読んだカードを USB の 1 行でブラウザへ渡すこと**と、
+//! **読めたことを音で返すこと**:
 //!
 //! - IC カード (FeliCa IDm / NFC-A UID) → `EVT NFC_LOGIN card_id=… card_kind=…`
 //!   ([`on_card`]。行の形は [`alc_hub_core::nfc_login`])
 //! - 従来 IC 運転免許証 → 読み取りの正本 (`alc_hub_drivers::nfc`) が出す
-//!   `EVT NFC_LICENSE issue=… expiry=…` をそのまま使う。**ここでは何も出さない**
+//!   `EVT NFC_LICENSE issue=… expiry=…` をそのまま使う。**ここでは行を出さない**
+//! - どちらも読めたら [`Sound::BeepOk`] (短く 1 回)、2 枚重なっていたら
+//!   [`Sound::PunchNg`] (長く 1 回) を鳴らす — 本機に画面も LED も無く、音が無いと
+//!   タッチが届いたかが手元で分からない。警告の合図 (3000Hz の 3 連 / 2 連 / 単発) と
+//!   聞き分けられるよう、読めたときは高さの違う 2kHz の音にしてある (理由は [`on_card`])
 //!
 //! **打刻ではない。** 本機は uplink を持たないので、サーバへは何も送らない
 //! (`EVT TIMECARD` も出さない — alc-app はそれを打刻として拾う)。
@@ -97,6 +102,7 @@ use alc_hub_common::{
 };
 use alc_hub_core::alarm::AlarmMonitor;
 use alc_hub_drivers::nfc::NfcEvent;
+use alc_hub_drivers::speaker::Sound;
 use alc_hub_drivers::timecard::Punch;
 use alc_hub_drivers::{alarm, crashlog, es8311, heap, nfc, speaker};
 use anyhow::Result;
@@ -108,7 +114,7 @@ use esp_idf_svc::hal::{
     units::Hertz,
 };
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
 /// 鳴動ループの周期。`ALERT_PERIOD_MS` (1800) に対して十分細かく、
 /// ボタンのデバウンス 3 サンプル = 150ms が体感で遅れない値
@@ -237,6 +243,10 @@ fn main() -> Result<()> {
     // ★ **失敗しても main を落とさない** — 警告デバイスの本務は鳴ること。
     //   ここで返る Err はスレッドを立てられなかったときだけで、Unit NFC が
     //   付いていない機体は Ok のまま、スレッドが 5 秒おきに初期化を試し続ける
+    //
+    // 読み取りの音は警告と同じ再生キューへ積む (clone)。元の `speaker_tx` は
+    // 鳴動ループの `alarm::run_actions` がそのまま使う
+    let nfc_speaker = speaker_tx.clone();
     if let Err(e) = nfc::start(
         I2C_PORT_NFC,
         p.pins.gpio2.into(),
@@ -244,7 +254,7 @@ fn main() -> Result<()> {
         nfc::PollOrder::LicenseFirst,
         nfc::PresenceGate::AlwaysPoll,
         Arc::clone(&status),
-        on_card,
+        move |e: &NfcEvent| on_card(e, nfc_speaker.as_ref()),
     ) {
         log::warn!("nfc: 読み取りスレッドを起動できない — カードを読まずに継続する: {e:#}");
         alc_hub_common::evtlog::emit("EVT NFC_START_NG");
@@ -304,7 +314,8 @@ fn main() -> Result<()> {
     }
 }
 
-/// カードを 1 枚読めたときの処理: IC カードなら `EVT NFC_LOGIN` を 1 行出す。
+/// カードを 1 枚読めたときの処理: IC カードなら `EVT NFC_LOGIN` を 1 行出し、
+/// 読めたことを音で返す。
 ///
 /// `NfcEvent` → (生の id, 種別) の写像は打刻と同じ `Punch::from_event`
 /// (CoreS3 / atoms3-timecard と共有) を通す — **「どのイベントを人のカードと
@@ -312,16 +323,41 @@ fn main() -> Result<()> {
 /// [`alc_hub_core::nfc_login::evt_line`] (免許証は行にしない — 正本が
 /// `EVT NFC_LICENSE` を出している)。
 ///
-/// **打刻にしない**: 送信キューも uplink も持たないので、出口はこの println だけ。
-/// 2 枚検知・読み取り失敗・電子車検証は何もしない (音も鳴らさない — 本機の音は警告)。
+/// **打刻にしない**: 送信キューも uplink も持たないので、出口は println と音だけ。
+///
+/// # 音 — 読み取りの手応えを返す (Refs ippoan/alc-app#387)
+///
+/// 本機は画面も LED も持たないので、鳴らないとタッチが届いたかが手元で分からない。
+///
+/// - **読めた (IC カード・免許証)** → [`Sound::BeepOk`] (2kHz 40ms ×1)。行を出したか
+///   どうかに関係なく鳴らす (免許証は行を正本が出すので、ここは音だけ)。
+///   **警告の合図と同じ音を使わない** — 打刻端末の成功音 (3000Hz 60ms ×2) は本機の
+///   「繋がっていない」の合図 [`Sound::SilenceTick`] と同じ波形で、読み取りに使うと
+///   聞き分けられない。警告の音はどれも 3000Hz (解消の合図だけ 1200Hz) なので、
+///   CoreS3 / atoms3-nfc がカードの読み取りで鳴らしている 2kHz の音にする
+/// - **2 枚重なっている** ([`NfcEvent::MultipleCards`]) → [`Sound::PunchNg`]
+///   (3000Hz 400ms ×1)。黙って捨てると無反応に見える (打刻端末の #155 と同じ判断)。
+///   **行は出さない** — 警告デバイスのポートに新しい行を足さない
+/// - 読み取り失敗・日付の壊れた免許証・電子車検証は何もしない (読み取り失敗は
+///   読めた直後の再読でも出るので、鳴らすと読めたのにエラー音になる — #155)
+///
+/// **警告の状態を見ずに送る。** 再生スレッドはキューを 1 つずつ鳴らすので、鳴動中でも
+/// 警告音と重ならず、切れ目に入る。送るだけで待たない (NFC のポーリングを止めない)。
+/// 音の初期化に失敗した機体 (`speaker` が None) は行だけ出す。
 ///
 /// **`evtlog::emit` にしない** — `card_id` は人を特定できる値で、リングに残さない
 /// (`alc_hub_common::evtlog` の「どの行を emit にするか」)
-fn on_card(event: &NfcEvent) {
+fn on_card(event: &NfcEvent, speaker: Option<&mpsc::Sender<Sound>>) {
     let Some(punch) = Punch::from_event(event) else {
+        if let (NfcEvent::MultipleCards, Some(tx)) = (event, speaker) {
+            let _ = tx.send(Sound::PunchNg);
+        }
         return;
     };
     if let Some(line) = alc_hub_core::nfc_login::evt_line(&punch.card_id, punch.kind) {
         println!("{line}");
+    }
+    if let Some(tx) = speaker {
+        let _ = tx.send(Sound::BeepOk);
     }
 }
