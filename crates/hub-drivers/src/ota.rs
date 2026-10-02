@@ -727,7 +727,8 @@ pub fn confirm_serial(settings: &Settings) {
     println!("OTA CONFIRMED RX={}", crate::console::usb_rx_buffer_bytes());
 }
 
-/// シリアル OTA の確定待ちを見張る (Refs #279)。起動時に 1 回呼ぶ。
+/// シリアル OTA の確定待ちを見張る (Refs #279)。起動時に 1 回呼ぶ
+/// (CoreS3 の src/main.rs と、atoms3-timecard / atoms3-alarm の main)。
 ///
 /// 印があって、実行中の image が未確定なら、起動から [`OTA_VERIFY_TIMEOUT_MS`] 後に
 /// まだ印が残っていれば (`OTA CONFIRM` が来なければ) 前の image へ戻す。
@@ -773,7 +774,7 @@ pub fn spawn_serial_confirm_watch(settings: Settings) {
 
 /// 前の起動で OTA 直後の image を戻していたら、その証跡を出して消す (Refs #217)。
 /// 戻った先がこのコードを持つ image のときだけ読まれる。起動時に呼ぶ
-/// (ws_uplink::start と atoms3-timecard の main。2 回呼んでも 2 回目は何も出ない)
+/// (ws_uplink::start と atoms3-timecard / atoms3-alarm の main。2 回呼んでも 2 回目は何も出ない)
 pub fn report_previous_rollback(settings: &Settings) {
     if let Some(note) = settings.take_ota_rollback_note() {
         alc_hub_common::evtlog::emit(&format!("EVT OTA_ROLLED_BACK {note}"));

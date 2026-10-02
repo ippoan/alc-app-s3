@@ -535,8 +535,8 @@ pub fn handle_omron(
 /// ([`feed_serial_ota`]。[`spawn_reader`] と CoreS3 の [`crate::host_link`] が持つ) が
 /// 前提で、確定待ちの見張り ([`crate::ota::spawn_serial_confirm_watch`]) を起動で
 /// 呼ぶ機だけが受けてよい。見張りの無い機が受けると、`OTA CONFIRM` が来なかった
-/// ときに戻らない。今呼ぶのはタイムカード端末 (`station` が本命) と CoreS3
-/// (Refs ippoan/alc-app#403) だけ。
+/// ときに戻らない。今呼ぶのはタイムカード端末 (`station` が本命)・CoreS3
+/// (Refs ippoan/alc-app#403)・警告デバイス (atoms3-alarm、Refs ippoan/alc-app#425) だけ。
 ///
 /// `flavor` は [`handle_common`] に渡すものと同じ語。ホストの `<flavor>` と
 /// 違えば `OTA ERR flavor` で断る。
