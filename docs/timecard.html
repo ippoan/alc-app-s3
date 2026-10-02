@@ -101,7 +101,8 @@
         <h3>動作要件</h3>
         <ul>
             <li>Chrome / Edge / Opera (Web Serial API 対応ブラウザ)</li>
-            <li>ESP32-S3 は USB Serial/JTAG 内蔵のため追加ドライバ不要</li>
+            <li>ESP32-S3 は USB Serial/JTAG 内蔵のため、通常は追加ドライバ不要（Windows 10 以降 / macOS / Linux）</li>
+            <li>Windows 7 の PC では、そのままではシリアルポートが出てこないことがあります。<a href="alarm.html#windows7">警告デバイスのページの「Windows 7 の PC で使うとき」</a>を参照し、同じ手順を試してください</li>
             <li>シリアルポートが出てこない場合は、<strong>本体ボタンを押したまま USB を挿し直す</strong>
                 (ROM ダウンロードモード)。工場出荷ファームや、書き込んだファームが
                 起動直後に落ちる状態では、これが唯一の入り口です</li>

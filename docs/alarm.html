@@ -70,6 +70,42 @@
         </div>
     </div>
 
+    <div class="card" id="windows7">
+        <h2>Windows 7 の PC で使うとき</h2>
+        <p>Windows 10 以降の PC では、この節の作業は要りません。
+           <strong>Windows 7 の PC では、USB で繋いでも本体がシリアルポートとして出てこない</strong>ため、
+           そのままでは書き込みも接続もできません
+           (デバイス マネージャーに「USB JTAG/serial debug unit」が
+           「ドライバーが見つかりません」の状態で 2 つ出ます)。
+           書き込みの前に、その PC で 1 回だけ次の手順でドライバを入れてください。</p>
+        <ol>
+            <li>本体を USB-C ケーブルで PC に接続したまま、
+                <a href="https://zadig.akeo.ie/" target="_blank" rel="noopener">Zadig</a>
+                をダウンロードして開く</li>
+            <li>メニューの <strong>Options → List All Devices</strong> にチェックを入れる</li>
+            <li>プルダウンで <strong>「USB JTAG/serial debug unit (Interface 0)」</strong>を選ぶ</li>
+            <li>右側のドライバを <strong>「USB Serial (CDC)」</strong>に切り替えて、
+                <strong>Install Driver</strong> を押す</li>
+            <li>デバイス マネージャーに COM ポートが出たことを確かめる</li>
+            <li><strong>Chrome を開き直す</strong> — このページの書き込み (Install) と、
+                運行管理者の画面の「警告デバイスを接続」で本体を選べるようになります</li>
+        </ol>
+        <div class="warning">
+            <h3>Zadig で押す前に確かめること</h3>
+            <ul>
+                <li>ドライバを入れるのは <strong>「(Interface 0)」だけ</strong>です。
+                    「(Interface 2)」には入れなくて構いません (そのままで使えます)</li>
+                <li>プルダウンには、その PC に繋がっているほかの USB 機器も並びます。
+                    <strong>別の機器を選んで Install Driver を押すと、その機器が動かなくなります</strong>。
+                    名前が「USB JTAG/serial debug unit」で「(Interface 0)」になっていることを
+                    確かめてから押してください</li>
+                <li>Espressif が配布しているドライバの zip
+                    (<code>idf-driver-esp32-usb-jtag-…zip</code>) では直りません
+                    (シリアルポートのドライバが入っていないため)</li>
+            </ul>
+        </div>
+    </div>
+
     <div class="card">
         <h2>書き込み手順</h2>
         <ol>
@@ -112,7 +148,8 @@
         <h3>動作要件</h3>
         <ul>
             <li>Chrome / Edge / Opera (Web Serial API 対応ブラウザ)</li>
-            <li>ESP32-S3 は USB Serial/JTAG 内蔵のため追加ドライバ不要</li>
+            <li>ESP32-S3 は USB Serial/JTAG 内蔵のため、通常は追加ドライバ不要（Windows 10 以降 / macOS / Linux）</li>
+            <li>Windows 7 の PC は、先に<a href="#windows7">「Windows 7 の PC で使うとき」</a>の手順でドライバを入れる</li>
             <li>シリアルポートが出てこない場合は、<strong>本体ボタンを押したまま USB を挿し直す</strong>
                 (ROM ダウンロードモード)。工場出荷ファームや、書き込んだファームが
                 起動直後に落ちる状態では、これが唯一の入り口です</li>
@@ -134,6 +171,8 @@
     <div class="card">
         <h2>つなぎ方 (書き込みのあと)</h2>
         <p>ブザーは運行管理者の画面から繋ぎます。焼いただけでは「沈黙」として鳴り続けます。</p>
+        <p>Windows 7 の PC で繋ぐときは、先に<a href="#windows7">「Windows 7 の PC で使うとき」</a>の
+           手順でドライバを入れてください (入れるまでシリアルポートの一覧に本体が出てきません)。</p>
         <ol>
             <li>運行管理者の PC で alc-app を開き、<strong>「運行管理者」タブ</strong>へ</li>
             <li><strong>デバイス管理</strong>を開く</li>
