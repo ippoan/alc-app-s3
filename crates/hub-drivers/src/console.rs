@@ -45,8 +45,8 @@ pub const MAX_LINE: usize = 512;
 /// リングが 1 チャンクを丸ごと受けられれば reader が遅れても溢れない (時間に頼らない)。
 /// 残りの 1 チャンクぶんは、間に紛れた行のための余裕。
 ///
-/// 大きさは `OTA READY <chunk> RX=<この値>` でホストへ伝える
-/// (docs/console-protocol.md §6)。**変えたらその決まりも見直すこと。**
+/// 大きさは `OTA CONFIRMED RX=<この値>` と `OTA READY <chunk> RX=<この値>` でホストへ
+/// 伝える (docs/console-protocol.md §6)。**変えたらその決まりも見直すこと。**
 ///
 /// 置き場: リングは `malloc` で取られる (`xRingbufferCreate`)。PSRAM を積む機種は
 /// `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024` を超えるので PSRAM に載り、内部RAM は

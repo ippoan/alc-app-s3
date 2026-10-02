@@ -220,7 +220,7 @@ pub enum HostCommand {
         flavor: String,
     },
     /// シリアル OTA 後の確定 (`OTA CONFIRM`)。確定待ちでなくても
-    /// `OTA CONFIRMED` を返す (冪等)
+    /// `OTA CONFIRMED RX=8192` (`RX=` は受信リングの大きさ) を返す (冪等)
     OtaConfirm,
     /// PDF を URL から取得しプリンター 9100 (raw) へストリーミング印刷
     /// (印刷ブリッジ用。宛先は `PRINTER ADDR` で保存済みのもの。

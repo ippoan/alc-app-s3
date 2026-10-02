@@ -454,8 +454,9 @@ impl<'a> SlotWriter<'a> {
 
 /// シリアル OTA のチャンク長 (`OTA READY <n> RX=<受信リング>` の `<n>` で伝える)。
 /// ホストは 1 チャンクごとに `OTA ACK` を待つ (stop-and-wait)。`RX=` は
-/// [`crate::console::USB_RX_BUFFER_BYTES`] — チャンク長以上なら、ホストは 1 チャンクを
-/// 1 回の書き込みで送ってよい (docs/console-protocol.md §6)
+/// [`crate::console::USB_RX_BUFFER_BYTES`] — ホストは `RX=` がチャンク長以上の機にだけ
+/// `OTA SERIAL` を送り、1 チャンクを 1 回の書き込みで送る (docs/console-protocol.md §6。
+/// 同じ欄を `OTA CONFIRMED` にも載せる — [`confirm_serial`])
 const SERIAL_CHUNK: usize = 4096;
 
 /// シリアル OTA で、これだけバイトが来なければ中止する (`OTA ERR timeout`)
@@ -710,7 +711,11 @@ fn serial_receive(
 }
 
 /// `OTA CONFIRM` を捌く (Refs #279)。確定待ちなら確定して印を消す。
-/// 確定待ちでなくても `OTA CONFIRMED` を返す (冪等)
+/// 確定待ちでなくても `OTA CONFIRMED RX=<USB_RX_BUFFER_BYTES>` を返す (冪等)。
+///
+/// `RX=` は受信リングの大きさ ([`crate::console::USB_RX_BUFFER_BYTES`])。ホストは
+/// `OTA SERIAL` を送る前にこの行で大きさを知り、チャンクを一気に送れる機かを
+/// 見分ける (docs/console-protocol.md §6)
 pub fn confirm_serial(settings: &Settings) {
     confirm_running_app_if_pending();
     if settings.ota_serial_pending() {
@@ -718,7 +723,10 @@ pub fn confirm_serial(settings: &Settings) {
             log::warn!("ota: 確定待ちの印を消せません: {e:?}");
         }
     }
-    println!("OTA CONFIRMED");
+    println!(
+        "OTA CONFIRMED RX={}",
+        crate::console::USB_RX_BUFFER_BYTES
+    );
 }
 
 /// シリアル OTA の確定待ちを見張る (Refs #279)。起動時に 1 回呼ぶ。

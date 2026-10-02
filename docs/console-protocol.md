@@ -233,11 +233,20 @@ USB でつながる警告デバイス (`alarm`、Refs ippoan/alc-app#425) を、
 ホスト → 端末の行は `\n` で終わり、端末 → ホストの行は CRLF で終わる。
 `EVT …` やログの行が間に混ざるので、**ホストは `OTA ` で始まる行だけを見る**。
 
+0. ホスト: **書き込みを始める前に** `OTA CONFIRM` を送り、応答
+   `OTA CONFIRMED RX=<受信リングのバイト数>` (例 `OTA CONFIRMED RX=8192`) の `RX=` を読む
+   - **`RX=` がチャンク長 (4096) 以上のときだけ `OTA SERIAL` を送る**
+   - `RX=` が無い (`OTA CONFIRMED` だけを返す古い版) か、チャンク長より小さい機には
+     `OTA SERIAL` を送らない。配布ページ (web インストーラ) から書き直す。
+     受信リングが満杯のとき、端末は受けたバイトを捨てる (ホストへ待てとは伝わらない)
+     ので、チャンクが揃わず `OTA ERR timeout` になる。小分けにして間を置いても
+     落ちることがあり、時間も掛かりすぎる
+   - `OTA CONFIRM` は確定待ちの機では確定もする (8.)。確定待ちでなければ何も変えない
 1. ホスト: `OTA SERIAL <size> <flavor>` — `<size>` はイメージのバイト数 (10 進)、
    `<flavor>` は §2 の語
 2. 端末: 受け入れたら `OTA READY 4096 RX=<受信リングのバイト数>` (例 `OTA READY 4096 RX=8192`。
-   最初の数字はチャンク長、`RX=` は端末の USB 受信リングの大きさ)。`RX=` の無い
-   `OTA READY 4096` を返す古い版も在る (ホストの送り方は 3.)。断るときは `OTA ERR <reason>`:
+   最初の数字はチャンク長、`RX=` は 0. と同じ値)。`RX=` の無い `OTA READY 4096` を返す
+   古い版も在る。断るときは `OTA ERR <reason>`:
 
    | `<reason>` | 意味 |
    |---|---|
@@ -248,11 +257,7 @@ USB でつながる警告デバイス (`alarm`、Refs ippoan/alc-app#425) を、
 
 3. ホスト: 生のバイト列を 4096 B ずつ送る (最後は端数)。**`OTA ACK` を受けてから
    次を送る** (stop-and-wait)
-   - `RX=` がチャンク長以上なら、チャンクを 1 回の書き込みで送ってよい
-   - `RX=` が無い (古い版) か、チャンク長より小さいなら、チャンクを小分けにして
-     間を置いて送る。受信リングが満杯のとき、端末は受けたバイトを捨てる
-     (ホストへ待てとは伝わらない) ので、一気に送るとチャンクが揃わず
-     `OTA ERR timeout` になる
+   - チャンクは 1 回の書き込みで送ってよい (0. で `RX=` がチャンク長以上と確かめてある)
 4. 端末: 1 チャンクを flash に書くたびに `OTA ACK <累計バイト数>`
    - 書き込みに失敗したら `OTA ERR write`
    - 10 秒バイトが来なければ `OTA ERR timeout`
@@ -264,8 +269,9 @@ USB でつながる警告デバイス (`alarm`、Refs ippoan/alc-app#425) を、
    (CoreS3 は `DEVICE cores3 VER=<ver> BOARD=<board> FLAVOR=cores3` — `FLAVOR=` は `KEY=` で拾う。
    警告デバイスは `DEVICE alarm VER=<ver> FLAVOR=alarm`)
 7. ホスト: FLAVOR が期待どおりなら `OTA CONFIRM` を送る
-8. 端末: 確定待ちなら確定して印を消し、`OTA CONFIRMED` を返す
-   - 確定待ちでなくても `OTA CONFIRMED` を返す (冪等)
+8. 端末: 確定待ちなら確定して印を消し、`OTA CONFIRMED RX=<受信リングのバイト数>` を返す
+   (ホストは `OTA CONFIRMED` で始まる行として待つ。`RX=` の無い古い版も在る)
+   - 確定待ちでなくても同じ行を返す (冪等)
    - 印があるのに起動から 10 分 (`OTA_VERIFY_TIMEOUT_MS`) 以内に `OTA CONFIRM` が
      来なければ、前の image へ戻す。戻った先の起動で
      `EVT OTA_ROLLED_BACK … reason=serial_unconfirmed` が出る
