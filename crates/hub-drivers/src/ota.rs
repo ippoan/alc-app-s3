@@ -723,10 +723,7 @@ pub fn confirm_serial(settings: &Settings) {
             log::warn!("ota: 確定待ちの印を消せません: {e:?}");
         }
     }
-    println!(
-        "OTA CONFIRMED RX={}",
-        crate::console::USB_RX_BUFFER_BYTES
-    );
+    println!("OTA CONFIRMED RX={}", crate::console::USB_RX_BUFFER_BYTES);
 }
 
 /// シリアル OTA の確定待ちを見張る (Refs #279)。起動時に 1 回呼ぶ。
