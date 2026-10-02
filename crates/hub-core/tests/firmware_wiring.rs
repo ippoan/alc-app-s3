@@ -124,6 +124,10 @@ fn timecard_evt_line_is_wired_spelled_once_and_never_emitted() {
 /// 4. **警告デバイスは打刻の経路を持たない** — 席でかざしたカードが打刻に
 ///    なってはいけない。`EVT TIMECARD` (alc-app が打刻として拾う行) も
 ///    送信キュー (`ws_uplink`) も配線しない
+/// 5. **警告デバイスは読み取りを音で返す** — 読めたら `Sound::BeepOk`、2 枚検知は
+///    `Sound::PunchNg`。画面も LED も無いので、鳴らないとタッチが届いたか分からない。
+///    **`Sound::PunchOk` は使わない** — 警告デバイスの「繋がっていない」の合図
+///    (`Sound::SilenceTick`) と同じ波形で、読み取りに使うと聞き分けられない
 #[test]
 fn nfc_login_evt_line_is_wired_spelled_once_and_never_a_punch() {
     let alarm = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/atoms3-alarm/src/main.rs");
@@ -152,6 +156,18 @@ fn nfc_login_evt_line_is_wired_spelled_once_and_never_a_punch() {
             continue;
         }
         alarm_wired = src.contains("nfc_login::evt_line");
+        for sound in ["Sound::BeepOk", "Sound::PunchNg"] {
+            assert!(
+                src.contains(sound),
+                "{main:?}: 警告デバイスがカードの読み取りを音 (`{sound}`) で返していない — \
+                 画面も LED も無いので、鳴らないとタッチが届いたか分からない (#387)"
+            );
+        }
+        assert!(
+            !src.contains("Sound::PunchOk"),
+            "{main:?}: 警告デバイスの読み取り音に `Sound::PunchOk` を使わないこと — \
+             「繋がっていない」の合図 (Sound::SilenceTick) と同じ波形で聞き分けられない (#387)"
+        );
         for punch in ["timecard::evt_line", "ws_uplink", ".record("] {
             assert!(
                 !src.contains(punch),

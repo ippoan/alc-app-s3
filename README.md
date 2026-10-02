@@ -391,8 +391,8 @@ VOICEVOX の利用規約によりクレジット表記が必要 — 本製品を
 | 人 / Pages → 端末 | `HB OFF` | 監視停止。`OK HB OFF` を返し、**次の `HB` まで鳴らない**未武装に戻す (起動猶予も捨てる)。USB/JTAG reset を跨ぐ武装フラグ (#194) も消す。CoreS3 と VoiceS3R の両方。CoreS3 は Pages の「警告音を止める」ボタン |
 | 管理者のブラウザ → 端末 | `STATUS` | `STATUS alarm state=<idle\|alarming\|muted> cause=<none\|silence\|ng:<reason>\|call> hb_age_ms=<n\|-> [grace_left_ms=<n>] VER=…` (`grace_left_ms` は `grace=` の猶予中のみ。CoreS3 は `ALARM=<state>/<cause>/<hb_age_ms>/<grace_left_ms>`、猶予外は `0`)。**名乗りではない** |
 | 端末 → 管理者のブラウザ | `EVT ALARM state=… cause=…` | 状態が変わるたび + 5 秒ごと (ブラウザのバナー用) |
-| 端末 → 管理者のブラウザ | `EVT NFC_LOGIN card_id=<生値> card_kind=felica_idm\|nfca_uid` | Unit NFC で IC カード (FeliCa IDm / NFC-A UID) を読んだ (Refs ippoan/alc-app#387)。**打刻ではない** — ブラウザがその人を「この席の運行管理者」に登録するための合図で、端末はサーバへ何も送らない。免許証では出さない (下の `EVT NFC_LICENSE` が出る)。行の形は `alc_hub_core::nfc_login::evt_line`。シリアルのみでログのリングには残らない |
-| 端末 → 管理者のブラウザ | `EVT NFC_LICENSE issue=YYYYMMDD expiry=YYYYMMDD` | Unit NFC で運転免許証 (IC) を読んだ。CoreS3 / タイムカード端末と同じ行 (読み取りの正本 `hub-drivers/src/nfc.rs` が出す) |
+| 端末 → 管理者のブラウザ | `EVT NFC_LOGIN card_id=<生値> card_kind=felica_idm\|nfca_uid` | Unit NFC で IC カード (FeliCa IDm / NFC-A UID) を読んだ (Refs ippoan/alc-app#387)。**打刻ではない** — ブラウザがその人を「この席の運行管理者」に登録するための合図で、端末はサーバへ何も送らない。免許証では出さない (下の `EVT NFC_LICENSE` が出る)。行の形は `alc_hub_core::nfc_login::evt_line`。シリアルのみでログのリングには残らない。読めたら短く 1 回鳴る (下の「カードの読み取りの音」) |
+| 端末 → 管理者のブラウザ | `EVT NFC_LICENSE issue=YYYYMMDD expiry=YYYYMMDD` | Unit NFC で運転免許証 (IC) を読んだ。CoreS3 / タイムカード端末と同じ行 (読み取りの正本 `hub-drivers/src/nfc.rs` が出す)。読めたら IC カードと同じ音が鳴る |
 
 `PING` / `DEVICE` / `HEAP` / `LOG DUMP` は共通実装 (`hub-drivers/src/console.rs`)。
 機種識別は `DEVICE` を見ること — 正本は
@@ -412,6 +412,14 @@ VOICEVOX の利用規約によりクレジット表記が必要 — 本製品を
 3000Hz 200ms ×3 (止まるまで 1.8 秒ごと)、沈黙の警告が 3000Hz 60ms ×2 (止まるまで
 5 秒ごと)、解消の合図が 1200Hz 150ms ×1、黙らせているあいだの合図が
 3000Hz 60ms ×1 (5 秒ごと)。
+
+**カードの読み取りの音** (Unit NFC を付けた機体。Refs ippoan/alc-app#387): IC カード・
+免許証を読めたら 2000Hz 40ms ×1 (`Sound::BeepOk`。CoreS3 がカードの読み取りで鳴らす音と
+同じ)、2 枚重なっていたら 3000Hz 400ms ×1 (`Sound::PunchNg`。行は出さない)。本機は画面も
+LED も無いので、鳴らないとタッチが届いたかが手元で分からない。**打刻端末の成功音
+(3000Hz 60ms ×2) は使わない** — 沈黙の警告と同じ波形で聞き分けられない (配線テストが見張る)。
+警告の状態は見ずに再生キューへ積むので、鳴動中は警告音の切れ目に鳴る。読み取り失敗・
+電子車検証では鳴らさない。
 
 **本体ボタン (G41) はトグル。** 鳴動中に押すと黙り、黙っているあいだにもう一度
 押すと鳴動へ戻る (押した手応えとして即 1 回鳴る)。**黙らせても無音にはしない** —
