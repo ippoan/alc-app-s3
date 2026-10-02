@@ -234,7 +234,9 @@ USB でつながる警告デバイス (`alarm`、Refs ippoan/alc-app#425) を、
 `EVT …` やログの行が間に混ざるので、**ホストは `OTA ` で始まる行だけを見る**。
 
 0. ホスト: **書き込みを始める前に** `OTA CONFIRM` を送り、応答
-   `OTA CONFIRMED RX=<受信リングのバイト数>` (例 `OTA CONFIRMED RX=8192`) の `RX=` を読む
+   `OTA CONFIRMED RX=<受信リングのバイト数>` (例 `OTA CONFIRMED RX=8192`) の `RX=` を読む。
+   `RX=` は機種ごとで、端末が実際に取れた大きさを名乗る。シリアル OTA を受ける機種
+   (CoreS3 / `timecard` / `alarm`) は 8192 (確保に失敗した機は 1024 に落ちて、そう名乗る)
    - **`RX=` がチャンク長 (4096) 以上のときだけ `OTA SERIAL` を送る**
    - `RX=` が無い (`OTA CONFIRMED` だけを返す古い版) か、チャンク長より小さい機には
      `OTA SERIAL` を送らない。配布ページ (web インストーラ) から書き直す。

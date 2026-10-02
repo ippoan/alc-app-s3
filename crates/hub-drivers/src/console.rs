@@ -11,6 +11,7 @@
 //! | | 内容 |
 //! |---|---|
 //! | [`install_usb_serial_jtag`] | USB Serial/JTAG ドライバの VFS 接続 (stdin をブロッキング読みにする) |
+//! | [`install_usb_serial_jtag_rx`] / [`spawn_reader_rx`] | 同上の、受信リングの大きさを選べる版 (シリアル OTA を受ける機種が 8192 を渡す) |
 //! | [`take_line`] | 受信バッファから 1 行を切り出す (改行待ち + ゴミ捨て) |
 //! | [`spawn_reader`] | stdin を読んで行ごとにコールバックを呼ぶスレッド (`OTA SERIAL` の後は生バイトを OTA へ渡す) |
 //! | [`feed_serial_ota`] | `OTA SERIAL` の後の生バイトを OTA へ渡す (reader が行を切り出す前に呼ぶ。[`spawn_reader`] と CoreS3 の [`crate::host_link`] が共有) |
@@ -28,6 +29,7 @@ use anyhow::Result;
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::sys;
 use std::io::Read;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use alc_hub_common::control::PairFlag;
 use alc_hub_common::{settings::Settings, status::SharedStatus};
@@ -35,8 +37,14 @@ use alc_hub_common::{settings::Settings, status::SharedStatus};
 /// 行としてバッファする最大長 (超えたら読み捨て — バイナリノイズ対策)
 pub const MAX_LINE: usize = 512;
 
-/// USB Serial/JTAG ドライバの受信リングの大きさ [bytes]。シリアル OTA のチャンク
+/// USB Serial/JTAG ドライバの受信リングの既定の大きさ [bytes]。
+/// シリアル OTA を受けない機種 (atoms3-print / atoms3-nfc) はこのまま使う
+pub const USB_RX_BUFFER_DEFAULT_BYTES: usize = 1024;
+
+/// シリアル OTA (`OTA SERIAL`) を受ける機種の受信リングの大きさ [bytes]。チャンク
 /// (`ota.rs` の `SERIAL_CHUNK` = 4096) の 2 倍 (Refs ippoan/alc-app#425)。
+/// **[`handle_ota_serial`] を呼ぶ機種だけが渡す** (CoreS3 の [`crate::host_link`] /
+/// atoms3-timecard / atoms3-alarm。[`spawn_reader_rx`] か [`install_usb_serial_jtag_rx`])。
 ///
 /// ESP-IDF のドライバは、リングが満杯のとき受けたバイトを**黙って捨て**、ホストへの
 /// 背圧も掛けない (ISR の `xRingbufferSendFromISR` の失敗を見ない)。1024 のままだと、
@@ -45,23 +53,54 @@ pub const MAX_LINE: usize = 512;
 /// リングが 1 チャンクを丸ごと受けられれば reader が遅れても溢れない (時間に頼らない)。
 /// 残りの 1 チャンクぶんは、間に紛れた行のための余裕。
 ///
-/// 大きさは `OTA CONFIRMED RX=<この値>` と `OTA READY <chunk> RX=<この値>` でホストへ
-/// 伝える (docs/console-protocol.md §6)。**変えたらその決まりも見直すこと。**
+/// 実際に取れた大きさ ([`usb_rx_buffer_bytes`]) を `OTA CONFIRMED RX=<n>` と
+/// `OTA READY <chunk> RX=<n>` でホストへ伝える (docs/console-protocol.md §6)。
+/// **変えたらその決まりも見直すこと。**
 ///
-/// 置き場: リングは `malloc` で取られる (`xRingbufferCreate`)。PSRAM を積む機種は
+/// 置き場: リングは `malloc` で取られる (`xRingbufferCreate`)。この 3 機種は PSRAM を積み
 /// `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024` を超えるので PSRAM に載り、内部RAM は
-/// 減らない。PSRAM の無い機種 (atoms3-print / atoms3-nfc の Lite) は内部RAM から取る
-pub const USB_RX_BUFFER_BYTES: usize = 8192;
+/// 減らない。PSRAM の無い機種 (atoms3-print / atoms3-nfc の Lite) は内部RAM から
+/// 取ることになるので、広げない
+pub const USB_RX_BUFFER_SERIAL_OTA_BYTES: usize = 8192;
+
+/// 実際に install できた受信リングの大きさ (0 = まだ / install できなかった)
+static USB_RX_INSTALLED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// 実際に install できた USB Serial/JTAG の受信リングの大きさ [bytes]
+/// (0 = まだ install していない / できなかった)。`OTA READY` / `OTA CONFIRMED` の
+/// `RX=` に載せる値 — 定数ではなく、取れた大きさを名乗る
+pub fn usb_rx_buffer_bytes() -> usize {
+    USB_RX_INSTALLED_BYTES.load(Ordering::Relaxed)
+}
 
 /// USB Serial/JTAG ドライバを VFS に接続し、stdin のブロッキング読み出しを
-/// 可能にする (`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` 前提)。
+/// 可能にする (`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` 前提)。受信リングは既定の
+/// 大きさ ([`USB_RX_BUFFER_DEFAULT_BYTES`])。
 pub fn install_usb_serial_jtag() {
+    install_usb_serial_jtag_rx(USB_RX_BUFFER_DEFAULT_BYTES);
+}
+
+/// [`install_usb_serial_jtag`] の、受信リングの大きさ (`rx_bytes`) を選べる版。
+/// シリアル OTA を受ける機種が [`USB_RX_BUFFER_SERIAL_OTA_BYTES`] を渡す。
+///
+/// 既定より大きい `rx_bytes` で確保に失敗したら、既定の大きさでやり直す
+/// (コンソールを失うより、シリアル OTA だけを諦める。ホストは `RX=` を見て書かない)。
+pub fn install_usb_serial_jtag_rx(rx_bytes: usize) {
     unsafe {
-        let mut cfg = sys::usb_serial_jtag_driver_config_t {
-            tx_buffer_size: 1024,
-            rx_buffer_size: USB_RX_BUFFER_BYTES as u32,
-        };
-        sys::usb_serial_jtag_driver_install(&mut cfg);
+        let mut installed = rx_bytes;
+        let mut err = usb_serial_jtag_driver_install(installed);
+        if err != sys::ESP_OK && installed > USB_RX_BUFFER_DEFAULT_BYTES {
+            log::warn!(
+                "console: 受信リング {installed} B で install 失敗 (err={err})。既定でやり直す"
+            );
+            installed = USB_RX_BUFFER_DEFAULT_BYTES;
+            err = usb_serial_jtag_driver_install(installed);
+        }
+        if err == sys::ESP_OK {
+            USB_RX_INSTALLED_BYTES.store(installed, Ordering::Relaxed);
+        } else {
+            log::warn!("console: USB Serial/JTAG ドライバを install できません (err={err})");
+        }
         sys::esp_vfs_usb_serial_jtag_use_driver();
         // 受信は無変換にする。既定の CR→LF 変換は Improv のバイナリフレーム中の
         // 0x0D (13 文字のパスワード長など) を書き換え、チェックサム不一致で黙って
@@ -70,6 +109,15 @@ pub fn install_usb_serial_jtag() {
             sys::esp_line_endings_t_ESP_LINE_ENDINGS_LF,
         );
     }
+}
+
+/// 受信リング `rx_bytes` で USB Serial/JTAG ドライバを install する (送信側は 1024 のまま)
+unsafe fn usb_serial_jtag_driver_install(rx_bytes: usize) -> sys::esp_err_t {
+    let mut cfg = sys::usb_serial_jtag_driver_config_t {
+        tx_buffer_size: 1024,
+        rx_buffer_size: rx_bytes as u32,
+    };
+    sys::usb_serial_jtag_driver_install(&mut cfg)
 }
 
 /// 受信バッファの先頭から 1 行 (CR か LF まで) を取り出す。改行がまだ来て
@@ -134,9 +182,21 @@ pub fn feed_serial_ota(raw: &mut Option<crate::ota::SerialSink>, acc: &mut Vec<u
 pub fn spawn_reader(
     name: &'static core::ffi::CStr,
     stack_size: usize,
+    on_line: impl FnMut(&str) + Send + 'static,
+) -> Result<()> {
+    spawn_reader_rx(name, stack_size, USB_RX_BUFFER_DEFAULT_BYTES, on_line)
+}
+
+/// [`spawn_reader`] の、USB の受信リングの大きさ (`rx_bytes`) を選べる版。
+/// シリアル OTA を受ける機種 ([`handle_ota_serial`] を呼ぶ機種) が
+/// [`USB_RX_BUFFER_SERIAL_OTA_BYTES`] を渡す ([`install_usb_serial_jtag_rx`])
+pub fn spawn_reader_rx(
+    name: &'static core::ffi::CStr,
+    stack_size: usize,
+    rx_bytes: usize,
     mut on_line: impl FnMut(&str) + Send + 'static,
 ) -> Result<()> {
-    install_usb_serial_jtag();
+    install_usb_serial_jtag_rx(rx_bytes);
     crate::task::name_next(name);
     std::thread::Builder::new()
         .name(name.to_string_lossy().into_owned())

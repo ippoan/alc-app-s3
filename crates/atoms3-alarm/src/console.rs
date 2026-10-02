@@ -43,7 +43,10 @@ use alc_hub_drivers::{alarm, console};
 use anyhow::Result;
 
 pub fn start(monitor: SharedMonitor, status: SharedStatus, settings: Settings) -> Result<()> {
-    console::spawn_reader(c"console", 8 * 1024, move |line| {
+    // シリアル OTA を受けるので、USB の受信リングは広い方 (チャンクを丸ごと受ける。
+    // Refs ippoan/alc-app#425)
+    let rx = console::USB_RX_BUFFER_SERIAL_OTA_BYTES;
+    console::spawn_reader_rx(c"console", 8 * 1024, rx, move |line| {
         handle_line(line, &monitor, &status, &settings)
     })
 }

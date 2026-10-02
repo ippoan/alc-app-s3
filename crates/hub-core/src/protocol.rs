@@ -212,7 +212,7 @@ pub enum HostCommand {
     /// もう一方の OTA スロットへ書き込み、再起動する (`EVT OTA_* ...` を出力)
     Ota { url: String },
     /// シリアル OTA の開始 (`OTA SERIAL <size> <flavor>`、Refs #279)。
-    /// 受け入れたら端末は `OTA READY 4096 RX=8192` (チャンク長と受信リングの大きさ) を
+    /// 受け入れたら端末は `OTA READY 4096 RX=8192` (チャンク長と、その機の受信リングの大きさ) を
     /// 返し、以後 `size` バイトを行に分けずそのまま受ける
     /// (docs/console-protocol.md の「シリアル OTA」)
     OtaSerial {

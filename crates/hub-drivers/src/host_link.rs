@@ -106,8 +106,9 @@ pub fn start(
     // stdin のブロッキング読み出しを可能にする (console.rs と同じ設置)。
     // 本 crate は Improv (バイナリフレーム) を混ぜるため console::spawn_reader は
     // 使わず、行の切り出し (console::take_line) とシリアル OTA の生バイトの
-    // 受け渡し (console::feed_serial_ota) を共有する
-    crate::console::install_usb_serial_jtag();
+    // 受け渡し (console::feed_serial_ota) を共有する。シリアル OTA を受けるので
+    // 受信リングは広い方 (チャンクを丸ごと受ける。Refs ippoan/alc-app#425)
+    crate::console::install_usb_serial_jtag_rx(crate::console::USB_RX_BUFFER_SERIAL_OTA_BYTES);
 
     crate::task::name_next(c"host_link");
     std::thread::Builder::new()
