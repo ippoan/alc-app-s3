@@ -66,7 +66,7 @@ CoreS3 固有のコマンドを中心にした一覧。
 |---|---|
 | `PING` | 疎通確認 (`PONG` 応答) |
 | `DEVICE` | `DEVICE cores3 VER=<version> BOARD=cores3\|cores3se FLAVOR=cores3\|cores3-wifi\|cores3-dev` 応答 (機種識別、詳細は上記正本) |
-| `OTA SERIAL <size> <flavor>` / `OTA CONFIRM` | シリアル OTA。USB で繋がった PC のブラウザ (キオスク PWA) が Pages の app 単体イメージ (`firmware/alc-hub-cores3-app.bin`、Wi-Fi 版は `-wifi-app.bin`、開発用は `-dev-app.bin`。FLAVOR に対応する bin を送る) を流し込む。応答は `OTA READY 4096` → チャンクごとに `OTA ACK <累計>` → `OTA OK` (再起動) / `OTA ERR <理由>`、再起動後に `OTA CONFIRM` → `OTA CONFIRMED` (10 分以内に来なければ前の image へ戻る)。**点呼中は `OTA ERR busy` で断る**。手順の正本は [docs/console-protocol.md](docs/console-protocol.md) §6 (Refs ippoan/alc-app#403) |
+| `OTA SERIAL <size> <flavor>` / `OTA CONFIRM` | シリアル OTA。USB で繋がった PC のブラウザ (キオスク PWA) が Pages の app 単体イメージ (`firmware/alc-hub-cores3-app.bin`、Wi-Fi 版は `-wifi-app.bin`、開発用は `-dev-app.bin`。FLAVOR に対応する bin を送る) を流し込む。応答は `OTA READY 4096 RX=8192` (`RX=` は USB の受信リングの大きさ) → チャンクごとに `OTA ACK <累計>` → `OTA OK` (再起動) / `OTA ERR <理由>`、再起動後に `OTA CONFIRM` → `OTA CONFIRMED RX=8192` (10 分以内に来なければ前の image へ戻る)。ホストは書き込みの前にも `OTA CONFIRM` を送り、`RX=` が 4096 以上の機にだけ `OTA SERIAL` を送る。**点呼中は `OTA ERR busy` で断る**。手順の正本は [docs/console-protocol.md](docs/console-protocol.md) §6 (Refs ippoan/alc-app#403) |
 | `QR <payload> [timeout_s]` | QR コード表示 (既定 60 秒で期限切れ) |
 | `MEASURE` | 測定中画面 |
 | `RESULT OK\|NG [value]` | 結果画面 (10 秒で自動クローズ) |
