@@ -35,13 +35,31 @@ use alc_hub_common::{settings::Settings, status::SharedStatus};
 /// 行としてバッファする最大長 (超えたら読み捨て — バイナリノイズ対策)
 pub const MAX_LINE: usize = 512;
 
+/// USB Serial/JTAG ドライバの受信リングの大きさ [bytes]。シリアル OTA のチャンク
+/// (`ota.rs` の `SERIAL_CHUNK` = 4096) の 2 倍 (Refs ippoan/alc-app#425)。
+///
+/// ESP-IDF のドライバは、リングが満杯のとき受けたバイトを**黙って捨て**、ホストへの
+/// 背圧も掛けない (ISR の `xRingbufferSendFromISR` の失敗を見ない)。1024 のままだと、
+/// ホストが 1 チャンクを一気に書いたとき reader が少しでも遅れると溢れ、チャンクが
+/// 揃わず `OTA ERR timeout` になっていた。ホストは `OTA ACK` を待ってから次を送るので、
+/// リングが 1 チャンクを丸ごと受けられれば reader が遅れても溢れない (時間に頼らない)。
+/// 残りの 1 チャンクぶんは、間に紛れた行のための余裕。
+///
+/// 大きさは `OTA READY <chunk> RX=<この値>` でホストへ伝える
+/// (docs/console-protocol.md §6)。**変えたらその決まりも見直すこと。**
+///
+/// 置き場: リングは `malloc` で取られる (`xRingbufferCreate`)。PSRAM を積む機種は
+/// `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024` を超えるので PSRAM に載り、内部RAM は
+/// 減らない。PSRAM の無い機種 (atoms3-print / atoms3-nfc の Lite) は内部RAM から取る
+pub const USB_RX_BUFFER_BYTES: usize = 8192;
+
 /// USB Serial/JTAG ドライバを VFS に接続し、stdin のブロッキング読み出しを
 /// 可能にする (`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` 前提)。
 pub fn install_usb_serial_jtag() {
     unsafe {
         let mut cfg = sys::usb_serial_jtag_driver_config_t {
             tx_buffer_size: 1024,
-            rx_buffer_size: 1024,
+            rx_buffer_size: USB_RX_BUFFER_BYTES as u32,
         };
         sys::usb_serial_jtag_driver_install(&mut cfg);
         sys::esp_vfs_usb_serial_jtag_use_driver();
