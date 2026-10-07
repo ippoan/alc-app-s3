@@ -45,6 +45,9 @@ pub const ES8311_ADDR: u8 = 0x18;
 /// AtomS3R では実装されている (issue #151)。同じ内蔵バスなので [`probe_bus`] のついでに見る
 pub const LP5562_ADDR: u8 = 0x30;
 
+/// DAC 音量 (reg 0x32)。下の [`ENABLE_SEQ`] のコメント参照
+const DAC_VOLUME: u8 = if cfg!(feature = "vein") { 0xBF } else { 0xB0 };
+
 /// M5Unified `_speaker_enabled_cb_atom_echos3r` の `enabled_bulk_data` (reg, value)。
 /// **順番に意味がある** — 0x00 のリセット/CSM 起動が先頭でないと以降が効かない
 const ENABLE_SEQ: [(u8, u8); 8] = [
@@ -57,8 +60,11 @@ const ENABLE_SEQ: [(u8, u8); 8] = [
     // DAC 音量。ES8311 は 0xBF = 0dB、1 step 0.5dB (0xFF = +32dB、0x00 = ミュート)。
     // M5Unified の移植では 0xFF (フル) だったが、実機では大きすぎて
     // 「音量を下げないとタップできない」(#155、2026-09-06) → 0xB0 (= −7.5dB、
-    // フルから −39.5dB)。実機で聞いて調整する
-    (0x32, 0xB0),
+    // フルから −39.5dB)。実機で聞いて調整する。
+    // `vein` (Vein Station) だけは 0xBF (0dB)。案内音声 (assets/vein_*.raw、ピークを
+    // フルスケールの 95% にそろえてある) が 0xB0 では聞き取れなかった (2026-10-07、
+    // 実機。ippoan/vein-base#105)。0dB を超えると 95% の音声が割れるので上限はここ
+    (0x32, DAC_VOLUME),
     (0x37, 0x08), // DAC: イコライザをバイパス (既定値ではない)
 ];
 
