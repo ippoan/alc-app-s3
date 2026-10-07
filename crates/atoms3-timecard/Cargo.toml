@@ -48,6 +48,10 @@ station = []
 # 出す。登録・照合の案内音声 3 本もこの feature のときだけ埋め込む。
 # **`station` だけのビルドの挙動は変えない** (FC-1200 の実機試験が進行中、#272)
 vein = ["station", "alc-hub-drivers/vein"]
+# 指静脈を VoiceS3R の Grove PORT.A に直接つなぐ構成 (Vein Unit、ippoan/vein-base#105)。
+# `vein` の UART2 を TX=G2 / RX=G1 (PORT.A の白 / 黄) に移し、PORT.A を使う Unit NFC は
+# 起動しない (NFC なしの構成)。中継基板 (vein-base / station 基板) の G5/G6 版は `vein` のまま
+vein-porta = ["vein"]
 
 [build-dependencies]
 embuild = "0.33"
