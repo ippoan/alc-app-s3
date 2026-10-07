@@ -67,6 +67,11 @@ pub const XG_ERR_SUCCESS: u8 = 0x00;
 pub const XG_ERR_FAIL: u8 = 0x01;
 /// 指の入力待ちがモジュール側で時間切れ
 pub const XG_ERR_TIME_OUT: u8 = 0x0B;
+/// 登録中、撮れた指が前の撮像と違う。**終わりではない** — モジュールが撮り直す (§2.2.20 の例)
+pub const XG_ERR_NO_SAME_FINGER: u8 = 0x09;
+/// 登録中、静脈が撮れなかった (置き方が浅い等)。**終わりではない** — モジュールが撮り直す
+/// (§2.2.20 の例: `bData[1]` が 0x11 / 0x09 のときは次の応答を待ち続ける。2026-10-07 実機で発生)
+pub const XG_ERR_NO_VEIN: u8 = 0x11;
 /// 「指を置いて」の途中経過 (登録中に届く)
 pub const XG_INPUT_FINGER: u8 = 0x20;
 /// 「指を離して」の途中経過 (登録中に届く)
@@ -166,6 +171,9 @@ pub enum Prompt {
     Place,
     /// 「指を離して」(`XG_RELEASE_FINGER`) = 撮れた
     Release,
+    /// 撮れなかった / 違う指だった (`01 11` / `01 09`)。モジュールが撮り直すので置き直してもらう。
+    /// 中身はそのエラーコード
+    Retry(u8),
 }
 
 /// ENROLL 中に届いた応答の意味 (§2.2.20)
@@ -185,6 +193,9 @@ pub enum EnrollReply {
 pub fn enroll_reply(p: &Packet) -> EnrollReply {
     match p.data[0] {
         XG_ERR_SUCCESS => EnrollReply::Done,
+        XG_ERR_FAIL if matches!(p.data[1], XG_ERR_NO_VEIN | XG_ERR_NO_SAME_FINGER) => {
+            EnrollReply::Prompt(Prompt::Retry(p.data[1]))
+        }
         XG_ERR_FAIL => EnrollReply::Failed(p.data[1]),
         XG_INPUT_FINGER => EnrollReply::Prompt(Prompt::Place),
         XG_RELEASE_FINGER => EnrollReply::Prompt(Prompt::Release),
@@ -374,6 +385,7 @@ pub fn capture(
         return Err(VeinError::ReadFail);
     }
     let mut enrolled = false;
+    let mut retries = 0u8;
     for _ in 0..=MAX_PROMPTS {
         let p = recv_packet(port, t.finger_ms, t.idle_ms).map_err(|e| match e {
             RecvError::Silent => VeinError::Timeout,
@@ -386,6 +398,14 @@ pub fn capture(
             EnrollReply::Done => {
                 enrolled = true;
                 break;
+            }
+            EnrollReply::Prompt(Prompt::Retry(code)) => {
+                // 撮り直しはモジュールが ENROLL_RETRIES 回まで続ける。それを超えて届いたら終わり
+                retries += 1;
+                if retries > ENROLL_RETRIES {
+                    return Err(VeinError::Rc(code));
+                }
+                on_prompt(Prompt::Retry(code));
             }
             EnrollReply::Prompt(x) => on_prompt(x),
             EnrollReply::Failed(XG_ERR_TIME_OUT) => return Err(VeinError::NoFinger),
@@ -715,6 +735,15 @@ mod tests {
             EnrollReply::Failed(0x0B)
         );
         assert_eq!(enroll_reply(&pk(&[0x42])), EnrollReply::Unknown(0x42));
+        // 撮れなかった / 違う指は終わりではなく撮り直し (§2.2.20)
+        assert_eq!(
+            enroll_reply(&pk(&[XG_ERR_FAIL, XG_ERR_NO_VEIN])),
+            EnrollReply::Prompt(Prompt::Retry(XG_ERR_NO_VEIN))
+        );
+        assert_eq!(
+            enroll_reply(&pk(&[XG_ERR_FAIL, XG_ERR_NO_SAME_FINGER])),
+            EnrollReply::Prompt(Prompt::Retry(XG_ERR_NO_SAME_FINGER))
+        );
     }
 
     #[test]
@@ -897,6 +926,36 @@ mod tests {
         assert_eq!(three(Some(SPEC_CONNECT_RECV[..3].to_vec())), Err(VeinError::ReadFail));
         let mut port = FailAt(FakePort::new(vec![connected(), cleared()]), 3);
         assert_eq!(run(&mut port), Err(VeinError::ReadFail));
+    }
+
+    #[test]
+    fn capture_retries_after_no_vein() {
+        // 置く → 撮れない (01 11) → 置き直す → 離して → 完了
+        let mut e = reply(CMD_ENROLL, &[XG_INPUT_FINGER]);
+        e.extend(reply(CMD_ENROLL, &[XG_ERR_FAIL, XG_ERR_NO_VEIN]));
+        e.extend(reply(CMD_ENROLL, &[XG_INPUT_FINGER]));
+        e.extend(reply(CMD_ENROLL, &[XG_RELEASE_FINGER]));
+        e.extend(reply(CMD_ENROLL, &[XG_ERR_SUCCESS, 1]));
+        let data = vec![0xDE, 0xED, 1, 2];
+        let mut port = FakePort::new(vec![connected(), cleared(), Some(e), size(4), Some(chunk(&data)), cleared()]);
+        let mut prompts = Vec::new();
+        assert_eq!(capture(&mut port, &Timeouts::DEFAULT, &mut |p| prompts.push(p)), Ok(data));
+        assert_eq!(
+            prompts,
+            vec![Prompt::Place, Prompt::Retry(XG_ERR_NO_VEIN), Prompt::Place, Prompt::Release]
+        );
+    }
+
+    #[test]
+    fn capture_gives_up_after_too_many_retries() {
+        let e: Vec<u8> = (0..=ENROLL_RETRIES)
+            .flat_map(|_| reply(CMD_ENROLL, &[XG_ERR_FAIL, XG_ERR_NO_SAME_FINGER]))
+            .collect();
+        let mut port = FakePort::new(vec![connected(), cleared(), Some(e)]);
+        let mut n = 0;
+        let got = capture(&mut port, &Timeouts::DEFAULT, &mut |_| n += 1);
+        assert_eq!(got, Err(VeinError::Rc(XG_ERR_NO_SAME_FINGER)));
+        assert_eq!(n, usize::from(ENROLL_RETRIES));
     }
 
     #[test]
