@@ -144,6 +144,11 @@ jobs:
           - { name: atoms3-timecard-vein,
               cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard cargo check --release --locked -p alc-hub-atoms3-timecard --features vein",
               cache_key: build-timecard-s3r }
+          # 指静脈を Grove PORT.A に直接挿す Vein Unit 版 (`vein-porta`、UART2 を G2/G1 に、NFC なし)。
+          # cfg で NFC の起動を外すので、その片側もここでコンパイルする
+          - { name: atoms3-timecard-vein-porta,
+              cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard cargo check --release --locked -p alc-hub-atoms3-timecard --features vein-porta",
+              cache_key: build-timecard-s3r }
           # 点呼端末の警告デバイス (#135)。同じ本番機 (Atom VoiceS3R) だが
           # sdkconfig は timecard とも違う (W5500 と BLE を持たず、音・PSRAM・
           # Unit NFC の legacy 衝突回避だけ) ため cache_key は timecard と**別**。

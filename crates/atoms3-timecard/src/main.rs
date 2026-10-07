@@ -119,7 +119,9 @@ use alc_hub_common::{
 use alc_hub_drivers::nfc::NfcEvent;
 use alc_hub_drivers::speaker::Sound;
 use alc_hub_drivers::timecard::Punch;
-use alc_hub_drivers::{crashlog, es8311, heap, nfc, ota, recorder, speaker};
+use alc_hub_drivers::{crashlog, es8311, heap, ota, recorder, speaker};
+#[cfg(not(feature = "vein-porta"))]
+use alc_hub_drivers::nfc;
 #[cfg(feature = "station")]
 use alc_hub_drivers::rs232;
 #[cfg(feature = "vein")]
@@ -143,6 +145,7 @@ use std::sync::{mpsc, Arc, Mutex};
 /// nfc_shim (C++ 側) に立てさせる I2C ポート。本機は他に I2C を使わないので
 /// I2C_NUM_0 (atoms3-nfc のベンチと同値、実機確認済み)。CoreS3 は内部バスが
 /// I2C_NUM_0 を使うので向こうは 1
+#[cfg(not(feature = "vein-porta"))]
 const I2C_PORT_NFC: i32 = 0;
 
 fn main() -> Result<()> {
@@ -181,9 +184,14 @@ fn main() -> Result<()> {
     // console より先に立てる。音の送り口は speaker が立ってから入れる (下)
     #[cfg(feature = "vein")]
     let vein = {
-        // ★ 指静脈の UART ピンは**ここ 1 か所**。中継基板 (vein-base、J1-2 = G5 →
-        //   モジュール RXD / J1-3 = G6 ← モジュール TXD) は未発注で変わりうる
+        // ★ 指静脈の UART ピンは**ここ 1 か所**。中継基板 (vein-base / station 基板、
+        //   J1-2 = G5 → モジュール RXD / J1-3 = G6 ← モジュール TXD) は G5/G6。
+        //   `vein-porta` は Grove PORT.A に挿す Vein Unit: Grove 1 (黄) = G1 ← モジュール
+        //   TXD、2 (白) = G2 → モジュール RXD (vein-base の pcb/vein_unit_board の J2)
+        #[cfg(not(feature = "vein-porta"))]
         let (tx, rx) = (p.pins.gpio5, p.pins.gpio6);
+        #[cfg(feature = "vein-porta")]
+        let (tx, rx) = (p.pins.gpio2, p.pins.gpio1);
         let pins = {
             use esp_idf_svc::hal::gpio::Pin;
             (tx.pin(), rx.pin())
@@ -320,7 +328,14 @@ fn main() -> Result<()> {
     let ws_for_bp = ws_meas_tx.clone();
 
     // Unit NFC (ST25R3916): Grove Port A (SDA=G2 / SCL=G1)。読み取りループは
-    // hub-drivers/src/nfc.rs (CoreS3 と共有)。**ここに NFC のコードを書かない**
+    // hub-drivers/src/nfc.rs (CoreS3 と共有)。**ここに NFC のコードを書かない**。
+    // `vein-porta` では PORT.A を指静脈の UART に使うので起動しない
+    #[cfg(feature = "vein-porta")]
+    {
+        let _ = (&ws_meas_tx, &speaker_tx);
+        alc_hub_common::evtlog::emit("EVT NFC_DISABLED port=A_used_by_vein");
+    }
+    #[cfg(not(feature = "vein-porta"))]
     nfc::start(
         I2C_PORT_NFC,
         p.pins.gpio2.into(),
@@ -433,6 +448,7 @@ fn main() -> Result<()> {
 /// **`card_id` は生値のまま**送る (接頭辞を付けると punch のカード照合が
 /// 必ず外れる — alc_hub_core::timecard の doc 参照)。`session_id` は
 /// 点呼ではないので付けない。
+#[cfg_attr(feature = "vein-porta", allow(dead_code))]
 fn on_card(
     event: &NfcEvent,
     ws_tx: &mpsc::Sender<UplinkRecord>,
