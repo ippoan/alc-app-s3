@@ -1,7 +1,7 @@
 //! 指静脈モジュール (Waveshare Finger Vein Scanner Module) の UART ドライバ
 //! (Vein Station、ippoan/vein-match#20)。
 //!
-//! 手順 (接続 → GET_CHARA → READ_DATA の分割読み) とパケットの検査は
+//! 手順 (接続 → 作業用 ID に 1 回登録 → 登録データの分割読み → 削除) とパケットの検査は
 //! `alc_hub_core::vein` (host test 付き) が持ち、ここは次の 3 つだけ:
 //!
 //! - UART を開き、[`alc_hub_core::vein::Port`] として渡す
@@ -9,9 +9,11 @@
 //!   (`VEIN CHARA <hex>` / `ERR VEIN <reason>`) でホストへ出す
 //! - `VEIN SAY <x>` を再生スレッド (speaker) へ取り次ぐ
 //!
-//! **音は読み取りと切り離してある** — 何をいつ鳴らすか (登録の 2 回読み・照合の
+//! **案内音声は読み取りと切り離してある** — 何をいつ鳴らすか (登録の 2 回読み・照合の
 //! 失敗時など) はホスト (alc-app) が決める。`VEIN SAY` は読み取り中でも
-//! すぐ鳴る (読み取りスレッドの列に並ばない)。
+//! すぐ鳴る (読み取りスレッドの列に並ばない)。例外は「離して」のビープだけ:
+//! 撮れた瞬間はモジュールの途中経過 (0x21) でしか分からないので、端末が鳴らす
+//! (指を離すタイミングが分からない、2026-10-07 実機)。
 //!
 //! FC-1200 の [`crate::rs232`] とは別物 (あちらは UART1 固定で FC-1200 の
 //! 行解析を持つ)。UART を開く十数行は共通化していない — rs232 の経路を
@@ -113,9 +115,12 @@ pub fn start(
         &cfg,
     )?;
     let (capture_tx, capture_rx) = mpsc::channel::<()>();
+    // 再生スレッドの送信口。読み取りスレッドも「離して」のビープに使う
+    let speaker: Arc<OnceLock<Sender<Sound>>> = Arc::new(OnceLock::new());
+    let beeper = Arc::clone(&speaker);
 
-    // NVS も flash も触らないので PSRAM スタックでよい。特徴量 (最大 2KB) と
-    // 16 進の行 (最大 4KB) はヒープに置く
+    // NVS も flash も触らないので PSRAM スタックでよい。特徴量 (最大 8KB) と
+    // 16 進の行 (最大 16KB) はヒープに置く
     crate::task::name_next_psram(c"vein", 8 * 1024);
     std::thread::Builder::new()
         .name("vein".into())
@@ -123,7 +128,14 @@ pub fn start(
         .spawn(move || {
             let mut port = UartPort(driver);
             while capture_rx.recv().is_ok() {
-                let line = match proto::capture(&mut port, &Timeouts::DEFAULT) {
+                let mut on_prompt = |p: proto::Prompt| {
+                    if p == proto::Prompt::Release {
+                        if let Some(tx) = beeper.get() {
+                            let _ = tx.send(Sound::BeepOk);
+                        }
+                    }
+                };
+                let line = match proto::capture(&mut port, &Timeouts::DEFAULT, &mut on_prompt) {
                     Ok(chara) => {
                         log::info!("vein: 特徴量 {} バイト", chara.len());
                         proto::chara_line(&chara)
@@ -138,7 +150,7 @@ pub fn start(
         })?;
     Ok(Link {
         capture_tx,
-        speaker: Arc::new(OnceLock::new()),
+        speaker,
     })
 }
 

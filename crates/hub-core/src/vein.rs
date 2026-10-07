@@ -5,20 +5,24 @@
 //! モジュールから特徴量を取り出し、`VEIN CHARA <hex>` 行でホスト (alc-app の
 //! Web Serial) へ渡すための手順。UART の読み書きは [`Port`] の向こう
 //! (`alc-hub-drivers::vein`) にあり、ここはパケットの組み立て・検査と
-//! 「接続 → 撮像 → 分割読み出し」の進め方だけを持つ (ホストで `cargo test`)。
+//! 「接続 → 作業用 ID に 1 回登録 → 登録データの分割読み出し → 作業用 ID を消す」の
+//! 進め方だけを持つ (ホストで `cargo test`)。
 //!
-//! # 出典 (机上。**実機では未確認**)
+//! # 出典と実機 (2026-10-07、Waveshare Finger Vein Scanner Module (A)、名乗りは `WS-FVS10`)
 //!
 //! 仕様書 Communication Protocol Ver 2.3 (§1.2 パケット・§1.2.6 分割読み出し・
-//! §2.2.1 接続・§2.2.28 GET_CHARA・付録のエラーコード) と、その机上調査
-//! (`finger-vein/report.md` §5・§7)。実機が届いたら最初に疑う点:
+//! §2.2.1 接続・§2.2.15 削除・§2.2.20 登録・§2.2.26 登録データ読み出し・付録のエラーコード)。
+//! 実機で確かめたこと (ippoan/vein-base#105):
 //!
-//! - **READ_DATA の応答は「生データ + 2 バイトの和」だけ**で、応答パケットを
-//!   前に挟まない (§1.2.6 のサンプルがそう読む)
-//! - **特徴量の大きさは `bData[1] + bData[2] * 256`**。§2.2.28 のサンプルは
-//!   `* 255` だが誤記と見る (report.md §5 の注、付録 5.4 のテンプレートサイズ)
-//! - 特徴量の中身 (0xBDBD で始まる 0x448 バイトか、外側の層か) は**ここでは
-//!   解釈しない** — モジュールが返した大きさのまま 16 進で出す
+//! - **GET_CHARA (0x28) は非対応** (`01 10` = XG_ERR_NO_SUPPORT)。仕様書には UART でも
+//!   使えるとあるが、この機種では使えない。そのため特徴量は「作業用 ID ([`SCRATCH_ID`]) へ
+//!   1 回だけ登録 → READ_ENROLL (0x22) で大きさ → READ_DATA の種別 0x22 で読む」で取る。
+//!   **モジュール内の登録領域はこの作業用 ID にしか使わない** (照合はホストが持つ)
+//! - **READ_DATA の応答は「生データ + 2 バイトの和」だけ**で、応答パケットを前に挟まない
+//! - **大きさは `bData[1] + bData[2] * 256`** (実機で 0x1FDC = 8156 バイト。先頭は `DE ED DE ED`)
+//! - 登録中は「置いて」(0x20) と「離して」(0x21) の途中経過が届く。間は最大 5 秒で、
+//!   置かれなければ `01 0B` (XG_ERR_TIME_OUT)
+//! - 中身は**ここでは解釈しない** — モジュールが返した大きさのまま 16 進で出す
 //!
 //! # パケット (24 バイト、§1.2.2)
 //!
@@ -37,8 +41,22 @@ pub const DATA_LEN: usize = 16;
 pub const CMD_CONNECTION: u8 = 0x01;
 /// 分割読み出し (§1.2.6)
 pub const CMD_READ_DATA: u8 = 0x20;
-/// 撮像して特徴量を作る。読み出しは READ_DATA の種別 0x28 (§2.2.28)
+/// 撮像して特徴量を作る (§2.2.28)。**WS-FVS10 は非対応** (冒頭 doc)。送らない
 pub const CMD_GET_CHARA: u8 = 0x28;
+/// 指定 ID の登録データを消す (§2.2.15)
+pub const CMD_CLEAR_ENROLL: u8 = 0x11;
+/// 指定 ID に登録する (§2.2.20)。完了まで途中経過が続けて届く
+pub const CMD_ENROLL: u8 = 0x16;
+/// 指定 ID の登録データの大きさを返す。中身は READ_DATA の種別 0x22 で読む (§2.2.26)
+pub const CMD_READ_ENROLL: u8 = 0x22;
+
+/// 特徴量を取り出すために 1 回だけ登録する作業用の ID。読み取りの前後で消す
+pub const SCRATCH_ID: u32 = 1;
+/// 1 回の登録で撮るテンプレートの数 (`bData[5]`)。読み取り 1 回 = 撮像 1 回
+pub const ENROLL_TEMPLATES: u8 = 1;
+/// 撮像に失敗したときにモジュールが撮り直す回数 (`bData[10]`)。1 回の待ちは最大 5 秒なので、
+/// ホスト (alc-app `useVeinSerial` の `CAPTURE_TIMEOUT_MS` = 20 秒) に収まる回数にする
+pub const ENROLL_RETRIES: u8 = 2;
 
 /// 工場出荷時の接続パスワード ("0" × 8、§2.2.1)
 pub const DEFAULT_PASSWORD: &[u8; 8] = b"00000000";
@@ -49,16 +67,16 @@ pub const XG_ERR_SUCCESS: u8 = 0x00;
 pub const XG_ERR_FAIL: u8 = 0x01;
 /// 指の入力待ちがモジュール側で時間切れ
 pub const XG_ERR_TIME_OUT: u8 = 0x0B;
-/// 「指を置いて」の途中経過 (GET_CHARA 中に届く)
+/// 「指を置いて」の途中経過 (登録中に届く)
 pub const XG_INPUT_FINGER: u8 = 0x20;
-/// 「指を離して」の途中経過 (GET_CHARA 中に届く)
+/// 「指を離して」の途中経過 (登録中に届く)
 pub const XG_RELEASE_FINGER: u8 = 0x21;
 
 /// READ_DATA の 1 回の上限 (**UART は 512 バイト**。USB は 4096、§1.2.6)
 pub const UART_DATA_PACKET_MAX: usize = 512;
-/// 特徴量として受け取る大きさの上限。DLL の読み込みが受け付ける上限
-/// (`len > 0x7d0` で err 3) に合わせる — これを超える値は応答の破損とみなす
-pub const CHARA_MAX: usize = 0x7d0;
+/// 特徴量 (登録データ) として受け取る大きさの上限。実機の登録データは 0x1FDC (8156) バイト
+/// (2026-10-07) なので 8KB とする — これを超える値は応答の破損とみなす
+pub const CHARA_MAX: usize = 0x2000;
 
 /// パケットのデータ部 (`bDataLen` 以降の 16 バイト) を足し合わせる和 (§1.2.3)。
 /// 下位 16 bit だけを使う
@@ -141,27 +159,36 @@ pub fn chunks(total: usize) -> impl Iterator<Item = (usize, usize)> {
         .map(move |off| (off, (total - off).min(UART_DATA_PACKET_MAX)))
 }
 
-/// GET_CHARA 中に届いた応答の意味 (§2.2.28)
+/// 登録中の途中経過。端末はこれに合わせて合図を鳴らす (`alc-hub-drivers::vein`)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CharaReply {
-    /// 撮像できた。特徴量の大きさ (バイト)
-    Ready(usize),
-    /// 途中経過 (「置いて」/「離して」)。次の応答を待つ
-    Prompt,
+pub enum Prompt {
+    /// 「指を置いて」(`XG_INPUT_FINGER`)
+    Place,
+    /// 「指を離して」(`XG_RELEASE_FINGER`) = 撮れた
+    Release,
+}
+
+/// ENROLL 中に届いた応答の意味 (§2.2.20)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrollReply {
+    /// 登録できた
+    Done,
+    /// 途中経過。次の応答を待つ
+    Prompt(Prompt),
     /// 失敗。`bData[1]` のエラーコード
     Failed(u8),
     /// 知らない `bData[0]`
     Unknown(u8),
 }
 
-/// GET_CHARA の応答を読む。大きさは `bData[1] + bData[2] * 256`
-/// (サンプルの `* 255` は誤記と見る — モジュールの冒頭 doc)
-pub fn chara_reply(p: &Packet) -> CharaReply {
+/// ENROLL の応答を読む
+pub fn enroll_reply(p: &Packet) -> EnrollReply {
     match p.data[0] {
-        XG_ERR_SUCCESS => CharaReply::Ready(usize::from(p.data[1]) + usize::from(p.data[2]) * 256),
-        XG_ERR_FAIL => CharaReply::Failed(p.data[1]),
-        XG_INPUT_FINGER | XG_RELEASE_FINGER => CharaReply::Prompt,
-        other => CharaReply::Unknown(other),
+        XG_ERR_SUCCESS => EnrollReply::Done,
+        XG_ERR_FAIL => EnrollReply::Failed(p.data[1]),
+        XG_INPUT_FINGER => EnrollReply::Prompt(Prompt::Place),
+        XG_RELEASE_FINGER => EnrollReply::Prompt(Prompt::Release),
+        other => EnrollReply::Unknown(other),
     }
 }
 
@@ -206,10 +233,10 @@ pub trait Port {
 /// 待ち時間 (ミリ秒)。**実機で未確認の値** — 合わなければここだけ直す
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
-    /// 接続の応答を待つ時間。これで来なければ [`VeinError::NoModule`]
+    /// 接続 (と削除・READ_ENROLL) の応答を待つ時間。接続で来なければ [`VeinError::NoModule`]
     pub connect_ms: u32,
-    /// GET_CHARA の応答 (途中経過を含む) 1 つを待つ時間。指を置くまでの
-    /// 待ちはモジュール側が持つので、それより長くとる
+    /// ENROLL の応答 (途中経過を含む) 1 つを待つ時間。指を置くまでの
+    /// 待ちはモジュール側 (5 秒) が持つので、それより長くとる
     pub finger_ms: u32,
     /// READ_DATA の最初のバイトを待つ時間
     pub data_ms: u32,
@@ -229,7 +256,7 @@ impl Timeouts {
 
 /// 読み直しの回数 (§1.2.6 の `ReadData` と同じく 1 塊につき 3 回まで読み直す)
 pub const READ_RETRIES: usize = 3;
-/// GET_CHARA 中に途中経過を受け付ける回数の上限 (応答が途切れず続く故障で
+/// 登録中に途中経過を受け付ける回数の上限 (応答が途切れず続く故障で
 /// スレッドを抱え込まないため)
 pub const MAX_PROMPTS: usize = 32;
 /// パケットの識別子を探すあいだに読み捨ててよいバイト数
@@ -289,11 +316,33 @@ fn recv_packet(port: &mut dyn Port, first_ms: u32, idle_ms: u32) -> Result<Packe
     parse_packet(&raw).map_err(|_| RecvError::Broken)
 }
 
-/// 接続して撮像し、特徴量を読み出す (§2.2.1 → §2.2.28 → §1.2.6)。
+/// 応答が 1 つだけのコマンドを送り、その応答を読む (削除・READ_ENROLL)
+fn exchange(port: &mut dyn Port, t: &Timeouts, cmd: u8, data: &[u8]) -> Result<Packet, VeinError> {
+    port.discard_input();
+    if !port.send(&command(cmd, data)) {
+        return Err(VeinError::ReadFail);
+    }
+    let p = recv_packet(port, t.connect_ms, t.idle_ms).map_err(|e| match e {
+        RecvError::Silent => VeinError::Timeout,
+        RecvError::Broken => VeinError::ReadFail,
+    })?;
+    if p.cmd != cmd {
+        return Err(VeinError::ReadFail);
+    }
+    Ok(p)
+}
+
+/// 接続して作業用 ID に 1 回登録し、その登録データを読み出す
+/// (§2.2.1 → §2.2.15 → §2.2.20 → §2.2.26 → §1.2.6 → §2.2.15)。
 ///
 /// 戻り値はモジュールが返した大きさそのままのバイト列 (中身は解釈しない)。
-/// 案内音声は鳴らさない — いつ何を鳴らすかはホストが `VEIN SAY` で決める
-pub fn capture(port: &mut dyn Port, t: &Timeouts) -> Result<Vec<u8>, VeinError> {
+/// 登録中の途中経過は `on_prompt` へ渡す (端末が「離して」の合図を鳴らす)。
+/// 案内音声 (置いて / もう一度) はホストが `VEIN SAY` で鳴らす
+pub fn capture(
+    port: &mut dyn Port,
+    t: &Timeouts,
+    on_prompt: &mut dyn FnMut(Prompt),
+) -> Result<Vec<u8>, VeinError> {
     // 1. 接続。応答が無ければモジュールが居ない
     port.discard_input();
     if !port.send(&command(CMD_CONNECTION, DEFAULT_PASSWORD)) {
@@ -310,45 +359,64 @@ pub fn capture(port: &mut dyn Port, t: &Timeouts) -> Result<Vec<u8>, VeinError> 
         return Err(VeinError::Rc(p.data[1]));
     }
 
-    // 2. 撮像。途中経過 (置いて / 離して) を読み流し、大きさが来るまで待つ
-    if !port.send(&command(CMD_GET_CHARA, &[])) {
+    // 2. 作業用 ID を空ける (前回の読み取りが途中で終わった残り)。未登録なら失敗が
+    //    返るが、応答さえあればよい
+    let id = SCRATCH_ID.to_le_bytes();
+    exchange(port, t, CMD_CLEAR_ENROLL, &id)?;
+
+    // 3. 1 回だけ登録する。途中経過 (置いて / 離して) を渡しながら完了を待つ
+    let mut req = [0u8; 12];
+    req[..4].copy_from_slice(&id);
+    req[5] = ENROLL_TEMPLATES;
+    req[10] = ENROLL_RETRIES;
+    port.discard_input();
+    if !port.send(&command(CMD_ENROLL, &req)) {
         return Err(VeinError::ReadFail);
     }
-    let mut size = None;
+    let mut enrolled = false;
     for _ in 0..=MAX_PROMPTS {
         let p = recv_packet(port, t.finger_ms, t.idle_ms).map_err(|e| match e {
             RecvError::Silent => VeinError::Timeout,
             RecvError::Broken => VeinError::ReadFail,
         })?;
-        if p.cmd != CMD_GET_CHARA {
+        if p.cmd != CMD_ENROLL {
             return Err(VeinError::ReadFail);
         }
-        match chara_reply(&p) {
-            CharaReply::Ready(n) => {
-                size = Some(n);
+        match enroll_reply(&p) {
+            EnrollReply::Done => {
+                enrolled = true;
                 break;
             }
-            CharaReply::Prompt => continue,
-            CharaReply::Failed(XG_ERR_TIME_OUT) => return Err(VeinError::NoFinger),
-            CharaReply::Failed(code) | CharaReply::Unknown(code) => {
+            EnrollReply::Prompt(x) => on_prompt(x),
+            EnrollReply::Failed(XG_ERR_TIME_OUT) => return Err(VeinError::NoFinger),
+            EnrollReply::Failed(code) | EnrollReply::Unknown(code) => {
                 return Err(VeinError::Rc(code))
             }
         }
     }
-    let size = match size {
-        Some(n) if (1..=CHARA_MAX).contains(&n) => n,
-        // 途中経過が上限まで続いた / 大きさが 0 や上限超え = 応答の破損
-        _ => return Err(VeinError::ReadFail),
-    };
+    if !enrolled {
+        // 途中経過が上限まで続いた = 応答の破損
+        return Err(VeinError::ReadFail);
+    }
 
-    // 3. 分割読み出し (種別 = GET_CHARA)。塊ごとに和を確かめ、合わなければ読み直す
+    // 4. 登録データの大きさ
+    let p = exchange(port, t, CMD_READ_ENROLL, &id)?;
+    if p.data[0] != XG_ERR_SUCCESS {
+        return Err(VeinError::Rc(p.data[1]));
+    }
+    let size = usize::from(p.data[1]) + usize::from(p.data[2]) * 256;
+    if !(1..=CHARA_MAX).contains(&size) {
+        return Err(VeinError::ReadFail);
+    }
+
+    // 5. 分割読み出し (種別 = READ_ENROLL)。塊ごとに和を確かめ、合わなければ読み直す
     let mut out = Vec::with_capacity(size);
     let mut buf = vec![0u8; UART_DATA_PACKET_MAX + 2];
     for (offset, len) in chunks(size) {
         let mut ok = false;
         for _ in 0..READ_RETRIES {
             port.discard_input();
-            let req = read_data_request(CMD_GET_CHARA, offset as u32, len as u32);
+            let req = read_data_request(CMD_READ_ENROLL, offset as u32, len as u32);
             if !port.send(&req) {
                 continue;
             }
@@ -365,6 +433,9 @@ pub fn capture(port: &mut dyn Port, t: &Timeouts) -> Result<Vec<u8>, VeinError> 
             return Err(VeinError::ReadFail);
         }
     }
+
+    // 6. 作業用 ID を消して終わる。失敗しても読めた分は返す (次の読み取りの 2. で消える)
+    let _ = exchange(port, t, CMD_CLEAR_ENROLL, &id);
     Ok(out)
 }
 
@@ -512,15 +583,50 @@ mod tests {
         Some(SPEC_CONNECT_RECV.to_vec())
     }
 
-    fn ready(size: usize) -> Option<Vec<u8>> {
-        Some(reply(CMD_GET_CHARA, &[0x00, size as u8, (size >> 8) as u8]))
+    /// 削除の応答 (未登録の ID なら失敗が返るが、capture は気にしない)
+    fn cleared() -> Option<Vec<u8>> {
+        Some(reply(CMD_CLEAR_ENROLL, &[XG_ERR_FAIL, 0x07]))
     }
 
-    /// 0xBDBD で始まる 0x448 バイトの見本 (中身は解釈しないので形だけ)
-    fn sample_chara() -> Vec<u8> {
-        let mut v: Vec<u8> = (0..0x448).map(|i| (i * 7 + 3) as u8).collect();
-        v[0] = 0xBD;
-        v[1] = 0xBD;
+    /// 登録の応答: 置いて → 離して → 完了 (ENROLL 1 回の送信に続けて届く)
+    fn enrolled() -> Option<Vec<u8>> {
+        let mut v = reply(CMD_ENROLL, &[XG_INPUT_FINGER]);
+        v.extend(reply(CMD_ENROLL, &[XG_RELEASE_FINGER]));
+        v.extend(reply(CMD_ENROLL, &[XG_ERR_SUCCESS, 1]));
+        Some(v)
+    }
+
+    fn size(n: usize) -> Option<Vec<u8>> {
+        Some(reply(CMD_READ_ENROLL, &[0x00, n as u8, (n >> 8) as u8]))
+    }
+
+    /// 接続 → 削除 → 登録 → 大きさ `n` までの台本
+    fn head(n: usize) -> Vec<Option<Vec<u8>>> {
+        vec![connected(), cleared(), enrolled(), size(n)]
+    }
+
+    fn run(port: &mut dyn Port) -> Result<Vec<u8>, VeinError> {
+        capture(port, &Timeouts::DEFAULT, &mut |_| {})
+    }
+
+    /// `n` 回目 (1 始まり) の送信だけ失敗する UART
+    struct FailAt(FakePort, usize);
+    impl Port for FailAt {
+        fn send(&mut self, b: &[u8]) -> bool {
+            self.0.send(b) && self.0.sent.len() != self.1
+        }
+        fn discard_input(&mut self) {
+            self.0.discard_input()
+        }
+        fn recv(&mut self, buf: &mut [u8], t: u32) -> usize {
+            self.0.recv(buf, t)
+        }
+    }
+
+    /// 実機の登録データの形 (先頭 `DE ED DE ED`) を真似た見本。中身は解釈しないので形だけ
+    fn sample_chara(n: usize) -> Vec<u8> {
+        let mut v: Vec<u8> = (0..n).map(|i| (i * 7 + 3) as u8).collect();
+        v[..4].copy_from_slice(&[0xDE, 0xED, 0xDE, 0xED]);
         v
     }
 
@@ -535,13 +641,6 @@ mod tests {
         assert_eq!(p[5], 16);
         assert_eq!(&p[6..22], &[1u8; 16]);
         assert_eq!(parse_packet(&p).unwrap().cmd, 0x55);
-    }
-
-    #[test]
-    fn get_chara_packet_has_no_data() {
-        let p = command(CMD_GET_CHARA, &[]);
-        assert_eq!(&p[..6], &[0xBB, 0xAA, 0x00, 0x28, 0x00, 0x00]);
-        assert_eq!(u16::from_le_bytes([p[22], p[23]]), 0xBB + 0xAA + 0x28);
     }
 
     #[test]
@@ -570,10 +669,10 @@ mod tests {
 
     #[test]
     fn read_data_request_layout() {
-        let p = read_data_request(CMD_GET_CHARA, 0x200, 0x48);
+        let p = read_data_request(CMD_READ_ENROLL, 0x200, 0x48);
         assert_eq!(p[3], CMD_READ_DATA);
         assert_eq!(p[5], 9);
-        assert_eq!(&p[6..15], &[0x28, 0x00, 0x02, 0, 0, 0x48, 0x00, 0, 0]);
+        assert_eq!(&p[6..15], &[0x22, 0x00, 0x02, 0, 0, 0x48, 0x00, 0, 0]);
         assert!(parse_packet(&p).is_ok());
     }
 
@@ -593,23 +692,29 @@ mod tests {
         assert_eq!(v, vec![(0, 512), (512, 512), (1024, 72)]);
         assert_eq!(chunks(512).collect::<Vec<_>>(), vec![(0, 512)]);
         assert_eq!(chunks(0).count(), 0);
+        // 実機の大きさ (0x1FDC) は 16 塊、最後は 476 バイト
+        let real: Vec<_> = chunks(0x1FDC).collect();
+        assert_eq!(real.len(), 16);
+        assert_eq!(real[15], (15 * 512, 0x1FDC - 15 * 512));
     }
 
     #[test]
-    fn chara_reply_kinds() {
-        let pk = |d: &[u8]| parse_packet(&reply(CMD_GET_CHARA, d).try_into().unwrap()).unwrap();
-        // * 256 (サンプルの * 255 ではない)
+    fn enroll_reply_kinds() {
+        let pk = |d: &[u8]| parse_packet(&reply(CMD_ENROLL, d).try_into().unwrap()).unwrap();
+        assert_eq!(enroll_reply(&pk(&[0x00, 1, 2])), EnrollReply::Done);
         assert_eq!(
-            chara_reply(&pk(&[0x00, 0x48, 0x04])),
-            CharaReply::Ready(0x448)
+            enroll_reply(&pk(&[XG_INPUT_FINGER])),
+            EnrollReply::Prompt(Prompt::Place)
         );
-        assert_eq!(chara_reply(&pk(&[XG_INPUT_FINGER])), CharaReply::Prompt);
-        assert_eq!(chara_reply(&pk(&[XG_RELEASE_FINGER])), CharaReply::Prompt);
         assert_eq!(
-            chara_reply(&pk(&[XG_ERR_FAIL, 0x0B])),
-            CharaReply::Failed(0x0B)
+            enroll_reply(&pk(&[XG_RELEASE_FINGER])),
+            EnrollReply::Prompt(Prompt::Release)
         );
-        assert_eq!(chara_reply(&pk(&[0x42])), CharaReply::Unknown(0x42));
+        assert_eq!(
+            enroll_reply(&pk(&[XG_ERR_FAIL, 0x0B])),
+            EnrollReply::Failed(0x0B)
+        );
+        assert_eq!(enroll_reply(&pk(&[0x42])), EnrollReply::Unknown(0x42));
     }
 
     #[test]
@@ -620,7 +725,7 @@ mod tests {
         assert_eq!(err_line(VeinError::ReadFail), "ERR VEIN READ_FAIL");
         assert_eq!(err_line(VeinError::Rc(0x0C)), "ERR VEIN RC=0C");
         assert_eq!(chara_line(&[0x0A, 0xBD]), "VEIN CHARA 0ABD");
-        assert_eq!(chara_line(&sample_chara()).len(), 11 + 2192);
+        assert_eq!(chara_line(&sample_chara(0x1FDC)).len(), 11 + 2 * 0x1FDC);
     }
 
     #[test]
@@ -639,35 +744,55 @@ mod tests {
     }
 
     #[test]
-    fn capture_happy_path_reads_three_chunks() {
-        let chara = sample_chara();
-        // 途中経過 (置いて / 離して) と大きさは GET_CHARA 1 回の送信に続けて届く
-        let mut get_chara = reply(CMD_GET_CHARA, &[XG_INPUT_FINGER]);
-        get_chara.extend(reply(CMD_GET_CHARA, &[XG_RELEASE_FINGER]));
-        get_chara.extend(ready(chara.len()).unwrap());
-        let mut script = vec![connected(), Some(get_chara)];
+    fn capture_happy_path() {
+        let chara = sample_chara(0x448);
+        let mut script = head(chara.len());
         for (off, len) in chunks(chara.len()) {
             script.push(Some(chunk(&chara[off..off + len])));
         }
+        script.push(cleared());
         let mut port = FakePort::new(script);
-        assert_eq!(capture(&mut port, &Timeouts::DEFAULT), Ok(chara));
-        // 接続 → GET_CHARA → READ_DATA ×3
-        assert_eq!(port.sent.len(), 5);
+        let mut prompts = Vec::new();
+        let got = capture(&mut port, &Timeouts::DEFAULT, &mut |p| prompts.push(p));
+        assert_eq!(got, Ok(chara));
+        assert_eq!(prompts, vec![Prompt::Place, Prompt::Release]);
+        // 接続 → 削除 → 登録 → 大きさ → READ_DATA ×3 → 削除
+        assert_eq!(port.sent.len(), 8);
         assert_eq!(port.sent[0], SPEC_CONNECT_SEND.to_vec());
-        assert_eq!(port.sent[1][3], CMD_GET_CHARA);
+        assert_eq!(&port.sent[1][3..10], &[CMD_CLEAR_ENROLL, 0, 4, 1, 0, 0, 0]);
+        // 登録: ID 1、テンプレート 1、撮り直し 2 (仕様書の例と同じ 12 バイト)
         assert_eq!(
-            &port.sent[4][6..15],
-            &[0x28, 0x00, 0x04, 0, 0, 0x48, 0, 0, 0]
+            &port.sent[2][3..18],
+            &[CMD_ENROLL, 0, 12, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 2, 0]
         );
+        assert_eq!(&port.sent[3][3..10], &[CMD_READ_ENROLL, 0, 4, 1, 0, 0, 0]);
+        assert_eq!(
+            &port.sent[6][6..15],
+            &[0x22, 0x00, 0x04, 0, 0, 0x48, 0, 0, 0]
+        );
+        assert_eq!(port.sent[7][3], CMD_CLEAR_ENROLL);
+    }
+
+    #[test]
+    fn capture_ok_even_if_final_clear_is_silent() {
+        let data = vec![0xDE, 0xED, 1, 2];
+        let mut script = head(4);
+        script.push(Some(chunk(&data)));
+        script.push(None);
+        let mut port = FakePort::new(script);
+        assert_eq!(run(&mut port), Ok(data));
     }
 
     #[test]
     fn capture_skips_garbage_before_prefix() {
-        let data = vec![0xBD, 0xBD, 1, 2];
+        let data = vec![0xDE, 0xED, 1, 2];
         let mut noisy = vec![0x00, 0xBB, 0x13];
         noisy.extend(SPEC_CONNECT_RECV);
-        let mut port = FakePort::new(vec![Some(noisy), ready(4), Some(chunk(&data))]);
-        assert_eq!(capture(&mut port, &Timeouts::DEFAULT), Ok(data));
+        let mut script = head(4);
+        script[0] = Some(noisy);
+        script.push(Some(chunk(&data)));
+        let mut port = FakePort::new(script);
+        assert_eq!(run(&mut port), Ok(data));
     }
 
     #[test]
@@ -675,192 +800,129 @@ mod tests {
         let data = vec![9u8; 10];
         let mut bad = chunk(&data);
         bad[0] ^= 0xFF;
-        let mut port = FakePort::new(vec![
-            connected(),
-            ready(10),
-            Some(bad),
-            None,
-            Some(chunk(&data)),
-        ]);
-        assert_eq!(capture(&mut port, &Timeouts::DEFAULT), Ok(data));
-        // 読み直しの前に毎回残りを捨てる (接続前 1 + 塊 3 回)
-        assert_eq!(port.discards, 4);
+        let mut script = head(10);
+        script.extend([Some(bad), None, Some(chunk(&data)), cleared()]);
+        let mut port = FakePort::new(script);
+        assert_eq!(run(&mut port), Ok(data));
+        // 送る前に毎回残りを捨てる (接続・削除・登録・大きさ・塊 3 回・削除)
+        assert_eq!(port.discards, 8);
     }
 
     #[test]
     fn capture_gives_up_after_retries() {
-        let mut port = FakePort::new(vec![connected(), ready(10), None, None, None]);
-        assert_eq!(
-            capture(&mut port, &Timeouts::DEFAULT),
-            Err(VeinError::ReadFail)
-        );
-        assert_eq!(port.sent.len(), 2 + READ_RETRIES);
+        let mut script = head(10);
+        script.extend([None, None, None]);
+        let mut port = FakePort::new(script);
+        assert_eq!(run(&mut port), Err(VeinError::ReadFail));
+        assert_eq!(port.sent.len(), 4 + READ_RETRIES);
     }
 
     #[test]
     fn capture_chunk_cut_short_is_retried_then_fails() {
-        let data = vec![1u8; 10];
-        let short = chunk(&data)[..5].to_vec();
-        let mut port = FakePort::new(vec![
-            connected(),
-            ready(10),
-            Some(short.clone()),
-            Some(short.clone()),
-            Some(short),
-        ]);
-        assert_eq!(
-            capture(&mut port, &Timeouts::DEFAULT),
-            Err(VeinError::ReadFail)
-        );
+        let short = chunk(&[1u8; 10])[..5].to_vec();
+        let mut script = head(10);
+        script.extend([Some(short.clone()), Some(short.clone()), Some(short)]);
+        let mut port = FakePort::new(script);
+        assert_eq!(run(&mut port), Err(VeinError::ReadFail));
+    }
+
+    #[test]
+    fn capture_read_data_send_fails_is_retried() {
+        let data = vec![5u8; 3];
+        let mut script = head(3);
+        script.extend([None, Some(chunk(&data)), cleared()]);
+        let mut port = FailAt(FakePort::new(script), 5);
+        assert_eq!(run(&mut port), Ok(data));
     }
 
     #[test]
     fn capture_no_module_when_silent() {
         let mut port = FakePort::new(vec![None]);
-        assert_eq!(
-            capture(&mut port, &Timeouts::DEFAULT),
-            Err(VeinError::NoModule)
-        );
+        assert_eq!(run(&mut port), Err(VeinError::NoModule));
     }
 
     #[test]
     fn capture_no_module_when_send_fails() {
         let mut port = FakePort::new(vec![]);
         port.send_ok = false;
-        assert_eq!(
-            capture(&mut port, &Timeouts::DEFAULT),
-            Err(VeinError::NoModule)
-        );
+        assert_eq!(run(&mut port), Err(VeinError::NoModule));
     }
 
     #[test]
     fn capture_connect_errors() {
+        let one = |r: Vec<u8>| run(&mut FakePort::new(vec![Some(r)]));
         // 途中で途絶えた接続応答
-        let mut port = FakePort::new(vec![Some(SPEC_CONNECT_RECV[..10].to_vec())]);
-        assert_eq!(
-            capture(&mut port, &Timeouts::DEFAULT),
-            Err(VeinError::ReadFail)
-        );
+        assert_eq!(one(SPEC_CONNECT_RECV[..10].to_vec()), Err(VeinError::ReadFail));
         // 別コマンドの応答
-        let mut port = FakePort::new(vec![Some(reply(0x02, &[0]))]);
-        assert_eq!(
-            capture(&mut port, &Timeouts::DEFAULT),
-            Err(VeinError::ReadFail)
-        );
+        assert_eq!(one(reply(0x02, &[0])), Err(VeinError::ReadFail));
         // パスワード違い (XG_ERR_INVALID_PWD = 0x04)
-        let mut port = FakePort::new(vec![Some(reply(CMD_CONNECTION, &[XG_ERR_FAIL, 0x04]))]);
         assert_eq!(
-            capture(&mut port, &Timeouts::DEFAULT),
+            one(reply(CMD_CONNECTION, &[XG_ERR_FAIL, 0x04])),
             Err(VeinError::Rc(0x04))
         );
         // 和が合わない
         let mut bad = SPEC_CONNECT_RECV.to_vec();
         bad[8] ^= 1;
-        let mut port = FakePort::new(vec![Some(bad)]);
-        assert_eq!(
-            capture(&mut port, &Timeouts::DEFAULT),
-            Err(VeinError::ReadFail)
-        );
+        assert_eq!(one(bad), Err(VeinError::ReadFail));
         // 1 バイトだけ届いて途絶えた (識別子の 2 バイト目が来ない)
-        let mut port = FakePort::new(vec![Some(vec![0xBB])]);
-        assert_eq!(
-            capture(&mut port, &Timeouts::DEFAULT),
-            Err(VeinError::ReadFail)
-        );
+        assert_eq!(one(vec![0xBB]), Err(VeinError::ReadFail));
         // 識別子が見つからないまま前置きが長すぎる
-        let mut port = FakePort::new(vec![Some(vec![0x11; MAX_GARBAGE + 3])]);
-        assert_eq!(
-            capture(&mut port, &Timeouts::DEFAULT),
-            Err(VeinError::ReadFail)
-        );
+        assert_eq!(one(vec![0x11; MAX_GARBAGE + 3]), Err(VeinError::ReadFail));
     }
 
     #[test]
-    fn capture_get_chara_errors() {
-        let run = |second: Option<Vec<u8>>| {
-            let mut port = FakePort::new(vec![connected(), second]);
-            capture(&mut port, &Timeouts::DEFAULT)
-        };
-        assert_eq!(run(None), Err(VeinError::Timeout));
+    fn capture_clear_errors() {
+        let two = |r: Option<Vec<u8>>| run(&mut FakePort::new(vec![connected(), r]));
+        assert_eq!(two(None), Err(VeinError::Timeout));
+        assert_eq!(two(Some(reply(CMD_CONNECTION, &[0]))), Err(VeinError::ReadFail));
+        assert_eq!(two(Some(SPEC_CONNECT_RECV[..5].to_vec())), Err(VeinError::ReadFail));
+        let mut port = FailAt(FakePort::new(vec![connected()]), 2);
+        assert_eq!(run(&mut port), Err(VeinError::ReadFail));
+    }
+
+    #[test]
+    fn capture_enroll_errors() {
+        let three = |r: Option<Vec<u8>>| run(&mut FakePort::new(vec![connected(), cleared(), r]));
+        assert_eq!(three(None), Err(VeinError::Timeout));
         assert_eq!(
-            run(Some(reply(CMD_GET_CHARA, &[XG_ERR_FAIL, XG_ERR_TIME_OUT]))),
+            three(Some(reply(CMD_ENROLL, &[XG_ERR_FAIL, XG_ERR_TIME_OUT]))),
             Err(VeinError::NoFinger)
         );
         assert_eq!(
-            run(Some(reply(CMD_GET_CHARA, &[XG_ERR_FAIL, 0x11]))),
-            Err(VeinError::Rc(0x11))
+            three(Some(reply(CMD_ENROLL, &[XG_ERR_FAIL, 0x0D]))),
+            Err(VeinError::Rc(0x0D))
         );
-        assert_eq!(
-            run(Some(reply(CMD_GET_CHARA, &[0x42]))),
-            Err(VeinError::Rc(0x42))
-        );
-        assert_eq!(
-            run(Some(reply(CMD_CONNECTION, &[0]))),
-            Err(VeinError::ReadFail)
-        );
-        assert_eq!(
-            run(Some(SPEC_CONNECT_RECV[..3].to_vec())),
-            Err(VeinError::ReadFail)
-        );
-        // 大きさ 0 / 上限超え
-        assert_eq!(run(ready(0)), Err(VeinError::ReadFail));
-        assert_eq!(run(ready(CHARA_MAX + 1)), Err(VeinError::ReadFail));
+        assert_eq!(three(Some(reply(CMD_ENROLL, &[0x42]))), Err(VeinError::Rc(0x42)));
+        assert_eq!(three(Some(reply(CMD_CONNECTION, &[0]))), Err(VeinError::ReadFail));
+        assert_eq!(three(Some(SPEC_CONNECT_RECV[..3].to_vec())), Err(VeinError::ReadFail));
+        let mut port = FailAt(FakePort::new(vec![connected(), cleared()]), 3);
+        assert_eq!(run(&mut port), Err(VeinError::ReadFail));
     }
 
     #[test]
     fn capture_endless_prompts_is_read_fail() {
         let prompts: Vec<u8> = (0..=MAX_PROMPTS)
-            .flat_map(|_| reply(CMD_GET_CHARA, &[XG_INPUT_FINGER]))
+            .flat_map(|_| reply(CMD_ENROLL, &[XG_INPUT_FINGER]))
             .collect();
-        let mut port = FakePort::new(vec![connected(), Some(prompts)]);
-        assert_eq!(
-            capture(&mut port, &Timeouts::DEFAULT),
-            Err(VeinError::ReadFail)
-        );
+        let mut port = FakePort::new(vec![connected(), cleared(), Some(prompts)]);
+        let mut n = 0;
+        let got = capture(&mut port, &Timeouts::DEFAULT, &mut |_| n += 1);
+        assert_eq!(got, Err(VeinError::ReadFail));
+        assert_eq!(n, MAX_PROMPTS + 1);
     }
 
     #[test]
-    fn capture_get_chara_send_fails() {
-        struct FailSecond(FakePort);
-        impl Port for FailSecond {
-            fn send(&mut self, b: &[u8]) -> bool {
-                self.0.send(b) && self.0.sent.len() < 2
-            }
-            fn discard_input(&mut self) {
-                self.0.discard_input()
-            }
-            fn recv(&mut self, buf: &mut [u8], t: u32) -> usize {
-                self.0.recv(buf, t)
-            }
-        }
-        let mut port = FailSecond(FakePort::new(vec![connected()]));
+    fn capture_read_enroll_errors() {
+        let four = |r: Option<Vec<u8>>| {
+            run(&mut FakePort::new(vec![connected(), cleared(), enrolled(), r]))
+        };
         assert_eq!(
-            capture(&mut port, &Timeouts::DEFAULT),
-            Err(VeinError::ReadFail)
+            four(Some(reply(CMD_READ_ENROLL, &[XG_ERR_FAIL, 0x07]))),
+            Err(VeinError::Rc(0x07))
         );
-    }
-
-    #[test]
-    fn capture_read_data_send_fails_is_retried() {
-        struct FailThird(FakePort);
-        impl Port for FailThird {
-            fn send(&mut self, b: &[u8]) -> bool {
-                self.0.send(b) && self.0.sent.len() != 3
-            }
-            fn discard_input(&mut self) {
-                self.0.discard_input()
-            }
-            fn recv(&mut self, buf: &mut [u8], t: u32) -> usize {
-                self.0.recv(buf, t)
-            }
-        }
-        let data = vec![5u8; 3];
-        let mut port = FailThird(FakePort::new(vec![
-            connected(),
-            ready(3),
-            None,
-            Some(chunk(&data)),
-        ]));
-        assert_eq!(capture(&mut port, &Timeouts::DEFAULT), Ok(data));
+        assert_eq!(four(None), Err(VeinError::Timeout));
+        // 大きさ 0 / 上限超え
+        assert_eq!(four(size(0)), Err(VeinError::ReadFail));
+        assert_eq!(four(size(CHARA_MAX + 1)), Err(VeinError::ReadFail));
     }
 }
