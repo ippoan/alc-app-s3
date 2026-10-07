@@ -11,9 +11,9 @@
 //!
 //! **案内音声は読み取りと切り離してある** — 何をいつ鳴らすか (登録の 2 回読み・照合の
 //! 失敗時など) はホスト (alc-app) が決める。`VEIN SAY` は読み取り中でも
-//! すぐ鳴る (読み取りスレッドの列に並ばない)。例外は「離して」のビープだけ:
-//! 撮れた瞬間はモジュールの途中経過 (0x21) でしか分からないので、端末が鳴らす
-//! (指を離すタイミングが分からない、2026-10-07 実機)。
+//! すぐ鳴る (読み取りスレッドの列に並ばない)。例外は「離して」のビープと撮り直しの
+//! 「もう一度置いてください」: 撮れた瞬間と撮り直しはモジュールの途中経過 (0x21 /
+//! `01 11`・`01 09`) でしか分からないので、端末が鳴らす (2026-10-07 実機)。
 //!
 //! FC-1200 の [`crate::rs232`] とは別物 (あちらは UART1 固定で FC-1200 の
 //! 行解析を持つ)。UART を開く十数行は共通化していない — rs232 の経路を
@@ -129,10 +129,15 @@ pub fn start(
             let mut port = UartPort(driver);
             while capture_rx.recv().is_ok() {
                 let mut on_prompt = |p: proto::Prompt| {
-                    if p == proto::Prompt::Release {
-                        if let Some(tx) = beeper.get() {
-                            let _ = tx.send(Sound::BeepOk);
-                        }
+                    // 「離して」はビープ、撮り直しは「もう一度置いてください」。どちらも
+                    // モジュールの途中経過でしか分からないので端末が鳴らす
+                    let sound = match p {
+                        proto::Prompt::Release => Some(Sound::BeepOk),
+                        proto::Prompt::Retry(_) => Some(Sound::VeinAgain),
+                        proto::Prompt::Place => None,
+                    };
+                    if let (Some(s), Some(tx)) = (sound, beeper.get()) {
+                        let _ = tx.send(s);
                     }
                 };
                 let line = match proto::capture(&mut port, &Timeouts::DEFAULT, &mut on_prompt) {
