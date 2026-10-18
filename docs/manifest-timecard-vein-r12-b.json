@@ -1,0 +1,16 @@
+{
+  "name": "alc-hub Timecard (Vein Station + 指静脈 / station_board r12 + 3D 印刷 B / NFC = Port A)",
+  "version": "0.1.0",
+  "home_assistant_domain": "",
+  "funding_url": "",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "firmware/alc-hub-atoms3-timecard-vein-boot.bin", "offset": 0 },
+        { "path": "firmware/alc-hub-atoms3-timecard-vein-main.bin", "offset": 65536 }
+      ]
+    }
+  ]
+}

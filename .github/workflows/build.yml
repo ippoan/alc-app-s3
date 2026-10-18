@@ -139,8 +139,8 @@ jobs:
               cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard cargo check --release --locked -p alc-hub-atoms3-timecard --features station",
               cache_key: build-timecard-s3r }
           # Vein Station + 指静脈 (ippoan/vein-match#20): `station` に UART2 の
-          # 指静脈ドライバと案内音声を足した `vein` feature。**Pages の配布には
-          # 足さない** (モジュールと基盤が未着)。sdkconfig は同じなので cache_key も同じ
+          # 指静脈ドライバと案内音声を足した `vein` feature。Pages の配布は下の
+          # build leg (docs/vein.html のボード選択)。sdkconfig は同じなので cache_key も同じ
           - { name: atoms3-timecard-vein,
               cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard cargo check --release --locked -p alc-hub-atoms3-timecard --features vein",
               cache_key: build-timecard-s3r }
@@ -384,6 +384,20 @@ jobs:
             bin: alc-hub-atoms3-timecard
             build_env: 'ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard'
             cargo_args: '--features station'
+            flash_size: 8mb
+            partition_table: crates/atoms3-timecard/partitions.csv
+            cache_key: build-timecard-s3r
+          # Vein Station + 指静脈 (ippoan/vein-match#20) の `vein` feature 版。
+          # 中継基板 vein-base `pcb/station_board` (r12) + 3D 印刷 B の配線
+          # (指静脈 = J3 の G5/G6、FC-1200 = G7/G8、NFC = Grove Port A の G2/G1)。
+          # docs/vein.html のボード選択から Web インストーラーで焼く。station leg と
+          # **bin 名が同じ**なので、Rename outputs step で `-vein-` を挟んで分ける。
+          # app イメージは station (約 1.67MB) + 案内音声 (約 0.3MB) で、3M の
+          # ota スロットに収まる (crates/atoms3-timecard/partitions.csv)
+          - name: atoms3-timecard-vein
+            bin: alc-hub-atoms3-timecard
+            build_env: 'ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard'
+            cargo_args: '--features vein'
             flash_size: 8mb
             partition_table: crates/atoms3-timecard/partitions.csv
             cache_key: build-timecard-s3r
@@ -744,6 +758,15 @@ jobs:
           done
           ls -la ${{ matrix.bin }}-station-*.bin
 
+      # vein leg も timecard leg と bin 名が同じ (station leg と同じ形)
+      - name: Rename outputs (Vein Station + 指静脈 leg)
+        if: matrix.name == 'atoms3-timecard-vein'
+        run: |
+          for f in ${{ matrix.bin }}-*.bin; do
+            mv "$f" "${f/${{ matrix.bin }}-/${{ matrix.bin }}-vein-}"
+          done
+          ls -la ${{ matrix.bin }}-vein-*.bin
+
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
@@ -801,6 +824,7 @@ jobs:
           cp docs/timecard.html _site/
           cp docs/alarm.html _site/
           cp docs/atoms3-nfc.html _site/
+          cp docs/vein.html _site/
           # boot/main = Web インストーラー用 (manifest の parts、NVS 温存 #48)。
           # merged = espflash/esptool で offset 0 に一括書き込みする CLI 用
           # (この経路は従来どおり NVS が消える)。app = OTA 用
@@ -830,6 +854,11 @@ jobs:
           cp alc-hub-atoms3-timecard-station-main.bin _site/firmware/
           cp alc-hub-atoms3-timecard-station-merged.bin _site/firmware/
           cp alc-hub-atoms3-timecard-station-app.bin _site/firmware/
+          # Vein Station + 指静脈 (ippoan/vein-match#20)。build job 側で `-vein-` を挟んである
+          cp alc-hub-atoms3-timecard-vein-boot.bin _site/firmware/
+          cp alc-hub-atoms3-timecard-vein-main.bin _site/firmware/
+          cp alc-hub-atoms3-timecard-vein-merged.bin _site/firmware/
+          cp alc-hub-atoms3-timecard-vein-app.bin _site/firmware/
           cp alc-hub-atoms3-alarm-boot.bin _site/firmware/
           cp alc-hub-atoms3-alarm-main.bin _site/firmware/
           cp alc-hub-atoms3-alarm-merged.bin _site/firmware/
@@ -865,6 +894,10 @@ jobs:
           # 運行者 PC のブラウザ (alc-app web/) がこの URL を直に読む)
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.timecard_version }}+$SHORT_SHA\"/" \
             docs/manifest-timecard-station.json > _site/manifest-timecard-station.json
+          # Vein Station + 指静脈の manifest (docs/vein.html のボード選択が使う)。
+          # station と同じ crate なので version は timecard_version を共有する
+          sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.timecard_version }}+$SHORT_SHA\"/" \
+            docs/manifest-timecard-vein-r12-b.json > _site/manifest-timecard-vein-r12-b.json
           # 点呼端末の警告デバイス (#135)。timecard と同じく **dev チャネルは出さない**
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.alarm_version }}+$SHORT_SHA\"/" \
             docs/manifest-alarm.json > _site/manifest-alarm.json
@@ -873,7 +906,7 @@ jobs:
           # timecard / alarm と同じく **dev チャネルは出さない**
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.nfc_version }}+$SHORT_SHA\"/" \
             docs/manifest-nfc.json > _site/manifest-nfc.json
-          cat _site/manifest.json _site/manifest-dev.json _site/manifest-wifi.json _site/manifest-atoms3-print.json _site/manifest-timecard.json _site/manifest-timecard-station.json _site/manifest-alarm.json _site/manifest-nfc.json
+          cat _site/manifest.json _site/manifest-dev.json _site/manifest-wifi.json _site/manifest-atoms3-print.json _site/manifest-timecard.json _site/manifest-timecard-station.json _site/manifest-timecard-vein-r12-b.json _site/manifest-alarm.json _site/manifest-nfc.json
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

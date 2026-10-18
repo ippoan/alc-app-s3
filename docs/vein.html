@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>alc-hub Vein Station - Firmware Writer</title>
+    <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px; margin: 0 auto; padding: 20px;
+            background: #f5f5f5; color: #333;
+        }
+        h1 { color: #1a73e8; border-bottom: 2px solid #1a73e8; padding-bottom: 10px; }
+        .card { background: white; border-radius: 12px; padding: 24px; margin: 20px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .card h2 { margin-top: 0; color: #333; }
+        .requirements { background: #e8f5e9; border-left: 4px solid #4caf50; padding: 16px; margin: 16px 0; }
+        .requirements h3 { margin-top: 0; color: #2e7d32; }
+        .warning { background: #fff3e0; border-left: 4px solid #ff9800; padding: 16px; margin: 16px 0; }
+        .warning h3 { margin-top: 0; color: #e65100; }
+        .install-section {
+            text-align: center; padding: 40px 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 12px; color: white;
+        }
+        .install-section h2 { color: white; margin-bottom: 20px; }
+        esp-web-install-button { --esp-tools-button-color: #4caf50; --esp-tools-button-text-color: white; }
+        .device-info { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-top: 16px; }
+        .device-info div { background: #f8f9fa; padding: 12px; border-radius: 8px; }
+        .device-info strong { display: block; color: #666; font-size: 12px; margin-bottom: 4px; }
+        code { background: #f0f0f0; padding: 2px 6px; border-radius: 4px; }
+        footer { text-align: center; margin-top: 40px; color: #666; font-size: 14px; }
+        footer a { color: #1a73e8; }
+        .board-select { display: block; margin: 0 auto 12px; padding: 10px 12px; border-radius: 8px; border: 1px solid #ccc; font-size: 15px; max-width: 100%; }
+        .board-note { font-size: 13px; color: #eee; margin: 0 0 20px; }
+    </style>
+</head>
+<body>
+    <h1>alc-hub Vein Station</h1>
+    <p>指静脈読み取り端末 (Vein Station) ファームウェア書き込みツール —
+       アルコール検知器 FC-1200・指静脈モジュール・NFC をまとめて PC に USB でつなぐ端末です。
+       NFC タイムカード端末は <a href="timecard.html">こちら</a>。</p>
+
+    <div class="card">
+        <h2>対応機器</h2>
+        <div class="device-info">
+            <div><strong>マイコン</strong>M5Stack Atom VoiceS3R (Atom EchoS3R / SKU C126-ECHO、8MB PSRAM)</div>
+            <div><strong>指静脈モジュール</strong>Waveshare Finger Vein Scanner Module (A) — 中継基板の J3 (G5 / G6)</div>
+            <div><strong>アルコール検知器</strong>タニタ FC-1200 — 中継基板の DB9 (G7 / G8)</div>
+            <div><strong>カードリーダー</strong>M5 Unit NFC (SKU U216, ST25R3916) — Grove Port A (G2 / G1)</div>
+        </div>
+        <div class="warning">
+            <h3>ボードの組み合わせに合ったものを選んでください</h3>
+            <p>配線 (どのピンに何をつなぐか) はボードと筐体の組み合わせごとに違います。
+               下の「ボード」で、お使いの組み合わせを選んでから書き込んでください。
+               違うものを焼くと、指静脈や NFC が読めません。</p>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>書き込み手順</h2>
+        <ol>
+            <li>本体を USB-C ケーブルで PC に接続</li>
+            <li><strong>箱出しの新品は本体ボタンを押しながら挿し直す</strong> —
+                工場出荷ファームは USB オーディオデバイスとして動いており、
+                そのままではシリアルポートが出てきません</li>
+            <li>下の「ボード」を選び、「Install」ボタンをクリックしてシリアルポートを選択</li>
+            <li><strong>書き込みが終わったら、ボタンから指を離して USB を挿し直す</strong> —
+                押したままだと起動のたびにダウンロードモードに入り、
+                <strong>焼けているのにアプリが動きません</strong></li>
+            <li>シリアルに <code>EVT NFC_READY</code> が出れば NFC は使えます。
+                <code>VEIN CAPTURE</code> で指静脈モジュールの読み取りを確かめられます</li>
+        </ol>
+        <div class="warning">
+            <h3>「焼けたのに動かない」ときに見るところ</h3>
+            <p>シリアルに <code>waiting for download</code> や
+               <code>boot:0x30 (DOWNLOAD(USB/UART0))</code> が出ていたら、
+               <strong>ダウンロードモードに入ったままです</strong>。ボタンから指を離して挿し直してください
+               (書き込みは成功しています)。</p>
+            <p><strong>Unit NFC は電源を入れる前に挿しておいてください。</strong>
+               起動時に挿さっていないと <code>EVT NFC_INIT_NG</code> が出て、
+               <strong>後から挿しても再起動するまで復帰しません</strong>。</p>
+        </div>
+    </div>
+
+    <div class="requirements">
+        <h3>動作要件</h3>
+        <ul>
+            <li>Chrome / Edge / Opera (Web Serial API 対応ブラウザ)</li>
+            <li>ESP32-S3 は USB Serial/JTAG 内蔵のため、通常は追加ドライバ不要（Windows 10 以降 / macOS / Linux）</li>
+            <li>Windows 7 の PC では、そのままではシリアルポートが出てこないことがあります。<a href="alarm.html#windows7">警告デバイスのページの「Windows 7 の PC で使うとき」</a>を参照し、同じ手順を試してください</li>
+        </ul>
+    </div>
+
+    <div class="card install-section">
+        <h2>ファームウェアをインストール</h2>
+        <label for="board" style="display: block; margin-bottom: 8px;">ボード</label>
+        <!-- 選択肢を足すときは option と install-* の button を 1 組ずつ足す (manifest も 1 本ずつ) -->
+        <select id="board" class="board-select">
+            <option value="r12-b" selected>station_board r12 + 3D 印刷 B (NFC = Port A)</option>
+        </select>
+        <p class="board-note" data-board="r12-b">
+            指静脈 = 中継基板 J3 (G5 / G6)、FC-1200 = DB9 (G7 / G8)、NFC = Grove Port A (G2 / G1)
+        </p>
+        <esp-web-install-button data-board="r12-b" manifest="manifest-timecard-vein-r12-b.json">
+            <button slot="activate">Install alc-hub Vein Station (r12 + B)</button>
+            <span slot="unsupported">
+                お使いのブラウザは Web Serial API に対応していません。<br>
+                Chrome, Edge, または Opera をお使いください。
+            </span>
+            <span slot="not-allowed">シリアルポートへのアクセスが許可されていません。</span>
+        </esp-web-install-button>
+    </div>
+
+    <div class="card">
+        <h2>動作確認 (シリアル 115200bps)</h2>
+        <ul>
+            <li><code>DEVICE</code> — <code>DEVICE timecard VER=…</code> (機種識別 + 版数)</li>
+            <li><code>VEIN CAPTURE</code> — 指を置くと <code>VEIN CHARA &lt;hex&gt;</code>。
+                モジュールがつながっていなければ <code>ERR VEIN NO_MODULE</code></li>
+            <li><code>LOG DUMP</code> — 起動直後のログ (USB 接続前に流れた分も残ります)</li>
+        </ul>
+        <p>コマンドの一覧と詳細は
+           <a href="https://github.com/ippoan/alc-app-s3/blob/main/docs/console-protocol.md" target="_blank">console-protocol.md</a> を参照してください。</p>
+    </div>
+
+    <footer>
+        <p><a href="https://github.com/ippoan/alc-app-s3" target="_blank">GitHub Repository</a> ·
+           <a href="index.html">CoreS3 統合ハブ</a> ·
+           <a href="timecard.html">NFC タイムカード端末</a></p>
+    </footer>
+
+    <script>
+        // ボード選択。esp-web-install-button は manifest 属性を connectedCallback 時にしか
+        // 読まない (属性変更を監視しない) ため、ボードごとに button を置いて表示だけ切り替える
+        // (index.html の LAN 版 / Wi-Fi 版と同じ形)
+        const board = document.getElementById('board');
+        function showBoard() {
+            document.querySelectorAll('[data-board]').forEach((el) => {
+                el.style.display = el.dataset.board === board.value ? '' : 'none';
+            });
+        }
+        board.addEventListener('change', showBoard);
+        showBoard();
+    </script>
+</body>
+</html>
