@@ -93,7 +93,7 @@
 //!
 //! `station` に Waveshare Finger Vein Module を足す。**UART2** (FC-1200 が
 //! UART1 を使うため) を TX=G5 / RX=G6、57600bps 8N1 で開き、`VEIN CAPTURE` で
-//! 特徴量を読んで `VEIN CHARA <hex>` の 1 行で USB へ出す (手順は
+//! 登録データを読み、0xBDBD の特徴量 (0x448 バイト) を取り出して `VEIN CHARA <hex>` の 1 行で USB へ出す (手順は
 //! `alc_hub_core::vein`、UART は `alc_hub_drivers::vein`)。案内音声 (`VEIN SAY`)
 //! はホストが鳴らす。ピンは `main` の `let vein = …` の 1 か所だけで決める —
 //! **中継基板 (vein-base) は未発注で変わりうる**。G5/G6 は PoE 版では W5500 の

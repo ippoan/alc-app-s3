@@ -173,12 +173,12 @@ ippoan/vein-match#20)。**モジュールは実機で未確認** — 手順は
 
 | 要求 | 応答 |
 |---|---|
-| `VEIN CAPTURE` | 成功: **1 行で** `VEIN CHARA <hex>` (モジュールが返した特徴量の大文字 16 進。0x448 バイトなら 2192 文字)。失敗: `ERR VEIN <reason>` |
+| `VEIN CAPTURE` | 成功: **1 行で** `VEIN CHARA <hex>` (モジュールの登録データ (1:N のテンプレート、先頭 `DEEDDEED`) から取り出した 0xBDBD の特徴量 1 件の大文字 16 進。常に 0x448 バイト = 2192 文字。取り出せなければ `READ_FAIL`)。失敗: `ERR VEIN <reason>` |
 | `VEIN SAY PLACE\|AGAIN\|ENROLLED\|FAILED` | 案内音声 (「指を置いてください」/「もう一度置いてください」/「登録完了しました」/「読み取れませんでした」) を鳴らし `OK VEIN SAY <x>`。スピーカーが起きていなければ `ERR VEIN NO_SPEAKER` |
 
 `<reason>`: `NO_MODULE` (接続に応答なし) / `TIMEOUT` (途中で応答が途絶えた) /
 `NO_FINGER` (指が置かれずモジュールが待ちを打ち切った) / `READ_FAIL` (応答の破損・
-読み直しの上限) / `RC=<hex 2 桁>` (モジュールのエラーコード)。`VEIN CAPTURE` は
+読み直しの上限・登録データから特徴量 1 件を取り出せない) / `RC=<hex 2 桁>` (モジュールのエラーコード)。`VEIN CAPTURE` は
 指を待つので**応答まで最大 15 秒強かかる** (途中経過 1 つにつき 15 秒)。続けて
 送った分は順に処理する。`VEIN SAY` は読み取り中でもすぐ鳴る。
 

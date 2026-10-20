@@ -54,6 +54,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # vein-match (private) を git 依存で取る (hub-core の指静脈の取り出し。
+      # alc-vein-worker と同じ。Refs ippoan/vein-base#109)
+      - uses: ippoan/ci-workflows/.github/actions/private-git-auth@main
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          repositories: vein-match
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -181,6 +189,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0 # restore-mtime が履歴からファイル時刻を復元するため
+
+      # vein-match (private) を git 依存で取る (hub-core の指静脈の取り出し。
+      # alc-vein-worker と同じ。Refs ippoan/vein-base#109)
+      - uses: ippoan/ci-workflows/.github/actions/private-git-auth@main
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          repositories: vein-match
 
       # 再コンパイルの根本原因対策: checkout はファイル mtime を現在時刻にする
       # ため、Cargo のフィンガープリントが毎回無効になり、変更が無くても
@@ -448,6 +464,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0 # restore-mtime が履歴からファイル時刻を復元するため
+
+      # vein-match (private) を git 依存で取る (hub-core の指静脈の取り出し。
+      # alc-vein-worker と同じ。Refs ippoan/vein-base#109)
+      - uses: ippoan/ci-workflows/.github/actions/private-git-auth@main
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          repositories: vein-match
 
       # 再コンパイルの根本原因対策: checkout はファイル mtime を現在時刻にする
       # ため、Cargo のフィンガープリントが毎回無効になり、変更が無くても

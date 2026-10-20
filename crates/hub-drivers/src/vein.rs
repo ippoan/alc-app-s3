@@ -119,12 +119,15 @@ pub fn start(
     let speaker: Arc<OnceLock<Sender<Sound>>> = Arc::new(OnceLock::new());
     let beeper = Arc::clone(&speaker);
 
-    // NVS も flash も触らないので PSRAM スタックでよい。特徴量 (最大 8KB) と
-    // 16 進の行 (最大 16KB) はヒープに置く
-    crate::task::name_next_psram(c"vein", 8 * 1024);
+    // NVS も flash も触らないので PSRAM スタックでよい。登録データ (最大 8KB) と
+    // 復号した記録・16 進の行はヒープに置く。スタックは 32KB: 取り出し
+    // (extract_chara) が AES (ソフト実装) の鍵展開と復号の作業領域、LZMA の層が
+    // 付いていればその復号器、取り出した特徴量 (0x448 × 2 の写し) をスタックに置く。
+    // 8KB では UART の手順の分と合わせて余裕が無い。PSRAM なので内部 RAM は減らない
+    crate::task::name_next_psram(c"vein", 32 * 1024);
     std::thread::Builder::new()
         .name("vein".into())
-        .stack_size(8 * 1024)
+        .stack_size(32 * 1024)
         .spawn(move || {
             let mut port = UartPort(driver);
             while capture_rx.recv().is_ok() {
@@ -140,7 +143,13 @@ pub fn start(
                         let _ = tx.send(s);
                     }
                 };
-                let line = match proto::capture(&mut port, &Timeouts::DEFAULT, &mut on_prompt) {
+                // 登録データ (1:N のテンプレート) から 0xBDBD の特徴量 1 件を取り出して送る
+                let got = proto::capture(&mut port, &Timeouts::DEFAULT, &mut on_prompt)
+                    .and_then(|enroll| {
+                        log::info!("vein: 登録データ {} バイト", enroll.len());
+                        proto::extract_chara(&enroll)
+                    });
+                let line = match got {
                     Ok(chara) => {
                         log::info!("vein: 特徴量 {} バイト", chara.len());
                         proto::chara_line(&chara)
@@ -161,7 +170,7 @@ pub fn start(
 
 /// 行頭から 1 行を **1 回の write で**出す。
 ///
-/// `VEIN CHARA` は 2 千文字を超える。`println!` だと Rust の stdout
+/// `VEIN CHARA` は 2 千文字を超える (0x448 バイト = 2192 文字)。`println!` だと Rust の stdout
 /// (LineWriter、1KB) が「前置き」「本文」「改行」を別々の write に分けることが
 /// あり、その間に ESP-IDF のログ (C 側、同じ USB Serial/JTAG) が割り込むと
 /// 行が割れる。VFS の write は 1 回の呼び出しの間ロックを持つので、1 本に
