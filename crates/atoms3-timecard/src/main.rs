@@ -334,7 +334,11 @@ fn main() -> Result<()> {
         move |e: &NfcEvent| on_card(e, &ws_meas_tx, speaker_tx.as_ref()),
     )?;
 
-    // 血圧計 (Omron HEM-6231T) — **`OMRON BP ON` のときだけ**。
+    // BLE (血圧計 Omron HEM-6231T と体温計) — **`OMRON BP ON` のとき、または vein 版**。
+    //
+    // vein 版 (Vein Station) は体温計 (NT-100B) を CoreS3 と同じく読むので BLE を常に起こす。
+    // 血圧計を拾うかは hub-ble が `status.omron_bp` で決める (OFF なら体温計だけ拾う)。
+    // station だけのビルドは変えない (#272)
     //
     // BLE central の中身 (scan / bond / 鍵登録 / 0x2A35 のデコード) は CoreS3 と
     // 同じ `alc_hub_ble`、測定値の JSON 化・重複排除・上りへの fan-out も同じ
@@ -357,7 +361,8 @@ fn main() -> Result<()> {
             None,
         )?;
     }
-    if omron_bp {
+    let vein = cfg!(feature = "vein");
+    if omron_bp || vein {
         // 再ペアリング要求は console の `PAIR` (Pages の「血圧計を再ペアリング」) が
         // 立てる。**起動時にボンドを消さない**ことが大事 (probe bin の作法を持ち込むと
         // 毎回ペアリングし直しになる)
@@ -373,7 +378,11 @@ fn main() -> Result<()> {
             bp_unbond_flag,
             settings.clone(),
         )?;
-        alc_hub_common::evtlog::emit("EVT BLE_ENABLED omron_bp");
+        alc_hub_common::evtlog::emit(&format!(
+            "EVT BLE_ENABLED omron_bp={} vein={}",
+            u8::from(omron_bp),
+            u8::from(vein)
+        ));
     } else {
         // 既定。**BT controller ごと起こさない** = 打刻だけの端末の内部RAM を
         // 削らない。`OMRON BP ON` のあとは再起動が要ることをログに残す
