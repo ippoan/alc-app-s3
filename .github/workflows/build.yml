@@ -906,6 +906,9 @@ jobs:
           # timecard / alarm と同じく **dev チャネルは出さない**
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.nfc_version }}+$SHORT_SHA\"/" \
             docs/manifest-nfc.json > _site/manifest-nfc.json
+          # Pages は max-age=600。path が毎回同じだとブラウザの HTTP キャッシュの古い bin を
+          # 書くため、配布ごとに URL を変える (Refs ippoan/alc-app#436)
+          sed -i 's#"path": "\(firmware/[^"]*\.bin\)"#"path": "\1?v='"$SHORT_SHA"'"#' _site/manifest*.json
           cat _site/manifest.json _site/manifest-dev.json _site/manifest-wifi.json _site/manifest-atoms3-print.json _site/manifest-timecard.json _site/manifest-timecard-station.json _site/manifest-timecard-vein-r12-b.json _site/manifest-alarm.json _site/manifest-nfc.json
 
       - name: Upload Pages artifact
