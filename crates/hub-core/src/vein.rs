@@ -22,7 +22,11 @@
 //! - **大きさは `bData[1] + bData[2] * 256`** (実機で 0x1FDC = 8156 バイト。先頭は `DE ED DE ED`)
 //! - 登録中は「置いて」(0x20) と「離して」(0x21) の途中経過が届く。間は最大 5 秒で、
 //!   置かれなければ `01 0B` (XG_ERR_TIME_OUT)
-//! - 中身は**ここでは解釈しない** — モジュールが返した大きさのまま 16 進で出す
+//! - 読めた登録データは 1:N 用のテンプレート (先頭 `DE ED DE ED`、AES の包み) で、
+//!   ホスト (alc-vein-worker) が受けるのはその中の **0xBDBD の特徴量 (0x448 バイト) 1 件**。
+//!   そのため送る前に [`extract_chara`] で取り出し、`VEIN CHARA` には 0x448 バイト
+//!   (2192 文字) だけを載せる (ippoan/vein-base#109)。取り出しは vein-match-search の
+//!   `template_to_charas` をそのまま使い、ここでは書き直さない
 //!
 //! # パケット (24 バイト、§1.2.2)
 //!
@@ -82,6 +86,9 @@ pub const UART_DATA_PACKET_MAX: usize = 512;
 /// 特徴量 (登録データ) として受け取る大きさの上限。実機の登録データは 0x1FDC (8156) バイト
 /// (2026-10-07) なので 8KB とする — これを超える値は応答の破損とみなす
 pub const CHARA_MAX: usize = 0x2000;
+/// ホストへ送る特徴量 (0xBDBD の構造体) の大きさ = 0x448 バイト。登録データ
+/// ([`CHARA_MAX`] まで) から [`extract_chara`] で取り出す
+pub const CHARA_LEN: usize = vein_match::REC_LEN;
 
 /// パケットのデータ部 (`bDataLen` 以降の 16 バイト) を足し合わせる和 (§1.2.3)。
 /// 下位 16 bit だけを使う
@@ -346,7 +353,8 @@ fn exchange(port: &mut dyn Port, t: &Timeouts, cmd: u8, data: &[u8]) -> Result<P
 /// 接続して作業用 ID に 1 回登録し、その登録データを読み出す
 /// (§2.2.1 → §2.2.15 → §2.2.20 → §2.2.26 → §1.2.6 → §2.2.15)。
 ///
-/// 戻り値はモジュールが返した大きさそのままのバイト列 (中身は解釈しない)。
+/// 戻り値はモジュールが返した大きさそのままの登録データ (ここでは解釈しない。ホストへ
+/// 送る特徴量は [`extract_chara`] で取り出す)。
 /// 登録中の途中経過は `on_prompt` へ渡す (端末が「離して」の合図を鳴らす)。
 /// 案内音声 (置いて / もう一度) はホストが `VEIN SAY` で鳴らす
 pub fn capture(
@@ -457,6 +465,20 @@ pub fn capture(
     // 6. 作業用 ID を消して終わる。失敗しても読めた分は返す (次の読み取りの 2. で消える)
     let _ = exchange(port, t, CMD_CLEAR_ENROLL, &id);
     Ok(out)
+}
+
+/// 登録データ ([`capture`] の結果。1:N 用のテンプレート、先頭 `DE ED DE ED`) から、
+/// ホストへ送る 0xBDBD の特徴量 ([`CHARA_LEN`] バイト) を取り出す。
+///
+/// 取り出しは vein-match-search の `template_to_charas` (外側ヘッダ → AES の包み → 記録の
+/// 各件の先頭 0x448 バイト)。読み取り 1 回 = 撮像 1 回 ([`ENROLL_TEMPLATES`]) なので
+/// **件数はちょうど 1**。0 件・2 件以上・形式違い・版違い・未対応の層 (LZW) はどれも
+/// 応答の破損として [`VeinError::ReadFail`] にする (ホストの `ERR VEIN` の解釈は変えない)
+pub fn extract_chara(enroll: &[u8]) -> Result<[u8; CHARA_LEN], VeinError> {
+    match vein_match_search::template_to_charas(enroll).as_deref() {
+        Ok([chara]) => Ok(*chara),
+        _ => Err(VeinError::ReadFail),
+    }
 }
 
 /// 成功の行 `VEIN CHARA <大文字 16 進>` (改行なし)
@@ -983,5 +1005,67 @@ mod tests {
         // 大きさ 0 / 上限超え
         assert_eq!(four(size(0)), Err(VeinError::ReadFail));
         assert_eq!(four(size(CHARA_MAX + 1)), Err(VeinError::ReadFail));
+    }
+
+    /// 合成の 0xBDBD 特徴量 (本物の指のデータは使わない — 公開 repo)。`seed` で模様を変えた
+    /// 平面を vein-match-search の `make_entry` で詰め、先頭 0x448 バイトを特徴量とする
+    /// (登録データの中の件と同じ書き方なので、テンプレートに包んで取り出すと同じに戻る)
+    fn synth_chara(seed: usize) -> [u8; CHARA_LEN] {
+        let mut plane = [0u8; vein_match::PLANE_LEN];
+        for (i, v) in plane.iter_mut().enumerate() {
+            *v = u8::from((i * 31 + seed * 17) % 7 < 3);
+        }
+        let entry = vein_match_search::make_entry(&plane);
+        let mut c = [0u8; CHARA_LEN];
+        c.copy_from_slice(&entry[..CHARA_LEN]);
+        c
+    }
+
+    /// 合成の特徴量からモジュールと同じ包み (mode 1 = AES のみ) の登録データを組む
+    fn synth_enroll(charas: &[&[u8]]) -> Vec<u8> {
+        vein_match_search::create_template(charas, 0, 0, 1, &[]).unwrap()
+    }
+
+    #[test]
+    fn extract_chara_returns_the_single_bdbd() {
+        let c = synth_chara(1);
+        assert!(vein_match::load(&c, CHARA_LEN as u32, &mut [0; vein_match::PLANE_LEN]).is_ok());
+        let t = synth_enroll(&[&c]);
+        assert_eq!(&t[..4], &[0xDE, 0xED, 0xDE, 0xED]);
+        assert_eq!(t[6], 1); // AES の包み
+        assert_eq!(extract_chara(&t), Ok(c));
+        assert_eq!(chara_line(&c).len(), 11 + 2 * CHARA_LEN);
+    }
+
+    #[test]
+    fn extract_chara_rejects_two_entries() {
+        let t = synth_enroll(&[&synth_chara(1), &synth_chara(2)]);
+        assert_eq!(extract_chara(&t), Err(VeinError::ReadFail));
+    }
+
+    #[test]
+    fn extract_chara_rejects_zero_entries() {
+        // 件数 0 の記録 (create_template は 0 件を組まないので、記録を直に作って包む)
+        let mut rec = vec![0u8; vein_match_search::REC_SIZE];
+        rec[..2].copy_from_slice(&vein_match_search::RECORD_MAGIC.to_le_bytes());
+        rec[3] = 2;
+        let t = vein_match_search::build_template(&rec, 0, 1, &[]).unwrap();
+        assert_eq!(extract_chara(&t), Err(VeinError::ReadFail));
+    }
+
+    #[test]
+    fn extract_chara_rejects_broken_input() {
+        // 外側ヘッダでない (取り出し前の見本の形・空)
+        assert_eq!(extract_chara(&sample_chara(0x40)), Err(VeinError::ReadFail));
+        assert_eq!(extract_chara(&[]), Err(VeinError::ReadFail));
+        // 記録の版違い
+        let mut rec = vein_match_search::make_record(&[[0u8; vein_match::PLANE_LEN]], 0, 0).unwrap();
+        rec[3] = 1;
+        let t = vein_match_search::build_template(&rec, 0, 1, &[]).unwrap();
+        assert_eq!(extract_chara(&t), Err(VeinError::ReadFail));
+        // 未対応の層 (LZW)
+        let mut t = synth_enroll(&[&synth_chara(3)]);
+        t[6] = 4;
+        assert_eq!(extract_chara(&t), Err(VeinError::ReadFail));
     }
 }

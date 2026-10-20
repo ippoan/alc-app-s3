@@ -7,3 +7,8 @@ description = "alc-hub-cores3 の純粋ロジック (ホストでテスト可能
 [dependencies]
 serde_json = "1"
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+# 指静脈の登録データ (1:N テンプレート、先頭 DEEDDEED) から 0xBDBD の特徴量を取り出す
+# (vein::extract_chara)。alc-vein-worker の crates/alc-vein と同じ版。private repo なので
+# CI は private-git-auth、手元は `gh auth setup-git` で取る (Refs ippoan/vein-base#109)
+vein-match = { git = "https://github.com/ippoan/vein-match", tag = "v0.1.1" }
+vein-match-search = { git = "https://github.com/ippoan/vein-match", tag = "v0.1.1" }
