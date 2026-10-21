@@ -482,7 +482,7 @@ pub fn handle_common(
         // 機 (Vein Station) だけが自前の console で捌く。それ以外の全機種は
         // ここで同じ文言を返す — ホストはこの行で「この端末では使えない」と分かる
         #[cfg(not(feature = "vein"))]
-        HostCommand::VeinCapture | HostCommand::VeinSay(_) => {
+        HostCommand::VeinCapture | HostCommand::VeinSay(_) | HostCommand::VeinFingerQuery => {
             println!("{}", alc_hub_core::vein::UNSUPPORTED_LINE)
         }
         other => return Some(other),

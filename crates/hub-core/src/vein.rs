@@ -28,6 +28,14 @@
 //!   (2192 文字) だけを載せる (ippoan/vein-base#109)。取り出しは vein-match-search の
 //!   `template_to_charas` をそのまま使い、ここでは書き直さない
 //!
+//! # 指の見張り (ippoan/alc-app#436)
+//!
+//! 画面が指を置いたら照合を始められるよう、ファームが [`CMD_FINGER_STATE`] (0x10) で指の有無を
+//! 見張る ([`FingerWatch`])。**番号と応答の読み方 (`bData[1]` = 1 なら有る、0 なら無い) は推測**
+//! — 仕様書の本文が repo に無く、WS-FVS10 で通るかは実機でしか分からない
+//! (`VEIN FINGER?` で確かめる)。非対応と決めるのは `01 10` の応答だけで、時間切れ・壊れた応答・
+//! 他のエラーコード・想定外のデータは一時的な失敗として見張りを続ける
+//!
 //! # パケット (24 バイト、§1.2.2)
 //!
 //! ```text
@@ -53,6 +61,12 @@ pub const CMD_CLEAR_ENROLL: u8 = 0x11;
 pub const CMD_ENROLL: u8 = 0x16;
 /// 指定 ID の登録データの大きさを返す。中身は READ_DATA の種別 0x22 で読む (§2.2.26)
 pub const CMD_READ_ENROLL: u8 = 0x22;
+
+/// 指の状態の問い合わせ (XG 系の「指の状態」)。**番号は推測 (0x10) — 仕様書の本文が repo に無く、
+/// WS-FVS10 で通るかは実機でしか分からない**。`VEIN FINGER?` で確かめる ([`finger_state`])
+pub const CMD_FINGER_STATE: u8 = 0x10;
+/// コマンド非対応 (`XG_ERR_NO_SUPPORT`、`bData[1]`)。GET_CHARA で実機確認済みの応答
+pub const XG_ERR_NO_SUPPORT: u8 = 0x10;
 
 /// 特徴量を取り出すために 1 回だけ登録する作業用の ID。読み取りの前後で消す
 pub const SCRATCH_ID: u32 = 1;
@@ -350,19 +364,9 @@ fn exchange(port: &mut dyn Port, t: &Timeouts, cmd: u8, data: &[u8]) -> Result<P
     Ok(p)
 }
 
-/// 接続して作業用 ID に 1 回登録し、その登録データを読み出す
-/// (§2.2.1 → §2.2.15 → §2.2.20 → §2.2.26 → §1.2.6 → §2.2.15)。
-///
-/// 戻り値はモジュールが返した大きさそのままの登録データ (ここでは解釈しない。ホストへ
-/// 送る特徴量は [`extract_chara`] で取り出す)。
-/// 登録中の途中経過は `on_prompt` へ渡す (端末が「離して」の合図を鳴らす)。
-/// 案内音声 (置いて / もう一度) はホストが `VEIN SAY` で鳴らす
-pub fn capture(
-    port: &mut dyn Port,
-    t: &Timeouts,
-    on_prompt: &mut dyn FnMut(Prompt),
-) -> Result<Vec<u8>, VeinError> {
-    // 1. 接続。応答が無ければモジュールが居ない
+/// 接続する (§2.2.1)。応答が無ければモジュールが居ない ([`VeinError::NoModule`])。
+/// 接続以外のコマンドは接続後でないと使えない
+pub fn connect(port: &mut dyn Port, t: &Timeouts) -> Result<(), VeinError> {
     port.discard_input();
     if !port.send(&command(CMD_CONNECTION, DEFAULT_PASSWORD)) {
         return Err(VeinError::NoModule);
@@ -377,6 +381,23 @@ pub fn capture(
     if p.data[0] != XG_ERR_SUCCESS {
         return Err(VeinError::Rc(p.data[1]));
     }
+    Ok(())
+}
+
+/// 接続して作業用 ID に 1 回登録し、その登録データを読み出す
+/// (§2.2.1 → §2.2.15 → §2.2.20 → §2.2.26 → §1.2.6 → §2.2.15)。
+///
+/// 戻り値はモジュールが返した大きさそのままの登録データ (ここでは解釈しない。ホストへ
+/// 送る特徴量は [`extract_chara`] で取り出す)。
+/// 登録中の途中経過は `on_prompt` へ渡す (端末が「離して」の合図を鳴らす)。
+/// 案内音声 (置いて / もう一度) はホストが `VEIN SAY` で鳴らす
+pub fn capture(
+    port: &mut dyn Port,
+    t: &Timeouts,
+    on_prompt: &mut dyn FnMut(Prompt),
+) -> Result<Vec<u8>, VeinError> {
+    // 1. 接続。応答が無ければモジュールが居ない
+    connect(port, t)?;
 
     // 2. 作業用 ID を空ける (前回の読み取りが途中で終わった残り)。未登録なら失敗が
     //    返るが、応答さえあればよい
@@ -465,6 +486,138 @@ pub fn capture(
     // 6. 作業用 ID を消して終わる。失敗しても読めた分は返す (次の読み取りの 2. で消える)
     let _ = exchange(port, t, CMD_CLEAR_ENROLL, &id);
     Ok(out)
+}
+
+/// 指の状態の問い合わせの結果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FingerReply {
+    /// 指が置かれている
+    Present,
+    /// 置かれていない
+    Absent,
+    /// コマンド非対応 (`01 10`)。**これだけが「この機種では見張れない」の根拠**
+    Unsupported,
+    /// 失敗 (時間切れ・壊れた応答・他の失敗コード・データの形が想定外)。一時的とみなす
+    Failed(VeinError),
+}
+
+/// 指の状態を 1 回問い合わせる ([`CMD_FINGER_STATE`]、接続済みであること)。
+///
+/// 応答の読み方は**推測**: 成功 (`bData[0]` = 0) のとき `bData[1]` が 1 なら有る、0 なら無い。
+/// それ以外の値は想定外として [`FingerReply::Failed`] (`ReadFail`)。実機で確かめるまで
+/// 見張りは「想定外」を一時的な失敗として扱い、止まらない
+pub fn finger_state(port: &mut dyn Port, t: &Timeouts) -> FingerReply {
+    let p = match exchange(port, t, CMD_FINGER_STATE, &[]) {
+        Ok(p) => p,
+        Err(e) => return FingerReply::Failed(e),
+    };
+    match (p.data[0], p.data[1]) {
+        (XG_ERR_SUCCESS, 0) => FingerReply::Absent,
+        (XG_ERR_SUCCESS, 1) => FingerReply::Present,
+        (XG_ERR_SUCCESS, _) => FingerReply::Failed(VeinError::ReadFail),
+        (XG_ERR_FAIL, XG_ERR_NO_SUPPORT) => FingerReply::Unsupported,
+        (XG_ERR_FAIL, code) => FingerReply::Failed(VeinError::Rc(code)),
+        _ => FingerReply::Failed(VeinError::ReadFail),
+    }
+}
+
+/// 見張りの問い合わせ間隔 (ミリ秒)。連続で失敗している間は延ばす
+pub const WATCH_INTERVAL_MS: u32 = 200;
+/// 連続で失敗しているときの間隔
+pub const WATCH_BACKOFF_MS: u32 = 5_000;
+/// この回数だけ続けて失敗したら間隔を延ばす
+pub const WATCH_BACKOFF_AFTER: u32 = 3;
+
+/// 見張り 1 回の結果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchPoll {
+    /// 何も出さない
+    Idle,
+    /// 指が「無い → 有る」に変わった (`EVT VEIN FINGER`)
+    Finger,
+    /// 非対応 (`01 10`)。見張りをやめる (`EVT VEIN FINGER UNSUPPORTED`)
+    Unsupported,
+}
+
+/// 指の見張りの状態。vein スレッドが依頼の無い回に [`FingerWatch::poll`] を呼ぶ
+#[derive(Debug, Clone, Default)]
+pub struct FingerWatch {
+    connected: bool,
+    /// 「無い」を見た後か。false の間は「有る」を見ても出さない
+    /// (起動時から置かれている指・読み取り直後の同じ指で 2 回目が走らないように)
+    armed: bool,
+    fails: u32,
+}
+
+impl FingerWatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 次の問い合わせまでの間隔
+    pub fn interval_ms(&self) -> u32 {
+        if self.fails >= WATCH_BACKOFF_AFTER {
+            WATCH_BACKOFF_MS
+        } else {
+            WATCH_INTERVAL_MS
+        }
+    }
+
+    /// 連続で失敗している (間隔が延びている) か。ログを状態の変わり目だけにするため
+    pub fn is_failing(&self) -> bool {
+        self.fails >= WATCH_BACKOFF_AFTER
+    }
+
+    /// 読み取り (VEIN CAPTURE) の後。接続し直し、いったん「無い」を見るまで出さない
+    pub fn after_capture(&mut self) {
+        self.connected = false;
+        self.armed = false;
+    }
+
+    /// 1 回問い合わせる。接続していなければ先に接続する
+    pub fn poll(&mut self, port: &mut dyn Port, t: &Timeouts) -> WatchPoll {
+        if !self.connected {
+            if connect(port, t).is_err() {
+                self.fails = self.fails.saturating_add(1);
+                return WatchPoll::Idle;
+            }
+            self.connected = true;
+        }
+        match finger_state(port, t) {
+            FingerReply::Absent => {
+                self.fails = 0;
+                self.armed = true;
+                WatchPoll::Idle
+            }
+            FingerReply::Present => {
+                self.fails = 0;
+                if self.armed {
+                    self.armed = false;
+                    WatchPoll::Finger
+                } else {
+                    WatchPoll::Idle
+                }
+            }
+            FingerReply::Unsupported => WatchPoll::Unsupported,
+            FingerReply::Failed(_) => {
+                // 一時的な失敗。次は接続し直してから
+                self.fails = self.fails.saturating_add(1);
+                self.connected = false;
+                WatchPoll::Idle
+            }
+        }
+    }
+}
+
+/// `VEIN FINGER?` の応答行 (改行なし): `VEIN FINGER 0` / `VEIN FINGER 1` /
+/// `ERR VEIN UNSUPPORTED` / `ERR VEIN <reason>`
+pub fn finger_line(r: FingerReply) -> String {
+    match r {
+        FingerReply::Present => "VEIN FINGER 1".into(),
+        FingerReply::Absent => "VEIN FINGER 0".into(),
+        FingerReply::Unsupported => "ERR VEIN UNSUPPORTED".into(),
+        FingerReply::Failed(e) => err_line(e),
+    }
 }
 
 /// 登録データ ([`capture`] の結果。1:N 用のテンプレート、先頭 `DE ED DE ED`) から、
@@ -670,6 +823,182 @@ mod tests {
         let mut v: Vec<u8> = (0..n).map(|i| (i * 7 + 3) as u8).collect();
         v[..4].copy_from_slice(&[0xDE, 0xED, 0xDE, 0xED]);
         v
+    }
+
+    fn finger(present: Option<u8>) -> Option<Vec<u8>> {
+        present.map(|v| reply(CMD_FINGER_STATE, &[XG_ERR_SUCCESS, v]))
+    }
+
+    fn fp(script: Vec<Option<Vec<u8>>>) -> FingerReply {
+        finger_state(&mut FakePort::new(script), &Timeouts::DEFAULT)
+    }
+
+    #[test]
+    fn finger_state_kinds() {
+        assert_eq!(fp(vec![finger(Some(1))]), FingerReply::Present);
+        assert_eq!(fp(vec![finger(Some(0))]), FingerReply::Absent);
+        // コマンド非対応 (01 10) だけが Unsupported
+        assert_eq!(
+            fp(vec![Some(reply(CMD_FINGER_STATE, &[XG_ERR_FAIL, XG_ERR_NO_SUPPORT]))]),
+            FingerReply::Unsupported
+        );
+        // 他の失敗コード・時間切れ・壊れた応答・想定外のデータ・別コマンドの応答は一時的な失敗
+        assert_eq!(
+            fp(vec![Some(reply(CMD_FINGER_STATE, &[XG_ERR_FAIL, 0x07]))]),
+            FingerReply::Failed(VeinError::Rc(0x07))
+        );
+        assert_eq!(fp(vec![None]), FingerReply::Failed(VeinError::Timeout));
+        assert_eq!(
+            fp(vec![Some(SPEC_CONNECT_RECV[..5].to_vec())]),
+            FingerReply::Failed(VeinError::ReadFail)
+        );
+        assert_eq!(fp(vec![finger(Some(7))]), FingerReply::Failed(VeinError::ReadFail));
+        assert_eq!(
+            fp(vec![Some(reply(CMD_FINGER_STATE, &[0x42]))]),
+            FingerReply::Failed(VeinError::ReadFail)
+        );
+        assert_eq!(
+            fp(vec![Some(reply(CMD_CONNECTION, &[0, 1]))]),
+            FingerReply::Failed(VeinError::ReadFail)
+        );
+        let mut port = FakePort::new(vec![]);
+        port.send_ok = false;
+        assert_eq!(
+            finger_state(&mut port, &Timeouts::DEFAULT),
+            FingerReply::Failed(VeinError::ReadFail)
+        );
+    }
+
+    #[test]
+    fn finger_state_sends_command_without_data() {
+        let mut port = FakePort::new(vec![finger(Some(0))]);
+        finger_state(&mut port, &Timeouts::DEFAULT);
+        assert_eq!(port.sent, vec![command(CMD_FINGER_STATE, &[]).to_vec()]);
+    }
+
+    #[test]
+    fn finger_lines() {
+        assert_eq!(finger_line(FingerReply::Present), "VEIN FINGER 1");
+        assert_eq!(finger_line(FingerReply::Absent), "VEIN FINGER 0");
+        assert_eq!(finger_line(FingerReply::Unsupported), "ERR VEIN UNSUPPORTED");
+        assert_eq!(
+            finger_line(FingerReply::Failed(VeinError::Rc(0x07))),
+            "ERR VEIN RC=07"
+        );
+    }
+
+    #[test]
+    fn connect_sends_spec_packet() {
+        let mut port = FakePort::new(vec![connected()]);
+        assert_eq!(connect(&mut port, &Timeouts::DEFAULT), Ok(()));
+        assert_eq!(port.sent[0], SPEC_CONNECT_SEND.to_vec());
+    }
+
+    /// 見張りを台本で進める: 接続 1 回 + 問い合わせ n 回
+    fn watch_run(script: Vec<Option<Vec<u8>>>, polls: usize) -> (Vec<WatchPoll>, FakePort) {
+        let mut port = FakePort::new(script);
+        let mut w = FingerWatch::new();
+        let out = (0..polls).map(|_| w.poll(&mut port, &Timeouts::DEFAULT)).collect();
+        (out, port)
+    }
+
+    #[test]
+    fn watch_emits_only_on_absent_to_present() {
+        // 起動時から指がある → 出さない / 離れた → 置いた で 1 回 / 置いたままなら出さない
+        let (out, port) = watch_run(
+            vec![
+                connected(),
+                finger(Some(1)),
+                finger(Some(0)),
+                finger(Some(1)),
+                finger(Some(1)),
+                finger(Some(0)),
+                finger(Some(1)),
+            ],
+            6,
+        );
+        use WatchPoll::*;
+        assert_eq!(out, vec![Idle, Idle, Finger, Idle, Idle, Finger]);
+        // 接続は最初の 1 回だけ (問い合わせのたびには送らない)
+        assert_eq!(port.sent.iter().filter(|p| p[3] == CMD_CONNECTION).count(), 1);
+    }
+
+    #[test]
+    fn watch_after_capture_needs_absent_and_reconnects() {
+        let mut port = FakePort::new(vec![
+            connected(),
+            finger(Some(0)),
+            finger(Some(1)),
+            connected(),
+            finger(Some(1)),
+            finger(Some(0)),
+            finger(Some(1)),
+        ]);
+        let t = Timeouts::DEFAULT;
+        let mut w = FingerWatch::new();
+        assert_eq!(w.poll(&mut port, &t), WatchPoll::Idle);
+        assert_eq!(w.poll(&mut port, &t), WatchPoll::Finger);
+        w.after_capture();
+        // 撮った直後の同じ指では出さない (接続し直してから問い合わせる)
+        assert_eq!(w.poll(&mut port, &t), WatchPoll::Idle);
+        assert_eq!(w.poll(&mut port, &t), WatchPoll::Idle);
+        assert_eq!(w.poll(&mut port, &t), WatchPoll::Finger);
+        assert_eq!(port.sent.iter().filter(|p| p[3] == CMD_CONNECTION).count(), 2);
+    }
+
+    #[test]
+    fn watch_unsupported_only_on_01_10() {
+        let (out, _) = watch_run(
+            vec![
+                connected(),
+                Some(reply(CMD_FINGER_STATE, &[XG_ERR_FAIL, XG_ERR_NO_SUPPORT])),
+            ],
+            1,
+        );
+        assert_eq!(out, vec![WatchPoll::Unsupported]);
+    }
+
+    #[test]
+    fn watch_transient_failures_back_off_then_recover() {
+        let mut port = FakePort::new(vec![
+            None, // 接続に応答なし
+            None,
+            None,
+            connected(),
+            finger(Some(0)),
+        ]);
+        let t = Timeouts::DEFAULT;
+        let mut w = FingerWatch::new();
+        assert_eq!(w.interval_ms(), WATCH_INTERVAL_MS);
+        for _ in 0..WATCH_BACKOFF_AFTER {
+            assert_eq!(w.poll(&mut port, &t), WatchPoll::Idle);
+        }
+        assert!(w.is_failing());
+        assert_eq!(w.interval_ms(), WATCH_BACKOFF_MS);
+        // 戻ったら成功で間隔も戻る
+        assert_eq!(w.poll(&mut port, &t), WatchPoll::Idle);
+        assert!(!w.is_failing());
+        assert_eq!(w.interval_ms(), WATCH_INTERVAL_MS);
+    }
+
+    #[test]
+    fn watch_failed_reply_reconnects_and_keeps_watching() {
+        // 時間切れ・壊れた応答・想定外のデータは止めずに接続し直す
+        let (out, port) = watch_run(
+            vec![
+                connected(),
+                None,
+                connected(),
+                finger(Some(9)),
+                connected(),
+                finger(Some(0)),
+                finger(Some(1)),
+            ],
+            4,
+        );
+        use WatchPoll::*;
+        assert_eq!(out, vec![Idle, Idle, Idle, Finger]);
+        assert_eq!(port.sent.iter().filter(|p| p[3] == CMD_CONNECTION).count(), 3);
     }
 
     #[test]

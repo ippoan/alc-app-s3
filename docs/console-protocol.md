@@ -133,7 +133,7 @@ CoreS3 の `STATUS LAN=…` も同様 (行頭は互換のため変えない)。
 | `AUTH TICKET` | 端末登録の一回券。**`cores3` のみ** (運行者 PWA が USB 越しに繋がるのはここだけ)、他は `ERR AUTH TICKET: unsupported` |
 | `AUTH KEYGEN` / `AUTH PUBKEY` / `AUTH SIGN` / `AUTH SIGNBP` | 警告デバイス管理者認証用の ed25519 鍵 (Refs #205, #249) |
 | `WS URL` / `WS STATUS` | cf-alc-recorder 常時接続の URL 上書き / 状態 |
-| `VEIN CAPTURE` / `VEIN SAY <x>` | `ERR VEIN: unsupported` — 指静脈を積む `vein` build だけがここを素通しして自前で答える (下記) |
+| `VEIN CAPTURE` / `VEIN SAY <x>` / `VEIN FINGER?` | `ERR VEIN: unsupported` — 指静脈を積む `vein` build だけがここを素通しして自前で答える (下記) |
 
 `AUTH SIGN` / `AUTH SIGNBP` の応答 (Refs #205, #249, #269):
 
@@ -175,12 +175,31 @@ ippoan/vein-match#20)。**モジュールは実機で未確認** — 手順は
 |---|---|
 | `VEIN CAPTURE` | 成功: **1 行で** `VEIN CHARA <hex>` (モジュールの登録データ (1:N のテンプレート、先頭 `DEEDDEED`) から取り出した 0xBDBD の特徴量 1 件の大文字 16 進。常に 0x448 バイト = 2192 文字。取り出せなければ `READ_FAIL`)。失敗: `ERR VEIN <reason>` |
 | `VEIN SAY PLACE\|AGAIN\|ENROLLED\|FAILED` | 案内音声 (「指を置いてください」/「もう一度置いてください」/「登録完了しました」/「読み取れませんでした」) を鳴らし `OK VEIN SAY <x>`。スピーカーが起きていなければ `ERR VEIN NO_SPEAKER` |
+| `VEIN FINGER?` | 指の有無を 1 回だけ問い合わせる: `VEIN FINGER 1` (有る) / `VEIN FINGER 0` (無い) / `ERR VEIN UNSUPPORTED` (モジュールが `01 10` = コマンド非対応を返した) / `ERR VEIN <reason>` (下の `<reason>`)。**実機で指の状態コマンドが通るかを確かめる口** (下の「指の見張り」) |
 
 `<reason>`: `NO_MODULE` (接続に応答なし) / `TIMEOUT` (途中で応答が途絶えた) /
 `NO_FINGER` (指が置かれずモジュールが待ちを打ち切った) / `READ_FAIL` (応答の破損・
 読み直しの上限・登録データから特徴量 1 件を取り出せない) / `RC=<hex 2 桁>` (モジュールのエラーコード)。`VEIN CAPTURE` は
 指を待つので**応答まで最大 15 秒強かかる** (途中経過 1 つにつき 15 秒)。続けて
 送った分は順に処理する。`VEIN SAY` は読み取り中でもすぐ鳴る。
+
+**指の見張り** (Refs ippoan/alc-app#436): `vein` build は依頼 (`VEIN CAPTURE` / `VEIN FINGER?`) の無い間、
+200ms ごとにモジュールへ指の有無を問い合わせ、**「無い → 有る」に変わったときだけ**
+`EVT VEIN FINGER` を 1 行出す (画面はこれを受けて照合 = `VEIN CAPTURE` を始める。ファームは撮らない)。
+
+| 行 | 意味 |
+|---|---|
+| `EVT VEIN FINGER` | 指が置かれた。指が離れる (「無い」を見る) まで次は出ない。`VEIN CAPTURE` の後も、いったん「無い」を見るまで出ない。起動時から置かれている指でも出ない |
+| `EVT VEIN FINGER UNSUPPORTED` | モジュールが指の状態コマンドに `01 10` (コマンド非対応) を返した。**見張りをやめる** (再起動まで出ない)。1 回だけ出る |
+
+- 非対応と決めるのは `01 10` だけ。時間切れ・壊れた応答・他のエラーコード・想定外のデータは一時的な失敗として
+  見張りを続ける (連続 3 回失敗したら間隔を 5 秒に延ばし、成功したら 200ms に戻す。`EVT` は出さない)
+- 接続 (CONNECTION) は見張りを始めるとき・失敗の後・`VEIN CAPTURE` の後だけ送り、問い合わせのたびには送らない
+- 読み取り中は問い合わせない (UART に触るのは vein スレッド 1 本で、直列)
+- **コマンド番号と応答の読み方は推測**: 指の状態コマンドを XG 系の `0x10` とし、成功 (`bData[0]` = 0) の
+  `bData[1]` が 1 なら有る・0 なら無いと読む。仕様書 (Communication Protocol Ver 2.3) の本文が repo に無く、
+  WS-FVS10 で通るかは未確認。`VEIN FINGER?` を打って確かめる (`UNSUPPORTED` ならこの機種では見張れない。
+  `RC=` や `READ_FAIL` なら番号か読み方が違う)
 
 上記に無いコマンド、または対応しない機種向けのコマンドは
 `ERR UNSUPPORTED (<kind>)` を返す (`<kind>` は §2 の語彙。現場の切り分け用)。
