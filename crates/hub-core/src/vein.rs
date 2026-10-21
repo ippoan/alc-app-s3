@@ -418,12 +418,16 @@ fn enroll_id(
     req[5] = ENROLL_TEMPLATES;
     req[10] = ENROLL_RETRIES;
     let p = send_and_await_final(port, t, CMD_ENROLL, &req, on_prompt)?;
-    match enroll_reply(&p) {
-        EnrollReply::Done => Ok(()),
-        EnrollReply::Failed(code) | EnrollReply::Unknown(code) => Err(VeinError::Rc(code)),
-        // 途中経過は send_and_await_final が読み切っている
-        EnrollReply::Prompt(_) => Err(VeinError::ReadFail),
+    // 途中経過は send_and_await_final が読み切っているので、ここに届くのは成功か失敗だけ。
+    // 失敗のコードは `01 xx` なら xx、知らない `bData[0]` ならその値 ([`enroll_reply`] と同じ)
+    if p.data[0] == XG_ERR_SUCCESS {
+        return Ok(());
     }
+    Err(VeinError::Rc(if p.data[0] == XG_ERR_FAIL {
+        p.data[1]
+    } else {
+        p.data[0]
+    }))
 }
 
 /// `cmd` を送り、途中経過 (置いて / 離して / 撮り直し) を `on_prompt` へ渡しながら
