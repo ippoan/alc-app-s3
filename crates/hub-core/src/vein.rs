@@ -1976,7 +1976,7 @@ mod tests {
         let (r, port, _) = run_test_verify(vec![connected(), Some(v)], 0);
         let data = r.unwrap();
         assert_eq!(&port.sent[1][3..10], &[CMD_VERIFY, 0, 4, 0, 0, 0, 0]);
-        assert_eq!(test_verify_line(0, &data), "VEIN TEST VERIFY 0 RC=00 DATA=07000000000000000000000000000000");
+        assert_eq!(test_verify_line(0, &data), "VEIN TEST VERIFY 0 RC=00 DATA=070000000000000000000000000000");
     }
 
     #[test]
