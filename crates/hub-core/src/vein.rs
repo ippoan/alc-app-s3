@@ -1991,13 +1991,13 @@ mod tests {
         );
         assert!(slot.is_none());
         assert_eq!(
-            port.sent[2],
+            port.sent[1],
             command(CMD_WRITE_ENROLL, &[5, 0, 0, 0, 0x2C, 0x01, 0, 0]).to_vec()
         );
         let mut want = read_data_request(CMD_WRITE_DATA, CMD_WRITE_ENROLL, 0, 300).to_vec();
         want.extend_from_slice(&data);
         want.extend_from_slice(&checksum(&data).to_le_bytes());
-        assert_eq!(port.sent[3], want);
+        assert_eq!(port.sent[2], want);
     }
 
     #[test]
