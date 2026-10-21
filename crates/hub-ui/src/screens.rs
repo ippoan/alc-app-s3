@@ -303,7 +303,7 @@ pub fn draw_boot(d: &mut Cs3Display) {
     jp2x_center(d, "alc-hub CoreS3", 70, C_TEXT, C_BG);
     jp_center(
         d,
-        &format!("起動中... v{}", config::FIRMWARE_VERSION),
+        &format!("起動中... v{}", config::firmware_version()),
         130,
         C_MUTED,
     );
@@ -834,7 +834,7 @@ fn draw_log(d: &mut Cs3Display, st: &HubStatus, now: u64) {
         flag(st.ble_connected),
         flag(st.wifi_connected),
         ws,
-        config::FIRMWARE_VERSION,
+        config::firmware_version(),
     );
     text(d, &JP16, &summary, 6, BAR_H + 2, C_ACCENT, HorizontalAlignment::Left);
     // 2 行目: IP + ヒープ low-water (min<n>K、Refs #27)。heap_min_int == 0 は

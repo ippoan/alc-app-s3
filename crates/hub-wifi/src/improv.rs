@@ -64,7 +64,7 @@ impl Improv {
                     cmd,
                     &[
                         "alc-hub-cores3",
-                        alc_hub_common::config::FIRMWARE_VERSION,
+                        alc_hub_common::config::firmware_version(),
                         "ESP32-S3",
                         "M5Stack CoreS3",
                     ],

@@ -161,6 +161,7 @@ const MAIN_TASK_PRIO: u32 = esp_idf_svc::sys::CONFIG_PTHREAD_TASK_PRIO_DEFAULT +
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    config::set_firmware_version(env!("CARGO_PKG_VERSION"));
     // 前回リセットの解析 + ログ捕捉 hook (`EVT BOOT reset=…` を出す)。
     // heap.rs の note() がリングに書くため、heap::start より前に必ず呼ぶこと。
     // **crash の中身は送らない** — 本機は uplink を持たないので、

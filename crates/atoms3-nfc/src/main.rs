@@ -120,6 +120,7 @@ const LATCH: Duration = Duration::from_secs(1);
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    alc_hub_common::config::set_firmware_version(env!("CARGO_PKG_VERSION"));
     log::info!("alc-hub-atoms3-nfc 起動 (Unit NFC 検証、Port A: SDA=G2/SCL=G1)");
     log::info!("firmware build time: {}", env!("FIRMWARE_BUILD_TIME"));
 

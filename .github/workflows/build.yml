@@ -342,6 +342,12 @@ jobs:
         if: matrix.name == 'atoms3-nfc-s3r'
         run: bash .github/verify-voices3r-sdkconfig.sh
 
+      # 5 つの main が自分の crate の版を名乗る登録を持つか (hub-common の単体テストは
+      # CI で走らないので grep で見る)。leg 共通の検査なので 1 leg だけで回す
+      - name: Verify firmware version registration (5 mains)
+        if: matrix.name == 'common'
+        run: bash .github/verify-firmware-version-set.sh
+
   # ------------------------------------------------------------------
   # build: フルビルド + 書き込みイメージ (main のみ)。
   # cores3 (CoreS3 統合ハブ) / atoms3-print (AtomS3 印刷ブリッジ) /
@@ -808,7 +814,8 @@ jobs:
   # 点呼端末の警告デバイス (alarm.html + manifest-alarm.json) /
   # 血圧計用 PC の測定台 (atoms3-nfc.html + manifest-nfc.json) の 5 機種分。
   # manifest の version は auth-worker /device/setup の「最新版」照会
-  # (機種別) が突き合わせるため、それぞれの crate version + SHA を刻む
+  # (機種別) が突き合わせるため、それぞれの crate version + SHA を刻む。
+  # 機体が名乗る版も同じ crate の版 (各 main の config::set_firmware_version)
   # ------------------------------------------------------------------
   assemble-pages:
     name: Assemble Pages site

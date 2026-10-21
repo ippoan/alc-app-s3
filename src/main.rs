@@ -54,6 +54,7 @@ const ALARM_TICK_MS: u32 = 50;
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    config::set_firmware_version(env!("CARGO_PKG_VERSION"));
     // 前回リセットの解析 (クラッシュ由来なら panic 前ログの snapshot を得る) と
     // ログ捕捉 hook (vprintf tee + Rust panic hook) の設置。他モジュールの
     // 初期化より先に呼び、起動中のログ・クラッシュも捕まえる (Refs #43)
@@ -79,7 +80,7 @@ fn main() -> Result<()> {
             );
         }
     }
-    log::info!("alc-hub-cores3 v{} 起動", config::FIRMWARE_VERSION);
+    log::info!("alc-hub-cores3 v{} 起動", config::firmware_version());
 
     let p = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;

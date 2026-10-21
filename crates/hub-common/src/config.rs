@@ -12,7 +12,44 @@
 //! - 次期構成 (`cores3-se` feature、CoreS3 SE + Base LAN PoE v1.2): RS232M を
 //!   TX=G10 / RX=G6 へ、Unit NFC を Port C (G17/G18) へ (main.rs の cfg 分岐)。
 
-pub const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
+use std::sync::OnceLock;
+
+/// hub-common 自身の版。**名乗る版ではない** — `set_firmware_version` が呼ばれなかった
+/// ときの既定値としてだけ使う (外から直接読ませない)。
+const HUB_COMMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// 実行ファイルが名乗る版 (各 main が起動時に 1 回渡す)。形は evtlog.rs の `SINK` と同じ。
+static FIRMWARE_VERSION: OnceLock<&'static str> = OnceLock::new();
+
+/// 未設定のまま読まれたことを 1 回だけ log::error に出すための印。
+static UNSET_REPORTED: OnceLock<()> = OnceLock::new();
+
+/// 実行ファイルの版を登録する。最初の登録だけが効く。
+///
+/// hub-common はライブラリなので、どの実行ファイルにリンクされたかをコンパイル時に
+/// 知れない (`env!("CARGO_PKG_VERSION")` は hub-common 自身の版になる)。そこで各 main が
+/// `set_firmware_version(env!("CARGO_PKG_VERSION"))` で自分の crate の版を渡す。
+/// CI の manifest (build.yml) も機種ごとの crate の版を載せるので、両者が一致する。
+/// EspLogger の初期化の直後・版を使う最初の処理の前に呼ぶこと。
+pub fn set_firmware_version(v: &'static str) {
+    let _ = FIRMWARE_VERSION.set(v);
+}
+
+/// 名乗る版。`set_firmware_version` が呼ばれていなければ hub-common の版を返し、
+/// 配線漏れとして 1 回だけ log::error を出す。
+pub fn firmware_version() -> &'static str {
+    match FIRMWARE_VERSION.get() {
+        Some(v) => v,
+        None => {
+            if UNSET_REPORTED.set(()).is_ok() {
+                log::error!(
+                    "firmware_version 未設定: main で config::set_firmware_version を呼んでいない (hub-common の版 {HUB_COMMON_VERSION} を名乗る)"
+                );
+            }
+            HUB_COMMON_VERSION
+        }
+    }
+}
 
 /// ビルド時の git 短縮 SHA (build.rs が埋め込む。git 無しは "dev")。
 pub const FIRMWARE_SHA: &str = env!("FW_GIT_SHA");
@@ -20,7 +57,7 @@ pub const FIRMWARE_SHA: &str = env!("FW_GIT_SHA");
 /// 完全なバージョン識別子 `<version>+<sha>`。CI が manifest.json に載せる形式
 /// (`<version>+<short-sha>`) と一致するので、OTA の更新要否判定に使える。
 pub fn firmware_version_full() -> String {
-    format!("{FIRMWARE_VERSION}+{FIRMWARE_SHA}")
+    format!("{}+{FIRMWARE_SHA}", firmware_version())
 }
 
 /// FC-1200 側 RS232 ボーレート (タニタ FC-1200/ALBLO 仕様: 9600bps 8N1、fc1200-wasm README 準拠)

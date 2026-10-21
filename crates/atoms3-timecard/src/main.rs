@@ -148,6 +148,7 @@ const I2C_PORT_NFC: i32 = 0;
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    config::set_firmware_version(env!("CARGO_PKG_VERSION"));
     // 前回リセットの解析 + ログ捕捉 hook (CoreS3 と同じ crashlog 基盤 #43)。
     // heap.rs の note() がリングに書くため、heap::start より前に必ず呼ぶこと
     let (_, crash) = crashlog::init();
