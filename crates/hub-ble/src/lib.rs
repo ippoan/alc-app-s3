@@ -849,8 +849,19 @@ async fn handle_device(
     // - 受信あり: 続報 (血圧計の過去分ダンプ) が静穏時間途切れたら切断して転送
     // - 機器の自発切断: 受信済み分を転送して終了
     // - 無データのままタイムアウト: 張り付き防止のためこちらから切断
-    // Omron 機は受信しても S3R から切らず、機器が切断するまで (上限 OMRON_SESSION_TIMEOUT_MS) 待つ
+    // Omron 機は受信しても S3R から切らず、機器が切断するまで (上限 OMRON_SESSION_TIMEOUT_MS) 待つ。
+    // 機器が「送信済み」と見なすのは切断の後なので切らないが、値は静穏時間途切れた時点で
+    // 最新 1 件を先に送る (切断を待つと画面に出るまで 5 秒ほど余計にかかる)
     let wait_start = now_ms();
+    let mut sent_order = None;
+    let mut sent_n = 0u32;
+    let mut send_omron = || {
+        if let Some(order) = send_latest(&buffer, meas_tx, sent_order) {
+            sent_order = Some(order);
+            sent_n += 1;
+            alc_hub_common::evtlog::emit(&format!("EVT OMRON_SENT n={sent_n}"));
+        }
+    };
     loop {
         if omron.is_some() {
             let by = if disconnected.is_set() {
@@ -859,9 +870,17 @@ async fn handle_device(
                 let _ = client.disconnect();
                 "timeout"
             } else {
+                if got_data.load(Ordering::SeqCst) {
+                    let quiet =
+                        u64::from((now_ms() as u32).wrapping_sub(last_rx.load(Ordering::SeqCst)));
+                    if quiet >= data_quiet_ms(kind) {
+                        send_omron();
+                    }
+                }
                 FreeRtos::delay_ms(100);
                 continue;
             };
+            send_omron();
             let n = buffer.lock().map(|b| b.len()).unwrap_or(0);
             if by == "timeout" && n == 0 {
                 alc_hub_common::evtlog::emit("EVT OMRON_RX timeout");
@@ -898,18 +917,32 @@ async fn handle_device(
         FreeRtos::delay_ms(100);
     }
 
-    // 貯めた測定のうち最新 (order 最大) の 1 件だけを recorder へ送る。
-    // 血圧計の過去分ダンプから「今測った 1 件」を選ぶ。
-    let latest = buffer
-        .lock()
-        .ok()
-        .and_then(|buf| buf.iter().max_by_key(|(_, order)| *order).map(|(m, _)| *m));
-    if let Some(m) = latest {
-        if let Ok(tx) = meas_tx.lock() {
-            let _ = tx.send(m);
-        }
+    // Omron 機は上の待ちの中で送り済み
+    if omron.is_none() {
+        send_latest(&buffer, meas_tx, None);
     }
     Ok(got_data.load(Ordering::SeqCst))
+}
+
+/// 貯めた測定のうち最新 (order 最大) の 1 件だけを recorder へ送る。
+/// 血圧計の過去分ダンプから「今測った 1 件」を選ぶ。`sent` (前に送った order) より
+/// 新しくなければ送らない。送ったらその order を返す
+fn send_latest(
+    buffer: &Mutex<Vec<(Measurement, u64)>>,
+    meas_tx: &MeasTx,
+    sent: Option<u64>,
+) -> Option<u64> {
+    let (m, order) = buffer
+        .lock()
+        .ok()
+        .and_then(|buf| buf.iter().max_by_key(|(_, order)| *order).copied())?;
+    if sent.is_some_and(|s| order <= s) {
+        return None;
+    }
+    if let Ok(tx) = meas_tx.lock() {
+        let _ = tx.send(m);
+    }
+    Some(order)
 }
 
 /// Omron 機のペアリング待ち (-P- 点滅) に接続した直後に呼ぶ。機種の系統で手順が違い、
