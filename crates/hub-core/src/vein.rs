@@ -2387,9 +2387,14 @@ mod tests {
         assert_eq!(lines[8], "VEIN RECORD 100 END 8156");
     }
 
+    /// `slot` を渡して 1 つ処理する。途中経過を受けるクロージャは 1 つにまとめる
+    /// (SYNC は途中経過を出さないので、呼び出しごとに書くと呼ばれない関数が残る)
+    fn run_in(slot: &mut Option<TemplateAssembler>, cmd: Command, script: Vec<Option<Vec<u8>>>) -> Vec<String> {
+        super::run(cmd, slot, &mut FakePort::new(script), &Timeouts::DEFAULT, &mut |_| {})
+    }
+
     fn run_t(cmd: Command, script: Vec<Option<Vec<u8>>>) -> Vec<String> {
-        let mut slot = None;
-        super::run(cmd, &mut slot, &mut FakePort::new(script), &Timeouts::DEFAULT, &mut |_| {})
+        run_in(&mut None, cmd, script)
     }
 
     #[test]
@@ -2414,9 +2419,8 @@ mod tests {
         assert_eq!(run_t(Command::Enroll(19), script), vec!["ERR VEIN RETAKE"]);
         // run は渡された組み立て中のものを使う
         let mut slot = None;
-        let mut port = FakePort::new(vec![]);
-        super::run(Command::SyncWrite(chunk_cmd(5, 0, &TEMPLATE_MAGIC)), &mut slot, &mut port, &Timeouts::DEFAULT, &mut |_| {});
-        let lines = super::run(Command::SyncWrite(chunk_cmd(5, 4, &[1])), &mut slot, &mut port, &Timeouts::DEFAULT, &mut |_| {});
+        run_in(&mut slot, Command::SyncWrite(chunk_cmd(5, 0, &TEMPLATE_MAGIC)), vec![]);
+        let lines = run_in(&mut slot, Command::SyncWrite(chunk_cmd(5, 4, &[1])), vec![]);
         assert_eq!(lines, vec!["VEIN SYNC WRITE 5 5"]);
     }
 
