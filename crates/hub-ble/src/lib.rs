@@ -782,8 +782,9 @@ async fn handle_device(
         .context("キャラクタリスティックが見つからない")?;
 
     // 血圧計は保存済みの過去測定をまとめて送ってくる。セッション中の測定を
-    // すべて貯め、最後に「最新 (タイムスタンプ最大) の 1 件」だけを recorder へ
-    // 送る。これで過去分が大量に記録されるのを防ぐ。
+    // すべて貯め、「最新 (タイムスタンプ最大) の 1 件」だけを recorder へ送る。
+    // これで過去分が大量に記録されるのを防ぐ。Omron 機は届くたびに見て、前に
+    // 送ったものより新しければ送り直す (ニプロ機は最後に 1 回だけ)。
     let got_data = Arc::new(AtomicBool::new(false));
     // 最終受信時刻 [ms, u32 切り詰め]。静穏時間の判定に使う (wrapping_sub で
     // 差分を取るため 49 日周期の折り返しは問題にならない)。
@@ -814,11 +815,24 @@ async fn handle_device(
     // (Arduino 版は canIndicate() 優先で登録)。CCCD はニプロ機では応答なしの書き込み、
     // Omron 機は応答あり (Write Request) でないと購読を無視する (Refs #237)
     let cccd_response = omron.is_some();
+    // Omron 機の送信。バッファに前回より新しい記録があれば最新 1 件を recorder へ送る。
+    // 購読の途中と購読後の待ちの両方から呼ぶ (on_notify は nimble_host タスクでスタックが
+    // 小さいので、そこからは呼ばない)
+    let mut sent_order = None;
+    let mut sent_n = 0u32;
+    let mut send_omron = || {
+        if let Some(order) = send_latest(&buffer, meas_tx, sent_order) {
+            sent_order = Some(order);
+            sent_n += 1;
+            alc_hub_common::evtlog::emit(&format!("EVT OMRON_SENT n={sent_n}"));
+        }
+    };
     if omron.is_some() {
         // Omron 機は 0x2A35 だけの購読では記録を送らない。Linux で記録が届いた回と同じく、
         // 全 service の notify / indicate を GATT の並び順に全部購読する
-        // (0x2A35 には上の受信コールバックが付いている)
-        let n = omron_subscribe_all(client, &disconnected).await?;
+        // (0x2A35 には上の受信コールバックが付いている)。記録は購読の途中にも届くので、
+        // 1 本ごとに送信を見る
+        let n = omron_subscribe_all(client, &disconnected, &mut send_omron).await?;
         alc_hub_common::evtlog::emit(&format!("EVT OMRON_SUB n={n}"));
     } else if characteristic.can_indicate() {
         characteristic
@@ -850,18 +864,9 @@ async fn handle_device(
     // - 機器の自発切断: 受信済み分を転送して終了
     // - 無データのままタイムアウト: 張り付き防止のためこちらから切断
     // Omron 機は受信しても S3R から切らず、機器が切断するまで (上限 OMRON_SESSION_TIMEOUT_MS) 待つ。
-    // 機器が「送信済み」と見なすのは切断の後なので切らないが、値は静穏時間途切れた時点で
+    // 機器が「送信済み」と見なすのは切断の後なので切らないが、値は届いた時点で (購読の途中でも)
     // 最新 1 件を先に送る (切断を待つと画面に出るまで 5 秒ほど余計にかかる)
     let wait_start = now_ms();
-    let mut sent_order = None;
-    let mut sent_n = 0u32;
-    let mut send_omron = || {
-        if let Some(order) = send_latest(&buffer, meas_tx, sent_order) {
-            sent_order = Some(order);
-            sent_n += 1;
-            alc_hub_common::evtlog::emit(&format!("EVT OMRON_SENT n={sent_n}"));
-        }
-    };
     loop {
         if omron.is_some() {
             let by = if disconnected.is_set() {
@@ -870,13 +875,7 @@ async fn handle_device(
                 let _ = client.disconnect();
                 "timeout"
             } else {
-                if got_data.load(Ordering::SeqCst) {
-                    let quiet =
-                        u64::from((now_ms() as u32).wrapping_sub(last_rx.load(Ordering::SeqCst)));
-                    if quiet >= data_quiet_ms(kind) {
-                        send_omron();
-                    }
-                }
+                send_omron();
                 FreeRtos::delay_ms(100);
                 continue;
             };
@@ -1423,8 +1422,13 @@ fn wait_omron_ack(
 /// Linux で記録が届いた接続は 0x2A35 の CCCD を 0x2A2B より先に書いていて、逆順 (ESP32 の
 /// ハンドル順) の接続では 0x2A2B の notify すら来なかった。機器は 0x2A2B の購読を送信開始の
 /// 合図にしていて、そのとき 0x2A35 が未購読だと何も送らないと読める (Refs #237)。
-/// 1 本ごとに `EVT OMRON_SUB chr=<uuid> ok|err` を出す
-async fn omron_subscribe_all(client: &mut BLEClient, disconnected: &Disconnected) -> Result<usize> {
+/// ただし 2026-10-21 の実測では、記録は購読の途中 (0x2A2B より前) に届いていた。
+/// 1 本ごとに `EVT OMRON_SUB chr=<uuid> ok|err` を出し、`on_each` を呼ぶ (届いた記録の送信)
+async fn omron_subscribe_all(
+    client: &mut BLEClient,
+    disconnected: &Disconnected,
+    on_each: &mut impl FnMut(),
+) -> Result<usize> {
     fn log_sub(uuid: BleUuid, res: &Result<(), esp32_nimble::BLEError>) -> usize {
         let ok = match res {
             Ok(()) => true,
@@ -1458,6 +1462,7 @@ async fn omron_subscribe_all(client: &mut BLEClient, disconnected: &Disconnected
             }
             .await;
             n += log_sub(bpm_uuid, &res);
+            on_each();
 
             // 2. 0x1810 と 0x1805 以外を並び順に
             let services: Vec<_> = client.get_services().await?.collect();
@@ -1484,6 +1489,7 @@ async fn omron_subscribe_all(client: &mut BLEClient, disconnected: &Disconnected
                         chr.subscribe_notify(true).await
                     };
                     n += log_sub(chr_uuid, &res);
+                    on_each();
                 }
             }
 
@@ -1499,6 +1505,7 @@ async fn omron_subscribe_all(client: &mut BLEClient, disconnected: &Disconnected
             }
             .await;
             n += log_sub(ct_uuid, &res);
+            on_each();
 
             anyhow::Ok(n)
         })
