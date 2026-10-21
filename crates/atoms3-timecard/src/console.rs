@@ -140,6 +140,8 @@ fn handle_line(
         HostCommand::VeinFingerQuery => vein.finger_query(),
         #[cfg(feature = "vein")]
         HostCommand::VeinTest(cmd) => vein.test(cmd),
+        #[cfg(feature = "vein")]
+        HostCommand::VeinWrite(cmd) => vein.write(cmd),
         // 本機で意味を持たないコマンド (画面遷移 / 印刷 / BLE / Wi-Fi / CFG 等)
         other => {
             log::debug!("console: unsupported command: {other:?}");

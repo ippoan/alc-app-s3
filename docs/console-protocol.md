@@ -133,7 +133,7 @@ CoreS3 の `STATUS LAN=…` も同様 (行頭は互換のため変えない)。
 | `AUTH TICKET` | 端末登録の一回券。**`cores3` のみ** (運行者 PWA が USB 越しに繋がるのはここだけ)、他は `ERR AUTH TICKET: unsupported` |
 | `AUTH KEYGEN` / `AUTH PUBKEY` / `AUTH SIGN` / `AUTH SIGNBP` | 警告デバイス管理者認証用の ed25519 鍵 (Refs #205, #249) |
 | `WS URL` / `WS STATUS` | cf-alc-recorder 常時接続の URL 上書き / 状態 |
-| `VEIN CAPTURE` / `VEIN SAY <x>` / `VEIN FINGER?` / `VEIN TEST …` | `ERR VEIN: unsupported` — 指静脈を積む `vein` build だけがここを素通しして自前で答える (下記) |
+| `VEIN CAPTURE` / `VEIN SAY <x>` / `VEIN FINGER?` / `VEIN TEST …` (`WRITE` を含む) | `ERR VEIN: unsupported` — 指静脈を積む `vein` build だけがここを素通しして自前で答える (下記) |
 
 `AUTH SIGN` / `AUTH SIGNBP` の応答 (Refs #205, #249, #269):
 
@@ -179,12 +179,21 @@ ippoan/vein-match#20)。**モジュールは実機で未確認** — 手順は
 | `VEIN TEST ENROLL <id>` | **試験用**。モジュール自身の登録に ID `<id>` (**2〜9 だけ**。1 は読み取りの作業用で毎回消されるので不可。範囲外・数字でないものは `ERR VEIN: TEST の ID は 2〜9 の数字だけです`) で 1 回登録する: ID を CLEAR → ENROLL (読み取りと同じ引数) で止め、READ_ENROLL も削除もしない (モジュールに残る)。成功: `VEIN TEST ENROLLED <id>`、失敗: `ERR VEIN <reason>`。指を待つので最大 15 秒強 |
 | `VEIN TEST VERIFY <id>` | **試験用**。モジュール自身の 1:1 照合 (`0x17` VERIFY) を ID 指定で 1 回行う。指を待つ途中経過 (置いて・離して) は読み取りと同じに扱う。最終応答: `VEIN TEST VERIFY <id> RC=<応答データの 1 バイト目、16 進 2 桁> DATA=<残りの 16 進>` (`DATA` は先頭 32 バイト = 64 文字で切る)。`01 10` (非対応) は `ERR VEIN UNSUPPORTED`、他は `ERR VEIN <reason>`。**引数の並び (`bData[0..4]` = ID LE) と応答の形は推測 — 実機で確認**。VERIFY が指を待たず即座に「指が無い」系を返す機種かどうかも**実機で確認** (そうなら FINGER_STATE で指を待ってから送る形に直す) |
 | `VEIN TEST CLEAR <id>` | **試験用**。ID `<id>` の登録を消す (CLEAR_ENROLL)。成功: `VEIN TEST CLEARED <id>`、失敗: `ERR VEIN <reason>` (未登録の ID はモジュールの失敗コードがそのまま `RC=…` で返る) |
+| `VEIN TEST INFO <id>` | **試験用**。ID `<id>` (2〜9) の登録テンプレート数 (GET_ID_INFO `0x15`、§2.2.19) と READ_ENROLL (`0x22`) が返す大きさだけを 1 行で返す: `VEIN TEST INFO <id> TEMPLATES=<n> SIZE=<バイト数>` (空の ID は READ_ENROLL が失敗するので `SIZE=0`)。登録データそのものは返さない。失敗: `ERR VEIN <reason>` |
+| `VEIN TEST COPY <from> <to>` | **試験用**。`<from>` の登録データを READ_ENROLL + READ_DATA で読み、`<to>` へ WRITE_ENROLL (`0x23`、§2.2.27) + WRITE_DATA (`0x21`、§2.2.25) で書く (**フラッシュに書く**)。`<from>` `<to>` はどちらも 2〜9 で、同じ ID は `ERR VEIN: COPY には違う 2 つの ID (2〜9) が必要です`。成功: `VEIN TEST COPIED <from> <to> <バイト数>`。失敗: `ERR VEIN <reason>` |
+| `VEIN TEST WRITE <id> <offset> <hex>` | **試験用**。外から受けた登録データを `<id>` (2〜9) へ書くために、組み立て中のデータへ足す。`<hex>` は 1 行 **192 バイトまで** (384 文字。超えたら `ERR VEIN: WRITE は …`)。`<offset>` は今までに受けたバイト数 (最初は 0 で、0 は組み立てを最初からやり直す)。飛び・重なり・組み立て中の ID が違うときは `ERR VEIN WRITE_SEQ`、合計が 0x2000 バイトを超えると `ERR VEIN WRITE_TOO_BIG` で、どちらも組み立て中のものを捨てる。成功: `VEIN TEST WRITE <id> <次の offset>`。**ホストは応答を待ってから次の行を送る** (console の 1 行は 512 バイトまで、USB の受信リングは 1024 バイトのため。超えた行は黙って捨てられる) |
+| `VEIN TEST WRITE <id> END` | **試験用**。組み立てたデータの先頭が `DE ED DE ED` であることを確かめ (違えば `ERR VEIN WRITE_HEADER`、書かない)、WRITE_ENROLL + WRITE_DATA で `<id>` へ書く (**フラッシュに書く**)。成功: `VEIN TEST WRITTEN <id> <バイト数>`。組み立て中のものが無い / ID が違えば `ERR VEIN WRITE_SEQ` |
 
-試験用の 3 つは**モジュール自身の登録と照合で撮像を確かめる診断**で、運用の画面からは送らない。開発用の端末の画面の `window.alcVein` からだけ送る (機体の撮像・モジュールの照合の確かめは別の機体・別の指でも今後要るため、口は残す)。指の見張りと同じ UART なので、同じ読み取りスレッドの列で直列に処理する。
+**INFO / COPY / WRITE は ippoan/alc-app#436 の切り分け専用で、運用では使わない。** サーバーの承認済みの記録をモジュールの ID に書き戻して `VEIN TEST VERIFY` させ、「照合の計算が違う (①)」か「モジュールが READ_ENROLL に出さないデータで照合している (②)」かを決めるためのもの。**① / ② の切り分けが済んだら、COPY・WRITE・INFO は外す (別 PR)**。
+
+- **受け取った WRITE の hex は、どこにも出さない**: 応答・`ERR` の行・crash_log・リング・EVT・PWALOG のいずれにも書かない (エラー文は offset と理由だけ。コマンドの `Debug` は大きさだけ)
+- 引数の並びは Waveshare の公開仕様 Ver 2.3 のとおり (GET_ID_INFO / READ_ENROLL は `bData[0..4]` = ID LE、WRITE_ENROLL は ID LE + 大きさ LE の 8 バイト、WRITE_DATA は種別 + オフセット + 大きさの 9 バイト + 本体 + 本体の和)。**推測・実機で確認**: WRITE_DATA の「種別」に WRITE_ENROLL の `0x23` を入れること (仕様の表に従ったが、本文の備考は READ_ENROLL のまま)、WRITE_DATA 1 塊の応答が 24 バイトのパケットで来ること、書き込みに `data_ms` (1 秒) で足りること、INFO の `SIZE` を `bData[1..5]` の 4 バイトで読むこと
+
+試験用のコマンドは**モジュール自身の登録と照合で撮像を確かめる診断**で、運用の画面からは送らない。開発用の端末の画面の `window.alcVein` からだけ送る (機体の撮像・モジュールの照合の確かめは別の機体・別の指でも今後要るため、口は残す)。指の見張りと同じ UART なので、同じ読み取りスレッドの列で直列に処理する。
 
 `<reason>`: `NO_MODULE` (接続に応答なし) / `TIMEOUT` (途中で応答が途絶えた) /
 `NO_FINGER` (指が置かれずモジュールが待ちを打ち切った) / `READ_FAIL` (応答の破損・
-読み直しの上限・登録データから特徴量 1 件を取り出せない) / `RC=<hex 2 桁>` (モジュールのエラーコード) / `UNSUPPORTED` (試験用 VERIFY がコマンド非対応 `01 10`)。`VEIN CAPTURE` は
+読み直しの上限・登録データから特徴量 1 件を取り出せない) / `RC=<hex 2 桁>` (モジュールのエラーコード) / `UNSUPPORTED` (試験用 VERIFY がコマンド非対応 `01 10`) / `WRITE_SEQ`・`WRITE_TOO_BIG`・`WRITE_HEADER` (試験用 WRITE の組み立ての誤り)。`VEIN CAPTURE` は
 指を待つので**応答まで最大 15 秒強かかる** (途中経過 1 つにつき 15 秒)。続けて
 送った分は順に処理する。`VEIN SAY` は読み取り中でもすぐ鳴る。
 

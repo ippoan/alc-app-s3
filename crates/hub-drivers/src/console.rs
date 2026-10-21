@@ -485,7 +485,8 @@ pub fn handle_common(
         HostCommand::VeinCapture
         | HostCommand::VeinSay(_)
         | HostCommand::VeinFingerQuery
-        | HostCommand::VeinTest(_) => {
+        | HostCommand::VeinTest(_)
+        | HostCommand::VeinWrite(_) => {
             println!("{}", alc_hub_core::vein::UNSUPPORTED_LINE)
         }
         other => return Some(other),

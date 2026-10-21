@@ -7,8 +7,10 @@
 //! - UART を開き、[`alc_hub_core::vein::Port`] として渡す
 //! - `VEIN CAPTURE` を受けて読み取る専用スレッド。結果は 1 行
 //!   (`VEIN CHARA <hex>` / `ERR VEIN <reason>`) でホストへ出す
-//! - `VEIN TEST ENROLL|VERIFY|CLEAR <id>` (試験用): モジュール自身の登録と照合で撮像を確かめる
-//!   診断。同じ読み取りスレッドで直列に捌く (結果は `VEIN TEST …` / `ERR VEIN <reason>`)
+//! - `VEIN TEST ENROLL|VERIFY|CLEAR|INFO|COPY <id>…` (試験用): モジュール自身の登録と照合で撮像を
+//!   確かめる診断。同じ読み取りスレッドで直列に捌く (結果は `VEIN TEST …` / `ERR VEIN <reason>`)
+//! - `VEIN TEST WRITE <id> <offset> <hex>|END` (試験用): 外から受けた登録データをモジュールの
+//!   ID へ書く。組み立て中のデータはこのスレッドが持つ。**受けたデータはログにも応答にも出さない**
 //! - `VEIN SAY <x>` を再生スレッド (speaker) へ取り次ぐ
 //!
 //! **指の見張り** (ippoan/alc-app#436): 読み取りスレッドは依頼が無い回だけ指の有無を
@@ -55,6 +57,8 @@ enum Request {
     Finger,
     /// `VEIN TEST ENROLL|VERIFY|CLEAR <id>` (試験用。指の見張りと同じ UART なので同じ列で直列に捌く)
     Test(proto::TestCommand),
+    /// `VEIN TEST WRITE …` (試験用。同じく直列。データは Debug に出ない型)
+    Write(proto::WriteCommand),
 }
 
 /// console から読み取りスレッドと再生スレッドへの口。clone して配る
@@ -86,6 +90,13 @@ impl Link {
     /// `VEIN TEST …`。結果は読み取りスレッドが後から 1 行で出す
     pub fn test(&self, cmd: proto::TestCommand) {
         if self.capture_tx.send(Request::Test(cmd)).is_err() {
+            println!("{}", proto::err_line(VeinError::NoModule));
+        }
+    }
+
+    /// `VEIN TEST WRITE …`。結果は読み取りスレッドが後から 1 行で出す
+    pub fn write(&self, cmd: proto::WriteCommand) {
+        if self.capture_tx.send(Request::Write(cmd)).is_err() {
             println!("{}", proto::err_line(VeinError::NoModule));
         }
     }
@@ -167,6 +178,8 @@ pub fn start(
             // 非対応と分かったら見張りをやめる (`VEIN FINGER?` と読み取りは受け続ける)
             let mut watching = true;
             let mut was_failing = false;
+            // `VEIN TEST WRITE` で組み立て中の登録データ (ヒープ。最大 8KB)
+            let mut assembling: Option<proto::TemplateAssembler> = None;
             loop {
                 let req = match capture_rx
                     .recv_timeout(Duration::from_millis(u64::from(watch.interval_ms())))
@@ -234,11 +247,28 @@ pub fn start(
                         proto::TestCommand::Clear(id) => {
                             proto::test_clear(&mut port, t, id).map(|()| proto::test_cleared_line(id))
                         }
+                        proto::TestCommand::Info(id) => proto::test_info(&mut port, t, id)
+                            .map(|(count, size)| proto::test_info_line(id, count, size)),
+                        proto::TestCommand::Duplicate { from, to } => {
+                            proto::test_copy(&mut port, t, from, to)
+                                .map(|len| proto::test_copied_line(from, to, len))
+                        }
                     }
                     .unwrap_or_else(proto::err_line);
                     emit_whole_line(&line);
                     // モジュール側の状態が変わったので、接続し直して「無い」を見るまで見張りは出さない
                     watch.after_capture();
+                    continue;
+                }
+                if let Request::Write(cmd) = req {
+                    // 受けたデータはここから先どこにも出さない (応答は offset と件数だけ)
+                    let line = proto::test_write(&mut assembling, &mut port, &Timeouts::DEFAULT, cmd)
+                        .unwrap_or_else(proto::err_line);
+                    emit_whole_line(&line);
+                    // END でモジュールに書いたときだけ状態が変わる。途中の塊は UART に触れていない
+                    if assembling.is_none() {
+                        watch.after_capture();
+                    }
                     continue;
                 }
                 // 登録データ (1:N のテンプレート) から 0xBDBD の特徴量 1 件を取り出して送る
