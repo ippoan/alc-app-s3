@@ -30,7 +30,7 @@
 //!
 //! # 照合をモジュールで行う本番の口 (ippoan/alc-app#436 の M-b)
 //!
-//! 新経路では照合をモジュール自身の 1:N (VERIFY 0) に任せ、モジュールの ID 2〜100 に
+//! 新経路では照合をモジュール自身の 1:N (VERIFY 0) に任せ、モジュールの ID 10〜100 に
 //! 乗務員の記録を置く ([`Command`] / [`run`])。`VEIN ENROLL` は登録の直後に置き直して照合し、
 //! 全部当たったときだけ記録全体 (READ_ENROLL の全体) を `VEIN RECORD` 行で返す
 //! (登録は 1 回ごとに当たり外れがあるため)。サーバーはその記録を保存し、ほかの端末へは
@@ -103,8 +103,9 @@ pub const ENROLL_RETRIES: u8 = 2;
 pub const TEST_ID_MIN: u32 = 2;
 pub const TEST_ID_MAX: u32 = 9;
 /// 本番の口 (`VEIN ENROLL` / `VEIN SYNC …`) が使う ID の範囲。モジュールの上限は 100 人
-/// (2026-10-21 実機の GET_ENROLL_INFO)、1 は作業用 ([`SCRATCH_ID`])
-pub const MODULE_ID_MIN: u32 = 2;
+/// (2026-10-21 実機の GET_ENROLL_INFO)。1 は作業用 ([`SCRATCH_ID`])、2〜9 は試験用
+/// ([`TEST_ID_MIN`]〜[`TEST_ID_MAX`]。確認タブの試験が本番の登録を上書きしないよう重ねない)
+pub const MODULE_ID_MIN: u32 = 10;
 pub const MODULE_ID_MAX: u32 = 100;
 /// `VEIN ENROLL` で登録の後に置き直して照合する回数。**全部当たったときだけ採用する**
 /// (モジュールの登録は 1 回ごとに当たり外れがあるため。2026-10-21 実機)
@@ -685,7 +686,7 @@ pub fn parse_test_id(s: &str) -> Option<u32> {
     parse_id_in(s, TEST_ID_MIN, TEST_ID_MAX)
 }
 
-/// 本番の口の ID を読む。[`MODULE_ID_MIN`]〜[`MODULE_ID_MAX`] の数字だけ (1 は作業用なので不可)
+/// 本番の口の ID を読む。[`MODULE_ID_MIN`]〜[`MODULE_ID_MAX`] の数字だけ (1 は作業用、2〜9 は試験用なので不可)
 pub fn parse_module_id(s: &str) -> Option<u32> {
     parse_id_in(s, MODULE_ID_MIN, MODULE_ID_MAX)
 }
@@ -2235,13 +2236,13 @@ mod tests {
         let data = sample_chara(1100);
         let mut script = vec![connected(), cleared(), enrolled()];
         // 1 回目: まだ置かれている → 離れた → 照合
-        script.extend([finger(Some(1)), finger(Some(0)), verified(Some(7))]);
+        script.extend([finger(Some(1)), finger(Some(0)), verified(Some(17))]);
         // 2 回目: すぐ離れている → 照合
-        script.extend([finger(Some(0)), verified(Some(7)), size(1100)]);
+        script.extend([finger(Some(0)), verified(Some(17)), size(1100)]);
         for (off, len) in chunks(1100) {
             script.push(Some(chunk(&data[off..off + len])));
         }
-        let (r, port, prompts) = run_enroll(script, 7);
+        let (r, port, prompts) = run_enroll(script, 17);
         assert_eq!(r, Ok(data));
         assert_eq!(
             prompts,
@@ -2258,80 +2259,80 @@ mod tests {
         );
         // 接続 → 削除 → 登録 → 指 ×2 → 照合 → 指 → 照合 → READ_ENROLL → READ_DATA ×3。最後の削除はしない
         assert_eq!(port.sent.len(), 12);
-        assert_eq!(&port.sent[2][3..10], &[CMD_ENROLL, 0, 12, 7, 0, 0, 0]);
+        assert_eq!(&port.sent[2][3..10], &[CMD_ENROLL, 0, 12, 17, 0, 0, 0]);
         assert_eq!(port.sent[3], command(CMD_FINGER_STATE, &[]).to_vec());
-        assert_eq!(port.sent[5], command(CMD_VERIFY, &[7, 0, 0, 0]).to_vec());
-        assert_eq!(port.sent[7], command(CMD_VERIFY, &[7, 0, 0, 0]).to_vec());
-        assert_eq!(&port.sent[8][3..10], &[CMD_READ_ENROLL, 0, 4, 7, 0, 0, 0]);
+        assert_eq!(port.sent[5], command(CMD_VERIFY, &[17, 0, 0, 0]).to_vec());
+        assert_eq!(port.sent[7], command(CMD_VERIFY, &[17, 0, 0, 0]).to_vec());
+        assert_eq!(&port.sent[8][3..10], &[CMD_READ_ENROLL, 0, 4, 17, 0, 0, 0]);
         // 置かれている間だけ 200ms 待った
         assert_eq!(port.pauses, vec![RELEASE_POLL_MS]);
     }
 
     #[test]
     fn enroll_miss_clears_the_id_and_asks_to_retake() {
-        let clear_7 = command(CMD_CLEAR_ENROLL, &[7, 0, 0, 0]).to_vec();
+        let clear_17 = command(CMD_CLEAR_ENROLL, &[17, 0, 0, 0]).to_vec();
         // 1 回目で外れ
         let script = vec![connected(), cleared(), enrolled(), finger(Some(0)), verified(None), cleared_ok()];
-        let (r, port, prompts) = run_enroll(script, 7);
+        let (r, port, prompts) = run_enroll(script, 17);
         assert_eq!(r, Err(VeinError::Retake));
         assert_eq!(port.sent.len(), 6);
-        assert_eq!(port.sent[5], clear_7);
+        assert_eq!(port.sent[5], clear_17);
         assert_eq!(prompts.last(), Some(&Prompt::Release));
         // 2 回目で外れ
-        let mut script = enroll_head(7);
+        let mut script = enroll_head(17);
         script.extend([finger(Some(0)), verified(None), cleared_ok()]);
-        let (r, port, _) = run_enroll(script, 7);
+        let (r, port, _) = run_enroll(script, 17);
         assert_eq!(r, Err(VeinError::Retake));
         assert_eq!(port.sent.len(), 8);
-        assert_eq!(port.sent[7], clear_7);
+        assert_eq!(port.sent[7], clear_17);
     }
 
     #[test]
     fn enroll_failures_after_registering_clear_the_id() {
-        let clear_7 = command(CMD_CLEAR_ENROLL, &[7, 0, 0, 0]).to_vec();
+        let clear_17 = command(CMD_CLEAR_ENROLL, &[17, 0, 0, 0]).to_vec();
         // 指が離れないまま 10 秒
         let mut script = vec![connected(), cleared(), enrolled()];
         script.extend((0..RELEASE_POLLS).map(|_| finger(Some(1))));
         script.push(cleared_ok());
-        let (r, port, _) = run_enroll(script, 7);
+        let (r, port, _) = run_enroll(script, 17);
         assert_eq!(r, Err(VeinError::Timeout));
         assert_eq!(port.pauses.len(), RELEASE_POLLS);
-        assert_eq!(port.sent.last(), Some(&clear_7));
+        assert_eq!(port.sent.last(), Some(&clear_17));
         // 指の状態が非対応 / 応答が無い
         let unsupported = Some(reply(CMD_FINGER_STATE, &[XG_ERR_FAIL, XG_ERR_NO_SUPPORT]));
-        let (r, port, _) = run_enroll(vec![connected(), cleared(), enrolled(), unsupported, cleared_ok()], 7);
+        let (r, port, _) = run_enroll(vec![connected(), cleared(), enrolled(), unsupported, cleared_ok()], 17);
         assert_eq!(r, Err(VeinError::Unsupported));
-        assert_eq!(port.sent.last(), Some(&clear_7));
-        let (r, _, _) = run_enroll(vec![connected(), cleared(), enrolled(), None, cleared_ok()], 7);
+        assert_eq!(port.sent.last(), Some(&clear_17));
+        let (r, _, _) = run_enroll(vec![connected(), cleared(), enrolled(), None, cleared_ok()], 17);
         assert_eq!(r, Err(VeinError::Timeout));
         // 置き直しで指が来ない
         let timeout = Some(reply(CMD_VERIFY, &[XG_ERR_FAIL, XG_ERR_TIME_OUT]));
         let script = vec![connected(), cleared(), enrolled(), finger(Some(0)), timeout, cleared_ok()];
-        let (r, port, _) = run_enroll(script, 7);
+        let (r, port, _) = run_enroll(script, 17);
         assert_eq!(r, Err(VeinError::NoFinger));
-        assert_eq!(port.sent.last(), Some(&clear_7));
+        assert_eq!(port.sent.last(), Some(&clear_17));
         // 照合は通ったが記録が読めない
-        let mut script = enroll_head(7);
-        script.extend([finger(Some(0)), verified(Some(7))]);
+        let mut script = enroll_head(17);
+        script.extend([finger(Some(0)), verified(Some(17))]);
         script.extend([Some(reply(CMD_READ_ENROLL, &[XG_ERR_FAIL, 0x0A])), cleared_ok()]);
-        let (r, port, _) = run_enroll(script, 7);
+        let (r, port, _) = run_enroll(script, 17);
         assert_eq!(r, Err(VeinError::Rc(0x0A)));
-        assert_eq!(port.sent.last(), Some(&clear_7));
+        assert_eq!(port.sent.last(), Some(&clear_17));
         // 外れの後の削除が送れなくても、返すのは外れ (7 回目の送信 = 削除)
         let script = vec![connected(), cleared(), enrolled(), finger(Some(1)), finger(Some(0)), verified(None)];
         let mut port = FailAt(FakePort::new(script), 7);
-        assert_eq!(enroll(&mut port, &Timeouts::DEFAULT, 7, &mut |_| {}), Err(VeinError::Retake));
-        assert_eq!(port.0.sent.last(), Some(&clear_7));
+        assert_eq!(enroll(&mut port, &Timeouts::DEFAULT, 17, &mut |_| {}), Err(VeinError::Retake));
+        assert_eq!(port.0.sent.last(), Some(&clear_17));
         assert_eq!(port.0.pauses, vec![RELEASE_POLL_MS]);
     }
 
     #[test]
     fn enroll_failures_before_registering_do_not_clear_again() {
-        let (r, port, _) = run_enroll(vec![None], 7);
+        let (r, port, _) = run_enroll(vec![None], 17);
         assert_eq!(r, Err(VeinError::NoModule));
         assert_eq!(port.sent.len(), 1);
         let timeout = Some(reply(CMD_ENROLL, &[XG_ERR_FAIL, XG_ERR_TIME_OUT]));
-        let (r, port, _) = run_enroll(vec![connected(), cleared(), timeout], 7);
+        let (r, port, _) = run_enroll(vec![connected(), cleared(), timeout], 17);
         assert_eq!(r, Err(VeinError::NoFinger));
         assert_eq!(port.sent.len(), 3);
     }
@@ -2371,13 +2372,13 @@ mod tests {
     #[test]
     fn record_lines_split_by_1024_bytes_and_end_with_the_total() {
         let rec: Vec<u8> = (0..1027u32).map(|i| i as u8).collect();
-        let lines = record_lines(7, &rec);
+        let lines = record_lines(17, &rec);
         assert_eq!(lines.len(), 3);
-        // "VEIN RECORD 7 0 " (16 文字) + 1024 バイト = 2048 文字
-        assert_eq!(lines[0].len(), 16 + 2048);
-        assert!(lines[0].starts_with("VEIN RECORD 7 0 000102030405"));
-        assert_eq!(lines[1], "VEIN RECORD 7 1024 000102");
-        assert_eq!(lines[2], "VEIN RECORD 7 END 1027");
+        // "VEIN RECORD 17 0 " (17 文字) + 1024 バイト = 2048 文字
+        assert_eq!(lines[0].len(), 17 + 2048);
+        assert!(lines[0].starts_with("VEIN RECORD 17 0 000102030405"));
+        assert_eq!(lines[1], "VEIN RECORD 17 1024 000102");
+        assert_eq!(lines[2], "VEIN RECORD 17 END 1027");
         // 実機の大きさ (8156 バイト) は 8 行 + END。最長の行 (offset 6144) は 21 + 2048 = 2069 文字
         let lines = record_lines(100, &[0xAB; 8156]);
         assert_eq!(lines.len(), 9);
@@ -2394,11 +2395,11 @@ mod tests {
     #[test]
     fn run_returns_the_lines_of_each_command() {
         let data = sample_chara(4);
-        let mut script = enroll_head(9);
-        script.extend([finger(Some(0)), verified(Some(9)), size(4), Some(chunk(&data))]);
+        let mut script = enroll_head(19);
+        script.extend([finger(Some(0)), verified(Some(19)), size(4), Some(chunk(&data))]);
         assert_eq!(
-            run_t(Command::Enroll(9), script),
-            vec!["VEIN RECORD 9 0 DEEDDEED".to_string(), "VEIN RECORD 9 END 4".to_string()]
+            run_t(Command::Enroll(19), script),
+            vec!["VEIN RECORD 19 0 DEEDDEED".to_string(), "VEIN RECORD 19 END 4".to_string()]
         );
         assert_eq!(run_t(Command::Identify, vec![connected(), verified(Some(3))]), vec!["VEIN IDENTIFIED 3"]);
         assert_eq!(run_t(Command::Identify, vec![connected(), verified(None)]), vec!["VEIN NOMATCH"]);
@@ -2406,11 +2407,11 @@ mod tests {
             run_t(Command::SyncWrite(chunk_cmd(5, 0, &TEMPLATE_MAGIC)), vec![]),
             vec!["VEIN SYNC WRITE 5 4"]
         );
-        assert_eq!(run_t(Command::SyncClear(5), vec![connected(), cleared_ok()]), vec!["VEIN SYNC CLEARED 5"]);
+        assert_eq!(run_t(Command::SyncClear(15), vec![connected(), cleared_ok()]), vec!["VEIN SYNC CLEARED 15"]);
         // 失敗は ERR の 1 行だけ (記録は出さない)
-        assert_eq!(run_t(Command::SyncClear(5), vec![None]), vec!["ERR VEIN NO_MODULE"]);
+        assert_eq!(run_t(Command::SyncClear(15), vec![None]), vec!["ERR VEIN NO_MODULE"]);
         let script = vec![connected(), cleared(), enrolled(), finger(Some(0)), verified(None), cleared_ok()];
-        assert_eq!(run_t(Command::Enroll(9), script), vec!["ERR VEIN RETAKE"]);
+        assert_eq!(run_t(Command::Enroll(19), script), vec!["ERR VEIN RETAKE"]);
         // run は渡された組み立て中のものを使う
         let mut slot = None;
         let mut port = FakePort::new(vec![]);
@@ -2421,9 +2422,10 @@ mod tests {
 
     #[test]
     fn module_id_range() {
-        assert_eq!(parse_module_id("2"), Some(2));
+        assert_eq!(parse_module_id("10"), Some(10));
         assert_eq!(parse_module_id("100"), Some(100));
-        for bad in ["1", "0", "101", "", "-2", "+2", "2a", " 2", "99999999999"] {
+        // 1 (作業用)・2〜9 (試験用)・範囲外・数字でないものは不可
+        for bad in ["1", "2", "9", "0", "101", "", "-10", "+10", "10a", " 10", "99999999999"] {
             assert_eq!(parse_module_id(bad), None, "{bad:?}");
         }
         assert_eq!(err_line(VeinError::Retake), "ERR VEIN RETAKE");
