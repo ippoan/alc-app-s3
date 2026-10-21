@@ -9,6 +9,12 @@
 //!   (`VEIN CHARA <hex>` / `ERR VEIN <reason>`) でホストへ出す
 //! - `VEIN SAY <x>` を再生スレッド (speaker) へ取り次ぐ
 //!
+//! **指の見張り** (ippoan/alc-app#436): 読み取りスレッドは依頼が無い回だけ指の有無を
+//! 問い合わせ ([`proto::FingerWatch`])、「無い → 有る」に変わったときに `EVT VEIN FINGER` を
+//! 1 行出す。照合 (`VEIN CAPTURE`) を始めるのは画面。UART に触るのはこのスレッドだけなので、
+//! 読み取り中は問い合わせない (直列)。非対応 (`01 10`) なら `EVT VEIN FINGER UNSUPPORTED`
+//! を 1 回出して見張りをやめる
+//!
 //! **案内音声は読み取りと切り離してある** — 何をいつ鳴らすか (登録の 2 回読み・照合の
 //! 失敗時など) はホスト (alc-app) が決める。`VEIN SAY` は読み取り中でも
 //! すぐ鳴る (読み取りスレッドの列に並ばない)。例外は「離して」のビープと撮り直しの
@@ -20,8 +26,9 @@
 //! 触らないため。
 
 use std::io::Write;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use anyhow::Result;
 use esp_idf_svc::hal::{
@@ -38,10 +45,18 @@ use crate::speaker::Sound;
 /// モジュールの UART 速度 (57600bps 8N1。Waveshare Wiki / vein-base README)
 pub const BAUD: u32 = 57_600;
 
+/// console から読み取りスレッドへの依頼
+enum Request {
+    /// `VEIN CAPTURE`
+    Capture,
+    /// `VEIN FINGER?`
+    Finger,
+}
+
 /// console から読み取りスレッドと再生スレッドへの口。clone して配る
 #[derive(Clone)]
 pub struct Link {
-    capture_tx: Sender<()>,
+    capture_tx: Sender<Request>,
     /// 再生スレッドの送信口。音は UART より後に立つので、立ったら
     /// [`Link::set_speaker`] で入れる (初期化に失敗したら空のまま)
     speaker: Arc<OnceLock<Sender<Sound>>>,
@@ -51,8 +66,15 @@ impl Link {
     /// `VEIN CAPTURE`。結果は読み取りスレッドが後から 1 行で出す。
     /// 続けて届いた分は順番に読む (同時には読まない)
     pub fn capture(&self) {
-        if self.capture_tx.send(()).is_err() {
+        if self.capture_tx.send(Request::Capture).is_err() {
             // 読み取りスレッドが居ない = モジュールへ届かない
+            println!("{}", proto::err_line(VeinError::NoModule));
+        }
+    }
+
+    /// `VEIN FINGER?`。指の有無を 1 回問い合わせる。結果は読み取りスレッドが後から 1 行で出す
+    pub fn finger_query(&self) {
+        if self.capture_tx.send(Request::Finger).is_err() {
             println!("{}", proto::err_line(VeinError::NoModule));
         }
     }
@@ -114,7 +136,7 @@ pub fn start(
         Option::<AnyIOPin>::None,
         &cfg,
     )?;
-    let (capture_tx, capture_rx) = mpsc::channel::<()>();
+    let (capture_tx, capture_rx) = mpsc::channel::<Request>();
     // 再生スレッドの送信口。読み取りスレッドも「離して」のビープに使う
     let speaker: Arc<OnceLock<Sender<Sound>>> = Arc::new(OnceLock::new());
     let beeper = Arc::clone(&speaker);
@@ -130,7 +152,55 @@ pub fn start(
         .stack_size(32 * 1024)
         .spawn(move || {
             let mut port = UartPort(driver);
-            while capture_rx.recv().is_ok() {
+            let mut watch = proto::FingerWatch::new();
+            // 非対応と分かったら見張りをやめる (`VEIN FINGER?` と読み取りは受け続ける)
+            let mut watching = true;
+            let mut was_failing = false;
+            loop {
+                let req = match capture_rx
+                    .recv_timeout(Duration::from_millis(u64::from(watch.interval_ms())))
+                {
+                    Ok(req) => req,
+                    Err(RecvTimeoutError::Timeout) => {
+                        // 依頼が無い回だけ問い合わせる
+                        if watching {
+                            match watch.poll(&mut port, &Timeouts::DEFAULT) {
+                                proto::WatchPoll::Idle => {}
+                                proto::WatchPoll::Finger => {
+                                    alc_hub_common::evtlog::emit("EVT VEIN FINGER")
+                                }
+                                proto::WatchPoll::Unsupported => {
+                                    watching = false;
+                                    log::warn!(
+                                        "vein: 指の状態コマンドが非対応 (01 10)。見張りをやめる"
+                                    );
+                                    alc_hub_common::evtlog::emit("EVT VEIN FINGER UNSUPPORTED");
+                                }
+                            }
+                            // ログは状態が変わったときだけ
+                            if watch.is_failing() != was_failing {
+                                was_failing = watch.is_failing();
+                                if was_failing {
+                                    log::warn!("vein: 指の問い合わせが続けて失敗。間隔を延ばす");
+                                } else {
+                                    log::info!("vein: 指の問い合わせが戻った");
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                };
+                if let Request::Finger = req {
+                    let line = match proto::connect(&mut port, &Timeouts::DEFAULT) {
+                        Ok(()) => {
+                            proto::finger_line(proto::finger_state(&mut port, &Timeouts::DEFAULT))
+                        }
+                        Err(e) => proto::err_line(e),
+                    };
+                    emit_whole_line(&line);
+                    continue;
+                }
                 let mut on_prompt = |p: proto::Prompt| {
                     // 「離して」はビープ、撮り直しは「もう一度置いてください」。どちらも
                     // モジュールの途中経過でしか分からないので端末が鳴らす
@@ -160,6 +230,8 @@ pub fn start(
                     }
                 };
                 emit_whole_line(&line);
+                // 撮った直後の同じ指で次の合図が出ないよう、離れるまで待つ (接続も張り直す)
+                watch.after_capture();
             }
         })?;
     Ok(Link {

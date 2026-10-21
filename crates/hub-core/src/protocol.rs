@@ -259,6 +259,9 @@ pub enum HostCommand {
     VeinCapture,
     /// 案内音声を鳴らす (`OK VEIN SAY <x>`)。いつ何を鳴らすかはホストが決める
     VeinSay(crate::vein::VeinVoice),
+    /// 指の有無を 1 回だけ問い合わせる (`VEIN FINGER?`)。応答は `VEIN FINGER 0|1` /
+    /// `ERR VEIN UNSUPPORTED` / `ERR VEIN <reason>`。実機で指の状態コマンドが通るかの確認用
+    VeinFingerQuery,
 }
 
 /// PC (運行者タブ) の点呼の段 (`STAGE NFC|TEMP|ALCOHOL|CARINS|PC`)。
@@ -553,7 +556,8 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                     return Err("ERR VEIN: SAY には PLACE|AGAIN|ENROLLED|FAILED が必要です".into())
                 }
             },
-            _ => return Err("ERR VEIN: CAPTURE|SAY が必要です".into()),
+            Some("FINGER?") => HostCommand::VeinFingerQuery,
+            _ => return Err("ERR VEIN: CAPTURE|SAY|FINGER? が必要です".into()),
         },
         // `PAIR` または `BLE PAIR`
         "PAIR" => HostCommand::BlePair,
@@ -1471,9 +1475,19 @@ mod tests {
         assert!(parse_line("VEIN SAY HELLO", T).is_err());
         assert_eq!(
             parse_line("VEIN", T),
-            Err("ERR VEIN: CAPTURE|SAY が必要です".into())
+            Err("ERR VEIN: CAPTURE|SAY|FINGER? が必要です".into())
         );
         assert!(parse_line("VEIN ENROLL", T).is_err());
+        assert_eq!(
+            parse_line("VEIN FINGER?", T),
+            Ok(Some(HostCommand::VeinFingerQuery))
+        );
+        assert_eq!(
+            parse_line("vein finger?", T),
+            Ok(Some(HostCommand::VeinFingerQuery))
+        );
+        // `?` の無い形は受けない
+        assert!(parse_line("VEIN FINGER", T).is_err());
     }
 
     #[test]

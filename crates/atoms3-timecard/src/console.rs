@@ -23,6 +23,7 @@
 //! | `OMRON BP ON\|OFF` / `OMRON STATUS` | 血圧計 (HEM-6231T) を拾うか (共通実装、既定 OFF)。**ON にしたら再起動が要る** — main.rs 冒頭の「血圧計」節 |
 //! | `VEIN CAPTURE` | 指静脈を読む (`vein` feature)。`VEIN CHARA <hex>` / `ERR VEIN <reason>`。feature 無しは共通実装が `ERR VEIN: unsupported` |
 //! | `VEIN SAY PLACE\|AGAIN\|ENROLLED\|FAILED` | 案内音声 (`vein` feature)。`OK VEIN SAY <x>` |
+//! | `VEIN FINGER?` | 指の有無を 1 回問い合わせる (`vein` feature)。`VEIN FINGER 0\|1` / `ERR VEIN UNSUPPORTED` / `ERR VEIN <reason>` |
 
 use alc_hub_common::{
     config,
@@ -135,6 +136,8 @@ fn handle_line(
         HostCommand::VeinCapture => vein.capture(),
         #[cfg(feature = "vein")]
         HostCommand::VeinSay(voice) => vein.say(voice),
+        #[cfg(feature = "vein")]
+        HostCommand::VeinFingerQuery => vein.finger_query(),
         // 本機で意味を持たないコマンド (画面遷移 / 印刷 / BLE / Wi-Fi / CFG 等)
         other => {
             log::debug!("console: unsupported command: {other:?}");
