@@ -24,6 +24,7 @@
 //! | `VEIN CAPTURE` | 指静脈を読む (`vein` feature)。`VEIN CHARA <hex>` / `ERR VEIN <reason>`。feature 無しは共通実装が `ERR VEIN: unsupported` |
 //! | `VEIN SAY PLACE\|AGAIN\|ENROLLED\|FAILED` | 案内音声 (`vein` feature)。`OK VEIN SAY <x>` |
 //! | `VEIN FINGER?` | 指の有無を 1 回問い合わせる (`vein` feature)。`VEIN FINGER 0\|1` / `ERR VEIN UNSUPPORTED` / `ERR VEIN <reason>` |
+//! | `VEIN ENROLL <id>` / `VEIN IDENTIFY` / `VEIN SYNC WRITE\|CLEAR …` | 照合をモジュールで行う本番の口 (`vein` feature、ippoan/alc-app#436)。行の形は docs/console-protocol.md |
 
 use alc_hub_common::{
     config,
@@ -141,7 +142,7 @@ fn handle_line(
         #[cfg(feature = "vein")]
         HostCommand::VeinTest(cmd) => vein.test(cmd),
         #[cfg(feature = "vein")]
-        HostCommand::VeinWrite(cmd) => vein.write(cmd),
+        HostCommand::Vein(cmd) => vein.run(cmd),
         // 本機で意味を持たないコマンド (画面遷移 / 印刷 / BLE / Wi-Fi / CFG 等)
         other => {
             log::debug!("console: unsupported command: {other:?}");

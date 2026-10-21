@@ -33,7 +33,7 @@ CoreS3 (`cores3`) はこれに `FC1200` (RS232 パススルー) / `CFG` (設定
 
 Vein Station の `vein` build (`timecard`) は `VEIN` (指静脈の特徴量、§4 の
 `VEIN CAPTURE`) が加わる。**この行は 2 千文字を超える** (特徴量 0x448 バイトなら
-2192 文字の 16 進) — ホストは行の長さで切り捨てないこと。
+2192 文字の 16 進。`VEIN ENROLL` の `VEIN RECORD` 行は最長 2069 文字) — ホストは行の長さで切り捨てないこと。
 
 ★ **ファームは応答行・`EVT ` 行を必ず改行から出す** (Refs ippoan/alc-app-s3#268)。
 起動直後は ESP-IDF のログ行が途中でバイトを落とすことがあり、そこへ応答が
@@ -133,7 +133,7 @@ CoreS3 の `STATUS LAN=…` も同様 (行頭は互換のため変えない)。
 | `AUTH TICKET` | 端末登録の一回券。**`cores3` のみ** (運行者 PWA が USB 越しに繋がるのはここだけ)、他は `ERR AUTH TICKET: unsupported` |
 | `AUTH KEYGEN` / `AUTH PUBKEY` / `AUTH SIGN` / `AUTH SIGNBP` | 警告デバイス管理者認証用の ed25519 鍵 (Refs #205, #249) |
 | `WS URL` / `WS STATUS` | cf-alc-recorder 常時接続の URL 上書き / 状態 |
-| `VEIN CAPTURE` / `VEIN SAY <x>` / `VEIN FINGER?` / `VEIN TEST …` (`WRITE` を含む) | `ERR VEIN: unsupported` — 指静脈を積む `vein` build だけがここを素通しして自前で答える (下記) |
+| `VEIN CAPTURE` / `VEIN SAY <x>` / `VEIN FINGER?` / `VEIN ENROLL` / `VEIN IDENTIFY` / `VEIN SYNC …` / `VEIN TEST …` | `ERR VEIN: unsupported` — 指静脈を積む `vein` build だけがここを素通しして自前で答える (下記) |
 
 `AUTH SIGN` / `AUTH SIGNBP` の応答 (Refs #205, #249, #269):
 
@@ -176,27 +176,26 @@ ippoan/vein-match#20)。**モジュールは実機で未確認** — 手順は
 | `VEIN CAPTURE` | 成功: **1 行で** `VEIN CHARA <hex>` (モジュールの登録データ (1:N のテンプレート、先頭 `DEEDDEED`) から取り出した 0xBDBD の特徴量 1 件の大文字 16 進。常に 0x448 バイト = 2192 文字。取り出せなければ `READ_FAIL`)。失敗: `ERR VEIN <reason>` |
 | `VEIN SAY PLACE\|AGAIN\|ENROLLED\|FAILED` | 案内音声 (「指を置いてください」/「もう一度置いてください」/「登録完了しました」/「読み取れませんでした」) を鳴らし `OK VEIN SAY <x>`。スピーカーが起きていなければ `ERR VEIN NO_SPEAKER` |
 | `VEIN FINGER?` | 指の有無を 1 回だけ問い合わせる: `VEIN FINGER 1` (有る) / `VEIN FINGER 0` (無い) / `ERR VEIN UNSUPPORTED` (モジュールが `01 10` = コマンド非対応を返した) / `ERR VEIN <reason>` (下の `<reason>`)。**実機で指の状態コマンドが通るかを確かめる口** (下の「指の見張り」) |
+| `VEIN ENROLL <id>` | **本番の登録** (照合をモジュールで行う M-b、ippoan/alc-app#436)。`<id>` は **2〜100** (モジュールの上限 100 人、1 は作業用。範囲外・数字でないもの・余分な引数は `ERR VEIN: ENROLL の ID は 2〜100 の数字だけです`)。手順: 接続 → `<id>` を CLEAR → ENROLL (読み取りと同じ引数) → **[指が離れるのを FINGER_STATUS で待つ (200ms ごと、10 秒で離れなければ `TIMEOUT`) → VERIFY `<id>` (1:1)] を 2 回** → 2 回とも当たれば READ_ENROLL + READ_DATA で記録全体 (実機 8156 バイト、先頭 `DEEDDEED`) を読む (仕様書 §5.7 の「照合の後、指が離れるのを待ってから次の照合」と同じ形)。置き直しのたびに端末が「もう一度置いてください」を鳴らし、`EVT VEIN PLACE <回目>` (2 か 3) を 1 行出す。成功: 記録を 1024 バイトずつ `VEIN RECORD <id> <offset> <大文字 16 進>` (1 行最長 2069 文字。8156 バイトなら 8 行) で出し、最後に `VEIN RECORD <id> END <総バイト数>`。**行はモジュールから全部読み終えてから続けて出す** (途中に `ERR` は挟まらない)。ホストは END を見てから offset の連続と総バイト数を確かめて使う。照合が 1 回でも外れたら (モジュールの `01 0C`) `<id>` を CLEAR して `ERR VEIN RETAKE` (撮り直し)。登録の後のほかの失敗 (指が来ない・応答なし等) も `<id>` を CLEAR してから `ERR VEIN <reason>` (確かめていない登録をモジュールに残さない)。3 回置くので応答まで最長 1 分弱 |
+| `VEIN IDENTIFY` | **本番の照合**。モジュールの 1:N 照合 (VERIFY `0`、§2.2.21) を 1 回行う。指を待つ途中経過 (置いて・離して) は読み取りと同じに扱う。当たれば `VEIN IDENTIFIED <id>` (最終応答の `bData[1..5]` LE)、不一致 (`01 0C`) は `VEIN NOMATCH`、`01 10` は `ERR VEIN UNSUPPORTED`、ほかは `ERR VEIN <reason>`。引数を付けると `ERR VEIN: IDENTIFY に引数は要りません` |
+| `VEIN SYNC WRITE <id> <offset> <hex>` | **同期の書き込み** (サーバーの記録をモジュールの `<id>` (2〜100) へ書く)。組み立て中のデータへ足す。`<hex>` は 1 行 **192 バイトまで** (384 文字)。`<offset>` は今までに受けたバイト数 (最初は 0 で、0 は組み立てを最初からやり直す)。飛び・重なり・組み立て中の ID が違うときは `ERR VEIN WRITE_SEQ`、合計が 0x2000 バイトを超えると `ERR VEIN WRITE_TOO_BIG` で、どちらも組み立て中のものを捨てる。成功: `VEIN SYNC WRITE <id> <次の offset>`。**ホストは応答を待ってから次の行を送る** (console の 1 行は 512 バイトまで、USB の受信リングは 1024 バイトのため。超えた行は黙って捨てられる)。形の誤り (ID・offset・hex・192 バイト超) は `ERR VEIN: SYNC は …` |
+| `VEIN SYNC WRITE <id> END` | 組み立てたデータの先頭が `DE ED DE ED` であることを確かめ (違えば `ERR VEIN WRITE_HEADER`、書かない)、WRITE_ENROLL (`0x23`、§2.2.27) + WRITE_DATA (`0x21`、§2.2.25) で `<id>` へ書く (**フラッシュに書く**。512 バイトずつ、応答が成功でなければ 3 回まで送り直す)。成功: `VEIN SYNC WRITTEN <id> <バイト数>`。組み立て中のものが無い / ID が違えば `ERR VEIN WRITE_SEQ` |
+| `VEIN SYNC CLEAR <id>` | `<id>` (2〜100) の登録を消す (CLEAR_ENROLL)。成功: `VEIN SYNC CLEARED <id>`、失敗: `ERR VEIN <reason>` (未登録の ID はモジュールの失敗コードがそのまま `RC=…`) |
 | `VEIN TEST ENROLL <id>` | **試験用**。モジュール自身の登録に ID `<id>` (**2〜9 だけ**。1 は読み取りの作業用で毎回消されるので不可。範囲外・数字でないものは `ERR VEIN: TEST の ID は 2〜9 の数字だけです`) で 1 回登録する: ID を CLEAR → ENROLL (読み取りと同じ引数) で止め、READ_ENROLL も削除もしない (モジュールに残る)。成功: `VEIN TEST ENROLLED <id>`、失敗: `ERR VEIN <reason>`。指を待つので最大 15 秒強 |
 | `VEIN TEST VERIFY <id>` | **試験用**。モジュール自身の照合 (`0x17` VERIFY) を ID 指定で 1 回行う。**`<id>` は 0 か 2〜9 (VERIFY だけ 0 を許す。範囲外・数字でないものは `ERR VEIN: VERIFY の ID は 0 か 2〜9 の数字だけです`)。2〜9 は 1:1、`0` は 1:N (登録済み全員から探す、§2.2.21)。1:N の成功時は `DATA` の先頭 4 バイト (LE) が当たった ID**。指を待つ途中経過 (置いて・離して) は読み取りと同じに扱う。最終応答: `VEIN TEST VERIFY <id> RC=<応答データの 1 バイト目、16 進 2 桁> DATA=<残りの 16 進>` (`DATA` は先頭 32 バイト = 64 文字で切る)。`01 10` (非対応) は `ERR VEIN UNSUPPORTED`、他は `ERR VEIN <reason>`。**引数の並び (`bData[0..4]` = ID LE) と応答の形は推測 — 実機で確認**。VERIFY が指を待たず即座に「指が無い」系を返す機種かどうかも**実機で確認** (そうなら FINGER_STATE で指を待ってから送る形に直す) |
 | `VEIN TEST CAPACITY` | **試験用**。登録ユーザー数と登録できる上限を GET_ENROLL_INFO (`0x14`、§2.2.18、送る `bData` 無し) で読む。成功: `VEIN TEST CAPACITY USERS=<bData[1..5] LE> MAX=<bData[9..13] LE>`、失敗: `ERR VEIN <reason>`。引数を付けると `ERR VEIN: CAPACITY に引数は要りません`。生体データは含まない。**応答の読み方は仕様書どおりで、WS-FVS10 の実機では未確認** |
 | `VEIN TEST CLEAR <id>` | **試験用**。ID `<id>` の登録を消す (CLEAR_ENROLL)。成功: `VEIN TEST CLEARED <id>`、失敗: `ERR VEIN <reason>` (未登録の ID はモジュールの失敗コードがそのまま `RC=…` で返る) |
-| `VEIN TEST INFO <id>` | **試験用**。ID `<id>` (2〜9) の登録テンプレート数 (GET_ID_INFO `0x15`、§2.2.19) と READ_ENROLL (`0x22`) が返す大きさだけを 1 行で返す: `VEIN TEST INFO <id> TEMPLATES=<n> SIZE=<バイト数>` (空の ID は READ_ENROLL が失敗するので `SIZE=0`)。登録データそのものは返さない。失敗: `ERR VEIN <reason>` |
-| `VEIN TEST COPY <from> <to>` | **試験用**。`<from>` の登録データを READ_ENROLL + READ_DATA で読み、`<to>` へ WRITE_ENROLL (`0x23`、§2.2.27) + WRITE_DATA (`0x21`、§2.2.25) で書く (**フラッシュに書く**)。`<from>` `<to>` はどちらも 2〜9 で、同じ ID は `ERR VEIN: COPY には違う 2 つの ID (2〜9) が必要です`。成功: `VEIN TEST COPIED <from> <to> <バイト数>`。失敗: `ERR VEIN <reason>` |
-| `VEIN TEST REBUILD <a> [<b>] <to> [U]` | **試験用**。`<a>` (と `<b>`) の登録データを READ_ENROLL で読み、特徴量 (件の先頭 0x448 バイト) だけ取り出して、サーバー (画面の登録) と同じ作り直し (`create_template`、グループ 0・mode 1・詰め物なし) で記録を組み直し、`<to>` へ書く (**フラッシュに書く**)。ID が 2 つなら `<a>` の特徴量 1 つ (件の数 1)、3 つなら `<a>` と `<b>` の特徴量 (件の数 2、サーバーと同じ形)。`<a>` `<b>` `<to>` は 2〜9 で互いに違うこと (違反は `ERR VEIN: REBUILD は …`)。flag なしは利用者番号 0 (サーバーと同じ)、`U` は `<a>` の記録の外側ヘッダ +0x10 の値を使う。成功: `VEIN TEST REBUILT <to> <バイト数> SRC_USER=<a の +0x10> SRC_GROUP=<a の +0x16> SRC_COUNT=<a の +0x15> DIFF=<a の記録と作り直した記録の違うバイト数> FLAGS=<U か空>`。`SRC_*` は暗号化されていない見出しの数値。`DIFF` は件の数 1 のときだけ数え、件の数 2 や長さが違うときは `DIFF=-`。違う位置も中身も出さない。`<a>` が 2 件の記録など特徴量を 1 つに決められないとき、特徴量が読み込めないときは `ERR VEIN READ_FAIL`。失敗: `ERR VEIN <reason>` |
-| `VEIN TEST WRITE <id> <offset> <hex>` | **試験用**。外から受けた登録データを `<id>` (2〜9) へ書くために、組み立て中のデータへ足す。`<hex>` は 1 行 **192 バイトまで** (384 文字。超えたら `ERR VEIN: WRITE は …`)。`<offset>` は今までに受けたバイト数 (最初は 0 で、0 は組み立てを最初からやり直す)。飛び・重なり・組み立て中の ID が違うときは `ERR VEIN WRITE_SEQ`、合計が 0x2000 バイトを超えると `ERR VEIN WRITE_TOO_BIG` で、どちらも組み立て中のものを捨てる。成功: `VEIN TEST WRITE <id> <次の offset>`。**ホストは応答を待ってから次の行を送る** (console の 1 行は 512 バイトまで、USB の受信リングは 1024 バイトのため。超えた行は黙って捨てられる) |
-| `VEIN TEST WRITE <id> END` | **試験用**。組み立てたデータの先頭が `DE ED DE ED` であることを確かめ (違えば `ERR VEIN WRITE_HEADER`、書かない)、WRITE_ENROLL + WRITE_DATA で `<id>` へ書く (**フラッシュに書く**)。成功: `VEIN TEST WRITTEN <id> <バイト数>`。組み立て中のものが無い / ID が違えば `ERR VEIN WRITE_SEQ` |
 
-**INFO / COPY / WRITE / REBUILD は ippoan/alc-app#436 の切り分け専用で、運用では使わない。** サーバーの承認済みの記録をモジュールの ID に書き戻して `VEIN TEST VERIFY` させ、「照合の計算が違う (①)」か「モジュールが READ_ENROLL に出さないデータで照合している (②)」かを決めるためのもの。**① / ② の切り分けが済んだら、COPY・WRITE・INFO は外す (別 PR)**。REBUILD は「サーバーの作り直しのどの違い (件の数・利用者番号) が照合を壊すか」を機体の中で特定するためのもので、**差の出どころが分かり構成を決めたら、INFO / COPY / WRITE / REBUILD は 1 PR で外す** (ENROLL / VERIFY / CLEAR は指静脈の確認タブが使うので残す)。
+**`VEIN TEST` の INFO / COPY / WRITE / REBUILD は ippoan/alc-app#436 の切り分けが済んだので外した** (0.1.6)。WRITE は本番の口 `VEIN SYNC WRITE` として残る。
 
-- **受け取った WRITE の hex は、どこにも出さない**: 応答・`ERR` の行・crash_log・リング・EVT・PWALOG のいずれにも書かない (エラー文は offset と理由だけ。コマンドの `Debug` は大きさだけ)
-- **REBUILD の応答は生体データを含まない**: 出すのは `<a>` の外側ヘッダの数値 (利用者番号・件の数・グループ) と違うバイト数だけ。記録・特徴量・平文は応答・`ERR`・ログのどこにも出さない。`create_template` の失敗の番号も出さず `READ_FAIL` にまとめる
-- 引数の並びは Waveshare の公開仕様 Ver 2.3 のとおり (GET_ID_INFO / READ_ENROLL は `bData[0..4]` = ID LE、WRITE_ENROLL は ID LE + 大きさ LE の 8 バイト、WRITE_DATA は種別 + オフセット + 大きさの 9 バイト + 本体 + 本体の和)。**推測・実機で確認**: WRITE_DATA の「種別」に WRITE_ENROLL の `0x23` を入れること (仕様の表に従ったが、本文の備考は READ_ENROLL のまま)、WRITE_DATA 1 塊の応答が 24 バイトのパケットで来ること、書き込みに `data_ms` (1 秒) で足りること、INFO の `SIZE` を `bData[1..5]` の 4 バイトで読むこと
+- **生体データ (記録・特徴量) を出すのは `VEIN RECORD` 行 (と旧経路の `VEIN CHARA` 行) だけ**: 受け取った `SYNC WRITE` の hex・読んだ記録は `ERR` の行・crash_log・リング・EVT・PWALOG・ログのいずれにも書かない (エラー文は理由だけで受け取った語を含めない。コマンドの `Debug` は大きさだけ)
+- 引数の並びは Waveshare の公開仕様 Ver 2.3 のとおり (READ_ENROLL / VERIFY / CLEAR は `bData[0..4]` = ID LE、WRITE_ENROLL は ID LE + 大きさ LE の 8 バイト、WRITE_DATA は種別 + オフセット + 大きさの 9 バイト + 本体 + 本体の和)。VERIFY (1:1・1:N) は 0.1.5 の実機で確認済み。**推測・実機で確認**: WRITE_DATA の「種別」に WRITE_ENROLL の `0x23` を入れること (仕様の表に従ったが、本文の備考は READ_ENROLL のまま)、WRITE_DATA 1 塊の応答が 24 バイトのパケットで来ること、書き込みに `data_ms` (1 秒) で足りること、書き戻した記録が VERIFY で当たること
 
 試験用のコマンドは**モジュール自身の登録と照合で撮像を確かめる診断**で、運用の画面からは送らない。開発用の端末の画面の `window.alcVein` からだけ送る (機体の撮像・モジュールの照合の確かめは別の機体・別の指でも今後要るため、口は残す)。指の見張りと同じ UART なので、同じ読み取りスレッドの列で直列に処理する。
 
-`<reason>`: `NO_MODULE` (接続に応答なし) / `TIMEOUT` (途中で応答が途絶えた) /
+`<reason>`: `NO_MODULE` (接続に応答なし) / `TIMEOUT` (途中で応答が途絶えた・`VEIN ENROLL` で指が 10 秒離れない) /
 `NO_FINGER` (指が置かれずモジュールが待ちを打ち切った) / `READ_FAIL` (応答の破損・
-読み直しの上限・登録データから特徴量 1 件を取り出せない) / `RC=<hex 2 桁>` (モジュールのエラーコード) / `UNSUPPORTED` (試験用 VERIFY がコマンド非対応 `01 10`) / `WRITE_SEQ`・`WRITE_TOO_BIG`・`WRITE_HEADER` (試験用 WRITE の組み立ての誤り)。`VEIN CAPTURE` は
+読み直しの上限・登録データから特徴量 1 件を取り出せない) / `RC=<hex 2 桁>` (モジュールのエラーコード) / `UNSUPPORTED` (VERIFY・指の状態がコマンド非対応 `01 10`) / `RETAKE` (`VEIN ENROLL` の置き直し照合が外れた。登録は消してある) / `WRITE_SEQ`・`WRITE_TOO_BIG`・`WRITE_HEADER` (`VEIN SYNC WRITE` の組み立ての誤り)。`VEIN CAPTURE` は
 指を待つので**応答まで最大 15 秒強かかる** (途中経過 1 つにつき 15 秒)。続けて
 送った分は順に処理する。`VEIN SAY` は読み取り中でもすぐ鳴る。
 
@@ -207,6 +206,7 @@ ippoan/vein-match#20)。**モジュールは実機で未確認** — 手順は
 | 行 | 意味 |
 |---|---|
 | `EVT VEIN FINGER` | 指が置かれた。指が離れる (「無い」を見る) まで次は出ない。`VEIN CAPTURE` の後も、いったん「無い」を見るまで出ない。起動時から置かれている指でも出ない |
+| `EVT VEIN PLACE <回目>` | `VEIN ENROLL` の途中で、指が離れたのを見て次の照合に入るとき (`<回目>` は 2 か 3。1 回目は登録)。同時に端末が「もう一度置いてください」を鳴らす。生体データは含まない |
 | `EVT VEIN FINGER UNSUPPORTED` | モジュールが指の状態コマンドに `01 10` (コマンド非対応) を返した。**見張りをやめる** (再起動まで出ない)。1 回だけ出る |
 
 - 非対応と決めるのは `01 10` だけ。時間切れ・壊れた応答・他のエラーコード・想定外のデータは一時的な失敗として
