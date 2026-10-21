@@ -61,6 +61,13 @@ pub const CMD_CLEAR_ENROLL: u8 = 0x11;
 pub const CMD_ENROLL: u8 = 0x16;
 /// 指定 ID の登録データの大きさを返す。中身は READ_DATA の種別 0x22 で読む (§2.2.26)
 pub const CMD_READ_ENROLL: u8 = 0x22;
+/// 書き込み (WRITE_DATA、§2.2.25)。種別は [`CMD_WRITE_ENROLL`] (§2.2.25 の表)。
+/// 試験用 (`VEIN TEST COPY|WRITE`) だけが使う
+pub const CMD_WRITE_DATA: u8 = 0x21;
+/// 指定 ID の登録データを書く前の確認 (WRITE_ENROLL、§2.2.27。ID と大きさを渡す)
+pub const CMD_WRITE_ENROLL: u8 = 0x23;
+/// 指定 ID の登録テンプレート数 (GET_ID_INFO、§2.2.19。0 件 = 空き ID)
+pub const CMD_GET_ID_INFO: u8 = 0x15;
 
 /// 指定 ID の指で照合する (1:1)。**試験用 (`VEIN TEST VERIFY`)。番号は `0x17` (出典は
 /// vein-match の調査メモ)、引数の並び (`bData[0..4]` = ID LE) と応答の形は推測 —
@@ -140,14 +147,22 @@ pub fn command(cmd: u8, data: &[u8]) -> [u8; PACKET_LEN] {
     p
 }
 
-/// READ_DATA の要求 (§1.2.6): `bData[0]` = 種別、`[1..4]` = オフセット、
-/// `[5..8]` = 大きさ (どちらも LE)
-pub fn read_data_request(kind: u8, offset: u32, size: u32) -> [u8; PACKET_LEN] {
+/// `VEIN TEST WRITE` 1 行で受ける登録データの最大バイト数 (hex で 384 文字。
+/// console の 1 行は 512 バイトで切れるので、前置きを含めて収まる大きさ)
+pub const WRITE_LINE_MAX: usize = 192;
+
+/// 登録データの先頭 (`DE ED DE ED`)。書き込む前に確かめる
+pub const TEMPLATE_MAGIC: [u8; 4] = [0xDE, 0xED, 0xDE, 0xED];
+
+/// READ_DATA / WRITE_DATA の要求 (§1.2.6 / §2.2.25): `cmd` = [`CMD_READ_DATA`] か
+/// [`CMD_WRITE_DATA`]、`bData[0]` = 種別、`[1..4]` = オフセット、`[5..8]` = 大きさ (どちらも LE)。
+/// WRITE_DATA はこの後ろに本体と和が続く
+pub fn read_data_request(cmd: u8, kind: u8, offset: u32, size: u32) -> [u8; PACKET_LEN] {
     let mut d = [0u8; 9];
     d[0] = kind;
     d[1..5].copy_from_slice(&offset.to_le_bytes());
     d[5..9].copy_from_slice(&size.to_le_bytes());
-    command(CMD_READ_DATA, &d)
+    command(cmd, &d)
 }
 
 /// 応答パケット (識別子と和を確かめたもの)
@@ -250,6 +265,12 @@ pub enum VeinError {
     ReadFail,
     /// コマンド非対応 (`01 10`)。試験用 VERIFY で、この機種では通らないと分かった
     Unsupported,
+    /// 試験用 WRITE: offset が続いていない・組み立て中のものが無い・ID が違う
+    WriteSeq,
+    /// 試験用 WRITE: 合計が [`CHARA_MAX`] を超える
+    WriteTooBig,
+    /// 試験用 WRITE: 先頭が [`TEMPLATE_MAGIC`] でない
+    WriteHeader,
     /// モジュールが返したその他のエラーコード
     Rc(u8),
 }
@@ -263,6 +284,9 @@ impl VeinError {
             Self::NoFinger => "NO_FINGER".into(),
             Self::ReadFail => "READ_FAIL".into(),
             Self::Unsupported => "UNSUPPORTED".into(),
+            Self::WriteSeq => "WRITE_SEQ".into(),
+            Self::WriteTooBig => "WRITE_TOO_BIG".into(),
+            Self::WriteHeader => "WRITE_HEADER".into(),
             Self::Rc(c) => format!("RC={c:02X}"),
         }
     }
@@ -492,10 +516,19 @@ pub fn capture(
 
     // 2.-3. 作業用 ID を空けて、1 回だけ登録する (途中経過は on_prompt へ)
     enroll_id(port, t, SCRATCH_ID, on_prompt)?;
-    let id = SCRATCH_ID.to_le_bytes();
+    // 4.-5. 登録データを読む
+    let out = read_enroll(port, t, SCRATCH_ID)?;
 
-    // 4. 登録データの大きさ
-    let p = exchange(port, t, CMD_READ_ENROLL, &id)?;
+    // 6. 作業用 ID を消して終わる。失敗しても読めた分は返す (次の読み取りの 2. で消える)
+    let _ = exchange(port, t, CMD_CLEAR_ENROLL, &SCRATCH_ID.to_le_bytes());
+    Ok(out)
+}
+
+/// ID `id` の登録データを読む (接続済みであること。READ_ENROLL → READ_DATA)。
+/// 読み取り ([`capture`]) と試験 ([`test_copy`]) が共有する
+fn read_enroll(port: &mut dyn Port, t: &Timeouts, id: u32) -> Result<Vec<u8>, VeinError> {
+    // 登録データの大きさ
+    let p = exchange(port, t, CMD_READ_ENROLL, &id.to_le_bytes())?;
     if p.data[0] != XG_ERR_SUCCESS {
         return Err(VeinError::Rc(p.data[1]));
     }
@@ -504,14 +537,14 @@ pub fn capture(
         return Err(VeinError::ReadFail);
     }
 
-    // 5. 分割読み出し (種別 = READ_ENROLL)。塊ごとに和を確かめ、合わなければ読み直す
+    // 分割読み出し (種別 = READ_ENROLL)。塊ごとに和を確かめ、合わなければ読み直す
     let mut out = Vec::with_capacity(size);
     let mut buf = vec![0u8; UART_DATA_PACKET_MAX + 2];
     for (offset, len) in chunks(size) {
         let mut ok = false;
         for _ in 0..READ_RETRIES {
             port.discard_input();
-            let req = read_data_request(CMD_READ_ENROLL, offset as u32, len as u32);
+            let req = read_data_request(CMD_READ_DATA, CMD_READ_ENROLL, offset as u32, len as u32);
             if !port.send(&req) {
                 continue;
             }
@@ -528,9 +561,6 @@ pub fn capture(
             return Err(VeinError::ReadFail);
         }
     }
-
-    // 6. 作業用 ID を消して終わる。失敗しても読めた分は返す (次の読み取りの 2. で消える)
-    let _ = exchange(port, t, CMD_CLEAR_ENROLL, &id);
     Ok(out)
 }
 
@@ -544,6 +574,56 @@ pub enum TestCommand {
     Verify(u32),
     /// `VEIN TEST CLEAR <id>`: ID の登録を消す
     Clear(u32),
+    /// `VEIN TEST INFO <id>`: ID の登録テンプレート数と READ_ENROLL の大きさだけを返す
+    Info(u32),
+    /// `VEIN TEST COPY <from> <to>`: `from` の登録データを読み、`to` へ書く
+    Duplicate { from: u32, to: u32 },
+}
+
+/// `VEIN TEST WRITE …` (試験用)。外から受けた登録データを ID へ書く。
+/// **データ (生体情報) を持つので、`Debug` は大きさだけを出す** (ログに hex を残さない)
+#[derive(Clone, PartialEq, Eq)]
+pub enum WriteCommand {
+    /// `VEIN TEST WRITE <id> <offset> <hex>`: 組み立て中のデータへ続ける (offset 0 は最初から)
+    Chunk { id: u32, offset: usize, data: Vec<u8> },
+    /// `VEIN TEST WRITE <id> END`: 組み上がったものを ID へ書く
+    End(u32),
+}
+
+impl core::fmt::Debug for WriteCommand {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Chunk { id, offset, data } => {
+                write!(f, "Chunk(id={id}, offset={offset}, len={})", data.len())
+            }
+            Self::End(id) => write!(f, "End(id={id})"),
+        }
+    }
+}
+
+/// 外から受けた登録データの組み立て中のもの (ID ごとに 1 つ)。offset の連続と上限を見る
+#[derive(Debug, Default)]
+pub struct TemplateAssembler {
+    id: u32,
+    buf: Vec<u8>,
+}
+
+impl TemplateAssembler {
+    fn new(id: u32) -> Self {
+        Self { id, buf: Vec::new() }
+    }
+
+    /// 続きを足す。`offset` は今までの長さと一致していること。戻り値は次の offset
+    fn push(&mut self, offset: usize, bytes: &[u8]) -> Result<usize, VeinError> {
+        if offset != self.buf.len() {
+            return Err(VeinError::WriteSeq);
+        }
+        if self.buf.len() + bytes.len() > CHARA_MAX {
+            return Err(VeinError::WriteTooBig);
+        }
+        self.buf.extend_from_slice(bytes);
+        Ok(self.buf.len())
+    }
 }
 
 /// 試験用の ID を読む。[`TEST_ID_MIN`]〜[`TEST_ID_MAX`] の数字だけ (1 は作業用なので不可)
@@ -604,6 +684,111 @@ pub fn test_enrolled_line(id: u32) -> String {
 /// `VEIN TEST CLEARED <id>`
 pub fn test_cleared_line(id: u32) -> String {
     format!("VEIN TEST CLEARED {id}")
+}
+
+/// 試験: 接続して ID のテンプレート数 (GET_ID_INFO) と READ_ENROLL が返す大きさを読む。
+/// 登録データそのものは読まない。大きさは `bData[1..5]` LE (§2.2.26)。空の ID は 0
+pub fn test_info(port: &mut dyn Port, t: &Timeouts, id: u32) -> Result<(u8, u32), VeinError> {
+    connect(port, t)?;
+    let p = exchange(port, t, CMD_GET_ID_INFO, &id.to_le_bytes())?;
+    if p.data[0] != XG_ERR_SUCCESS {
+        return Err(VeinError::Rc(p.data[1]));
+    }
+    let count = p.data[1];
+    let p = exchange(port, t, CMD_READ_ENROLL, &id.to_le_bytes())?;
+    let size = if p.data[0] == XG_ERR_SUCCESS {
+        u32::from_le_bytes([p.data[1], p.data[2], p.data[3], p.data[4]])
+    } else {
+        0
+    };
+    Ok((count, size))
+}
+
+/// `VEIN TEST INFO <id> TEMPLATES=<n> SIZE=<バイト数>`
+pub fn test_info_line(id: u32, count: u8, size: u32) -> String {
+    format!("VEIN TEST INFO {id} TEMPLATES={count} SIZE={size}")
+}
+
+/// ID `id` の登録データを書く (接続済みであること。WRITE_ENROLL → WRITE_DATA、§2.2.27 / §2.2.25)。
+/// `data` は 1 バイト以上 [`CHARA_MAX`] 以下。塊ごとに和を付けて送り、応答が成功でなければ
+/// 3 回まで送り直す。**フラッシュに書く**ので試験用の ID (2〜9) だけに使う
+fn write_enroll(port: &mut dyn Port, t: &Timeouts, id: u32, data: &[u8]) -> Result<(), VeinError> {
+    let mut d = [0u8; 8];
+    d[..4].copy_from_slice(&id.to_le_bytes());
+    d[4..].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    let p = exchange(port, t, CMD_WRITE_ENROLL, &d)?;
+    if p.data[0] != XG_ERR_SUCCESS {
+        return Err(VeinError::Rc(p.data[1]));
+    }
+    for (offset, len) in chunks(data.len()) {
+        let body = &data[offset..offset + len];
+        let mut req = read_data_request(CMD_WRITE_DATA, CMD_WRITE_ENROLL, offset as u32, len as u32).to_vec();
+        req.extend_from_slice(body);
+        req.extend_from_slice(&checksum(body).to_le_bytes());
+        let mut ok = false;
+        for _ in 0..READ_RETRIES {
+            port.discard_input();
+            if !port.send(&req) {
+                continue;
+            }
+            let acked = recv_packet(port, t.data_ms, t.idle_ms).is_ok_and(|p| {
+                p.cmd == CMD_WRITE_DATA && p.data[0] == XG_ERR_SUCCESS
+            });
+            if acked {
+                ok = true;
+                break;
+            }
+        }
+        if !ok {
+            return Err(VeinError::ReadFail);
+        }
+    }
+    Ok(())
+}
+
+/// 試験: 接続して `from` の登録データを読み、`to` へ書く。戻り値は書いたバイト数
+pub fn test_copy(port: &mut dyn Port, t: &Timeouts, from: u32, to: u32) -> Result<usize, VeinError> {
+    connect(port, t)?;
+    let data = read_enroll(port, t, from)?;
+    write_enroll(port, t, to, &data)?;
+    Ok(data.len())
+}
+
+/// `VEIN TEST COPIED <from> <to> <バイト数>`
+pub fn test_copied_line(from: u32, to: u32, len: usize) -> String {
+    format!("VEIN TEST COPIED {from} {to} {len}")
+}
+
+/// 試験: 外から受けた登録データを足す / 書く。`slot` は組み立て中のもの (スレッドが持つ)。
+/// offset 0 は組み立てを最初からやり直す。失敗したら組み立て中のものは捨てる。
+/// 戻り値は応答の 1 行: 塊なら `VEIN TEST WRITE <id> <次の offset>`、END なら
+/// `VEIN TEST WRITTEN <id> <バイト数>`。**data を行にもログにも出さない**
+pub fn test_write(
+    slot: &mut Option<TemplateAssembler>,
+    port: &mut dyn Port,
+    t: &Timeouts,
+    cmd: WriteCommand,
+) -> Result<String, VeinError> {
+    match cmd {
+        WriteCommand::Chunk { id, offset, data } => {
+            let mut asm = match slot.take() {
+                Some(a) if offset != 0 && a.id == id => a,
+                _ => TemplateAssembler::new(id),
+            };
+            let next = asm.push(offset, &data)?;
+            *slot = Some(asm);
+            Ok(format!("VEIN TEST WRITE {id} {next}"))
+        }
+        WriteCommand::End(id) => {
+            let asm = slot.take().filter(|a| a.id == id).ok_or(VeinError::WriteSeq)?;
+            if !asm.buf.starts_with(&TEMPLATE_MAGIC) {
+                return Err(VeinError::WriteHeader);
+            }
+            connect(port, t)?;
+            write_enroll(port, t, id, &asm.buf)?;
+            Ok(format!("VEIN TEST WRITTEN {id} {}", asm.buf.len()))
+        }
+    }
 }
 
 /// `VEIN TEST VERIFY <id> RC=<1 バイト目> DATA=<残り>` (大文字 16 進)。
@@ -1171,11 +1356,15 @@ mod tests {
 
     #[test]
     fn read_data_request_layout() {
-        let p = read_data_request(CMD_READ_ENROLL, 0x200, 0x48);
+        let p = read_data_request(CMD_READ_DATA, CMD_READ_ENROLL, 0x200, 0x48);
         assert_eq!(p[3], CMD_READ_DATA);
         assert_eq!(p[5], 9);
         assert_eq!(&p[6..15], &[0x22, 0x00, 0x02, 0, 0, 0x48, 0x00, 0, 0]);
         assert!(parse_packet(&p).is_ok());
+        // WRITE_DATA は同じ並びで、種別が WRITE_ENROLL (0x23)
+        let p = read_data_request(CMD_WRITE_DATA, CMD_WRITE_ENROLL, 0x200, 0x48);
+        assert_eq!(p[3], CMD_WRITE_DATA);
+        assert_eq!(&p[6..15], &[0x23, 0x00, 0x02, 0, 0, 0x48, 0x00, 0, 0]);
     }
 
     #[test]
@@ -1673,6 +1862,226 @@ mod tests {
         assert!(data.starts_with("0102030405"));
         assert_eq!(VeinError::Unsupported.reason(), "UNSUPPORTED");
         assert_eq!(err_line(VeinError::Unsupported), "ERR VEIN UNSUPPORTED");
+    }
+
+    fn ack_write(ok: bool) -> Option<Vec<u8>> {
+        let rc = if ok { XG_ERR_SUCCESS } else { XG_ERR_FAIL };
+        Some(reply(CMD_WRITE_DATA, &[rc]))
+    }
+
+    fn write_ready() -> Option<Vec<u8>> {
+        Some(reply(CMD_WRITE_ENROLL, &[XG_ERR_SUCCESS]))
+    }
+
+    #[test]
+    fn test_info_reads_template_count_and_size() {
+        let mut port = FakePort::new(vec![
+            connected(),
+            Some(reply(CMD_GET_ID_INFO, &[XG_ERR_SUCCESS, 2])),
+            Some(reply(CMD_READ_ENROLL, &[XG_ERR_SUCCESS, 0x48, 0x04, 0, 0])),
+        ]);
+        assert_eq!(test_info(&mut port, &Timeouts::DEFAULT, 4), Ok((2, 0x448)));
+        assert_eq!(port.sent.len(), 3);
+        assert_eq!(&port.sent[1][3..10], &[CMD_GET_ID_INFO, 0, 4, 4, 0, 0, 0]);
+        assert_eq!(&port.sent[2][3..10], &[CMD_READ_ENROLL, 0, 4, 4, 0, 0, 0]);
+        // 空の ID: READ_ENROLL が失敗でも大きさ 0 で返す
+        let mut port = FakePort::new(vec![
+            connected(),
+            Some(reply(CMD_GET_ID_INFO, &[XG_ERR_SUCCESS, 0])),
+            Some(reply(CMD_READ_ENROLL, &[XG_ERR_FAIL, 0x0A])),
+        ]);
+        assert_eq!(test_info(&mut port, &Timeouts::DEFAULT, 4), Ok((0, 0)));
+        // GET_ID_INFO の失敗コードは Rc、応答が無ければ Timeout
+        let mut port = FakePort::new(vec![connected(), Some(reply(CMD_GET_ID_INFO, &[XG_ERR_FAIL, 0x07]))]);
+        assert_eq!(test_info(&mut port, &Timeouts::DEFAULT, 4), Err(VeinError::Rc(0x07)));
+        let mut port = FakePort::new(vec![connected(), None]);
+        assert_eq!(test_info(&mut port, &Timeouts::DEFAULT, 4), Err(VeinError::Timeout));
+        assert_eq!(test_info_line(4, 2, 1096), "VEIN TEST INFO 4 TEMPLATES=2 SIZE=1096");
+    }
+
+    #[test]
+    fn test_copy_reads_from_and_writes_to() {
+        let data = sample_chara(600);
+        let mut script = vec![connected(), size(600)];
+        for (off, len) in chunks(600) {
+            script.push(Some(chunk(&data[off..off + len])));
+        }
+        script.extend([write_ready(), ack_write(true), ack_write(true)]);
+        let mut port = FakePort::new(script);
+        assert_eq!(test_copy(&mut port, &Timeouts::DEFAULT, 2, 3), Ok(600));
+        // 接続 → READ_ENROLL → READ_DATA ×2 → WRITE_ENROLL → WRITE_DATA ×2
+        assert_eq!(port.sent.len(), 7);
+        assert_eq!(&port.sent[1][3..10], &[CMD_READ_ENROLL, 0, 4, 2, 0, 0, 0]);
+        // 書き込み先 ID 3 と大きさ 600 = 0x258
+        assert_eq!(
+            port.sent[4],
+            command(CMD_WRITE_ENROLL, &[3, 0, 0, 0, 0x58, 0x02, 0, 0]).to_vec()
+        );
+        // WRITE_DATA: 要求 24 バイト + 本体 + 和 (本体だけの和、LE)
+        let mut want = read_data_request(CMD_WRITE_DATA, CMD_WRITE_ENROLL, 0, 512).to_vec();
+        want.extend_from_slice(&data[..512]);
+        want.extend_from_slice(&checksum(&data[..512]).to_le_bytes());
+        assert_eq!(port.sent[5], want);
+        let mut want = read_data_request(CMD_WRITE_DATA, CMD_WRITE_ENROLL, 512, 88).to_vec();
+        want.extend_from_slice(&data[512..]);
+        want.extend_from_slice(&checksum(&data[512..]).to_le_bytes());
+        assert_eq!(port.sent[6], want);
+        assert_eq!(test_copied_line(2, 3, 600), "VEIN TEST COPIED 2 3 600");
+    }
+
+    #[test]
+    fn test_copy_failures() {
+        // 読めない (空の ID) / 接続できない
+        let mut port = FakePort::new(vec![connected(), Some(reply(CMD_READ_ENROLL, &[XG_ERR_FAIL, 0x0A]))]);
+        assert_eq!(test_copy(&mut port, &Timeouts::DEFAULT, 2, 3), Err(VeinError::Rc(0x0A)));
+        let mut port = FakePort::new(vec![None]);
+        assert_eq!(test_copy(&mut port, &Timeouts::DEFAULT, 2, 3), Err(VeinError::NoModule));
+        // WRITE_ENROLL が断られた
+        let data = sample_chara(4);
+        let head = vec![connected(), size(4), Some(chunk(&data))];
+        let mut script = head.clone();
+        script.push(Some(reply(CMD_WRITE_ENROLL, &[XG_ERR_FAIL, 0x03])));
+        let mut port = FakePort::new(script);
+        assert_eq!(test_copy(&mut port, &Timeouts::DEFAULT, 2, 3), Err(VeinError::Rc(0x03)));
+        // WRITE_DATA の応答が失敗 → 送り直し、2 回目で通る
+        let mut script = head.clone();
+        script.extend([write_ready(), ack_write(false), ack_write(true)]);
+        let mut port = FakePort::new(script);
+        assert_eq!(test_copy(&mut port, &Timeouts::DEFAULT, 2, 3), Ok(4));
+        assert_eq!(port.sent.len(), 6);
+        // 無応答・別コマンドの応答が 3 回続くと諦める
+        let mut script = head.clone();
+        script.extend([write_ready(), None, Some(reply(CMD_READ_DATA, &[XG_ERR_SUCCESS])), ack_write(false)]);
+        let mut port = FakePort::new(script);
+        assert_eq!(test_copy(&mut port, &Timeouts::DEFAULT, 2, 3), Err(VeinError::ReadFail));
+        assert_eq!(port.sent.len(), 7);
+        // 送信に失敗しても 3 回まで繰り返す (WRITE_DATA は 5 回目以降の送信)
+        let mut script = head;
+        script.push(write_ready());
+        let mut port = FailAt(FakePort::new(script), 5);
+        assert_eq!(test_copy(&mut port, &Timeouts::DEFAULT, 2, 3), Err(VeinError::ReadFail));
+    }
+
+    fn chunk_cmd(id: u32, offset: usize, data: &[u8]) -> WriteCommand {
+        WriteCommand::Chunk { id, offset, data: data.to_vec() }
+    }
+
+    fn write_t(slot: &mut Option<TemplateAssembler>, port: &mut dyn Port, cmd: WriteCommand) -> Result<String, VeinError> {
+        test_write(slot, port, &Timeouts::DEFAULT, cmd)
+    }
+
+    #[test]
+    fn test_write_assembles_lines_then_writes_on_end() {
+        let data = sample_chara(300);
+        let mut slot = None;
+        let mut port = FakePort::new(vec![connected(), write_ready(), ack_write(true)]);
+        assert_eq!(
+            write_t(&mut slot, &mut port, chunk_cmd(5, 0, &data[..192])).as_deref(),
+            Ok("VEIN TEST WRITE 5 192")
+        );
+        assert_eq!(
+            write_t(&mut slot, &mut port, chunk_cmd(5, 192, &data[192..])).as_deref(),
+            Ok("VEIN TEST WRITE 5 300")
+        );
+        // 塊の間はモジュールに触らない
+        assert!(port.sent.is_empty());
+        assert_eq!(
+            write_t(&mut slot, &mut port, WriteCommand::End(5)).as_deref(),
+            Ok("VEIN TEST WRITTEN 5 300")
+        );
+        assert!(slot.is_none());
+        assert_eq!(
+            port.sent[2],
+            command(CMD_WRITE_ENROLL, &[5, 0, 0, 0, 0x2C, 0x01, 0, 0]).to_vec()
+        );
+        let mut want = read_data_request(CMD_WRITE_DATA, CMD_WRITE_ENROLL, 0, 300).to_vec();
+        want.extend_from_slice(&data);
+        want.extend_from_slice(&checksum(&data).to_le_bytes());
+        assert_eq!(port.sent[3], want);
+    }
+
+    #[test]
+    fn test_write_sequence_errors_discard_the_buffer() {
+        let magic = TEMPLATE_MAGIC;
+        let mut port = FakePort::new(vec![]);
+        // 飛び・重なり・最初が 0 でない・END だけ・別の ID の END は WRITE_SEQ で、組み立て中を捨てる
+        let mut slot = None;
+        write_t(&mut slot, &mut port, chunk_cmd(5, 0, &magic)).unwrap();
+        assert_eq!(write_t(&mut slot, &mut port, chunk_cmd(5, 8, &magic)), Err(VeinError::WriteSeq));
+        assert!(slot.is_none());
+        write_t(&mut slot, &mut port, chunk_cmd(5, 0, &magic)).unwrap();
+        assert_eq!(write_t(&mut slot, &mut port, chunk_cmd(5, 2, &magic)), Err(VeinError::WriteSeq));
+        assert_eq!(write_t(&mut slot, &mut port, chunk_cmd(5, 4, &magic)), Err(VeinError::WriteSeq));
+        assert_eq!(write_t(&mut slot, &mut port, WriteCommand::End(5)), Err(VeinError::WriteSeq));
+        write_t(&mut slot, &mut port, chunk_cmd(5, 0, &magic)).unwrap();
+        assert_eq!(write_t(&mut slot, &mut port, chunk_cmd(6, 4, &magic)), Err(VeinError::WriteSeq));
+        write_t(&mut slot, &mut port, chunk_cmd(5, 0, &magic)).unwrap();
+        assert_eq!(write_t(&mut slot, &mut port, WriteCommand::End(6)), Err(VeinError::WriteSeq));
+        // offset 0 は組み立てを最初からやり直す (別の ID でも)
+        write_t(&mut slot, &mut port, chunk_cmd(5, 0, &magic)).unwrap();
+        assert_eq!(
+            write_t(&mut slot, &mut port, chunk_cmd(6, 0, &[1, 2])).as_deref(),
+            Ok("VEIN TEST WRITE 6 2")
+        );
+        assert_eq!(slot.as_ref().map(|a| a.id), Some(6));
+        assert!(port.sent.is_empty());
+    }
+
+    #[test]
+    fn test_write_limits_size_and_checks_header() {
+        let mut port = FakePort::new(vec![]);
+        let mut slot = None;
+        // CHARA_MAX ちょうどまでは受け、1 バイトでも超えたら WRITE_TOO_BIG
+        let block = vec![0u8; WRITE_LINE_MAX];
+        let mut offset = 0;
+        while offset + WRITE_LINE_MAX <= CHARA_MAX {
+            write_t(&mut slot, &mut port, chunk_cmd(5, offset, &block)).unwrap();
+            offset += WRITE_LINE_MAX;
+        }
+        let rest = CHARA_MAX - offset;
+        assert_eq!(
+            write_t(&mut slot, &mut port, chunk_cmd(5, offset, &vec![0u8; rest])).as_deref(),
+            Ok(format!("VEIN TEST WRITE 5 {CHARA_MAX}").as_str())
+        );
+        assert_eq!(
+            write_t(&mut slot, &mut port, chunk_cmd(5, CHARA_MAX, &[0])),
+            Err(VeinError::WriteTooBig)
+        );
+        assert!(slot.is_none());
+        // 先頭が DE ED DE ED でなければ書かない (モジュールに触らない) / 短すぎても同じ
+        write_t(&mut slot, &mut port, chunk_cmd(5, 0, &[0xDE, 0xED, 0xDE, 0xEE])).unwrap();
+        assert_eq!(write_t(&mut slot, &mut port, WriteCommand::End(5)), Err(VeinError::WriteHeader));
+        write_t(&mut slot, &mut port, chunk_cmd(5, 0, &[0xDE, 0xED])).unwrap();
+        assert_eq!(write_t(&mut slot, &mut port, WriteCommand::End(5)), Err(VeinError::WriteHeader));
+        assert!(port.sent.is_empty());
+    }
+
+    #[test]
+    fn test_write_end_reports_module_errors() {
+        let magic = TEMPLATE_MAGIC;
+        let mut slot = None;
+        let mut port = FakePort::new(vec![None]);
+        write_t(&mut slot, &mut port, chunk_cmd(5, 0, &magic)).unwrap();
+        assert_eq!(write_t(&mut slot, &mut port, WriteCommand::End(5)), Err(VeinError::NoModule));
+        assert!(slot.is_none());
+        let mut port = FakePort::new(vec![connected(), Some(reply(CMD_WRITE_ENROLL, &[XG_ERR_FAIL, 0x04]))]);
+        write_t(&mut slot, &mut port, chunk_cmd(5, 0, &magic)).unwrap();
+        assert_eq!(write_t(&mut slot, &mut port, WriteCommand::End(5)), Err(VeinError::Rc(0x04)));
+    }
+
+    #[test]
+    fn write_command_debug_hides_the_data() {
+        let c = chunk_cmd(5, 192, &[0xDE, 0xED, 0xCA, 0xFE]);
+        let text = format!("{c:?} {:?}", WriteCommand::End(5));
+        assert_eq!(text, "Chunk(id=5, offset=192, len=4) End(id=5)");
+        assert_eq!(WRITE_LINE_MAX * 2, 384);
+    }
+
+    #[test]
+    fn write_errors_have_reasons() {
+        assert_eq!(err_line(VeinError::WriteSeq), "ERR VEIN WRITE_SEQ");
+        assert_eq!(err_line(VeinError::WriteTooBig), "ERR VEIN WRITE_TOO_BIG");
+        assert_eq!(err_line(VeinError::WriteHeader), "ERR VEIN WRITE_HEADER");
     }
 
     /// 抜き出した後も capture は今までと同じバイトを同じ順に送る (ID 1)

@@ -265,6 +265,70 @@ pub enum HostCommand {
     /// 試験用 (`VEIN TEST ENROLL|VERIFY|CLEAR <id>`)。モジュール自身の登録と照合で撮像を
     /// 確かめる診断。結果は 1 行 (`VEIN TEST …` / `ERR VEIN <reason>`)。id は 2〜9 だけ
     VeinTest(crate::vein::TestCommand),
+    /// 試験用 (`VEIN TEST WRITE <id> <offset> <hex>` / `VEIN TEST WRITE <id> END`)。外から
+    /// 受けた登録データをモジュールの ID へ書く。**生体データを持つので Debug は大きさだけ**
+    VeinWrite(crate::vein::WriteCommand),
+}
+
+/// `VEIN TEST …` の本体 (`TEST` の後ろ)。**エラー文には受け取った語を含めない**
+/// (`WRITE` の hex を行に残さないため)
+fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostCommand, String> {
+    use crate::vein::{parse_test_id, TestCommand, WriteCommand, WRITE_LINE_MAX};
+    const BAD_ID: &str = "ERR VEIN: TEST の ID は 2〜9 の数字だけです";
+    const BAD_COPY: &str = "ERR VEIN: COPY には違う 2 つの ID (2〜9) が必要です";
+    const BAD_WRITE: &str = "ERR VEIN: WRITE は <id> <offset> <hex> か <id> END です (hex は 192 バイトまで)";
+    let verb = it.next().map(|s| s.to_ascii_uppercase());
+    let args: Vec<&str> = it.collect();
+    match (verb.as_deref(), args.as_slice()) {
+        (Some(v @ ("ENROLL" | "VERIFY" | "CLEAR" | "INFO")), [id]) => {
+            let make: fn(u32) -> TestCommand = match v {
+                "ENROLL" => TestCommand::Enroll,
+                "VERIFY" => TestCommand::Verify,
+                "CLEAR" => TestCommand::Clear,
+                _ => TestCommand::Info,
+            };
+            parse_test_id(id).map(|id| HostCommand::VeinTest(make(id))).ok_or_else(|| BAD_ID.into())
+        }
+        (Some("ENROLL" | "VERIFY" | "CLEAR" | "INFO"), _) => Err(BAD_ID.into()),
+        (Some("COPY"), [from, to]) => match (parse_test_id(from), parse_test_id(to)) {
+            (Some(from), Some(to)) if from != to => {
+                Ok(HostCommand::VeinTest(TestCommand::Duplicate { from, to }))
+            }
+            _ => Err(BAD_COPY.into()),
+        },
+        (Some("COPY"), _) => Err(BAD_COPY.into()),
+        (Some("WRITE"), [id, end]) if end.eq_ignore_ascii_case("END") => parse_test_id(id)
+            .map(|id| HostCommand::VeinWrite(WriteCommand::End(id)))
+            .ok_or_else(|| BAD_ID.into()),
+        (Some("WRITE"), [id, offset, hex]) => {
+            let id = parse_test_id(id).ok_or_else(|| String::from(BAD_ID))?;
+            let offset = offset
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| offset.parse::<usize>().ok())
+                .flatten();
+            match (offset, decode_hex(hex)) {
+                (Some(offset), Some(data)) if data.len() <= WRITE_LINE_MAX => {
+                    Ok(HostCommand::VeinWrite(WriteCommand::Chunk { id, offset, data }))
+                }
+                _ => Err(BAD_WRITE.into()),
+            }
+        }
+        (Some("WRITE"), _) => Err(BAD_WRITE.into()),
+        _ => Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|INFO|COPY|WRITE が必要です".into()),
+    }
+}
+
+/// 16 進 (大小どちらも) をバイト列に直す。空・奇数長・16 進でない文字があれば `None`
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let digit = |c: u8| char::from(c).to_digit(16).map(|d| d as u8);
+    if s.is_empty() || s.len() & 1 == 1 {
+        return None;
+    }
+    s.as_bytes()
+        .chunks_exact(2)
+        .map(|p| Some(digit(p[0])? << 4 | digit(p[1])?))
+        .collect()
 }
 
 /// PC (運行者タブ) の点呼の段 (`STAGE NFC|TEMP|ALCOHOL|CARINS|PC`)。
@@ -560,20 +624,7 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                 }
             },
             Some("FINGER?") => HostCommand::VeinFingerQuery,
-            Some("TEST") => {
-                use crate::vein::TestCommand;
-                let make: fn(u32) -> TestCommand =
-                    match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
-                        Some("ENROLL") => TestCommand::Enroll,
-                        Some("VERIFY") => TestCommand::Verify,
-                        Some("CLEAR") => TestCommand::Clear,
-                        _ => return Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR が必要です".into()),
-                    };
-                match it.next().and_then(crate::vein::parse_test_id) {
-                    Some(id) if it.next().is_none() => HostCommand::VeinTest(make(id)),
-                    _ => return Err("ERR VEIN: TEST の ID は 2〜9 の数字だけです".into()),
-                }
-            }
+            Some("TEST") => parse_vein_test(&mut it)?,
             _ => return Err("ERR VEIN: CAPTURE|SAY|FINGER?|TEST が必要です".into()),
         },
         // `PAIR` または `BLE PAIR`
@@ -1530,6 +1581,93 @@ mod tests {
         );
         // `?` の無い形は受けない
         assert!(parse_line("VEIN FINGER", T).is_err());
+    }
+
+    #[test]
+    fn vein_test_info_copy_and_write_parse() {
+        use crate::vein::{TestCommand, WriteCommand, WRITE_LINE_MAX};
+        assert_eq!(
+            parse_line("VEIN TEST INFO 4", T),
+            Ok(Some(HostCommand::VeinTest(TestCommand::Info(4))))
+        );
+        assert_eq!(
+            parse_line("vein test copy 2 3", T),
+            Ok(Some(HostCommand::VeinTest(TestCommand::Duplicate { from: 2, to: 3 })))
+        );
+        assert_eq!(
+            parse_line("VEIN TEST WRITE 3 END", T),
+            Ok(Some(HostCommand::VeinWrite(WriteCommand::End(3))))
+        );
+        assert_eq!(
+            parse_line("VEIN TEST WRITE 3 end", T),
+            Ok(Some(HostCommand::VeinWrite(WriteCommand::End(3))))
+        );
+        assert_eq!(
+            parse_line("VEIN TEST WRITE 3 192 DEeD00ff", T),
+            Ok(Some(HostCommand::VeinWrite(WriteCommand::Chunk {
+                id: 3,
+                offset: 192,
+                data: vec![0xDE, 0xED, 0x00, 0xFF],
+            })))
+        );
+        // 1 行の上限ちょうど (192 バイト = 384 文字) は通り、1 バイト超えると断る。
+        // 上限の行 (前置き + 384 文字) は console の MAX_LINE (512) に収まる
+        let line = format!("VEIN TEST WRITE 9 {} {}", 999_999, "ab".repeat(WRITE_LINE_MAX));
+        assert!(line.len() < 512);
+        assert!(matches!(
+            parse_line(&line, T),
+            Ok(Some(HostCommand::VeinWrite(WriteCommand::Chunk { id: 9, offset: 999_999, .. })))
+        ));
+        let over = format!("VEIN TEST WRITE 9 0 {}", "ab".repeat(WRITE_LINE_MAX + 1));
+        assert!(parse_line(&over, T).is_err());
+        for bad in [
+            "VEIN TEST INFO",
+            "VEIN TEST INFO 1",
+            "VEIN TEST INFO 2 3",
+            "VEIN TEST COPY",
+            "VEIN TEST COPY 2",
+            "VEIN TEST COPY 2 2",
+            "VEIN TEST COPY 1 3",
+            "VEIN TEST COPY 2 x",
+            "VEIN TEST COPY 2 3 4",
+            "VEIN TEST WRITE",
+            "VEIN TEST WRITE 3",
+            "VEIN TEST WRITE 3 5",
+            "VEIN TEST WRITE 1 END",
+            "VEIN TEST WRITE 10 0 ab",
+            "VEIN TEST WRITE 3 0 ab cd",
+            "VEIN TEST WRITE 3 x ab",
+            "VEIN TEST WRITE 3 +1 ab",
+            "VEIN TEST WRITE 3 99999999999999999999999999 ab",
+            "VEIN TEST WRITE 3 0 abc",
+            "VEIN TEST WRITE 3 0 zz",
+            "VEIN TEST WRITE 3 0 +f",
+        ] {
+            assert!(parse_line(bad, T).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn vein_write_errors_never_echo_the_input() {
+        // 受け取った hex をエラー行に含めない (ログに生体データを残さない)
+        for bad in [
+            "VEIN TEST WRITE 3 0 deedXXdeed",
+            "VEIN TEST WRITE 3 x deedcafe",
+            "VEIN TEST WRITE 3 77 deedcafe extra",
+            "VEIN TEST WRITE 10 0 deedcafe",
+        ] {
+            let err = parse_line(bad, T).unwrap_err();
+            assert!(!err.to_ascii_lowercase().contains("cafe"), "{err}");
+            assert!(!err.to_ascii_lowercase().contains("deed"), "{err}");
+        }
+    }
+
+    #[test]
+    fn decode_hex_rejects_empty_odd_and_non_hex() {
+        assert_eq!(decode_hex(""), None);
+        assert_eq!(decode_hex("abc"), None);
+        assert_eq!(decode_hex("0g"), None);
+        assert_eq!(decode_hex("aBff"), Some(vec![0xAB, 0xFF]));
     }
 
     #[test]
