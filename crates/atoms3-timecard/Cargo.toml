@@ -8,7 +8,7 @@
 # metadata (下記) を使わせること (atoms3-print と同じ理由)。
 [package]
 name = "alc-hub-atoms3-timecard"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 rust-version = "1.77"
 description = "NFC タイムカード端末 — カードをかざすと kind=timecard の打刻イベントを WS uplink へ積む"
