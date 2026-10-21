@@ -2115,6 +2115,7 @@ mod tests {
         assert_eq!(rebuild_t(&mut port, None, false), Err(VeinError::ReadFail));
         // 書き込み先が断った
         let mut script = rebuild_script(&[&src], 0);
+        script.truncate(script.len() - 1); // 成功の write_ready を外して断りに差し替える
         script.push(Some(reply(CMD_WRITE_ENROLL, &[XG_ERR_FAIL, 0x03])));
         let mut port = FakePort::new(script);
         assert_eq!(rebuild_t(&mut port, None, false), Err(VeinError::Rc(0x03)));
