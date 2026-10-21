@@ -262,6 +262,9 @@ pub enum HostCommand {
     /// 指の有無を 1 回だけ問い合わせる (`VEIN FINGER?`)。応答は `VEIN FINGER 0|1` /
     /// `ERR VEIN UNSUPPORTED` / `ERR VEIN <reason>`。実機で指の状態コマンドが通るかの確認用
     VeinFingerQuery,
+    /// 試験用 (`VEIN TEST ENROLL|VERIFY|CLEAR <id>`)。モジュール自身の登録と照合で撮像を
+    /// 確かめる診断。結果は 1 行 (`VEIN TEST …` / `ERR VEIN <reason>`)。id は 2〜9 だけ
+    VeinTest(crate::vein::TestCommand),
 }
 
 /// PC (運行者タブ) の点呼の段 (`STAGE NFC|TEMP|ALCOHOL|CARINS|PC`)。
@@ -557,7 +560,21 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                 }
             },
             Some("FINGER?") => HostCommand::VeinFingerQuery,
-            _ => return Err("ERR VEIN: CAPTURE|SAY|FINGER? が必要です".into()),
+            Some("TEST") => {
+                use crate::vein::TestCommand;
+                let make: fn(u32) -> TestCommand =
+                    match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+                        Some("ENROLL") => TestCommand::Enroll,
+                        Some("VERIFY") => TestCommand::Verify,
+                        Some("CLEAR") => TestCommand::Clear,
+                        _ => return Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR が必要です".into()),
+                    };
+                match it.next().and_then(crate::vein::parse_test_id) {
+                    Some(id) if it.next().is_none() => HostCommand::VeinTest(make(id)),
+                    _ => return Err("ERR VEIN: TEST の ID は 2〜9 の数字だけです".into()),
+                }
+            }
+            _ => return Err("ERR VEIN: CAPTURE|SAY|FINGER?|TEST が必要です".into()),
         },
         // `PAIR` または `BLE PAIR`
         "PAIR" => HostCommand::BlePair,
@@ -1475,9 +1492,34 @@ mod tests {
         assert!(parse_line("VEIN SAY HELLO", T).is_err());
         assert_eq!(
             parse_line("VEIN", T),
-            Err("ERR VEIN: CAPTURE|SAY|FINGER? が必要です".into())
+            Err("ERR VEIN: CAPTURE|SAY|FINGER?|TEST が必要です".into())
         );
         assert!(parse_line("VEIN ENROLL", T).is_err());
+        // 試験用 (モジュール自身の登録と照合)。ID は 2〜9 だけ
+        use crate::vein::TestCommand;
+        assert_eq!(
+            parse_line("VEIN TEST ENROLL 2", T),
+            Ok(Some(HostCommand::VeinTest(TestCommand::Enroll(2))))
+        );
+        assert_eq!(
+            parse_line("vein test verify 9", T),
+            Ok(Some(HostCommand::VeinTest(TestCommand::Verify(9))))
+        );
+        assert_eq!(
+            parse_line("VEIN TEST CLEAR 5", T),
+            Ok(Some(HostCommand::VeinTest(TestCommand::Clear(5))))
+        );
+        for bad in [
+            "VEIN TEST",
+            "VEIN TEST ENROLL",
+            "VEIN TEST ENROLL 1",
+            "VEIN TEST ENROLL 10",
+            "VEIN TEST VERIFY x",
+            "VEIN TEST CLEAR 2 3",
+            "VEIN TEST SAY 2",
+        ] {
+            assert!(parse_line(bad, T).is_err(), "{bad:?}");
+        }
         assert_eq!(
             parse_line("VEIN FINGER?", T),
             Ok(Some(HostCommand::VeinFingerQuery))
