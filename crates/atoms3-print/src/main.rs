@@ -36,6 +36,7 @@ use std::sync::{mpsc, Arc, Mutex};
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    config::set_firmware_version(env!("CARGO_PKG_VERSION"));
     // 前回リセットの解析 + ログ捕捉 hook (CoreS3 と同じ crashlog 基盤 #43)。
     // heap.rs の note() がリングに書くため、heap::start より前に必ず呼ぶこと
     // (配線漏れで .noinit のゴミ帳簿に書いて boot loop になった実害 2026-07-14)

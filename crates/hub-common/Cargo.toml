@@ -1,7 +1,7 @@
 [package]
 name = "alc-hub-common"
-# FIRMWARE_VERSION (config.rs の env!) はこのクレートのバージョンを参照するため、
-# ルート (alc-hub-cores3) とバージョンを揃えて更新すること
+# 名乗る版は各実行ファイルの crate の版 (main が config::set_firmware_version で渡す)。
+# manifest (build.yml) と同じ。このクレートの版は名乗りに使われない
 version = "0.1.0"
 edition = "2021"
 description = "alc-hub-cores3 の共有基盤 (状態 / 設定 / 定数 / UI コマンド定義)"
