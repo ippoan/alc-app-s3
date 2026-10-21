@@ -7,7 +7,7 @@
 //! - UART を開き、[`alc_hub_core::vein::Port`] として渡す
 //! - `VEIN CAPTURE` を受けて読み取る専用スレッド。結果は 1 行
 //!   (`VEIN CHARA <hex>` / `ERR VEIN <reason>`) でホストへ出す
-//! - `VEIN TEST ENROLL|VERIFY|CLEAR|INFO|COPY <id>…` (試験用): モジュール自身の登録と照合で撮像を
+//! - `VEIN TEST ENROLL|VERIFY|CLEAR|INFO|COPY|REBUILD <id>…` (試験用): モジュール自身の登録と照合で撮像を
 //!   確かめる診断。同じ読み取りスレッドで直列に捌く (結果は `VEIN TEST …` / `ERR VEIN <reason>`)
 //! - `VEIN TEST WRITE <id> <offset> <hex>|END` (試験用): 外から受けた登録データをモジュールの
 //!   ID へ書く。組み立て中のデータはこのスレッドが持つ。**受けたデータはログにも応答にも出さない**
@@ -252,6 +252,9 @@ pub fn start(
                         proto::TestCommand::Duplicate { from, to } => {
                             proto::test_copy(&mut port, t, from, to)
                                 .map(|len| proto::test_copied_line(from, to, len))
+                        }
+                        proto::TestCommand::Rebuild { a, b, to, user } => {
+                            proto::test_rebuild(&mut port, t, a, b, to, user)
                         }
                     }
                     .unwrap_or_else(proto::err_line);
