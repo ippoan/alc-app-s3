@@ -276,6 +276,8 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
     use crate::vein::{parse_test_id, TestCommand, WriteCommand, WRITE_LINE_MAX};
     const BAD_ID: &str = "ERR VEIN: TEST の ID は 2〜9 の数字だけです";
     const BAD_COPY: &str = "ERR VEIN: COPY には違う 2 つの ID (2〜9) が必要です";
+    const BAD_REBUILD: &str =
+        "ERR VEIN: REBUILD は <a> [<b>] <to> [U] です (ID は違う 2〜9 の数字)";
     const BAD_WRITE: &str = "ERR VEIN: WRITE は <id> <offset> <hex> か <id> END です (hex は 192 バイトまで)";
     let verb = it.next().map(|s| s.to_ascii_uppercase());
     let args: Vec<&str> = it.collect();
@@ -297,6 +299,22 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
             _ => Err(BAD_COPY.into()),
         },
         (Some("COPY"), _) => Err(BAD_COPY.into()),
+        (Some("REBUILD"), args) => {
+            let (ids, user) = match args.split_last() {
+                Some((last, rest)) if last.eq_ignore_ascii_case("U") => (rest, true),
+                _ => (args, false),
+            };
+            let ids: Option<Vec<u32>> = ids.iter().map(|s| parse_test_id(s)).collect();
+            match ids.as_deref() {
+                Some(&[a, to]) if a != to => {
+                    Ok(HostCommand::VeinTest(TestCommand::Rebuild { a, b: None, to, user }))
+                }
+                Some(&[a, b, to]) if a != b && a != to && b != to => {
+                    Ok(HostCommand::VeinTest(TestCommand::Rebuild { a, b: Some(b), to, user }))
+                }
+                _ => Err(BAD_REBUILD.into()),
+            }
+        }
         (Some("WRITE"), [id, end]) if end.eq_ignore_ascii_case("END") => parse_test_id(id)
             .map(|id| HostCommand::VeinWrite(WriteCommand::End(id)))
             .ok_or_else(|| BAD_ID.into()),
@@ -315,7 +333,7 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
             }
         }
         (Some("WRITE"), _) => Err(BAD_WRITE.into()),
-        _ => Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|INFO|COPY|WRITE が必要です".into()),
+        _ => Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|INFO|COPY|REBUILD|WRITE が必要です".into()),
     }
 }
 
@@ -1595,6 +1613,22 @@ mod tests {
             Ok(Some(HostCommand::VeinTest(TestCommand::Duplicate { from: 2, to: 3 })))
         );
         assert_eq!(
+            parse_line("vein test rebuild 2 3", T),
+            Ok(Some(HostCommand::VeinTest(TestCommand::Rebuild { a: 2, b: None, to: 3, user: false })))
+        );
+        assert_eq!(
+            parse_line("VEIN TEST REBUILD 2 3 u", T),
+            Ok(Some(HostCommand::VeinTest(TestCommand::Rebuild { a: 2, b: None, to: 3, user: true })))
+        );
+        assert_eq!(
+            parse_line("VEIN TEST REBUILD 2 4 5", T),
+            Ok(Some(HostCommand::VeinTest(TestCommand::Rebuild { a: 2, b: Some(4), to: 5, user: false })))
+        );
+        assert_eq!(
+            parse_line("VEIN TEST REBUILD 2 4 5 U", T),
+            Ok(Some(HostCommand::VeinTest(TestCommand::Rebuild { a: 2, b: Some(4), to: 5, user: true })))
+        );
+        assert_eq!(
             parse_line("VEIN TEST WRITE 3 END", T),
             Ok(Some(HostCommand::VeinWrite(WriteCommand::End(3))))
         );
@@ -1630,6 +1664,20 @@ mod tests {
             "VEIN TEST COPY 1 3",
             "VEIN TEST COPY 2 x",
             "VEIN TEST COPY 2 3 4",
+            "VEIN TEST REBUILD",
+            "VEIN TEST REBUILD 2",
+            "VEIN TEST REBUILD U",
+            "VEIN TEST REBUILD 2 U",
+            "VEIN TEST REBUILD 2 2",
+            "VEIN TEST REBUILD 1 3",
+            "VEIN TEST REBUILD 2 10",
+            "VEIN TEST REBUILD 2 x",
+            "VEIN TEST REBUILD 2 3 X",
+            "VEIN TEST REBUILD 2 3 U U",
+            "VEIN TEST REBUILD 2 3 2",
+            "VEIN TEST REBUILD 2 2 3",
+            "VEIN TEST REBUILD 2 3 3",
+            "VEIN TEST REBUILD 2 3 4 5",
             "VEIN TEST WRITE",
             "VEIN TEST WRITE 3",
             "VEIN TEST WRITE 3 5",

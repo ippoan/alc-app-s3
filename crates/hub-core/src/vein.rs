@@ -578,6 +578,10 @@ pub enum TestCommand {
     Info(u32),
     /// `VEIN TEST COPY <from> <to>`: `from` の登録データを読み、`to` へ書く
     Duplicate { from: u32, to: u32 },
+    /// `VEIN TEST REBUILD <a> [<b>] <to> [U]`: `a` (と `b`) の登録データから特徴量を取り出し、
+    /// サーバーと同じ作り直し (`create_template`) で記録を組んで `to` へ書く。`b` があれば
+    /// 件の数 2、無ければ 1。`user` は利用者番号を `a` の記録の値にする (無ければ 0)
+    Rebuild { a: u32, b: Option<u32>, to: u32, user: bool },
 }
 
 /// `VEIN TEST WRITE …` (試験用)。外から受けた登録データを ID へ書く。
@@ -757,6 +761,48 @@ pub fn test_copy(port: &mut dyn Port, t: &Timeouts, from: u32, to: u32) -> Resul
 /// `VEIN TEST COPIED <from> <to> <バイト数>`
 pub fn test_copied_line(from: u32, to: u32, len: usize) -> String {
     format!("VEIN TEST COPIED {from} {to} {len}")
+}
+
+/// 試験: `a` (と `b`) の登録データを読み、特徴量だけ取り出して `create_template` で記録を
+/// 作り直し (サーバーの画面の登録と同じ: group 0, mode 1, 詰め物なし)、`to` へ書く。
+/// 戻り値は応答の 1 行 (`VEIN TEST REBUILT …`)。
+///
+/// 行に出すのは `a` の外側ヘッダの値 (利用者番号 +0x10 / 件の数 +0x15 / グループ +0x16。暗号化
+/// されていない数値で生体データではない) と、件の数 1 のときの `a` との違うバイト数だけ。
+/// 位置も中身も出さない。`create_template` の失敗の番号は応答の破損 ([`VeinError::ReadFail`])
+/// にまとめる
+pub fn test_rebuild(
+    port: &mut dyn Port,
+    t: &Timeouts,
+    a: u32,
+    b: Option<u32>,
+    to: u32,
+    user: bool,
+) -> Result<String, VeinError> {
+    connect(port, t)?;
+    let src = read_enroll(port, t, a)?;
+    let mut charas = vec![extract_chara(&src)?];
+    if let Some(b) = b {
+        charas.push(extract_chara(&read_enroll(port, t, b)?)?);
+    }
+    // extract_chara が通った = 外側ヘッダ (0x20 バイト) を読めている
+    let src_user = u32::from_le_bytes([src[0x10], src[0x11], src[0x12], src[0x13]]);
+    let refs: Vec<&[u8]> = charas.iter().map(|c| c.as_slice()).collect();
+    let rebuilt = vein_match_search::create_template(&refs, if user { src_user } else { 0 }, 0, 1, &[])
+        .map_err(|_| VeinError::ReadFail)?;
+    write_enroll(port, t, to, &rebuilt)?;
+    let diff = if b.is_none() && rebuilt.len() == src.len() {
+        src.iter().zip(&rebuilt).filter(|(x, y)| x != y).count().to_string()
+    } else {
+        "-".into()
+    };
+    Ok(format!(
+        "VEIN TEST REBUILT {to} {} SRC_USER={src_user} SRC_GROUP={} SRC_COUNT={} DIFF={diff} FLAGS={}",
+        rebuilt.len(),
+        src[0x16],
+        src[0x15],
+        if user { "U" } else { "" },
+    ))
 }
 
 /// 試験: 外から受けた登録データを足す / 書く。`slot` は組み立て中のもの (スレッドが持つ)。
@@ -1960,6 +2006,118 @@ mod tests {
         script.push(write_ready());
         let mut port = FailAt(FakePort::new(script), 5);
         assert_eq!(test_copy(&mut port, &Timeouts::DEFAULT, 2, 3), Err(VeinError::ReadFail));
+    }
+
+    /// REBUILD の台本: 接続 → (READ_ENROLL → READ_DATA …) を元の数だけ → WRITE_ENROLL → WRITE_DATA …
+    fn rebuild_script(srcs: &[&[u8]], out_len: usize) -> Vec<Option<Vec<u8>>> {
+        let mut script = vec![connected()];
+        for src in srcs {
+            script.push(size(src.len()));
+            for (off, len) in chunks(src.len()) {
+                script.push(Some(chunk(&src[off..off + len])));
+            }
+        }
+        script.push(write_ready());
+        script.extend(chunks(out_len).map(|_| ack_write(true)));
+        script
+    }
+
+    fn rebuild_t(port: &mut dyn Port, b: Option<u32>, user: bool) -> Result<String, VeinError> {
+        test_rebuild(port, &Timeouts::DEFAULT, 2, b, 3, user)
+    }
+
+    #[test]
+    fn test_rebuild_one_chara_matches_the_server_shape() {
+        // サーバーと同じ作り直し (user 0) で組んだ記録を元にすれば、作り直しても同じ
+        let src = synth_enroll(&[&synth_chara(1)]);
+        let mut port = FakePort::new(rebuild_script(&[&src], src.len()));
+        let line = rebuild_t(&mut port, None, false).unwrap();
+        assert_eq!(
+            line,
+            format!("VEIN TEST REBUILT 3 {} SRC_USER=0 SRC_GROUP=0 SRC_COUNT=1 DIFF=0 FLAGS=", src.len())
+        );
+        // 接続 → READ_ENROLL → READ_DATA ×n → WRITE_ENROLL → WRITE_DATA ×m
+        let n = chunks(src.len()).count();
+        assert_eq!(port.sent.len(), 3 + 2 * n);
+        assert_eq!(&port.sent[1][3..10], &[CMD_READ_ENROLL, 0, 4, 2, 0, 0, 0]);
+        let len = (src.len() as u32).to_le_bytes();
+        assert_eq!(
+            port.sent[2 + n],
+            command(CMD_WRITE_ENROLL, &[3, 0, 0, 0, len[0], len[1], len[2], len[3]]).to_vec()
+        );
+        let mut want = read_data_request(CMD_WRITE_DATA, CMD_WRITE_ENROLL, 0, 512).to_vec();
+        want.extend_from_slice(&src[..512]);
+        want.extend_from_slice(&checksum(&src[..512]).to_le_bytes());
+        assert_eq!(port.sent[3 + n], want);
+    }
+
+    #[test]
+    fn test_rebuild_user_flag_takes_the_source_user() {
+        // 利用者番号 5 の記録: flag なしは 0 に作り直すので違いが出る、U は 5 を引き継ぐ
+        let src = vein_match_search::create_template(&[&synth_chara(1)[..]], 5, 0, 1, &[]).unwrap();
+        let mut port = FakePort::new(rebuild_script(&[&src], src.len()));
+        let line = rebuild_t(&mut port, None, false).unwrap();
+        assert!(line.contains(" SRC_USER=5 SRC_GROUP=0 SRC_COUNT=1 DIFF="), "{line}");
+        assert!(!line.contains("DIFF=0 "), "{line}");
+        let mut port = FakePort::new(rebuild_script(&[&src], src.len()));
+        let line = rebuild_t(&mut port, None, true).unwrap();
+        assert_eq!(
+            line,
+            format!("VEIN TEST REBUILT 3 {} SRC_USER=5 SRC_GROUP=0 SRC_COUNT=1 DIFF=0 FLAGS=U", src.len())
+        );
+    }
+
+    #[test]
+    fn test_rebuild_two_charas_makes_a_two_entry_record() {
+        let a = synth_enroll(&[&synth_chara(1)]);
+        let b = synth_enroll(&[&synth_chara(2)]);
+        let want = synth_enroll(&[&synth_chara(1), &synth_chara(2)]);
+        let mut port = FakePort::new(rebuild_script(&[&a, &b], want.len()));
+        let line = rebuild_t(&mut port, Some(4), false).unwrap();
+        // 件の数 2 は元の記録と長さが違うので DIFF は数えない。SRC_* は a の値
+        assert_eq!(
+            line,
+            format!("VEIN TEST REBUILT 3 {} SRC_USER=0 SRC_GROUP=0 SRC_COUNT=1 DIFF=- FLAGS=", want.len())
+        );
+        // 2 つ目は ID 4 から読む
+        let n = chunks(a.len()).count();
+        assert_eq!(&port.sent[2 + n][3..10], &[CMD_READ_ENROLL, 0, 4, 4, 0, 0, 0]);
+        // 元が 2 件の記録は特徴量を 1 つに決められないので断る
+        let mut port = FakePort::new(rebuild_script(&[&want], a.len()));
+        assert_eq!(rebuild_t(&mut port, None, false), Err(VeinError::ReadFail));
+    }
+
+    #[test]
+    fn test_rebuild_failures() {
+        let src = synth_enroll(&[&synth_chara(1)]);
+        // 読めない (空の ID) / 接続できない
+        let mut port = FakePort::new(vec![connected(), Some(reply(CMD_READ_ENROLL, &[XG_ERR_FAIL, 0x0A]))]);
+        assert_eq!(rebuild_t(&mut port, None, false), Err(VeinError::Rc(0x0A)));
+        let mut port = FakePort::new(vec![None]);
+        assert_eq!(rebuild_t(&mut port, None, false), Err(VeinError::NoModule));
+        // 読めたが登録データの形ではない
+        let junk = sample_chara(0x40);
+        let mut port = FakePort::new(rebuild_script(&[&junk], 0));
+        assert_eq!(rebuild_t(&mut port, None, false), Err(VeinError::ReadFail));
+        // 2 つ目が読めない / 形ではない
+        let mut script = rebuild_script(&[&src], 0);
+        script.truncate(script.len() - 1);
+        script.push(Some(reply(CMD_READ_ENROLL, &[XG_ERR_FAIL, 0x0A])));
+        let mut port = FakePort::new(script);
+        assert_eq!(rebuild_t(&mut port, Some(4), false), Err(VeinError::Rc(0x0A)));
+        let mut port = FakePort::new(rebuild_script(&[&src, &junk], 0));
+        assert_eq!(rebuild_t(&mut port, Some(4), false), Err(VeinError::ReadFail));
+        // 特徴量が壊れていて作り直せない (件の先頭の印を潰した記録)
+        let mut rec = vein_match_search::make_record(&[[0u8; vein_match::PLANE_LEN]], 0, 0).unwrap();
+        rec[0x40] = 0;
+        let bad = vein_match_search::build_template(&rec, 0, 1, &[]).unwrap();
+        let mut port = FakePort::new(rebuild_script(&[&bad], 0));
+        assert_eq!(rebuild_t(&mut port, None, false), Err(VeinError::ReadFail));
+        // 書き込み先が断った
+        let mut script = rebuild_script(&[&src], 0);
+        script.push(Some(reply(CMD_WRITE_ENROLL, &[XG_ERR_FAIL, 0x03])));
+        let mut port = FakePort::new(script);
+        assert_eq!(rebuild_t(&mut port, None, false), Err(VeinError::Rc(0x03)));
     }
 
     fn chunk_cmd(id: u32, offset: usize, data: &[u8]) -> WriteCommand {
