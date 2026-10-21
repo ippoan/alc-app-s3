@@ -7,10 +7,12 @@
 //! - UART を開き、[`alc_hub_core::vein::Port`] として渡す
 //! - `VEIN CAPTURE` を受けて読み取る専用スレッド。結果は 1 行
 //!   (`VEIN CHARA <hex>` / `ERR VEIN <reason>`) でホストへ出す
-//! - `VEIN TEST ENROLL|VERIFY|CLEAR|INFO|COPY|REBUILD <id>…` (試験用): モジュール自身の登録と照合で撮像を
-//!   確かめる診断。同じ読み取りスレッドで直列に捌く (結果は `VEIN TEST …` / `ERR VEIN <reason>`)
-//! - `VEIN TEST WRITE <id> <offset> <hex>|END` (試験用): 外から受けた登録データをモジュールの
-//!   ID へ書く。組み立て中のデータはこのスレッドが持つ。**受けたデータはログにも応答にも出さない**
+//! - `VEIN TEST ENROLL|VERIFY|CLEAR <id>` / `VEIN TEST CAPACITY` (試験用): モジュール自身の登録と
+//!   照合で撮像を確かめる診断。同じ読み取りスレッドで直列に捌く (結果は `VEIN TEST …` / `ERR VEIN <reason>`)
+//! - 本番の口 `VEIN ENROLL <id>` / `VEIN IDENTIFY` / `VEIN SYNC WRITE|CLEAR …` (ippoan/alc-app#436 の
+//!   M-b): 手順と行は `alc_hub_core::vein::run`。同じスレッドで直列に捌き、返った行をそのまま出す。
+//!   `SYNC WRITE` の組み立て中のデータはこのスレッドが持つ。**記録を出すのは `VEIN RECORD` 行だけ**
+//!   (受けたデータ・読んだ記録はログに出さない)
 //! - `VEIN SAY <x>` を再生スレッド (speaker) へ取り次ぐ
 //!
 //! **指の見張り** (ippoan/alc-app#436): 読み取りスレッドは依頼が無い回だけ指の有無を
@@ -55,10 +57,10 @@ enum Request {
     Capture,
     /// `VEIN FINGER?`
     Finger,
-    /// `VEIN TEST ENROLL|VERIFY|CLEAR <id>` (試験用。指の見張りと同じ UART なので同じ列で直列に捌く)
+    /// `VEIN TEST …` (試験用。指の見張りと同じ UART なので同じ列で直列に捌く)
     Test(proto::TestCommand),
-    /// `VEIN TEST WRITE …` (試験用。同じく直列。データは Debug に出ない型)
-    Write(proto::WriteCommand),
+    /// 本番の口 (同じく直列。`SYNC WRITE` のデータは Debug に出ない型)
+    Run(proto::Command),
 }
 
 /// console から読み取りスレッドと再生スレッドへの口。clone して配る
@@ -94,9 +96,9 @@ impl Link {
         }
     }
 
-    /// `VEIN TEST WRITE …`。結果は読み取りスレッドが後から 1 行で出す
-    pub fn write(&self, cmd: proto::WriteCommand) {
-        if self.capture_tx.send(Request::Write(cmd)).is_err() {
+    /// 本番の口 (`VEIN ENROLL` / `VEIN IDENTIFY` / `VEIN SYNC …`)。結果は読み取りスレッドが後から出す
+    pub fn run(&self, cmd: proto::Command) {
+        if self.capture_tx.send(Request::Run(cmd)).is_err() {
             println!("{}", proto::err_line(VeinError::NoModule));
         }
     }
@@ -140,6 +142,10 @@ impl Port for UartPort {
             .read(buf, TickType::new_millis(u64::from(timeout_ms)).ticks())
             .unwrap_or(0)
     }
+
+    fn pause(&mut self, ms: u32) {
+        std::thread::sleep(Duration::from_millis(u64::from(ms)));
+    }
 }
 
 /// UART を開いて読み取りスレッドを立てる。ピンは呼び出し側 (main.rs) が
@@ -178,7 +184,7 @@ pub fn start(
             // 非対応と分かったら見張りをやめる (`VEIN FINGER?` と読み取りは受け続ける)
             let mut watching = true;
             let mut was_failing = false;
-            // `VEIN TEST WRITE` で組み立て中の登録データ (ヒープ。最大 8KB)
+            // `VEIN SYNC WRITE` で組み立て中の登録データ (ヒープ。最大 8KB)
             let mut assembling: Option<proto::TemplateAssembler> = None;
             loop {
                 let req = match capture_rx
@@ -226,11 +232,16 @@ pub fn start(
                     continue;
                 }
                 let mut on_prompt = |p: proto::Prompt| {
-                    // 「離して」はビープ、撮り直しは「もう一度置いてください」。どちらも
-                    // モジュールの途中経過でしか分からないので端末が鳴らす
+                    // 「離して」はビープ、撮り直しと登録の置き直しは「もう一度置いてください」。
+                    // どれもモジュールの途中経過 (置き直しは指が離れたこと) でしか分からないので端末が鳴らす
                     let sound = match p {
                         proto::Prompt::Release => Some(Sound::BeepOk),
                         proto::Prompt::Retry(_) => Some(Sound::VeinAgain),
+                        proto::Prompt::Replace(n) => {
+                            // 画面が文言と進み具合に使う (生体データなし)
+                            alc_hub_common::evtlog::emit(&format!("EVT VEIN PLACE {n}"));
+                            Some(Sound::VeinAgain)
+                        }
                         proto::Prompt::Place => None,
                     };
                     if let (Some(s), Some(tx)) = (sound, beeper.get()) {
@@ -245,19 +256,10 @@ pub fn start(
                         proto::TestCommand::Verify(id) => proto::test_verify(&mut port, t, id, &mut on_prompt)
                             .map(|data| proto::test_verify_line(id, &data)),
                         proto::TestCommand::Clear(id) => {
-                            proto::test_clear(&mut port, t, id).map(|()| proto::test_cleared_line(id))
+                            proto::clear(&mut port, t, id).map(|()| proto::test_cleared_line(id))
                         }
-                        proto::TestCommand::Info(id) => proto::test_info(&mut port, t, id)
-                            .map(|(count, size)| proto::test_info_line(id, count, size)),
                         proto::TestCommand::Capacity => proto::test_capacity(&mut port, t)
                             .map(|(users, max)| proto::test_capacity_line(users, max)),
-                        proto::TestCommand::Duplicate { from, to } => {
-                            proto::test_copy(&mut port, t, from, to)
-                                .map(|len| proto::test_copied_line(from, to, len))
-                        }
-                        proto::TestCommand::Rebuild { a, b, to, user } => {
-                            proto::test_rebuild(&mut port, t, a, b, to, user)
-                        }
                     }
                     .unwrap_or_else(proto::err_line);
                     emit_whole_line(&line);
@@ -265,13 +267,15 @@ pub fn start(
                     watch.after_capture();
                     continue;
                 }
-                if let Request::Write(cmd) = req {
-                    // 受けたデータはここから先どこにも出さない (応答は offset と件数だけ)
-                    let line = proto::test_write(&mut assembling, &mut port, &Timeouts::DEFAULT, cmd)
-                        .unwrap_or_else(proto::err_line);
-                    emit_whole_line(&line);
-                    // END でモジュールに書いたときだけ状態が変わる。途中の塊は UART に触れていない
-                    if assembling.is_none() {
+                if let Request::Run(cmd) = req {
+                    // SYNC WRITE の途中の塊だけは UART に触れない。ほかはモジュールの状態が変わりうる
+                    let touches = !matches!(cmd, proto::Command::SyncWrite(proto::WriteCommand::Chunk { .. }));
+                    // 行は 1 行ずつ 1 回の write で出す (VEIN RECORD は 1 行 2 千文字を超える)。
+                    // 受けたデータ・読んだ記録はここから先ログに出さない
+                    for line in proto::run(cmd, &mut assembling, &mut port, &Timeouts::DEFAULT, &mut on_prompt) {
+                        emit_whole_line(&line);
+                    }
+                    if touches {
                         watch.after_capture();
                     }
                     continue;
@@ -305,7 +309,7 @@ pub fn start(
 
 /// 行頭から 1 行を **1 回の write で**出す。
 ///
-/// `VEIN CHARA` は 2 千文字を超える (0x448 バイト = 2192 文字)。`println!` だと Rust の stdout
+/// `VEIN CHARA` / `VEIN RECORD` は 2 千文字を超える (0x448 バイト = 2192 文字)。`println!` だと Rust の stdout
 /// (LineWriter、1KB) が「前置き」「本文」「改行」を別々の write に分けることが
 /// あり、その間に ESP-IDF のログ (C 側、同じ USB Serial/JTAG) が割り込むと
 /// 行が割れる。VFS の write は 1 回の呼び出しの間ロックを持つので、1 本に
