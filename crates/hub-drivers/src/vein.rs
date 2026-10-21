@@ -249,6 +249,8 @@ pub fn start(
                         }
                         proto::TestCommand::Info(id) => proto::test_info(&mut port, t, id)
                             .map(|(count, size)| proto::test_info_line(id, count, size)),
+                        proto::TestCommand::Capacity => proto::test_capacity(&mut port, t)
+                            .map(|(users, max)| proto::test_capacity_line(users, max)),
                         proto::TestCommand::Duplicate { from, to } => {
                             proto::test_copy(&mut port, t, from, to)
                                 .map(|len| proto::test_copied_line(from, to, len))

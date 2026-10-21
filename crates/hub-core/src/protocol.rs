@@ -264,6 +264,7 @@ pub enum HostCommand {
     VeinFingerQuery,
     /// 試験用 (`VEIN TEST ENROLL|VERIFY|CLEAR <id>`)。モジュール自身の登録と照合で撮像を
     /// 確かめる診断。結果は 1 行 (`VEIN TEST …` / `ERR VEIN <reason>`)。id は 2〜9 だけ
+    /// (VERIFY は 0 = 1:N も可。`VEIN TEST CAPACITY` は引数なし)
     VeinTest(crate::vein::TestCommand),
     /// 試験用 (`VEIN TEST WRITE <id> <offset> <hex>` / `VEIN TEST WRITE <id> END`)。外から
     /// 受けた登録データをモジュールの ID へ書く。**生体データを持つので Debug は大きさだけ**
@@ -275,6 +276,8 @@ pub enum HostCommand {
 fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostCommand, String> {
     use crate::vein::{parse_test_id, TestCommand, WriteCommand, WRITE_LINE_MAX};
     const BAD_ID: &str = "ERR VEIN: TEST の ID は 2〜9 の数字だけです";
+    const BAD_VERIFY: &str = "ERR VEIN: VERIFY の ID は 0 か 2〜9 の数字だけです";
+    const BAD_CAPACITY: &str = "ERR VEIN: CAPACITY に引数は要りません";
     const BAD_COPY: &str = "ERR VEIN: COPY には違う 2 つの ID (2〜9) が必要です";
     const BAD_REBUILD: &str =
         "ERR VEIN: REBUILD は <a> [<b>] <to> [U] です (ID は違う 2〜9 の数字)";
@@ -282,16 +285,24 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
     let verb = it.next().map(|s| s.to_ascii_uppercase());
     let args: Vec<&str> = it.collect();
     match (verb.as_deref(), args.as_slice()) {
-        (Some(v @ ("ENROLL" | "VERIFY" | "CLEAR" | "INFO")), [id]) => {
+        // VERIFY だけ ID 0 (1:N) を通す。ENROLL 0 / CLEAR 0 は意味が違うので開かない
+        (Some("VERIFY"), [id]) => (*id == "0")
+            .then_some(0)
+            .or_else(|| parse_test_id(id))
+            .map(|id| HostCommand::VeinTest(TestCommand::Verify(id)))
+            .ok_or_else(|| BAD_VERIFY.into()),
+        (Some("VERIFY"), _) => Err(BAD_VERIFY.into()),
+        (Some("CAPACITY"), []) => Ok(HostCommand::VeinTest(TestCommand::Capacity)),
+        (Some("CAPACITY"), _) => Err(BAD_CAPACITY.into()),
+        (Some(v @ ("ENROLL" | "CLEAR" | "INFO")), [id]) => {
             let make: fn(u32) -> TestCommand = match v {
                 "ENROLL" => TestCommand::Enroll,
-                "VERIFY" => TestCommand::Verify,
                 "CLEAR" => TestCommand::Clear,
                 _ => TestCommand::Info,
             };
             parse_test_id(id).map(|id| HostCommand::VeinTest(make(id))).ok_or_else(|| BAD_ID.into())
         }
-        (Some("ENROLL" | "VERIFY" | "CLEAR" | "INFO"), _) => Err(BAD_ID.into()),
+        (Some("ENROLL" | "CLEAR" | "INFO"), _) => Err(BAD_ID.into()),
         (Some("COPY"), [from, to]) => match (parse_test_id(from), parse_test_id(to)) {
             (Some(from), Some(to)) if from != to => {
                 Ok(HostCommand::VeinTest(TestCommand::Duplicate { from, to }))
@@ -333,7 +344,7 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
             }
         }
         (Some("WRITE"), _) => Err(BAD_WRITE.into()),
-        _ => Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|INFO|COPY|REBUILD|WRITE が必要です".into()),
+        _ => Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|INFO|CAPACITY|COPY|REBUILD|WRITE が必要です".into()),
     }
 }
 
@@ -1578,6 +1589,29 @@ mod tests {
             parse_line("VEIN TEST CLEAR 5", T),
             Ok(Some(HostCommand::VeinTest(TestCommand::Clear(5))))
         );
+        // VERIFY だけ ID 0 (1:N) を通す。CAPACITY は引数なし
+        assert_eq!(
+            parse_line("VEIN TEST VERIFY 0", T),
+            Ok(Some(HostCommand::VeinTest(TestCommand::Verify(0))))
+        );
+        assert_eq!(
+            parse_line("VEIN TEST CAPACITY", T),
+            Ok(Some(HostCommand::VeinTest(TestCommand::Capacity)))
+        );
+        for bad in ["VEIN TEST VERIFY", "VEIN TEST VERIFY 1", "VEIN TEST VERIFY 10", "VEIN TEST VERIFY 00", "VEIN TEST VERIFY 0 2"] {
+            assert_eq!(
+                parse_line(bad, T),
+                Err("ERR VEIN: VERIFY の ID は 0 か 2〜9 の数字だけです".into()),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            parse_line("VEIN TEST CAPACITY 2", T),
+            Err("ERR VEIN: CAPACITY に引数は要りません".into())
+        );
+        for bad in ["VEIN TEST ENROLL 0", "VEIN TEST CLEAR 0", "VEIN TEST INFO 0"] {
+            assert_eq!(parse_line(bad, T), Err("ERR VEIN: TEST の ID は 2〜9 の数字だけです".into()), "{bad}");
+        }
         for bad in [
             "VEIN TEST",
             "VEIN TEST ENROLL",

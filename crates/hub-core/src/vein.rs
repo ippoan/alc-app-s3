@@ -68,6 +68,9 @@ pub const CMD_WRITE_DATA: u8 = 0x21;
 pub const CMD_WRITE_ENROLL: u8 = 0x23;
 /// 指定 ID の登録テンプレート数 (GET_ID_INFO、§2.2.19。0 件 = 空き ID)
 pub const CMD_GET_ID_INFO: u8 = 0x15;
+/// 登録ユーザー数と上限 (GET_ENROLL_INFO、§2.2.18。送る `bData` は無し)。
+/// 試験用 (`VEIN TEST CAPACITY`) だけが使う
+pub const CMD_GET_ENROLL_INFO: u8 = 0x14;
 
 /// 指定 ID の指で照合する (1:1)。**試験用 (`VEIN TEST VERIFY`)。番号は `0x17` (出典は
 /// vein-match の調査メモ)、引数の並び (`bData[0..4]` = ID LE) と応答の形は推測 —
@@ -570,12 +573,14 @@ fn read_enroll(port: &mut dyn Port, t: &Timeouts, id: u32) -> Result<Vec<u8>, Ve
 pub enum TestCommand {
     /// `VEIN TEST ENROLL <id>`: ID に登録してモジュールに残す
     Enroll(u32),
-    /// `VEIN TEST VERIFY <id>`: ID で 1:1 照合する
+    /// `VEIN TEST VERIFY <id>`: ID で 1:1 照合する。`0` は 1:N (登録済み全員から探す、§2.2.21)
     Verify(u32),
     /// `VEIN TEST CLEAR <id>`: ID の登録を消す
     Clear(u32),
     /// `VEIN TEST INFO <id>`: ID の登録テンプレート数と READ_ENROLL の大きさだけを返す
     Info(u32),
+    /// `VEIN TEST CAPACITY`: 登録ユーザー数と登録できる上限を返す
+    Capacity,
     /// `VEIN TEST COPY <from> <to>`: `from` の登録データを読み、`to` へ書く
     Duplicate { from: u32, to: u32 },
     /// `VEIN TEST REBUILD <a> [<b>] <to> [U]`: `a` (と `b`) の登録データから特徴量を取り出し、
@@ -651,7 +656,8 @@ pub fn test_enroll(
     enroll_id(port, t, id, on_prompt)
 }
 
-/// 試験: 接続して ID で 1:1 照合する。戻り値は最終応答のデータ部 (`bData[0]` = RC)。
+/// 試験: 接続して ID で照合する。**ID `0` は 1:N (§2.2.21)**: 登録済み全員から探し、成功なら
+/// 応答の `bData[1..5]` (LE) が当たった ID。戻り値は最終応答のデータ部 (`bData[0]` = RC)。
 /// **引数は ENROLL と同じ形 (`bData[0..4]` = ID LE) の推測**。待ち方も推測で、
 /// ENROLL と同じく VERIFY 送信後にモジュールが指を待ち、途中経過 (置いて / 離して) が届く前提
 /// (指を待たず即座に「指が無い」を返す機種なら FINGER_STATE で待ってから送る形に直す — 実機で確認)。
@@ -711,6 +717,23 @@ pub fn test_info(port: &mut dyn Port, t: &Timeouts, id: u32) -> Result<(u8, u32)
 /// `VEIN TEST INFO <id> TEMPLATES=<n> SIZE=<バイト数>`
 pub fn test_info_line(id: u32, count: u8, size: u32) -> String {
     format!("VEIN TEST INFO {id} TEMPLATES={count} SIZE={size}")
+}
+
+/// 試験: 接続して登録ユーザー数と上限を読む (GET_ENROLL_INFO、§2.2.18)。
+/// 戻り値は (`bData[1..5]` LE = 登録ユーザー数, `bData[9..13]` LE = 上限)
+pub fn test_capacity(port: &mut dyn Port, t: &Timeouts) -> Result<(u32, u32), VeinError> {
+    connect(port, t)?;
+    let p = exchange(port, t, CMD_GET_ENROLL_INFO, &[])?;
+    if p.data[0] != XG_ERR_SUCCESS {
+        return Err(VeinError::Rc(p.data[1]));
+    }
+    let word = |i: usize| u32::from_le_bytes([p.data[i], p.data[i + 1], p.data[i + 2], p.data[i + 3]]);
+    Ok((word(1), word(9)))
+}
+
+/// `VEIN TEST CAPACITY USERS=<登録ユーザー数> MAX=<上限>`
+pub fn test_capacity_line(users: u32, max: u32) -> String {
+    format!("VEIN TEST CAPACITY USERS={users} MAX={max}")
 }
 
 /// ID `id` の登録データを書く (接続済みであること。WRITE_ENROLL → WRITE_DATA、§2.2.27 / §2.2.25)。
@@ -1943,6 +1966,38 @@ mod tests {
         let mut port = FakePort::new(vec![connected(), None]);
         assert_eq!(test_info(&mut port, &Timeouts::DEFAULT, 4), Err(VeinError::Timeout));
         assert_eq!(test_info_line(4, 2, 1096), "VEIN TEST INFO 4 TEMPLATES=2 SIZE=1096");
+    }
+
+    #[test]
+    fn test_verify_id_zero_is_one_to_n() {
+        // ID 0 = 1:N (§2.2.21)。送る bData は ID の LE 4 バイト (00 00 00 00)、
+        // 成功の応答の bData[1..5] (LE) が当たった ID
+        let v = reply(CMD_VERIFY, &[XG_ERR_SUCCESS, 7, 0, 0, 0]);
+        let (r, port, _) = run_test_verify(vec![connected(), Some(v)], 0);
+        let data = r.unwrap();
+        assert_eq!(&port.sent[1][3..10], &[CMD_VERIFY, 0, 4, 0, 0, 0, 0]);
+        assert_eq!(test_verify_line(0, &data), "VEIN TEST VERIFY 0 RC=00 DATA=07000000000000000000000000000000");
+    }
+
+    #[test]
+    fn test_capacity_reads_users_and_max() {
+        let mut d = [0u8; 13];
+        d[0] = XG_ERR_SUCCESS;
+        d[1..5].copy_from_slice(&2u32.to_le_bytes());
+        d[9..13].copy_from_slice(&0x0102u32.to_le_bytes());
+        let mut port = FakePort::new(vec![connected(), Some(reply(CMD_GET_ENROLL_INFO, &d))]);
+        assert_eq!(test_capacity(&mut port, &Timeouts::DEFAULT), Ok((2, 0x0102)));
+        // 接続 → GET_ENROLL_INFO (bData 無し)
+        assert_eq!(port.sent.len(), 2);
+        assert_eq!(port.sent[1], command(CMD_GET_ENROLL_INFO, &[]).to_vec());
+        // 失敗コードは Rc、応答が無ければ Timeout、モジュールが居なければ NoModule
+        let mut port = FakePort::new(vec![connected(), Some(reply(CMD_GET_ENROLL_INFO, &[XG_ERR_FAIL, 0x07]))]);
+        assert_eq!(test_capacity(&mut port, &Timeouts::DEFAULT), Err(VeinError::Rc(0x07)));
+        let mut port = FakePort::new(vec![connected(), None]);
+        assert_eq!(test_capacity(&mut port, &Timeouts::DEFAULT), Err(VeinError::Timeout));
+        let mut port = FakePort::new(vec![None]);
+        assert_eq!(test_capacity(&mut port, &Timeouts::DEFAULT), Err(VeinError::NoModule));
+        assert_eq!(test_capacity_line(2, 500), "VEIN TEST CAPACITY USERS=2 MAX=500");
     }
 
     #[test]
