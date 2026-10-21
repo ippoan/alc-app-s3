@@ -2,11 +2,13 @@
 //! (Vein Station、ippoan/vein-match#20)。
 //!
 //! 手順 (接続 → 作業用 ID に 1 回登録 → 登録データの分割読み → 削除) とパケットの検査は
-//! `alc_hub_core::vein` (host test 付き) が持ち、ここは次の 3 つだけ:
+//! `alc_hub_core::vein` (host test 付き) が持ち、ここは次の 4 つだけ:
 //!
 //! - UART を開き、[`alc_hub_core::vein::Port`] として渡す
 //! - `VEIN CAPTURE` を受けて読み取る専用スレッド。結果は 1 行
 //!   (`VEIN CHARA <hex>` / `ERR VEIN <reason>`) でホストへ出す
+//! - `VEIN TEST ENROLL|VERIFY|CLEAR <id>` (試験用): モジュール自身の登録と照合で撮像を確かめる
+//!   診断。同じ読み取りスレッドで直列に捌く (結果は `VEIN TEST …` / `ERR VEIN <reason>`)
 //! - `VEIN SAY <x>` を再生スレッド (speaker) へ取り次ぐ
 //!
 //! **指の見張り** (ippoan/alc-app#436): 読み取りスレッドは依頼が無い回だけ指の有無を
@@ -51,6 +53,8 @@ enum Request {
     Capture,
     /// `VEIN FINGER?`
     Finger,
+    /// `VEIN TEST ENROLL|VERIFY|CLEAR <id>` (試験用。指の見張りと同じ UART なので同じ列で直列に捌く)
+    Test(proto::TestCommand),
 }
 
 /// console から読み取りスレッドと再生スレッドへの口。clone して配る
@@ -75,6 +79,13 @@ impl Link {
     /// `VEIN FINGER?`。指の有無を 1 回問い合わせる。結果は読み取りスレッドが後から 1 行で出す
     pub fn finger_query(&self) {
         if self.capture_tx.send(Request::Finger).is_err() {
+            println!("{}", proto::err_line(VeinError::NoModule));
+        }
+    }
+
+    /// `VEIN TEST …`。結果は読み取りスレッドが後から 1 行で出す
+    pub fn test(&self, cmd: proto::TestCommand) {
+        if self.capture_tx.send(Request::Test(cmd)).is_err() {
             println!("{}", proto::err_line(VeinError::NoModule));
         }
     }
@@ -213,6 +224,23 @@ pub fn start(
                         let _ = tx.send(s);
                     }
                 };
+                if let Request::Test(cmd) = req {
+                    let t = &Timeouts::DEFAULT;
+                    let line = match cmd {
+                        proto::TestCommand::Enroll(id) => proto::test_enroll(&mut port, t, id, &mut on_prompt)
+                            .map(|()| proto::test_enrolled_line(id)),
+                        proto::TestCommand::Verify(id) => proto::test_verify(&mut port, t, id, &mut on_prompt)
+                            .map(|data| proto::test_verify_line(id, &data)),
+                        proto::TestCommand::Clear(id) => {
+                            proto::test_clear(&mut port, t, id).map(|()| proto::test_cleared_line(id))
+                        }
+                    }
+                    .unwrap_or_else(proto::err_line);
+                    emit_whole_line(&line);
+                    // モジュール側の状態が変わったので、接続し直して「無い」を見るまで見張りは出さない
+                    watch.after_capture();
+                    continue;
+                }
                 // 登録データ (1:N のテンプレート) から 0xBDBD の特徴量 1 件を取り出して送る
                 let got = proto::capture(&mut port, &Timeouts::DEFAULT, &mut on_prompt)
                     .and_then(|enroll| {

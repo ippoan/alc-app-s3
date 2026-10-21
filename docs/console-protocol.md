@@ -133,7 +133,7 @@ CoreS3 の `STATUS LAN=…` も同様 (行頭は互換のため変えない)。
 | `AUTH TICKET` | 端末登録の一回券。**`cores3` のみ** (運行者 PWA が USB 越しに繋がるのはここだけ)、他は `ERR AUTH TICKET: unsupported` |
 | `AUTH KEYGEN` / `AUTH PUBKEY` / `AUTH SIGN` / `AUTH SIGNBP` | 警告デバイス管理者認証用の ed25519 鍵 (Refs #205, #249) |
 | `WS URL` / `WS STATUS` | cf-alc-recorder 常時接続の URL 上書き / 状態 |
-| `VEIN CAPTURE` / `VEIN SAY <x>` / `VEIN FINGER?` | `ERR VEIN: unsupported` — 指静脈を積む `vein` build だけがここを素通しして自前で答える (下記) |
+| `VEIN CAPTURE` / `VEIN SAY <x>` / `VEIN FINGER?` / `VEIN TEST …` | `ERR VEIN: unsupported` — 指静脈を積む `vein` build だけがここを素通しして自前で答える (下記) |
 
 `AUTH SIGN` / `AUTH SIGNBP` の応答 (Refs #205, #249, #269):
 
@@ -176,10 +176,15 @@ ippoan/vein-match#20)。**モジュールは実機で未確認** — 手順は
 | `VEIN CAPTURE` | 成功: **1 行で** `VEIN CHARA <hex>` (モジュールの登録データ (1:N のテンプレート、先頭 `DEEDDEED`) から取り出した 0xBDBD の特徴量 1 件の大文字 16 進。常に 0x448 バイト = 2192 文字。取り出せなければ `READ_FAIL`)。失敗: `ERR VEIN <reason>` |
 | `VEIN SAY PLACE\|AGAIN\|ENROLLED\|FAILED` | 案内音声 (「指を置いてください」/「もう一度置いてください」/「登録完了しました」/「読み取れませんでした」) を鳴らし `OK VEIN SAY <x>`。スピーカーが起きていなければ `ERR VEIN NO_SPEAKER` |
 | `VEIN FINGER?` | 指の有無を 1 回だけ問い合わせる: `VEIN FINGER 1` (有る) / `VEIN FINGER 0` (無い) / `ERR VEIN UNSUPPORTED` (モジュールが `01 10` = コマンド非対応を返した) / `ERR VEIN <reason>` (下の `<reason>`)。**実機で指の状態コマンドが通るかを確かめる口** (下の「指の見張り」) |
+| `VEIN TEST ENROLL <id>` | **試験用**。モジュール自身の登録に ID `<id>` (**2〜9 だけ**。1 は読み取りの作業用で毎回消されるので不可。範囲外・数字でないものは `ERR VEIN: TEST の ID は 2〜9 の数字だけです`) で 1 回登録する: ID を CLEAR → ENROLL (読み取りと同じ引数) で止め、READ_ENROLL も削除もしない (モジュールに残る)。成功: `VEIN TEST ENROLLED <id>`、失敗: `ERR VEIN <reason>`。指を待つので最大 15 秒強 |
+| `VEIN TEST VERIFY <id>` | **試験用**。モジュール自身の 1:1 照合 (`0x17` VERIFY) を ID 指定で 1 回行う。指を待つ途中経過 (置いて・離して) は読み取りと同じに扱う。最終応答: `VEIN TEST VERIFY <id> RC=<応答データの 1 バイト目、16 進 2 桁> DATA=<残りの 16 進>` (`DATA` は先頭 32 バイト = 64 文字で切る)。`01 10` (非対応) は `ERR VEIN UNSUPPORTED`、他は `ERR VEIN <reason>`。**引数の並び (`bData[0..4]` = ID LE) と応答の形は推測 — 実機で確認**。VERIFY が指を待たず即座に「指が無い」系を返す機種かどうかも**実機で確認** (そうなら FINGER_STATE で指を待ってから送る形に直す) |
+| `VEIN TEST CLEAR <id>` | **試験用**。ID `<id>` の登録を消す (CLEAR_ENROLL)。成功: `VEIN TEST CLEARED <id>`、失敗: `ERR VEIN <reason>` (未登録の ID はモジュールの失敗コードがそのまま `RC=…` で返る) |
+
+試験用の 3 つは**モジュール自身の登録と照合で撮像を確かめる診断**で、運用の画面からは送らない。開発用の端末の画面の `window.alcVein` からだけ送る (機体の撮像・モジュールの照合の確かめは別の機体・別の指でも今後要るため、口は残す)。指の見張りと同じ UART なので、同じ読み取りスレッドの列で直列に処理する。
 
 `<reason>`: `NO_MODULE` (接続に応答なし) / `TIMEOUT` (途中で応答が途絶えた) /
 `NO_FINGER` (指が置かれずモジュールが待ちを打ち切った) / `READ_FAIL` (応答の破損・
-読み直しの上限・登録データから特徴量 1 件を取り出せない) / `RC=<hex 2 桁>` (モジュールのエラーコード)。`VEIN CAPTURE` は
+読み直しの上限・登録データから特徴量 1 件を取り出せない) / `RC=<hex 2 桁>` (モジュールのエラーコード) / `UNSUPPORTED` (試験用 VERIFY がコマンド非対応 `01 10`)。`VEIN CAPTURE` は
 指を待つので**応答まで最大 15 秒強かかる** (途中経過 1 つにつき 15 秒)。続けて
 送った分は順に処理する。`VEIN SAY` は読み取り中でもすぐ鳴る。
 
