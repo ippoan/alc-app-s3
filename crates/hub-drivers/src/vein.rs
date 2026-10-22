@@ -7,7 +7,7 @@
 //! - UART を開き、[`alc_hub_core::vein::Port`] として渡す
 //! - `VEIN CAPTURE` を受けて読み取る専用スレッド。結果は 1 行
 //!   (`VEIN CHARA <hex>` / `ERR VEIN <reason>`) でホストへ出す
-//! - `VEIN TEST ENROLL|VERIFY|CLEAR <id>` / `VEIN TEST CAPACITY` / `VEIN TEST SYSINFO` (試験用): モジュール自身の登録と
+//! - `VEIN TEST ENROLL|VERIFY|CLEAR <id>` / `VEIN TEST CAPACITY` / `VEIN TEST SYSINFO` / `VEIN TEST IMAGE` (試験用): モジュール自身の登録と
 //!   照合で撮像を確かめる診断。同じ読み取りスレッドで直列に捌く (結果は `VEIN TEST …` / `ERR VEIN <reason>`)
 //! - 本番の口 `VEIN ENROLL <id>` / `VEIN IDENTIFY` / `VEIN SYNC WRITE|CLEAR …` (ippoan/alc-app#436 の
 //!   M-b): 手順と行は `alc_hub_core::vein::run`。同じスレッドで直列に捌き、返った行をそのまま出す。
@@ -257,22 +257,28 @@ pub fn start(
                 };
                 if let Request::Test(cmd) = req {
                     let t = &Timeouts::DEFAULT;
-                    let line = match cmd {
+                    // 生画像 (IMAGE) は何十行にもなるので、どの試験も行の列で返す
+                    let one = |line: String| vec![line];
+                    let lines = match cmd {
                         proto::TestCommand::Enroll(id) => proto::test_enroll(&mut port, t, id, &mut on_prompt)
-                            .map(|()| proto::test_enrolled_line(id)),
+                            .map(|()| one(proto::test_enrolled_line(id))),
                         proto::TestCommand::Verify(id) => proto::test_verify(&mut port, t, id, &mut on_prompt)
-                            .map(|data| proto::test_verify_line(id, &data)),
+                            .map(|data| one(proto::test_verify_line(id, &data))),
                         proto::TestCommand::Clear(id) => {
-                            proto::clear(&mut port, t, id).map(|()| proto::test_cleared_line(id))
+                            proto::clear(&mut port, t, id).map(|()| one(proto::test_cleared_line(id)))
                         }
                         proto::TestCommand::Capacity => proto::test_capacity(&mut port, t)
-                            .map(|(users, max)| proto::test_capacity_line(users, max)),
+                            .map(|(users, max)| one(proto::test_capacity_line(users, max))),
                         proto::TestCommand::SysInfo => {
-                            proto::test_sysinfo(&mut port, t).map(|data| proto::test_sysinfo_line(&data))
+                            proto::test_sysinfo(&mut port, t).map(|data| one(proto::test_sysinfo_line(&data)))
                         }
+                        proto::TestCommand::Image => proto::test_image(&mut port, t, &mut on_prompt)
+                            .map(|(w, h, img)| proto::image_lines(w, h, &img)),
                     }
-                    .unwrap_or_else(proto::err_line);
-                    emit_whole_line(&line);
+                    .unwrap_or_else(|e| one(proto::err_line(e)));
+                    for line in &lines {
+                        emit_whole_line(line);
+                    }
                     // モジュール側の状態が変わったので、接続し直して「無い」を見るまで見張りは出さない
                     watch.after_capture();
                     continue;
