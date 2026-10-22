@@ -268,8 +268,9 @@ pub enum Prompt {
     /// 撮れなかった / 違う指だった (`01 11` / `01 09`)。モジュールが撮り直すので置き直してもらう。
     /// 中身はそのエラーコード
     Retry(u8),
-    /// `VEIN ENROLL` で指が離れたのを見て、次の照合のために置き直してもらう。中身は何回目に
-    /// 置くか (登録が 1 回目なので 2 から [`ENROLL_CONFIRMS`] + 1 まで)
+    /// `VEIN ENROLL` で置き直してもらう。中身は何回目に置くか (撮影からの通し番号): 撮影の 2 枚目以降は
+    /// モジュールが次の指を待ち始めたとき、確認の照合は指が離れたのを見たとき。撮影 3 回 + 確認
+    /// [`ENROLL_CONFIRMS`] 回なら 2〜5
     Replace(u8),
 }
 
@@ -495,7 +496,26 @@ fn enroll_id(
     req[..4].copy_from_slice(&id);
     req[5] = templates;
     req[10] = ENROLL_RETRIES;
-    let p = send_and_await_final(port, t, CMD_ENROLL, &req, on_prompt)?;
+    // テンプレートを複数撮るとき、1 枚撮れる (「離して」) たびにモジュールは次の指を待ち直す
+    // (`XG_INPUT_FINGER`)。その「置いて」を [`Prompt::Replace`] (n 回目に置く) に替えて、端末が
+    // 「もう一度置いてください」を鳴らせるようにする。撮れた直後に決め打ちの間で鳴らすと早すぎる
+    // ので、モジュールが次を待ち始めた合図に合わせる (仕様書 §2.2.20 の例は 0.2 秒後に鳴らしている)。
+    // 撮り直し (`Retry`) の後の「置いて」は同じ回の置き直しなので数えない
+    let mut taken = 0u8;
+    let mut released = false;
+    let mut relay = |pr: Prompt| match pr {
+        Prompt::Release => {
+            taken += 1;
+            released = true;
+            on_prompt(pr);
+        }
+        Prompt::Place if released => {
+            released = false;
+            on_prompt(Prompt::Replace(taken + 1));
+        }
+        _ => on_prompt(pr),
+    };
+    let p = send_and_await_final(port, t, CMD_ENROLL, &req, &mut relay)?;
     // 途中経過は send_and_await_final が読み切っているので、ここに届くのは成功か失敗だけ。
     // 失敗のコードは `01 xx` なら xx、知らない `bData[0]` ならその値 ([`enroll_reply`] と同じ)
     if p.data[0] == XG_ERR_SUCCESS {
@@ -1045,7 +1065,7 @@ pub fn enroll(
 ) -> Result<Vec<u8>, VeinError> {
     connect(port, t)?;
     enroll_id(port, t, id, ENROLL_TEMPLATES_PRODUCTION, on_prompt)?;
-    let got = confirm_and_read(port, t, id, on_prompt);
+    let got = confirm_and_read(port, t, id, ENROLL_TEMPLATES_PRODUCTION, on_prompt);
     if got.is_err() {
         let _ = exchange(port, t, CMD_CLEAR_ENROLL, &id.to_le_bytes());
     }
@@ -1057,11 +1077,13 @@ fn confirm_and_read(
     port: &mut dyn Port,
     t: &Timeouts,
     id: u32,
+    templates: u8,
     on_prompt: &mut dyn FnMut(Prompt),
 ) -> Result<Vec<u8>, VeinError> {
+    // 置き直しの番号は登録の撮影から通し (撮影 3 回なら確認は 4・5 回目)
     for n in 0..ENROLL_CONFIRMS {
         await_release(port, t)?;
-        on_prompt(Prompt::Replace(n + 2));
+        on_prompt(Prompt::Replace(templates + n + 1));
         if verify(port, t, id, on_prompt)?.is_none() {
             return Err(VeinError::Retake);
         }
@@ -1475,6 +1497,25 @@ mod tests {
         let mut v = reply(CMD_ENROLL, &[XG_INPUT_FINGER]);
         v.extend(reply(CMD_ENROLL, &[XG_RELEASE_FINGER]));
         v.extend(reply(CMD_ENROLL, &[XG_ERR_SUCCESS, 1]));
+        Some(v)
+    }
+
+    /// 本番の登録 (テンプレート 3 本) の応答。2 枚目で 1 回撮り直しが入る
+    fn enrolled_three() -> Option<Vec<u8>> {
+        let mut v = Vec::new();
+        for d in [
+            &[XG_INPUT_FINGER, 0][..],
+            &[XG_RELEASE_FINGER, 0],
+            &[XG_INPUT_FINGER, 1],
+            &[XG_ERR_FAIL, XG_ERR_NO_VEIN],
+            &[XG_INPUT_FINGER, 1],
+            &[XG_RELEASE_FINGER, 1],
+            &[XG_INPUT_FINGER, 2],
+            &[XG_RELEASE_FINGER, 2],
+            &[XG_ERR_SUCCESS, 3],
+        ] {
+            v.extend(reply(CMD_ENROLL, d));
+        }
         Some(v)
     }
 
@@ -2576,7 +2617,7 @@ mod tests {
     #[test]
     fn enroll_confirms_twice_then_reads_the_record() {
         let data = sample_chara(1100);
-        let mut script = vec![connected(), cleared(), enrolled()];
+        let mut script = vec![connected(), cleared(), enrolled_three()];
         // 1 回目: まだ置かれている → 離れた → 照合
         script.extend([finger(Some(1)), finger(Some(0)), verified(Some(17))]);
         // 2 回目: すぐ離れている → 照合
@@ -2586,15 +2627,23 @@ mod tests {
         }
         let (r, port, prompts) = run_enroll(script, 17);
         assert_eq!(r, Ok(data));
+        // 撮影 3 枚: 2・3 枚目の「置いて」は置き直し (2・3 回目)。撮り直しの後の「置いて」は同じ回なので
+        // そのまま。確認の照合は撮影からの通しで 4・5 回目
         assert_eq!(
             prompts,
             vec![
                 Prompt::Place,
                 Prompt::Release,
                 Prompt::Replace(2),
+                Prompt::Retry(XG_ERR_NO_VEIN),
                 Prompt::Place,
                 Prompt::Release,
                 Prompt::Replace(3),
+                Prompt::Release,
+                Prompt::Replace(4),
+                Prompt::Place,
+                Prompt::Release,
+                Prompt::Replace(5),
                 Prompt::Place,
                 Prompt::Release,
             ]
