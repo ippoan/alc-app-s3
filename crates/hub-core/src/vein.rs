@@ -643,6 +643,10 @@ pub enum TestCommand {
     /// 続かないとモジュールが受信を打ち切る (`SynoRevDataEndPkt TIMEOUT`) が、コンソールの 1 行
     /// ([`RAW_SEND_MAX`]) には 1 人分 (700〜850 バイト) が載らないため (ippoan/alc-app#436)
     RawQueue(Vec<u8>),
+    /// `VEIN TEST RAWGAP <ms>`: 次からの `VEIN TEST RAW` で、ためた 1 行ずつ (= 1 枠ずつ) の間に置く
+    /// 間隔 (0〜[`RAW_GAP_MAX_MS`])。指紋互換の DownChar は、データの枠を詰めて流すと 1 枠ずつ取りこぼし、
+    /// 間が空きすぎると打ち切るので、通る間隔を探すため (ippoan/alc-app#436)
+    RawGap(u32),
 }
 
 /// `VEIN TEST RAW` で一度に送れるバイト数の上限 (SYNC WRITE の 1 行と同じ)
@@ -652,28 +656,41 @@ pub const RAW_WAIT_MAX_MS: u32 = 30_000;
 /// `VEIN TEST RAWQ` でためられるバイト数の上限
 pub const RAW_QUEUE_MAX: usize = 4096;
 
-/// `VEIN TEST RAWQ` でためたバイト列。`VEIN TEST RAW` が [`RawQueue::take_with`] で空にする
+/// `VEIN TEST RAWGAP` の上限 (ミリ秒)
+pub const RAW_GAP_MAX_MS: u32 = 1_000;
+
+/// `VEIN TEST RAWQ` でためたバイト列。1 行 = 1 枠のまま持つ (`VEIN TEST RAWGAP` の間隔は枠の間に置く)。
+/// `VEIN TEST RAW` が [`RawQueue::take_with`] で空にする
 #[derive(Debug, Default)]
-pub struct RawQueue(Vec<u8>);
+pub struct RawQueue(Vec<Vec<u8>>);
 
 impl RawQueue {
-    /// 後ろにつなぐ。合わせて [`RAW_QUEUE_MAX`] を超えるなら全部捨てて `Err` (半端なまま流さない)。
+    /// 1 枠として後ろにつなぐ。合わせて [`RAW_QUEUE_MAX`] を超えるなら全部捨てて `Err` (半端なまま流さない)。
     /// 戻り値はためたバイト数
     pub fn push(&mut self, bytes: &[u8]) -> Result<usize, String> {
-        if self.0.len() + bytes.len() > RAW_QUEUE_MAX {
+        if self.len() + bytes.len() > RAW_QUEUE_MAX {
             self.0.clear();
             return Err(format!("ERR VEIN: RAWQ は合わせて {RAW_QUEUE_MAX} バイトまでです (ためた分は捨てた)"));
         }
-        self.0.extend_from_slice(bytes);
-        Ok(self.0.len())
+        self.0.push(bytes.to_vec());
+        Ok(self.len())
     }
 
-    /// ためた分の後ろに `tail` をつないで返し、空にする
-    pub fn take_with(&mut self, tail: &[u8]) -> Vec<u8> {
+    fn len(&self) -> usize {
+        self.0.iter().map(Vec::len).sum()
+    }
+
+    /// ためた枠の後ろに `tail` を最後の枠としてつないで返し、空にする
+    pub fn take_with(&mut self, tail: &[u8]) -> Vec<Vec<u8>> {
         let mut all = core::mem::take(&mut self.0);
-        all.extend_from_slice(tail);
+        all.push(tail.to_vec());
         all
     }
+}
+
+/// `VEIN TEST RAWGAP <ms>`
+pub fn raw_gap_line(ms: u32) -> String {
+    format!("VEIN TEST RAWGAP {ms}")
 }
 
 /// `VEIN TEST RAWQ <ためたバイト数>`
@@ -882,13 +899,26 @@ pub fn image_lines(w: u16, h: u16, img: &[u8]) -> Vec<String> {
     lines
 }
 
-/// 試験: `bytes` を枠も和も付けずにそのまま送り、返ってきたバイトをそのまま返す。
+/// 試験: `frames` を順に、枠も和も付けずにそのまま送り (枠の間に `gap_ms` を置く)、返ってきたバイトをそのまま返す。
 /// 接続 (CONNECTION) もしない — 送る側が枠ごと組み立てる。最初の 1 バイトを `wait_ms` まで待ち、
 /// その後はバイトの間が `t.idle_ms` 空くか [`RECORD_LINE_MAX`] バイトたまるまで読む (0 バイトなら空で返す)
-pub fn test_raw(port: &mut dyn Port, t: &Timeouts, wait_ms: u32, bytes: &[u8]) -> Result<Vec<u8>, VeinError> {
+pub fn test_raw(
+    port: &mut dyn Port,
+    t: &Timeouts,
+    wait_ms: u32,
+    frames: &[Vec<u8>],
+    gap_ms: u32,
+) -> Result<Vec<u8>, VeinError> {
     port.discard_input();
-    if !port.send(bytes) {
-        return Err(VeinError::ReadFail);
+    for (i, f) in frames.iter().enumerate() {
+        // 枠の間にだけ置く。UART の送信バッファに渡した時点から数える (57600bps で 1 バイト約 0.17ms の
+        // 送出時間を含む)
+        if i > 0 && gap_ms > 0 {
+            port.pause(gap_ms);
+        }
+        if !port.send(f) {
+            return Err(VeinError::ReadFail);
+        }
     }
     let mut out = Vec::new();
     let mut buf = [0u8; 256];
@@ -2309,23 +2339,35 @@ mod tests {
         let frame = vec![0xEF, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x03, 0x01, 0x00, 0x05];
         let answer: Vec<u8> = (0u8..20).collect();
         let mut port = FakePort::new(vec![Some(answer.clone())]);
-        assert_eq!(test_raw(&mut port, &Timeouts::DEFAULT, 1000, &frame), Ok(answer.clone()));
-        // 接続もせず、送ったのはそのままの 1 回だけ
+        let one = [frame.clone()];
+        assert_eq!(test_raw(&mut port, &Timeouts::DEFAULT, 1000, &one, 20), Ok(answer.clone()));
+        // 接続もせず、送ったのはそのままの 1 回だけ。枠が 1 つなら間隔は置かない
         assert_eq!(port.sent, vec![frame.clone()]);
         assert_eq!(port.discards, 1);
+        assert_eq!(port.pauses, Vec::<u32>::new());
+        // 枠が複数なら、枠の間にだけ間隔を置いて順に送る。0 なら置かない
+        let three = [vec![1], vec![2, 3], vec![4]];
+        let mut port = FakePort::new(vec![]);
+        assert_eq!(test_raw(&mut port, &Timeouts::DEFAULT, 0, &three, 15), Ok(vec![]));
+        assert_eq!(port.sent, three.to_vec());
+        assert_eq!(port.pauses, vec![15, 15]);
+        let mut port = FakePort::new(vec![]);
+        assert_eq!(test_raw(&mut port, &Timeouts::DEFAULT, 0, &three, 0), Ok(vec![]));
+        assert_eq!(port.pauses, Vec::<u32>::new());
+        assert_eq!(raw_gap_line(15), "VEIN TEST RAWGAP 15");
         assert_eq!(test_raw_line(&answer[..3]), "VEIN TEST RAW RX=000102");
         // 何も返らなければ空
         let mut port = FakePort::new(vec![None]);
-        assert_eq!(test_raw(&mut port, &Timeouts::DEFAULT, 1000, &frame), Ok(vec![]));
+        assert_eq!(test_raw(&mut port, &Timeouts::DEFAULT, 1000, &one, 0), Ok(vec![]));
         assert_eq!(test_raw_line(&[]), "VEIN TEST RAW RX=");
         // 長い応答は RECORD_LINE_MAX で打ち切る
         let mut port = FakePort::new(vec![Some(vec![0xAA; RECORD_LINE_MAX + 50])]);
         port.max_per_recv = 300;
-        assert_eq!(test_raw(&mut port, &Timeouts::DEFAULT, 1000, &frame).unwrap().len(), RECORD_LINE_MAX);
+        assert_eq!(test_raw(&mut port, &Timeouts::DEFAULT, 1000, &one, 0).unwrap().len(), RECORD_LINE_MAX);
         // 送れなければ ReadFail
         let mut port = FakePort::new(vec![]);
         port.send_ok = false;
-        assert_eq!(test_raw(&mut port, &Timeouts::DEFAULT, 1000, &frame), Err(VeinError::ReadFail));
+        assert_eq!(test_raw(&mut port, &Timeouts::DEFAULT, 1000, &one, 0), Err(VeinError::ReadFail));
     }
 
     #[test]
@@ -2335,15 +2377,15 @@ mod tests {
         assert_eq!(q.push(&[3]), Ok(3));
         assert_eq!(raw_queue_line(3), "VEIN TEST RAWQ 3");
         // RAW の分を後ろにつなぎ、空になる
-        assert_eq!(q.take_with(&[9]), vec![1, 2, 3, 9]);
-        assert_eq!(q.take_with(&[]), Vec::<u8>::new());
+        assert_eq!(q.take_with(&[9]), vec![vec![1, 2], vec![3], vec![9]]);
+        assert_eq!(q.take_with(&[]), vec![Vec::<u8>::new()]);
         // 上限ちょうどは入る。超えたら全部捨てる
         assert_eq!(q.push(&vec![0; RAW_QUEUE_MAX]), Ok(RAW_QUEUE_MAX));
         assert_eq!(
             q.push(&[0]),
             Err(format!("ERR VEIN: RAWQ は合わせて {RAW_QUEUE_MAX} バイトまでです (ためた分は捨てた)"))
         );
-        assert_eq!(q.take_with(&[7]), vec![7]);
+        assert_eq!(q.take_with(&[7]), vec![vec![7]]);
     }
 
     #[test]

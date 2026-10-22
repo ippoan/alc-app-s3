@@ -188,6 +188,8 @@ pub fn start(
             let mut assembling: Option<proto::TemplateAssembler> = None;
             // `VEIN TEST RAWQ` でためたバイト列。次の `VEIN TEST RAW` がまとめて流す
             let mut raw_queue = proto::RawQueue::default();
+            // `VEIN TEST RAWGAP` で決めた、ためた枠の間の間隔 (ms)
+            let mut raw_gap = 0u32;
             loop {
                 let req = match capture_rx
                     .recv_timeout(Duration::from_millis(u64::from(watch.interval_ms())))
@@ -277,10 +279,14 @@ pub fn start(
                         proto::TestCommand::Image => proto::test_image(&mut port, t, &mut on_prompt)
                             .map(|(w, h, img)| proto::image_lines(w, h, &img)),
                         proto::TestCommand::Raw { wait_ms, bytes } => {
-                            proto::test_raw(&mut port, t, wait_ms, &raw_queue.take_with(&bytes))
+                            proto::test_raw(&mut port, t, wait_ms, &raw_queue.take_with(&bytes), raw_gap)
                                 .map(|rx| one(proto::test_raw_line(&rx)))
                         }
                         // UART には触れない (ためるだけ)
+                        proto::TestCommand::RawGap(ms) => {
+                            raw_gap = ms;
+                            Ok(one(proto::raw_gap_line(ms)))
+                        }
                         proto::TestCommand::RawQueue(bytes) => Ok(one(
                             raw_queue.push(&bytes).map(proto::raw_queue_line).unwrap_or_else(|e| e),
                         )),
