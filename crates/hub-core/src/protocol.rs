@@ -337,11 +337,12 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
 /// (`WRITE` の hex を行に残さないため)
 fn parse_vein_sync<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<crate::vein::Command, String> {
     use crate::vein::{parse_module_id, Command, WriteCommand, WRITE_LINE_MAX};
-    const BAD_SYNC: &str = "ERR VEIN: SYNC は WRITE <id> <offset> <hex> / WRITE <id> END / CLEAR <id> です (ID は 10〜100、hex は 192 バイトまで)";
+    const BAD_SYNC: &str = "ERR VEIN: SYNC は WRITE <id> <offset> <hex> / WRITE <id> END / CLEAR <id> / INFO です (ID は 10〜100、hex は 192 バイトまで)";
     let verb = it.next().map(|s| s.to_ascii_uppercase());
     let args: Vec<&str> = it.collect();
     let parsed = match (verb.as_deref(), args.as_slice()) {
         (Some("CLEAR"), [id]) => parse_module_id(id).map(Command::SyncClear),
+        (Some("INFO"), []) => Some(Command::SyncInfo),
         (Some("WRITE"), [id, end]) if end.eq_ignore_ascii_case("END") => {
             parse_module_id(id).map(|id| Command::SyncWrite(WriteCommand::End(id)))
         }
@@ -684,8 +685,12 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                 None => HostCommand::Vein(crate::vein::Command::Identify),
                 Some(_) => return Err("ERR VEIN: IDENTIFY に引数は要りません".into()),
             },
+            Some("VERIFY") => match (it.next().and_then(crate::vein::parse_module_id), it.next()) {
+                (Some(id), None) => HostCommand::Vein(crate::vein::Command::Verify(id)),
+                _ => return Err("ERR VEIN: VERIFY の ID は 10〜100 の数字だけです".into()),
+            },
             Some("SYNC") => HostCommand::Vein(parse_vein_sync(&mut it)?),
-            _ => return Err("ERR VEIN: CAPTURE|SAY|FINGER?|ENROLL|IDENTIFY|SYNC|TEST が必要です".into()),
+            _ => return Err("ERR VEIN: CAPTURE|SAY|FINGER?|ENROLL|IDENTIFY|VERIFY|SYNC|TEST が必要です".into()),
         },
         // `PAIR` または `BLE PAIR`
         "PAIR" => HostCommand::BlePair,
@@ -1603,7 +1608,7 @@ mod tests {
         assert!(parse_line("VEIN SAY HELLO", T).is_err());
         assert_eq!(
             parse_line("VEIN", T),
-            Err("ERR VEIN: CAPTURE|SAY|FINGER?|ENROLL|IDENTIFY|SYNC|TEST が必要です".into())
+            Err("ERR VEIN: CAPTURE|SAY|FINGER?|ENROLL|IDENTIFY|VERIFY|SYNC|TEST が必要です".into())
         );
         assert!(parse_line("VEIN ENROLL", T).is_err());
         // 試験用 (モジュール自身の登録と照合)。ID は 2〜9 だけ
@@ -1720,6 +1725,12 @@ mod tests {
         assert_eq!(parse_line("VEIN ENROLL 10", T), ok(Command::Enroll(10)));
         assert_eq!(parse_line("vein enroll 100", T), ok(Command::Enroll(100)));
         assert_eq!(parse_line("VEIN IDENTIFY", T), ok(Command::Identify));
+        assert_eq!(parse_line("VEIN VERIFY 10", T), ok(Command::Verify(10)));
+        assert_eq!(parse_line("vein verify 100", T), ok(Command::Verify(100)));
+        for bad in ["VEIN VERIFY", "VEIN VERIFY 9", "VEIN VERIFY 101", "VEIN VERIFY x", "VEIN VERIFY 10 1"] {
+            assert_eq!(parse_line(bad, T), Err("ERR VEIN: VERIFY の ID は 10〜100 の数字だけです".into()), "{bad}");
+        }
+        assert_eq!(parse_line("VEIN SYNC INFO", T), ok(Command::SyncInfo));
         assert_eq!(parse_line("vein identify", T), ok(Command::Identify));
         assert_eq!(parse_line("VEIN SYNC CLEAR 55", T), ok(Command::SyncClear(55)));
         assert_eq!(parse_line("VEIN SYNC WRITE 13 END", T), ok(Command::SyncWrite(WriteCommand::End(13))));
@@ -1743,10 +1754,11 @@ mod tests {
             assert_eq!(parse_line(bad, T), Err(BAD_ENROLL.into()), "{bad}");
         }
         assert_eq!(parse_line("VEIN IDENTIFY 2", T), Err("ERR VEIN: IDENTIFY に引数は要りません".into()));
-        const BAD_SYNC: &str = "ERR VEIN: SYNC は WRITE <id> <offset> <hex> / WRITE <id> END / CLEAR <id> です (ID は 10〜100、hex は 192 バイトまで)";
+        const BAD_SYNC: &str = "ERR VEIN: SYNC は WRITE <id> <offset> <hex> / WRITE <id> END / CLEAR <id> / INFO です (ID は 10〜100、hex は 192 バイトまで)";
         for bad in [
             "VEIN SYNC",
             "VEIN SYNC FOO 10",
+            "VEIN SYNC INFO 1",
             "VEIN SYNC CLEAR",
             "VEIN SYNC CLEAR 9",
             "VEIN SYNC CLEAR 101",
