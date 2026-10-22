@@ -222,9 +222,9 @@
         // ------------------------------------------------------------------
         // 血圧計をつなぐボタン: 行プロトコル (OMRON BP ON / PAIR) を Web Serial で送る
         // ------------------------------------------------------------------
-        // serialCommand と PAIR の待ち受けは docs/index.html (CoreS3) の実装を写したもの。
-        // 向こうはそのページのインライン script で共有 JS が無く、このページからは読めないため複製している。
-        // 片方を直したらもう片方も直すこと。
+        // serialCommand と PAIR の待ち受けは docs/index.html (CoreS3) の実装を写したもの (docs/vein.html にも同じ複製がある)。
+        // どのページもインライン script で共有 JS が無く、他のページからは読めないため複製している。
+        // 1 つを直したら残りの 2 つも直すこと。
         const bpOut = document.getElementById('bp-result');
         const bpButtons = ['bp-on', 'bp-pair'].map((id) => document.getElementById(id));
 
