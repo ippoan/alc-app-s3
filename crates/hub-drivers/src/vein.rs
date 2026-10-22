@@ -236,10 +236,12 @@ pub fn start(
                     // どれもモジュールの途中経過 (置き直しは指が離れたこと) でしか分からないので端末が鳴らす
                     let sound = match p {
                         proto::Prompt::Release => Some(Sound::BeepOk),
-                        proto::Prompt::Retry(_) => {
+                        proto::Prompt::Retry(code) => {
                             // 画面が「もう一度置いてください」を出し、次の指を待つ時間を延ばすのに使う。
-                            // 音だけだと、撮り直しの指待ち (最長 15 秒) の間に画面が何も言えない
-                            alc_hub_common::evtlog::emit("EVT VEIN AGAIN");
+                            // 音だけだと、撮り直しの指待ち (最長 15 秒) の間に画面が何も言えない。
+                            // 理由コード (11 = 静脈が写らない / 09 = 同じ指でない) も載せる — 毎回撮り直しに
+                            // なるときの切り分けに要る (生体データではない)
+                            alc_hub_common::evtlog::emit(&format!("EVT VEIN AGAIN {code:02X}"));
                             Some(Sound::VeinAgain)
                         }
                         proto::Prompt::Replace(n) => {
