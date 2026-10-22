@@ -186,6 +186,8 @@ pub fn start(
             let mut was_failing = false;
             // `VEIN SYNC WRITE` で組み立て中の登録データ (ヒープ。最大 8KB)
             let mut assembling: Option<proto::TemplateAssembler> = None;
+            // `VEIN TEST RAWQ` でためたバイト列。次の `VEIN TEST RAW` がまとめて流す
+            let mut raw_queue = proto::RawQueue::default();
             loop {
                 let req = match capture_rx
                     .recv_timeout(Duration::from_millis(u64::from(watch.interval_ms())))
@@ -274,8 +276,14 @@ pub fn start(
                         }
                         proto::TestCommand::Image => proto::test_image(&mut port, t, &mut on_prompt)
                             .map(|(w, h, img)| proto::image_lines(w, h, &img)),
-                        proto::TestCommand::Raw { wait_ms, bytes } => proto::test_raw(&mut port, t, wait_ms, &bytes)
-                            .map(|rx| one(proto::test_raw_line(&rx))),
+                        proto::TestCommand::Raw { wait_ms, bytes } => {
+                            proto::test_raw(&mut port, t, wait_ms, &raw_queue.take_with(&bytes))
+                                .map(|rx| one(proto::test_raw_line(&rx)))
+                        }
+                        // UART には触れない (ためるだけ)
+                        proto::TestCommand::RawQueue(bytes) => Ok(one(
+                            raw_queue.push(&bytes).map(proto::raw_queue_line).unwrap_or_else(|e| e),
+                        )),
                     }
                     .unwrap_or_else(|e| one(proto::err_line(e)));
                     for line in &lines {
