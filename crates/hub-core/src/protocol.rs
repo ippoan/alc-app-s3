@@ -278,6 +278,7 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
     const BAD_VERIFY: &str = "ERR VEIN: VERIFY の ID は 0 か 2〜9 の数字だけです";
     const BAD_CAPACITY: &str = "ERR VEIN: CAPACITY に引数は要りません";
     const BAD_SYSINFO: &str = "ERR VEIN: SYSINFO に引数は要りません";
+    const BAD_IMAGE: &str = "ERR VEIN: IMAGE に引数は要りません";
     let verb = it.next().map(|s| s.to_ascii_uppercase());
     let args: Vec<&str> = it.collect();
     match (verb.as_deref(), args.as_slice()) {
@@ -292,12 +293,14 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
         (Some("CAPACITY"), _) => Err(BAD_CAPACITY.into()),
         (Some("SYSINFO"), []) => Ok(HostCommand::VeinTest(TestCommand::SysInfo)),
         (Some("SYSINFO"), _) => Err(BAD_SYSINFO.into()),
+        (Some("IMAGE"), []) => Ok(HostCommand::VeinTest(TestCommand::Image)),
+        (Some("IMAGE"), _) => Err(BAD_IMAGE.into()),
         (Some(v @ ("ENROLL" | "CLEAR")), [id]) => {
             let make: fn(u32) -> TestCommand = if v == "ENROLL" { TestCommand::Enroll } else { TestCommand::Clear };
             parse_test_id(id).map(|id| HostCommand::VeinTest(make(id))).ok_or_else(|| BAD_ID.into())
         }
         (Some("ENROLL" | "CLEAR"), _) => Err(BAD_ID.into()),
-        _ => Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|CAPACITY|SYSINFO が必要です".into()),
+        _ => Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|CAPACITY|SYSINFO|IMAGE が必要です".into()),
     }
 }
 
@@ -1605,6 +1608,8 @@ mod tests {
             parse_line("VEIN TEST SYSINFO 1", T),
             Err("ERR VEIN: SYSINFO に引数は要りません".into())
         );
+        assert_eq!(parse_line("VEIN TEST IMAGE", T), Ok(Some(HostCommand::VeinTest(TestCommand::Image))));
+        assert_eq!(parse_line("VEIN TEST IMAGE 1", T), Err("ERR VEIN: IMAGE に引数は要りません".into()));
         for bad in ["VEIN TEST ENROLL 0", "VEIN TEST CLEAR 0"] {
             assert_eq!(parse_line(bad, T), Err("ERR VEIN: TEST の ID は 2〜9 の数字だけです".into()), "{bad}");
         }
@@ -1688,7 +1693,7 @@ mod tests {
         for gone in ["VEIN TEST INFO 2", "VEIN TEST COPY 2 3", "VEIN TEST REBUILD 2 3", "VEIN TEST WRITE 3 END"] {
             assert_eq!(
                 parse_line(gone, T),
-                Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|CAPACITY|SYSINFO が必要です".into()),
+                Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|CAPACITY|SYSINFO|IMAGE が必要です".into()),
                 "{gone}"
             );
         }

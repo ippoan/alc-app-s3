@@ -83,6 +83,14 @@ pub const CMD_GET_ENROLL_INFO: u8 = 0x14;
 /// 設定値が応答のデータ部に並ぶのが通例なので、データ部をそのまま返して実機で読む (ippoan/alc-app#436)
 pub const CMD_GET_SYSTEM_INFO: u8 = 0x03;
 
+/// 撮影して生画像の幅と高さを返す (READ_IMAGE、仕様書の表に無い。送る `bData` は 6 バイトの 0)。
+/// 画像そのものは READ_DATA の種別 `0x24` で読む。320×240・8bit グレースケールのはず。
+/// **DLL の解析 (vein-match `docs/research/waveshare-finger-vein.md` §3) からの推測で、この機種の
+/// 実機で通るかは未確認**。試験用 (`VEIN TEST IMAGE`) だけが使う (ippoan/alc-app#436)
+pub const CMD_READ_IMAGE: u8 = 0x24;
+/// 生画像の大きさの上限 (幅 × 高さ)。320×240 = 76,800 に余裕を持たせる
+pub const IMAGE_MAX: usize = 0x20000;
+
 /// 照合する (§2.2.21)。`bData[0..4]` = ID LE。**ID が 1 以上なら 1:1、`0` なら 1:N** で、
 /// 1:N の成功時は応答の `bData[1..5]` (LE) が当たった ID。途中経過 (置いて / 離して) は
 /// ENROLL と同じく届く。2026-10-21 の実機 (0.1.5) で 1:1・1:N とも通り、不一致は `01 0C`
@@ -578,14 +586,19 @@ fn read_enroll(port: &mut dyn Port, t: &Timeouts, id: u32) -> Result<Vec<u8>, Ve
         return Err(VeinError::ReadFail);
     }
 
-    // 分割読み出し (種別 = READ_ENROLL)。塊ごとに和を確かめ、合わなければ読み直す
+    read_data(port, t, CMD_READ_ENROLL, size)
+}
+
+/// 分割読み出し (READ_DATA、種別 `kind`) で `size` バイトを読む。塊ごとに和を確かめ、合わなければ読み直す。
+/// 登録データ ([`read_enroll`]) と生画像 ([`test_image`]) が共有する
+fn read_data(port: &mut dyn Port, t: &Timeouts, kind: u8, size: usize) -> Result<Vec<u8>, VeinError> {
     let mut out = Vec::with_capacity(size);
     let mut buf = vec![0u8; UART_DATA_PACKET_MAX + 2];
     for (offset, len) in chunks(size) {
         let mut ok = false;
         for _ in 0..READ_RETRIES {
             port.discard_input();
-            let req = read_data_request(CMD_READ_DATA, CMD_READ_ENROLL, offset as u32, len as u32);
+            let req = read_data_request(CMD_READ_DATA, kind, offset as u32, len as u32);
             if !port.send(&req) {
                 continue;
             }
@@ -619,6 +632,8 @@ pub enum TestCommand {
     Capacity,
     /// `VEIN TEST SYSINFO`: モジュールの設定 (GET_SYSTEM_INFO の応答のデータ部) をそのまま返す
     SysInfo,
+    /// `VEIN TEST IMAGE`: 撮影して生画像を返す (READ_IMAGE、[`CMD_READ_IMAGE`])
+    Image,
 }
 
 /// 本番の口 (ippoan/alc-app#436 の M-b: 照合を端末のモジュールで行う)。結果は [`run`] が返す行
@@ -774,6 +789,52 @@ pub fn test_sysinfo(port: &mut dyn Port, t: &Timeouts) -> Result<[u8; DATA_LEN],
         return Err(VeinError::Unsupported);
     }
     Ok(p.data)
+}
+
+/// 試験: 接続して撮影し、生画像を読む ([`CMD_READ_IMAGE`] → READ_DATA 種別 `0x24`)。
+/// 戻り値は (幅, 高さ, 画素 (幅 × 高さ バイト))。撮影の途中経過 (置いて / 離して / 撮り直し) は
+/// 登録と同じく `on_prompt` へ渡す。非対応 (`01 10`) は [`VeinError::Unsupported`]、他の失敗コードは
+/// [`VeinError::Rc`]、幅 × 高さが 0 か [`IMAGE_MAX`] を超えるなら [`VeinError::ReadFail`]
+pub fn test_image(
+    port: &mut dyn Port,
+    t: &Timeouts,
+    on_prompt: &mut dyn FnMut(Prompt),
+) -> Result<(u16, u16, Vec<u8>), VeinError> {
+    connect(port, t)?;
+    let p = send_and_await_final(port, t, CMD_READ_IMAGE, &[0u8; 6], on_prompt)?;
+    match (p.data[0], p.data[1]) {
+        (XG_ERR_SUCCESS, _) => {}
+        (XG_ERR_FAIL, XG_ERR_NO_SUPPORT) => return Err(VeinError::Unsupported),
+        (XG_ERR_FAIL, code) => return Err(VeinError::Rc(code)),
+        (other, _) => return Err(VeinError::Rc(other)),
+    }
+    let w = u16::from_le_bytes([p.data[1], p.data[2]]);
+    let h = u16::from_le_bytes([p.data[3], p.data[4]]);
+    let size = usize::from(w) * usize::from(h);
+    if !(1..=IMAGE_MAX).contains(&size) {
+        return Err(VeinError::ReadFail);
+    }
+    Ok((w, h, read_data(port, t, CMD_READ_IMAGE, size)?))
+}
+
+/// `VEIN TEST IMAGE` の成功の行: 画素を [`RECORD_LINE_MAX`] バイトずつ
+/// `VEIN TEST IMAGE <offset> <大文字 16 進>` にし、最後に `VEIN TEST IMAGE END <幅> <高さ> <総バイト数>`。
+/// 行は読み終えてから続けて出す (途中に `ERR` は挟まらない)
+pub fn image_lines(w: u16, h: u16, img: &[u8]) -> Vec<String> {
+    use core::fmt::Write;
+    let mut lines: Vec<String> = img
+        .chunks(RECORD_LINE_MAX)
+        .enumerate()
+        .map(|(i, part)| {
+            let mut s = format!("VEIN TEST IMAGE {} ", i * RECORD_LINE_MAX);
+            for b in part {
+                let _ = write!(s, "{b:02X}");
+            }
+            s
+        })
+        .collect();
+    lines.push(format!("VEIN TEST IMAGE END {w} {h} {}", img.len()));
+    lines
 }
 
 /// `VEIN TEST SYSINFO RC=<1 バイト目> DATA=<残り>` (大文字 16 進。生体データは含まない)
@@ -2103,6 +2164,65 @@ mod tests {
         let mut port = FakePort::new(vec![None]);
         assert_eq!(test_capacity(&mut port, &Timeouts::DEFAULT), Err(VeinError::NoModule));
         assert_eq!(test_capacity_line(2, 500), "VEIN TEST CAPACITY USERS=2 MAX=500");
+    }
+
+    #[test]
+    fn test_image_reads_size_then_pixels_in_chunks() {
+        let (w, h) = (40u16, 30u16);
+        let img: Vec<u8> = (0..usize::from(w) * usize::from(h)).map(|i| i as u8).collect();
+        let mut script = vec![connected()];
+        let mut r = reply(CMD_READ_IMAGE, &[XG_INPUT_FINGER]);
+        r.extend(reply(CMD_READ_IMAGE, &[XG_ERR_SUCCESS, w as u8, (w >> 8) as u8, h as u8, (h >> 8) as u8]));
+        script.push(Some(r));
+        for (off, len) in chunks(img.len()) {
+            script.push(Some(chunk(&img[off..off + len])));
+        }
+        let mut port = FakePort::new(script);
+        let mut prompts = Vec::new();
+        let got = test_image(&mut port, &Timeouts::DEFAULT, &mut |p| prompts.push(p)).unwrap();
+        assert_eq!(got, (w, h, img.clone()));
+        assert_eq!(prompts, vec![Prompt::Place]);
+        // 接続 → READ_IMAGE (bData 6 バイトの 0) → READ_DATA 種別 0x24 ×3 (1200 = 512 + 512 + 176)
+        assert_eq!(port.sent[1], command(CMD_READ_IMAGE, &[0u8; 6]).to_vec());
+        assert_eq!(port.sent[2], read_data_request(CMD_READ_DATA, CMD_READ_IMAGE, 0, 512).to_vec());
+        assert_eq!(port.sent[4], read_data_request(CMD_READ_DATA, CMD_READ_IMAGE, 1024, 176).to_vec());
+        assert_eq!(port.sent.len(), 5);
+
+        let lines = image_lines(w, h, &img);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("VEIN TEST IMAGE 0 000102"));
+        assert!(lines[1].starts_with("VEIN TEST IMAGE 1024 "));
+        assert_eq!(lines[1].len(), "VEIN TEST IMAGE 1024 ".len() + 176 * 2);
+        assert_eq!(lines[2], "VEIN TEST IMAGE END 40 30 1200");
+    }
+
+    #[test]
+    fn test_image_errors() {
+        // 途中経過は数えるだけ (どの台本も 1 回は「置いて」を挟む)
+        let mut prompts = 0;
+        let mut run = |script: Vec<Option<Vec<u8>>>| {
+            let mut port = FakePort::new(script);
+            test_image(&mut port, &Timeouts::DEFAULT, &mut |_| prompts += 1)
+        };
+        let fin = |final_reply: &[u8]| {
+            let mut r = reply(CMD_READ_IMAGE, &[XG_INPUT_FINGER]);
+            r.extend(reply(CMD_READ_IMAGE, final_reply));
+            vec![connected(), Some(r)]
+        };
+        assert_eq!(run(fin(&[XG_ERR_FAIL, XG_ERR_NO_SUPPORT])), Err(VeinError::Unsupported));
+        assert_eq!(run(fin(&[XG_ERR_FAIL, 0x05])), Err(VeinError::Rc(0x05)));
+        assert_eq!(run(fin(&[0x42])), Err(VeinError::Rc(0x42)));
+        // 幅 × 高さが 0、または上限を超える
+        assert_eq!(run(fin(&[XG_ERR_SUCCESS, 0, 0, 240, 0])), Err(VeinError::ReadFail));
+        assert_eq!(run(fin(&[XG_ERR_SUCCESS, 0xFF, 0xFF, 0xFF, 0xFF])), Err(VeinError::ReadFail));
+        // 塊が読めない
+        let mut script = fin(&[XG_ERR_SUCCESS, 4, 0, 1, 0]);
+        script.extend([None, None, None]);
+        assert_eq!(run(script), Err(VeinError::ReadFail));
+        // 応答が無い / モジュールが居ない
+        assert_eq!(run(vec![connected(), None]), Err(VeinError::Timeout));
+        assert_eq!(run(vec![None]), Err(VeinError::NoModule));
+        assert_eq!(prompts, 6);
     }
 
     #[test]
