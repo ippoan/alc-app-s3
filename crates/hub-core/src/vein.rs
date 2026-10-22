@@ -620,7 +620,7 @@ fn read_data(port: &mut dyn Port, t: &Timeouts, kind: u8, size: usize) -> Result
 
 /// 試験用コマンド (`VEIN TEST …`)。モジュール自身の登録と照合で撮像を確かめる診断で、
 /// 運用の画面からは送らない (指静脈の確認タブだけ)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TestCommand {
     /// `VEIN TEST ENROLL <id>`: ID に登録してモジュールに残す
     Enroll(u32),
@@ -634,7 +634,16 @@ pub enum TestCommand {
     SysInfo,
     /// `VEIN TEST IMAGE`: 撮影して生画像を返す (READ_IMAGE、[`CMD_READ_IMAGE`])
     Image,
+    /// `VEIN TEST RAW <待ち ms> <16 進>`: バイト列をそのまま UART へ送り、返ってきたバイトをそのまま返す
+    /// ([`test_raw`])。仕様書にない命令 (指紋互換の EF01 形式、GET_DEBUG 0x26 など) が通じるかを
+    /// ホスト側で組み立てて確かめるため (ippoan/alc-app#436)
+    Raw { wait_ms: u32, bytes: Vec<u8> },
 }
+
+/// `VEIN TEST RAW` で一度に送れるバイト数の上限 (SYNC WRITE の 1 行と同じ)
+pub const RAW_SEND_MAX: usize = WRITE_LINE_MAX;
+/// `VEIN TEST RAW` の最初の 1 バイトを待つ上限 (ミリ秒)。指を待つ命令 (撮影) も試せる長さ
+pub const RAW_WAIT_MAX_MS: u32 = 30_000;
 
 /// 本番の口 (ippoan/alc-app#436 の M-b: 照合を端末のモジュールで行う)。結果は [`run`] が返す行
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -835,6 +844,39 @@ pub fn image_lines(w: u16, h: u16, img: &[u8]) -> Vec<String> {
         .collect();
     lines.push(format!("VEIN TEST IMAGE END {w} {h} {}", img.len()));
     lines
+}
+
+/// 試験: `bytes` を枠も和も付けずにそのまま送り、返ってきたバイトをそのまま返す。
+/// 接続 (CONNECTION) もしない — 送る側が枠ごと組み立てる。最初の 1 バイトを `wait_ms` まで待ち、
+/// その後はバイトの間が `t.idle_ms` 空くか [`RECORD_LINE_MAX`] バイトたまるまで読む (0 バイトなら空で返す)
+pub fn test_raw(port: &mut dyn Port, t: &Timeouts, wait_ms: u32, bytes: &[u8]) -> Result<Vec<u8>, VeinError> {
+    port.discard_input();
+    if !port.send(bytes) {
+        return Err(VeinError::ReadFail);
+    }
+    let mut out = Vec::new();
+    let mut buf = [0u8; 256];
+    let mut wait = wait_ms;
+    while out.len() < RECORD_LINE_MAX {
+        let room = buf.len().min(RECORD_LINE_MAX - out.len());
+        let n = port.recv(&mut buf[..room], wait);
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+        wait = t.idle_ms;
+    }
+    Ok(out)
+}
+
+/// `VEIN TEST RAW RX=<大文字 16 進>` (何も返らなければ `RX=` のまま)
+pub fn test_raw_line(rx: &[u8]) -> String {
+    use core::fmt::Write;
+    let mut s = String::from("VEIN TEST RAW RX=");
+    for b in rx {
+        let _ = write!(s, "{b:02X}");
+    }
+    s
 }
 
 /// `VEIN TEST SYSINFO RC=<1 バイト目> DATA=<残り>` (大文字 16 進。生体データは含まない)
@@ -2223,6 +2265,31 @@ mod tests {
         assert_eq!(run(vec![connected(), None]), Err(VeinError::Timeout));
         assert_eq!(run(vec![None]), Err(VeinError::NoModule));
         assert_eq!(prompts, 6);
+    }
+
+    #[test]
+    fn test_raw_sends_bytes_verbatim_and_returns_whatever_comes_back() {
+        // 応答は 7 バイトずつ分けて届く (FakePort)。全部つないで返す
+        let frame = vec![0xEF, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x03, 0x01, 0x00, 0x05];
+        let answer: Vec<u8> = (0u8..20).collect();
+        let mut port = FakePort::new(vec![Some(answer.clone())]);
+        assert_eq!(test_raw(&mut port, &Timeouts::DEFAULT, 1000, &frame), Ok(answer.clone()));
+        // 接続もせず、送ったのはそのままの 1 回だけ
+        assert_eq!(port.sent, vec![frame.clone()]);
+        assert_eq!(port.discards, 1);
+        assert_eq!(test_raw_line(&answer[..3]), "VEIN TEST RAW RX=000102");
+        // 何も返らなければ空
+        let mut port = FakePort::new(vec![None]);
+        assert_eq!(test_raw(&mut port, &Timeouts::DEFAULT, 1000, &frame), Ok(vec![]));
+        assert_eq!(test_raw_line(&[]), "VEIN TEST RAW RX=");
+        // 長い応答は RECORD_LINE_MAX で打ち切る
+        let mut port = FakePort::new(vec![Some(vec![0xAA; RECORD_LINE_MAX + 50])]);
+        port.max_per_recv = 300;
+        assert_eq!(test_raw(&mut port, &Timeouts::DEFAULT, 1000, &frame).unwrap().len(), RECORD_LINE_MAX);
+        // 送れなければ ReadFail
+        let mut port = FakePort::new(vec![]);
+        port.send_ok = false;
+        assert_eq!(test_raw(&mut port, &Timeouts::DEFAULT, 1000, &frame), Err(VeinError::ReadFail));
     }
 
     #[test]
