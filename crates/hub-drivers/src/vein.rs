@@ -7,7 +7,7 @@
 //! - UART を開き、[`alc_hub_core::vein::Port`] として渡す
 //! - `VEIN CAPTURE` を受けて読み取る専用スレッド。結果は 1 行
 //!   (`VEIN CHARA <hex>` / `ERR VEIN <reason>`) でホストへ出す
-//! - `VEIN TEST ENROLL|VERIFY|CLEAR <id>` / `VEIN TEST CAPACITY` (試験用): モジュール自身の登録と
+//! - `VEIN TEST ENROLL|VERIFY|CLEAR <id>` / `VEIN TEST CAPACITY` / `VEIN TEST SYSINFO` (試験用): モジュール自身の登録と
 //!   照合で撮像を確かめる診断。同じ読み取りスレッドで直列に捌く (結果は `VEIN TEST …` / `ERR VEIN <reason>`)
 //! - 本番の口 `VEIN ENROLL <id>` / `VEIN IDENTIFY` / `VEIN SYNC WRITE|CLEAR …` (ippoan/alc-app#436 の
 //!   M-b): 手順と行は `alc_hub_core::vein::run`。同じスレッドで直列に捌き、返った行をそのまま出す。
@@ -267,6 +267,9 @@ pub fn start(
                         }
                         proto::TestCommand::Capacity => proto::test_capacity(&mut port, t)
                             .map(|(users, max)| proto::test_capacity_line(users, max)),
+                        proto::TestCommand::SysInfo => {
+                            proto::test_sysinfo(&mut port, t).map(|data| proto::test_sysinfo_line(&data))
+                        }
                     }
                     .unwrap_or_else(proto::err_line);
                     emit_whole_line(&line);

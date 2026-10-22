@@ -78,6 +78,11 @@ pub const CMD_WRITE_ENROLL: u8 = 0x23;
 /// 試験用 (`VEIN TEST CAPACITY`) だけが使う
 pub const CMD_GET_ENROLL_INFO: u8 = 0x14;
 
+/// モジュールの設定を読む (GET_SYSTEM_INFO、送る `bData` は無し)。試験用 (`VEIN TEST SYSINFO`) だけが使う。
+/// **番号と応答の並びは推測** — 仕様書の本文が repo に無い。XG 系では版・機器番号・照合の厳しさ (安全レベル) などの
+/// 設定値が応答のデータ部に並ぶのが通例なので、データ部をそのまま返して実機で読む (ippoan/alc-app#436)
+pub const CMD_GET_SYSTEM_INFO: u8 = 0x03;
+
 /// 照合する (§2.2.21)。`bData[0..4]` = ID LE。**ID が 1 以上なら 1:1、`0` なら 1:N** で、
 /// 1:N の成功時は応答の `bData[1..5]` (LE) が当たった ID。途中経過 (置いて / 離して) は
 /// ENROLL と同じく届く。2026-10-21 の実機 (0.1.5) で 1:1・1:N とも通り、不一致は `01 0C`
@@ -612,6 +617,8 @@ pub enum TestCommand {
     Clear(u32),
     /// `VEIN TEST CAPACITY`: 登録ユーザー数と登録できる上限を返す
     Capacity,
+    /// `VEIN TEST SYSINFO`: モジュールの設定 (GET_SYSTEM_INFO の応答のデータ部) をそのまま返す
+    SysInfo,
 }
 
 /// 本番の口 (ippoan/alc-app#436 の M-b: 照合を端末のモジュールで行う)。結果は [`run`] が返す行
@@ -755,6 +762,29 @@ pub fn test_capacity(port: &mut dyn Port, t: &Timeouts) -> Result<(u32, u32), Ve
 /// `VEIN TEST CAPACITY USERS=<登録ユーザー数> MAX=<上限>`
 pub fn test_capacity_line(users: u32, max: u32) -> String {
     format!("VEIN TEST CAPACITY USERS={users} MAX={max}")
+}
+
+/// 試験: 接続してモジュールの設定を読む (GET_SYSTEM_INFO、[`CMD_GET_SYSTEM_INFO`])。
+/// 戻り値は応答のデータ部そのまま (`bData[0]` = RC)。失敗コードも解釈せずに返す (読み方を実機で決めるため)。
+/// 非対応 (`01 10`) だけは [`VeinError::Unsupported`]
+pub fn test_sysinfo(port: &mut dyn Port, t: &Timeouts) -> Result<[u8; DATA_LEN], VeinError> {
+    connect(port, t)?;
+    let p = exchange(port, t, CMD_GET_SYSTEM_INFO, &[])?;
+    if p.data[0] == XG_ERR_FAIL && p.data[1] == XG_ERR_NO_SUPPORT {
+        return Err(VeinError::Unsupported);
+    }
+    Ok(p.data)
+}
+
+/// `VEIN TEST SYSINFO RC=<1 バイト目> DATA=<残り>` (大文字 16 進。生体データは含まない)
+pub fn test_sysinfo_line(data: &[u8]) -> String {
+    use core::fmt::Write;
+    let rc = data.first().copied().unwrap_or(0);
+    let mut s = format!("VEIN TEST SYSINFO RC={rc:02X} DATA=");
+    for b in data.get(1..).unwrap_or(&[]) {
+        let _ = write!(s, "{b:02X}");
+    }
+    s
 }
 
 /// ID `id` の登録データを書く (接続済みであること。WRITE_ENROLL → WRITE_DATA、§2.2.27 / §2.2.25)。
@@ -2073,6 +2103,30 @@ mod tests {
         let mut port = FakePort::new(vec![None]);
         assert_eq!(test_capacity(&mut port, &Timeouts::DEFAULT), Err(VeinError::NoModule));
         assert_eq!(test_capacity_line(2, 500), "VEIN TEST CAPACITY USERS=2 MAX=500");
+    }
+
+    #[test]
+    fn test_sysinfo_returns_the_data_part_as_is() {
+        let d = [XG_ERR_SUCCESS, 0x12, 0x34, 0x02, 0x00, 0xAB];
+        let mut port = FakePort::new(vec![connected(), Some(reply(CMD_GET_SYSTEM_INFO, &d))]);
+        let got = test_sysinfo(&mut port, &Timeouts::DEFAULT).unwrap();
+        assert_eq!(&got[..6], &d);
+        // 接続 → GET_SYSTEM_INFO (bData 無し)
+        assert_eq!(port.sent.len(), 2);
+        assert_eq!(port.sent[1], command(CMD_GET_SYSTEM_INFO, &[]).to_vec());
+        assert_eq!(
+            test_sysinfo_line(&got),
+            format!("VEIN TEST SYSINFO RC=00 DATA=12340200AB{}", "00".repeat(DATA_LEN - 6))
+        );
+        // 失敗コードも解釈せずに返す。非対応だけは Unsupported、応答が無ければ Timeout、モジュールが居なければ NoModule
+        let mut port = FakePort::new(vec![connected(), Some(reply(CMD_GET_SYSTEM_INFO, &[XG_ERR_FAIL, 0x05]))]);
+        assert_eq!(&test_sysinfo(&mut port, &Timeouts::DEFAULT).unwrap()[..2], &[XG_ERR_FAIL, 0x05]);
+        let mut port = FakePort::new(vec![connected(), Some(reply(CMD_GET_SYSTEM_INFO, &[XG_ERR_FAIL, XG_ERR_NO_SUPPORT]))]);
+        assert_eq!(test_sysinfo(&mut port, &Timeouts::DEFAULT), Err(VeinError::Unsupported));
+        let mut port = FakePort::new(vec![connected(), None]);
+        assert_eq!(test_sysinfo(&mut port, &Timeouts::DEFAULT), Err(VeinError::Timeout));
+        let mut port = FakePort::new(vec![None]);
+        assert_eq!(test_sysinfo(&mut port, &Timeouts::DEFAULT), Err(VeinError::NoModule));
     }
 
     fn chunk_cmd(id: u32, offset: usize, data: &[u8]) -> WriteCommand {
