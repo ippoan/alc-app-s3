@@ -276,9 +276,9 @@ pub enum HostCommand {
 
 /// `VEIN TEST …` の本体 (`TEST` の後ろ)
 fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostCommand, String> {
-    use crate::vein::{parse_test_id, TestCommand};
+    use crate::vein::{parse_module_id, parse_test_id, TestCommand};
     const BAD_ID: &str = "ERR VEIN: TEST の ID は 2〜9 の数字だけです";
-    const BAD_VERIFY: &str = "ERR VEIN: VERIFY の ID は 0 か 2〜9 の数字だけです";
+    const BAD_VERIFY: &str = "ERR VEIN: VERIFY の ID は 0 か 2〜100 の数字だけです";
     const BAD_CAPACITY: &str = "ERR VEIN: CAPACITY に引数は要りません";
     const BAD_SYSINFO: &str = "ERR VEIN: SYSINFO に引数は要りません";
     const BAD_IMAGE: &str = "ERR VEIN: IMAGE に引数は要りません";
@@ -286,10 +286,13 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
     let verb = it.next().map(|s| s.to_ascii_uppercase());
     let args: Vec<&str> = it.collect();
     match (verb.as_deref(), args.as_slice()) {
-        // VERIFY だけ ID 0 (1:N) を通す。ENROLL 0 / CLEAR 0 は意味が違うので開かない
+        // VERIFY だけ ID 0 (1:N) と本番の ID (10〜100) も通す。照合は読むだけで登録を書き換えないので、
+        // 同期で書いた記録を 1:1 で試せる (撮れた合図のビープもファームが鳴らす)。
+        // ENROLL 0 / CLEAR 0 は意味が違うので開かない
         (Some("VERIFY"), [id]) => (*id == "0")
             .then_some(0)
             .or_else(|| parse_test_id(id))
+            .or_else(|| parse_module_id(id))
             .map(|id| HostCommand::VeinTest(TestCommand::Verify(id)))
             .ok_or_else(|| BAD_VERIFY.into()),
         (Some("VERIFY"), _) => Err(BAD_VERIFY.into()),
@@ -1612,10 +1615,13 @@ mod tests {
             parse_line("VEIN TEST CAPACITY", T),
             Ok(Some(HostCommand::VeinTest(TestCommand::Capacity)))
         );
-        for bad in ["VEIN TEST VERIFY", "VEIN TEST VERIFY 1", "VEIN TEST VERIFY 10", "VEIN TEST VERIFY 00", "VEIN TEST VERIFY 0 2"] {
+        for (line, id) in [("VEIN TEST VERIFY 10", 10), ("VEIN TEST VERIFY 100", 100)] {
+            assert_eq!(parse_line(line, T), Ok(Some(HostCommand::VeinTest(TestCommand::Verify(id)))), "{line}");
+        }
+        for bad in ["VEIN TEST VERIFY", "VEIN TEST VERIFY 1", "VEIN TEST VERIFY 101", "VEIN TEST VERIFY 00", "VEIN TEST VERIFY 0 2"] {
             assert_eq!(
                 parse_line(bad, T),
-                Err("ERR VEIN: VERIFY の ID は 0 か 2〜9 の数字だけです".into()),
+                Err("ERR VEIN: VERIFY の ID は 0 か 2〜100 の数字だけです".into()),
                 "{bad}"
             );
         }
