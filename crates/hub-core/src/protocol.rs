@@ -282,6 +282,7 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
     const BAD_CAPACITY: &str = "ERR VEIN: CAPACITY に引数は要りません";
     const BAD_SYSINFO: &str = "ERR VEIN: SYSINFO に引数は要りません";
     const BAD_IMAGE: &str = "ERR VEIN: IMAGE に引数は要りません";
+    const BAD_RAW: &str = "ERR VEIN: RAW <待ち ms (0〜30000)> <16 進 (1〜192 バイト)> です";
     let verb = it.next().map(|s| s.to_ascii_uppercase());
     let args: Vec<&str> = it.collect();
     match (verb.as_deref(), args.as_slice()) {
@@ -298,12 +299,20 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
         (Some("SYSINFO"), _) => Err(BAD_SYSINFO.into()),
         (Some("IMAGE"), []) => Ok(HostCommand::VeinTest(TestCommand::Image)),
         (Some("IMAGE"), _) => Err(BAD_IMAGE.into()),
+        (Some("RAW"), [wait, hex]) => wait
+            .parse::<u32>()
+            .ok()
+            .filter(|w| *w <= crate::vein::RAW_WAIT_MAX_MS && wait.bytes().all(|c| c.is_ascii_digit()))
+            .zip(decode_hex(hex).filter(|b| b.len() <= crate::vein::RAW_SEND_MAX))
+            .map(|(wait_ms, bytes)| HostCommand::VeinTest(TestCommand::Raw { wait_ms, bytes }))
+            .ok_or_else(|| BAD_RAW.into()),
+        (Some("RAW"), _) => Err(BAD_RAW.into()),
         (Some(v @ ("ENROLL" | "CLEAR")), [id]) => {
             let make: fn(u32) -> TestCommand = if v == "ENROLL" { TestCommand::Enroll } else { TestCommand::Clear };
             parse_test_id(id).map(|id| HostCommand::VeinTest(make(id))).ok_or_else(|| BAD_ID.into())
         }
         (Some("ENROLL" | "CLEAR"), _) => Err(BAD_ID.into()),
-        _ => Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|CAPACITY|SYSINFO|IMAGE が必要です".into()),
+        _ => Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|CAPACITY|SYSINFO|IMAGE|RAW が必要です".into()),
     }
 }
 
@@ -1623,6 +1632,22 @@ mod tests {
             Err("ERR VEIN: SYSINFO に引数は要りません".into())
         );
         assert_eq!(parse_line("VEIN TEST IMAGE", T), Ok(Some(HostCommand::VeinTest(TestCommand::Image))));
+        assert_eq!(
+            parse_line("VEIN TEST RAW 1500 ef01FFff", T),
+            Ok(Some(HostCommand::VeinTest(TestCommand::Raw { wait_ms: 1500, bytes: vec![0xEF, 0x01, 0xFF, 0xFF] })))
+        );
+        assert_eq!(
+            parse_line(&format!("VEIN TEST RAW 0 {}", "00".repeat(192)), T),
+            Ok(Some(HostCommand::VeinTest(TestCommand::Raw { wait_ms: 0, bytes: vec![0; 192] })))
+        );
+        let too_long = format!("VEIN TEST RAW 10 {}", "00".repeat(193));
+        for bad in ["VEIN TEST RAW", "VEIN TEST RAW 10", "VEIN TEST RAW 30001 00", "VEIN TEST RAW +5 00", "VEIN TEST RAW 10 0", "VEIN TEST RAW 10 zz", "VEIN TEST RAW 10 00 00", too_long.as_str()] {
+            assert_eq!(
+                parse_line(bad, T),
+                Err("ERR VEIN: RAW <待ち ms (0〜30000)> <16 進 (1〜192 バイト)> です".into()),
+                "{bad}"
+            );
+        }
         assert_eq!(parse_line("LED 255 0 16", T), Ok(Some(HostCommand::Led { r: 255, g: 0, b: 16, w: 0 })));
         assert_eq!(parse_line("led 1 2 3 4", T), Ok(Some(HostCommand::Led { r: 1, g: 2, b: 3, w: 4 })));
         for bad in ["LED", "LED 1 2", "LED 1 2 3 4 5", "LED 256 0 0", "LED a 0 0", "LED -1 0 0"] {
@@ -1712,7 +1737,7 @@ mod tests {
         for gone in ["VEIN TEST INFO 2", "VEIN TEST COPY 2 3", "VEIN TEST REBUILD 2 3", "VEIN TEST WRITE 3 END"] {
             assert_eq!(
                 parse_line(gone, T),
-                Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|CAPACITY|SYSINFO|IMAGE が必要です".into()),
+                Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|CAPACITY|SYSINFO|IMAGE|RAW が必要です".into()),
                 "{gone}"
             );
         }

@@ -274,6 +274,8 @@ pub fn start(
                         }
                         proto::TestCommand::Image => proto::test_image(&mut port, t, &mut on_prompt)
                             .map(|(w, h, img)| proto::image_lines(w, h, &img)),
+                        proto::TestCommand::Raw { wait_ms, bytes } => proto::test_raw(&mut port, t, wait_ms, &bytes)
+                            .map(|rx| one(proto::test_raw_line(&rx))),
                     }
                     .unwrap_or_else(|e| one(proto::err_line(e)));
                     for line in &lines {
