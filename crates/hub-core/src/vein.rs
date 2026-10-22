@@ -128,6 +128,8 @@ pub const MODULE_ID_MAX: u32 = 100;
 /// `VEIN ENROLL` で登録の後に置き直して照合する回数。**全部当たったときだけ採用する**
 /// (モジュールの登録は 1 回ごとに当たり外れがあるため。2026-10-21 実機)
 pub const ENROLL_CONFIRMS: u8 = 2;
+/// 本番の登録で置く回数の合計 (撮影 + 確認)。`EVT VEIN PLACE <n> <合計>` の合計
+pub const ENROLL_PLACEMENTS: u8 = ENROLL_TEMPLATES_PRODUCTION + ENROLL_CONFIRMS;
 /// 置き直しの前に指が離れるのを見る間隔と回数 (仕様書 §5.7: 照合の後、FINGER_STATUS で
 /// 指が離れるのを待ってから次の照合)。200ms × 50 = 10 秒で離れなければ [`VeinError::Timeout`]
 pub const RELEASE_POLL_MS: u32 = 200;
@@ -731,10 +733,14 @@ pub enum Command {
     Enroll(u32),
     /// `VEIN IDENTIFY`: 1:N 照合 (VERIFY 0)
     Identify,
+    /// `VEIN VERIFY <id>`: 1:1 照合 (VERIFY <id>)。免許証で本人が決まった後に使う
+    Verify(u32),
     /// `VEIN SYNC WRITE …`: サーバーの記録をモジュールの ID へ書く
     SyncWrite(WriteCommand),
     /// `VEIN SYNC CLEAR <id>`: ID の登録を消す
     SyncClear(u32),
+    /// `VEIN SYNC INFO`: モジュールの登録人数と上限 (モジュールを入れ替えたかの見分けに使う)
+    SyncInfo,
 }
 
 /// `VEIN SYNC WRITE …`。外から受けた登録データを ID へ書く。
@@ -1111,14 +1117,67 @@ pub fn record_lines(id: u32, record: &[u8]) -> Vec<String> {
     lines
 }
 
-/// 本番の照合 (`VEIN IDENTIFY`): 接続して 1:N 照合 (VERIFY 0)。当たった ID か不一致 (`None`)
+/// 照合の前に、指が置かれたのを見てから待つ時間 (ミリ秒)。触れた瞬間に撮ると置ききる前になり、
+/// 点数の付かない落ち方が増えた (ippoan/alc-app#436 の実測)
+pub const IDENTIFY_SETTLE_MS: u32 = 200;
+/// 指が置かれるのを待つ間の問い合わせ間隔 (ミリ秒)
+pub const SETTLE_POLL_MS: u32 = 50;
+
+/// 照合の前: 指の状態を問い合わせ、「有る」を見たら [`IDENTIFY_SETTLE_MS`] 待つ。
+/// 来なければ `t.finger_ms` ほどで諦める。非対応・失敗のときは待たない
+/// (どちらも続く VERIFY がモジュールの指待ちで受ける)
+fn settle_finger(port: &mut dyn Port, t: &Timeouts) {
+    for _ in 0..=t.finger_ms / SETTLE_POLL_MS {
+        match finger_state(port, t) {
+            FingerReply::Present => return port.pause(IDENTIFY_SETTLE_MS),
+            FingerReply::Absent => port.pause(SETTLE_POLL_MS),
+            FingerReply::Unsupported | FingerReply::Failed(_) => return,
+        }
+    }
+}
+
+/// 本番の照合 (`VEIN IDENTIFY`): 接続 → 指が置ききるのを待つ → 1:N 照合 (VERIFY 0)。
+/// 当たった ID か不一致 (`None`)
 pub fn identify(
     port: &mut dyn Port,
     t: &Timeouts,
     on_prompt: &mut dyn FnMut(Prompt),
 ) -> Result<Option<u32>, VeinError> {
+    verify_settled(port, t, 0, on_prompt)
+}
+
+/// 本番の 1:1 照合 (`VEIN VERIFY <id>`): [`identify`] と同じ手順で VERIFY <id>
+pub fn verify_id(
+    port: &mut dyn Port,
+    t: &Timeouts,
+    id: u32,
+    on_prompt: &mut dyn FnMut(Prompt),
+) -> Result<Option<u32>, VeinError> {
+    verify_settled(port, t, id, on_prompt)
+}
+
+fn verify_settled(
+    port: &mut dyn Port,
+    t: &Timeouts,
+    id: u32,
+    on_prompt: &mut dyn FnMut(Prompt),
+) -> Result<Option<u32>, VeinError> {
     connect(port, t)?;
-    verify(port, t, 0, on_prompt)
+    settle_finger(port, t);
+    verify(port, t, id, on_prompt)
+}
+
+/// `VEIN VERIFIED <id>` / `VEIN NOMATCH`
+pub fn verify_line(id: u32, hit: Option<u32>) -> String {
+    match hit {
+        Some(_) => format!("VEIN VERIFIED {id}"),
+        None => "VEIN NOMATCH".into(),
+    }
+}
+
+/// `VEIN SYNC INFO USERS=<登録人数> MAX=<上限>`
+pub fn sync_info_line(users: u32, max: u32) -> String {
+    format!("VEIN SYNC INFO USERS={users} MAX={max}")
 }
 
 /// `VEIN IDENTIFIED <id>` / `VEIN NOMATCH`
@@ -1174,8 +1233,10 @@ pub fn run(
     let lines = match cmd {
         Command::Enroll(id) => enroll(port, t, id, on_prompt).map(|rec| record_lines(id, &rec)),
         Command::Identify => identify(port, t, on_prompt).map(|hit| vec![identify_line(hit)]),
+        Command::Verify(id) => verify_id(port, t, id, on_prompt).map(|hit| vec![verify_line(id, hit)]),
         Command::SyncWrite(w) => sync_write(slot, port, t, w).map(|line| vec![line]),
         Command::SyncClear(id) => clear(port, t, id).map(|()| vec![format!("VEIN SYNC CLEARED {id}")]),
+        Command::SyncInfo => test_capacity(port, t).map(|(users, max)| vec![sync_info_line(users, max)]),
     };
     lines.unwrap_or_else(|e| vec![err_line(e)])
 }
@@ -2730,14 +2791,53 @@ mod tests {
 
     #[test]
     fn identify_is_verify_zero() {
-        let (r, port) = run_identify(vec![connected(), verified(Some(0x0102_0304))]);
+        let (r, port) = run_identify(vec![connected(), finger(Some(1)), verified(Some(0x0102_0304))]);
         assert_eq!(r, Ok(Some(0x0102_0304)));
-        assert_eq!(port.sent.len(), 2);
-        assert_eq!(port.sent[1], command(CMD_VERIFY, &[0, 0, 0, 0]).to_vec());
-        let (r, _) = run_identify(vec![connected(), verified(None)]);
+        // 接続 → 指の状態 (有る) → 置ききるのを待つ → VERIFY 0
+        assert_eq!(port.sent.len(), 3);
+        assert_eq!(port.sent[1], command(CMD_FINGER_STATE, &[]).to_vec());
+        assert_eq!(port.sent[2], command(CMD_VERIFY, &[0, 0, 0, 0]).to_vec());
+        assert_eq!(port.pauses, vec![IDENTIFY_SETTLE_MS]);
+        let (r, _) = run_identify(vec![connected(), finger(Some(1)), verified(None)]);
         assert_eq!(r, Ok(None));
         assert_eq!(identify_line(Some(42)), "VEIN IDENTIFIED 42");
         assert_eq!(identify_line(None), "VEIN NOMATCH");
+    }
+
+    #[test]
+    fn identify_waits_for_the_finger_to_settle() {
+        // 無い → 無い → 有る: 問い合わせ間隔で待ち、有るを見てから置ききるのを待つ
+        let script = vec![connected(), finger(Some(0)), finger(Some(0)), finger(Some(1)), verified(Some(7))];
+        let (r, port) = run_identify(script);
+        assert_eq!(r, Ok(Some(7)));
+        assert_eq!(port.pauses, vec![SETTLE_POLL_MS, SETTLE_POLL_MS, IDENTIFY_SETTLE_MS]);
+        // 非対応・失敗なら待たずに VERIFY (モジュールの指待ちに任せる)
+        let unsupported = Some(reply(CMD_FINGER_STATE, &[XG_ERR_FAIL, XG_ERR_NO_SUPPORT]));
+        let (r, port) = run_identify(vec![connected(), unsupported, verified(Some(7))]);
+        assert_eq!(r, Ok(Some(7)));
+        assert_eq!(port.pauses, Vec::<u32>::new());
+        let failed = Some(reply(CMD_FINGER_STATE, &[XG_ERR_FAIL, 0x07]));
+        let (r, port) = run_identify(vec![connected(), failed, verified(None)]);
+        assert_eq!(r, Ok(None));
+        assert_eq!(port.pauses, Vec::<u32>::new());
+        // 指が来ないまま上限まで問い合わせたら、そのまま VERIFY
+        let t = Timeouts { finger_ms: 2 * SETTLE_POLL_MS, ..Timeouts::DEFAULT };
+        let mut port = FakePort::new(vec![connected(), finger(Some(0)), finger(Some(0)), finger(Some(0)), verified(None)]);
+        assert_eq!(identify(&mut port, &t, &mut |_| {}), Ok(None));
+        assert_eq!(port.pauses, vec![SETTLE_POLL_MS; 3]);
+        assert_eq!(port.sent.last(), Some(&command(CMD_VERIFY, &[0, 0, 0, 0]).to_vec()));
+    }
+
+    #[test]
+    fn verify_id_is_verify_with_the_id_after_settling() {
+        let mut port = FakePort::new(vec![connected(), finger(Some(1)), verified(Some(42))]);
+        assert_eq!(verify_id(&mut port, &Timeouts::DEFAULT, 42, &mut |_| {}), Ok(Some(42)));
+        assert_eq!(port.sent[2], command(CMD_VERIFY, &[42, 0, 0, 0]).to_vec());
+        assert_eq!(port.pauses, vec![IDENTIFY_SETTLE_MS]);
+        assert_eq!(verify_line(42, Some(42)), "VEIN VERIFIED 42");
+        assert_eq!(verify_line(42, None), "VEIN NOMATCH");
+        assert_eq!(sync_info_line(3, 100), "VEIN SYNC INFO USERS=3 MAX=100");
+        assert_eq!(ENROLL_PLACEMENTS, ENROLL_TEMPLATES_PRODUCTION + ENROLL_CONFIRMS);
     }
 
     #[test]
@@ -2745,13 +2845,13 @@ mod tests {
         let (r, _) = run_identify(vec![None]);
         assert_eq!(r, Err(VeinError::NoModule));
         let unsupported = Some(reply(CMD_VERIFY, &[XG_ERR_FAIL, XG_ERR_NO_SUPPORT]));
-        assert_eq!(run_identify(vec![connected(), unsupported]).0, Err(VeinError::Unsupported));
+        assert_eq!(run_identify(vec![connected(), finger(Some(1)), unsupported]).0, Err(VeinError::Unsupported));
         let other = Some(reply(CMD_VERIFY, &[XG_ERR_FAIL, 0x07]));
-        assert_eq!(run_identify(vec![connected(), other]).0, Err(VeinError::Rc(0x07)));
+        assert_eq!(run_identify(vec![connected(), finger(Some(1)), other]).0, Err(VeinError::Rc(0x07)));
         let unknown = Some(reply(CMD_VERIFY, &[0x05]));
-        assert_eq!(run_identify(vec![connected(), unknown]).0, Err(VeinError::Rc(0x05)));
+        assert_eq!(run_identify(vec![connected(), finger(Some(1)), unknown]).0, Err(VeinError::Rc(0x05)));
         let timeout = Some(reply(CMD_VERIFY, &[XG_ERR_FAIL, XG_ERR_TIME_OUT]));
-        assert_eq!(run_identify(vec![connected(), timeout]).0, Err(VeinError::NoFinger));
+        assert_eq!(run_identify(vec![connected(), finger(Some(1)), timeout]).0, Err(VeinError::NoFinger));
     }
 
     #[test]
@@ -2791,13 +2891,24 @@ mod tests {
             run_t(Command::Enroll(19), script),
             vec!["VEIN RECORD 19 0 DEEDDEED".to_string(), "VEIN RECORD 19 END 4".to_string()]
         );
-        assert_eq!(run_t(Command::Identify, vec![connected(), verified(Some(3))]), vec!["VEIN IDENTIFIED 3"]);
-        assert_eq!(run_t(Command::Identify, vec![connected(), verified(None)]), vec!["VEIN NOMATCH"]);
+        assert_eq!(run_t(Command::Identify, vec![connected(), finger(Some(1)), verified(Some(3))]), vec!["VEIN IDENTIFIED 3"]);
+        assert_eq!(run_t(Command::Identify, vec![connected(), finger(Some(1)), verified(None)]), vec!["VEIN NOMATCH"]);
         assert_eq!(
             run_t(Command::SyncWrite(chunk_cmd(5, 0, &TEMPLATE_MAGIC)), vec![]),
             vec!["VEIN SYNC WRITE 5 4"]
         );
         assert_eq!(run_t(Command::SyncClear(15), vec![connected(), cleared_ok()]), vec!["VEIN SYNC CLEARED 15"]);
+        assert_eq!(
+            run_t(Command::Verify(15), vec![connected(), finger(Some(1)), verified(Some(15))]),
+            vec!["VEIN VERIFIED 15"]
+        );
+        assert_eq!(run_t(Command::Verify(15), vec![connected(), finger(Some(1)), verified(None)]), vec!["VEIN NOMATCH"]);
+        let mut info = vec![XG_ERR_SUCCESS, 3, 0, 0, 0, 0, 0, 0, 0, 100, 0, 0, 0];
+        info.resize(DATA_LEN, 0);
+        assert_eq!(
+            run_t(Command::SyncInfo, vec![connected(), Some(reply(CMD_GET_ENROLL_INFO, &info))]),
+            vec!["VEIN SYNC INFO USERS=3 MAX=100"]
+        );
         // 失敗は ERR の 1 行だけ (記録は出さない)
         assert_eq!(run_t(Command::SyncClear(15), vec![None]), vec!["ERR VEIN NO_MODULE"]);
         let script = vec![connected(), cleared(), enrolled(), finger(Some(0)), verified(None), cleared_ok()];

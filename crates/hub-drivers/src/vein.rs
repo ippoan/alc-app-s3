@@ -250,7 +250,8 @@ pub fn start(
                         }
                         proto::Prompt::Replace(n) => {
                             // 画面が文言と進み具合に使う (生体データなし)
-                            alc_hub_common::evtlog::emit(&format!("EVT VEIN PLACE {n}"));
+                            // 合計も名乗る (画面の「n/合計」を、ファームの本数と食い違わせない)
+                            alc_hub_common::evtlog::emit(&format!("EVT VEIN PLACE {n} {}", proto::ENROLL_PLACEMENTS));
                             Some(Sound::VeinAgain)
                         }
                         proto::Prompt::Place => None,
