@@ -107,10 +107,11 @@ pub const XG_ERR_NO_SUPPORT: u8 = 0x10;
 pub const SCRATCH_ID: u32 = 1;
 /// 1 回の登録で撮るテンプレートの数 (`bData[5]`)。読み取り 1 回 = 撮像 1 回
 pub const ENROLL_TEMPLATES: u8 = 1;
-/// 本番の登録 (`VEIN ENROLL`) で撮るテンプレートの数。メーカーの試験ソフトの登録と同じ 3 本
-/// (読み出した記録の「テンプレート数 3」)。1 本だと、登録したときと置き方が少し変わったり別の端末の
-/// モジュールだったりすると照合の最初のふるいで落ちていた (ippoan/alc-app#436)
-pub const ENROLL_TEMPLATES_PRODUCTION: u8 = 3;
+/// 本番の登録 (`VEIN ENROLL`) で撮るテンプレートの数。1 本だと、登録したときと置き方が少し変わったり
+/// 別の端末のモジュールだったりすると照合の最初のふるいで落ちていた。3 本 (メーカーの試験ソフトと同じ)
+/// で別の端末の記録が 1:1 で 2/4 通るようになったので、4 本を試す。仕様書は「最大 3 本」と書くが、
+/// この機種 (XG-NV7S、1 人 6 本まで) は 4 本・6 本の登録を受け付けた (ippoan/alc-app#436)
+pub const ENROLL_TEMPLATES_PRODUCTION: u8 = 4;
 /// 撮像に失敗したときにモジュールが撮り直す回数 (`bData[10]`)。1 回の待ちは最大 5 秒なので、
 /// ホスト (alc-app `useVeinSerial` の `CAPTURE_TIMEOUT_MS` = 20 秒) に収まる回数にする
 pub const ENROLL_RETRIES: u8 = 2;
@@ -269,8 +270,8 @@ pub enum Prompt {
     /// 中身はそのエラーコード
     Retry(u8),
     /// `VEIN ENROLL` で置き直してもらう。中身は何回目に置くか (撮影からの通し番号): 撮影の 2 枚目以降は
-    /// モジュールが次の指を待ち始めたとき、確認の照合は指が離れたのを見たとき。撮影 3 回 + 確認
-    /// [`ENROLL_CONFIRMS`] 回なら 2〜5
+    /// モジュールが次の指を待ち始めたとき、確認の照合は指が離れたのを見たとき。撮影
+    /// [`ENROLL_TEMPLATES_PRODUCTION`] 回 + 確認 [`ENROLL_CONFIRMS`] 回なら 2 から両者の和まで
     Replace(u8),
 }
 
@@ -1500,22 +1501,18 @@ mod tests {
         Some(v)
     }
 
-    /// 本番の登録 (テンプレート 3 本) の応答。2 枚目で 1 回撮り直しが入る
-    fn enrolled_three() -> Option<Vec<u8>> {
+    /// 本番の登録 ([`ENROLL_TEMPLATES_PRODUCTION`] 本) の応答。2 枚目で 1 回撮り直しが入る
+    fn enrolled_production() -> Option<Vec<u8>> {
         let mut v = Vec::new();
-        for d in [
-            &[XG_INPUT_FINGER, 0][..],
-            &[XG_RELEASE_FINGER, 0],
-            &[XG_INPUT_FINGER, 1],
-            &[XG_ERR_FAIL, XG_ERR_NO_VEIN],
-            &[XG_INPUT_FINGER, 1],
-            &[XG_RELEASE_FINGER, 1],
-            &[XG_INPUT_FINGER, 2],
-            &[XG_RELEASE_FINGER, 2],
-            &[XG_ERR_SUCCESS, 3],
-        ] {
-            v.extend(reply(CMD_ENROLL, d));
+        for k in 0..ENROLL_TEMPLATES_PRODUCTION {
+            v.extend(reply(CMD_ENROLL, &[XG_INPUT_FINGER, k]));
+            if k == 1 {
+                v.extend(reply(CMD_ENROLL, &[XG_ERR_FAIL, XG_ERR_NO_VEIN]));
+                v.extend(reply(CMD_ENROLL, &[XG_INPUT_FINGER, k]));
+            }
+            v.extend(reply(CMD_ENROLL, &[XG_RELEASE_FINGER, k]));
         }
+        v.extend(reply(CMD_ENROLL, &[XG_ERR_SUCCESS, ENROLL_TEMPLATES_PRODUCTION]));
         Some(v)
     }
 
@@ -2617,7 +2614,7 @@ mod tests {
     #[test]
     fn enroll_confirms_twice_then_reads_the_record() {
         let data = sample_chara(1100);
-        let mut script = vec![connected(), cleared(), enrolled_three()];
+        let mut script = vec![connected(), cleared(), enrolled_production()];
         // 1 回目: まだ置かれている → 離れた → 照合
         script.extend([finger(Some(1)), finger(Some(0)), verified(Some(17))]);
         // 2 回目: すぐ離れている → 照合
@@ -2627,27 +2624,21 @@ mod tests {
         }
         let (r, port, prompts) = run_enroll(script, 17);
         assert_eq!(r, Ok(data));
-        // 撮影 3 枚: 2・3 枚目の「置いて」は置き直し (2・3 回目)。撮り直しの後の「置いて」は同じ回なので
-        // そのまま。確認の照合は撮影からの通しで 4・5 回目
-        assert_eq!(
-            prompts,
-            vec![
-                Prompt::Place,
-                Prompt::Release,
-                Prompt::Replace(2),
-                Prompt::Retry(XG_ERR_NO_VEIN),
-                Prompt::Place,
-                Prompt::Release,
-                Prompt::Replace(3),
-                Prompt::Release,
-                Prompt::Replace(4),
-                Prompt::Place,
-                Prompt::Release,
-                Prompt::Replace(5),
-                Prompt::Place,
-                Prompt::Release,
-            ]
-        );
+        // 撮影: 2 枚目以降の「置いて」は置き直し (2, 3, …)。撮り直しの後の「置いて」は同じ回なのでそのまま。
+        // 確認の照合は撮影からの通し番号で続く
+        let n = ENROLL_TEMPLATES_PRODUCTION;
+        let mut want = vec![Prompt::Place, Prompt::Release];
+        for k in 2..=n {
+            want.push(Prompt::Replace(k));
+            if k == 2 {
+                want.extend([Prompt::Retry(XG_ERR_NO_VEIN), Prompt::Place]);
+            }
+            want.push(Prompt::Release);
+        }
+        for c in 1..=ENROLL_CONFIRMS {
+            want.extend([Prompt::Replace(n + c), Prompt::Place, Prompt::Release]);
+        }
+        assert_eq!(prompts, want);
         // 接続 → 削除 → 登録 → 指 ×2 → 照合 → 指 → 照合 → READ_ENROLL → READ_DATA ×3。最後の削除はしない
         assert_eq!(port.sent.len(), 12);
         assert_eq!(&port.sent[2][3..10], &[CMD_ENROLL, 0, 12, 17, 0, 0, 0]);
