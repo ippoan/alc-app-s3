@@ -107,6 +107,10 @@ pub const XG_ERR_NO_SUPPORT: u8 = 0x10;
 pub const SCRATCH_ID: u32 = 1;
 /// 1 回の登録で撮るテンプレートの数 (`bData[5]`)。読み取り 1 回 = 撮像 1 回
 pub const ENROLL_TEMPLATES: u8 = 1;
+/// 本番の登録 (`VEIN ENROLL`) で撮るテンプレートの数。メーカーの試験ソフトの登録と同じ 3 本
+/// (読み出した記録の「テンプレート数 3」)。1 本だと、登録したときと置き方が少し変わったり別の端末の
+/// モジュールだったりすると照合の最初のふるいで落ちていた (ippoan/alc-app#436)
+pub const ENROLL_TEMPLATES_PRODUCTION: u8 = 3;
 /// 撮像に失敗したときにモジュールが撮り直す回数 (`bData[10]`)。1 回の待ちは最大 5 秒なので、
 /// ホスト (alc-app `useVeinSerial` の `CAPTURE_TIMEOUT_MS` = 20 秒) に収まる回数にする
 pub const ENROLL_RETRIES: u8 = 2;
@@ -480,6 +484,7 @@ fn enroll_id(
     port: &mut dyn Port,
     t: &Timeouts,
     id: u32,
+    templates: u8,
     on_prompt: &mut dyn FnMut(Prompt),
 ) -> Result<(), VeinError> {
     // 前回が途中で終わった残りを消す。未登録なら失敗が返るが、応答さえあればよい
@@ -488,7 +493,7 @@ fn enroll_id(
 
     let mut req = [0u8; 12];
     req[..4].copy_from_slice(&id);
-    req[5] = ENROLL_TEMPLATES;
+    req[5] = templates;
     req[10] = ENROLL_RETRIES;
     let p = send_and_await_final(port, t, CMD_ENROLL, &req, on_prompt)?;
     // 途中経過は send_and_await_final が読み切っているので、ここに届くのは成功か失敗だけ。
@@ -564,7 +569,7 @@ pub fn capture(
     connect(port, t)?;
 
     // 2.-3. 作業用 ID を空けて、1 回だけ登録する (途中経過は on_prompt へ)
-    enroll_id(port, t, SCRATCH_ID, on_prompt)?;
+    enroll_id(port, t, SCRATCH_ID, ENROLL_TEMPLATES, on_prompt)?;
     // 4.-5. 登録データを読む
     let out = read_enroll(port, t, SCRATCH_ID)?;
 
@@ -783,7 +788,7 @@ pub fn test_enroll(
     on_prompt: &mut dyn FnMut(Prompt),
 ) -> Result<(), VeinError> {
     connect(port, t)?;
-    enroll_id(port, t, id, on_prompt)
+    enroll_id(port, t, id, ENROLL_TEMPLATES, on_prompt)
 }
 
 /// 試験: 接続して ID で照合する。**ID `0` は 1:N (§2.2.21)**: 登録済み全員から探し、成功なら
@@ -1039,7 +1044,7 @@ pub fn enroll(
     on_prompt: &mut dyn FnMut(Prompt),
 ) -> Result<Vec<u8>, VeinError> {
     connect(port, t)?;
-    enroll_id(port, t, id, on_prompt)?;
+    enroll_id(port, t, id, ENROLL_TEMPLATES_PRODUCTION, on_prompt)?;
     let got = confirm_and_read(port, t, id, on_prompt);
     if got.is_err() {
         let _ = exchange(port, t, CMD_CLEAR_ENROLL, &id.to_le_bytes());
@@ -2597,6 +2602,9 @@ mod tests {
         // 接続 → 削除 → 登録 → 指 ×2 → 照合 → 指 → 照合 → READ_ENROLL → READ_DATA ×3。最後の削除はしない
         assert_eq!(port.sent.len(), 12);
         assert_eq!(&port.sent[2][3..10], &[CMD_ENROLL, 0, 12, 17, 0, 0, 0]);
+        // 本番の登録はテンプレート 3 本 (bData[5])、撮り直し 2 (bData[10])
+        assert_eq!(port.sent[2][6 + 5], ENROLL_TEMPLATES_PRODUCTION);
+        assert_eq!(port.sent[2][6 + 10], ENROLL_RETRIES);
         assert_eq!(port.sent[3], command(CMD_FINGER_STATE, &[]).to_vec());
         assert_eq!(port.sent[5], command(CMD_VERIFY, &[17, 0, 0, 0]).to_vec());
         assert_eq!(port.sent[7], command(CMD_VERIFY, &[17, 0, 0, 0]).to_vec());
