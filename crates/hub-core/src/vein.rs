@@ -638,12 +638,48 @@ pub enum TestCommand {
     /// ([`test_raw`])。仕様書にない命令 (指紋互換の EF01 形式、GET_DEBUG 0x26 など) が通じるかを
     /// ホスト側で組み立てて確かめるため (ippoan/alc-app#436)
     Raw { wait_ms: u32, bytes: Vec<u8> },
+    /// `VEIN TEST RAWQ <16 進>`: バイト列を送らずに端末の中にためる ([`RawQueue`])。次の `VEIN TEST RAW` が
+    /// ためた分の後ろに自分の分をつないで 1 回で流す。指紋互換の DownChar は命令の直後にデータが
+    /// 続かないとモジュールが受信を打ち切る (`SynoRevDataEndPkt TIMEOUT`) が、コンソールの 1 行
+    /// ([`RAW_SEND_MAX`]) には 1 人分 (700〜850 バイト) が載らないため (ippoan/alc-app#436)
+    RawQueue(Vec<u8>),
 }
 
 /// `VEIN TEST RAW` で一度に送れるバイト数の上限 (SYNC WRITE の 1 行と同じ)
 pub const RAW_SEND_MAX: usize = WRITE_LINE_MAX;
 /// `VEIN TEST RAW` の最初の 1 バイトを待つ上限 (ミリ秒)。指を待つ命令 (撮影) も試せる長さ
 pub const RAW_WAIT_MAX_MS: u32 = 30_000;
+/// `VEIN TEST RAWQ` でためられるバイト数の上限
+pub const RAW_QUEUE_MAX: usize = 4096;
+
+/// `VEIN TEST RAWQ` でためたバイト列。`VEIN TEST RAW` が [`RawQueue::take_with`] で空にする
+#[derive(Debug, Default)]
+pub struct RawQueue(Vec<u8>);
+
+impl RawQueue {
+    /// 後ろにつなぐ。合わせて [`RAW_QUEUE_MAX`] を超えるなら全部捨てて `Err` (半端なまま流さない)。
+    /// 戻り値はためたバイト数
+    pub fn push(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        if self.0.len() + bytes.len() > RAW_QUEUE_MAX {
+            self.0.clear();
+            return Err(format!("ERR VEIN: RAWQ は合わせて {RAW_QUEUE_MAX} バイトまでです (ためた分は捨てた)"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(self.0.len())
+    }
+
+    /// ためた分の後ろに `tail` をつないで返し、空にする
+    pub fn take_with(&mut self, tail: &[u8]) -> Vec<u8> {
+        let mut all = core::mem::take(&mut self.0);
+        all.extend_from_slice(tail);
+        all
+    }
+}
+
+/// `VEIN TEST RAWQ <ためたバイト数>`
+pub fn raw_queue_line(len: usize) -> String {
+    format!("VEIN TEST RAWQ {len}")
+}
 
 /// 本番の口 (ippoan/alc-app#436 の M-b: 照合を端末のモジュールで行う)。結果は [`run`] が返す行
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2290,6 +2326,24 @@ mod tests {
         let mut port = FakePort::new(vec![]);
         port.send_ok = false;
         assert_eq!(test_raw(&mut port, &Timeouts::DEFAULT, 1000, &frame), Err(VeinError::ReadFail));
+    }
+
+    #[test]
+    fn raw_queue_joins_then_empties_and_refuses_overflow() {
+        let mut q = RawQueue::default();
+        assert_eq!(q.push(&[1, 2]), Ok(2));
+        assert_eq!(q.push(&[3]), Ok(3));
+        assert_eq!(raw_queue_line(3), "VEIN TEST RAWQ 3");
+        // RAW の分を後ろにつなぎ、空になる
+        assert_eq!(q.take_with(&[9]), vec![1, 2, 3, 9]);
+        assert_eq!(q.take_with(&[]), Vec::<u8>::new());
+        // 上限ちょうどは入る。超えたら全部捨てる
+        assert_eq!(q.push(&vec![0; RAW_QUEUE_MAX]), Ok(RAW_QUEUE_MAX));
+        assert_eq!(
+            q.push(&[0]),
+            Err(format!("ERR VEIN: RAWQ は合わせて {RAW_QUEUE_MAX} バイトまでです (ためた分は捨てた)"))
+        );
+        assert_eq!(q.take_with(&[7]), vec![7]);
     }
 
     #[test]
