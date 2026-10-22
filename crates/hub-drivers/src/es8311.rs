@@ -68,6 +68,35 @@ const ENABLE_SEQ: [(u8, u8); 8] = [
     (0x37, 0x08), // DAC: イコライザをバイパス (既定値ではない)
 ];
 
+/// 本体の LED に使う内蔵 I2C。起動時に ES8311 を起こし終えた [`install_led_bus`] が預ける
+/// (それまでは `None` で、`LED` コマンドは「まだ使えない」と答える)
+static LED_BUS: std::sync::OnceLock<std::sync::Mutex<I2cDriver<'static>>> = std::sync::OnceLock::new();
+
+/// ES8311 の初期化が終わった内蔵 I2C を、LED (LP5562) 用に預ける。以後この I2C は LED しか使わない
+pub fn install_led_bus(i2c: I2cDriver<'static>) {
+    let _ = LED_BUS.set(std::sync::Mutex::new(i2c));
+}
+
+/// LP5562 の明るさを書く (試験用の `LED` コマンド、ippoan/alc-app#436)。
+/// **VoiceS3R に LP5562 が載っているか、どのチャンネルが LED かは未確定** — 載っていなければ
+/// I2C が NACK で返り `Err` になる (= 「この個体に LED は無い」の確定)。
+/// 手順はデータシートどおり: 有効化 (0x00 = 0x40) → 内部クロック (0x08 = 0x01) →
+/// 全チャンネルを I2C の値で駆動 (0x70 = 0x00) → PWM (青 0x02 / 緑 0x03 / 赤 0x04 / 白 0x0E)。
+/// 電流は既定 (17.5 mA) のまま
+pub fn set_led(r: u8, g: u8, b: u8, w: u8) -> std::result::Result<(), &'static str> {
+    let bus = LED_BUS.get().ok_or("内蔵 I2C がまだ使えません (音の初期化前か失敗)")?;
+    let mut i2c = bus.lock().map_err(|_| "内蔵 I2C の錠が壊れています")?;
+    // NACK で待ち続けないよう、BLOCK ではなく短い待ちで書く
+    const WAIT_TICKS: u32 = 50;
+    let mut put = |reg: u8, value: u8| i2c.write(LP5562_ADDR, &[reg, value], WAIT_TICKS);
+    put(0x00, 0x40).map_err(|_| "LP5562 (0x30) が応答しません")?;
+    FreeRtos::delay_ms(1);
+    for (reg, value) in [(0x08, 0x01), (0x70, 0x00), (0x04, r), (0x03, g), (0x02, b), (0x0E, w)] {
+        put(reg, value).map_err(|_| "LP5562 への書き込みに失敗しました")?;
+    }
+    Ok(())
+}
+
 fn write_reg(i2c: &mut I2cDriver, reg: u8, value: u8) -> Result<()> {
     i2c.write(ES8311_ADDR, &[reg, value], BLOCK)?;
     Ok(())

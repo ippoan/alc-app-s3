@@ -198,6 +198,9 @@ pub enum HostCommand {
     OmronBp { enabled: bool },
     /// Omron 構成の問い合わせ (`OMRON BP=0` を応答)
     OmronStatus,
+    /// 本体の LED (VoiceS3R の LP5562) の明るさ (`LED <赤> <緑> <青> [<白>]`、各 0〜255)。
+    /// 試験用: 挿した複数台のどれかを見分ける (ippoan/alc-app#436)。`OK LED …` / `ERR LED: …` を応答
+    Led { r: u8, g: u8, b: u8, w: u8 },
     /// ヒープ状態の問い合わせ
     /// (`HEAP FREE_INT=<n> MIN_INT=<n> FREE_PSRAM=<n> ...` を応答、Refs #27)
     Heap,
@@ -571,6 +574,17 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
             },
             _ => return Err("ERR OMRON: BP|STATUS が必要です".into()),
         },
+        // 本体の LED (VoiceS3R の LP5562)。白は省略できる (0)
+        "LED" => {
+            const BAD_LED: &str = "ERR LED: LED <赤> <緑> <青> [<白>] (各 0〜255) です";
+            let vals: Vec<&str> = it.by_ref().collect();
+            let nums: Option<Vec<u8>> = vals.iter().map(|v| v.parse::<u8>().ok()).collect();
+            match nums.as_deref() {
+                Some([r, g, b]) => HostCommand::Led { r: *r, g: *g, b: *b, w: 0 },
+                Some([r, g, b, w]) => HostCommand::Led { r: *r, g: *g, b: *b, w: *w },
+                _ => return Err(BAD_LED.into()),
+            }
+        }
         // PC (運行者タブ) の点呼の段。点呼画面を PC の流れに合わせる (hub-ui)
         "STAGE" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
             Some("NFC") => HostCommand::Stage(HostStage::Nfc),
@@ -1609,6 +1623,11 @@ mod tests {
             Err("ERR VEIN: SYSINFO に引数は要りません".into())
         );
         assert_eq!(parse_line("VEIN TEST IMAGE", T), Ok(Some(HostCommand::VeinTest(TestCommand::Image))));
+        assert_eq!(parse_line("LED 255 0 16", T), Ok(Some(HostCommand::Led { r: 255, g: 0, b: 16, w: 0 })));
+        assert_eq!(parse_line("led 1 2 3 4", T), Ok(Some(HostCommand::Led { r: 1, g: 2, b: 3, w: 4 })));
+        for bad in ["LED", "LED 1 2", "LED 1 2 3 4 5", "LED 256 0 0", "LED a 0 0", "LED -1 0 0"] {
+            assert_eq!(parse_line(bad, T), Err("ERR LED: LED <赤> <緑> <青> [<白>] (各 0〜255) です".into()), "{bad}");
+        }
         assert_eq!(parse_line("VEIN TEST IMAGE 1", T), Err("ERR VEIN: IMAGE に引数は要りません".into()));
         for bad in ["VEIN TEST ENROLL 0", "VEIN TEST CLEAR 0"] {
             assert_eq!(parse_line(bad, T), Err("ERR VEIN: TEST の ID は 2〜9 の数字だけです".into()), "{bad}");

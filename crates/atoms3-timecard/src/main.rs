@@ -308,6 +308,9 @@ fn main() -> Result<()> {
             (None, None)
         }
     };
+    // 音の初期化を終えた内蔵 I2C は、本体の LED (LP5562) の試験用に `LED` コマンドへ預ける
+    // (ippoan/alc-app#436。VoiceS3R に LED があるかは未確定で、無ければコマンドが NACK を答える)
+    es8311::install_led_bus(audio_i2c);
 
     // `VEIN SAY` の音はこの再生スレッドで鳴らす (初期化に失敗したら入れない
     // = `ERR VEIN NO_SPEAKER`)

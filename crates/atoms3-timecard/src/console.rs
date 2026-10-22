@@ -143,6 +143,11 @@ fn handle_line(
         HostCommand::VeinTest(cmd) => vein.test(cmd),
         #[cfg(feature = "vein")]
         HostCommand::Vein(cmd) => vein.run(cmd),
+        // 本体の LED (LP5562)。挿した複数台のどれかを見分ける試験用 (ippoan/alc-app#436)
+        HostCommand::Led { r, g, b, w } => match alc_hub_drivers::es8311::set_led(r, g, b, w) {
+            Ok(()) => println!("OK LED {r} {g} {b} {w}"),
+            Err(e) => println!("ERR LED: {e}"),
+        },
         // 本機で意味を持たないコマンド (画面遷移 / 印刷 / BLE / Wi-Fi / CFG 等)
         other => {
             log::debug!("console: unsupported command: {other:?}");
