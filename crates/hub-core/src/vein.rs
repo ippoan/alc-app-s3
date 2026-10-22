@@ -125,15 +125,9 @@ pub const TEST_ID_MAX: u32 = 9;
 /// ([`TEST_ID_MIN`]〜[`TEST_ID_MAX`]。確認タブの試験が本番の登録を上書きしないよう重ねない)
 pub const MODULE_ID_MIN: u32 = 10;
 pub const MODULE_ID_MAX: u32 = 100;
-/// `VEIN ENROLL` で登録の後に置き直して照合する回数。**全部当たったときだけ採用する**
-/// (モジュールの登録は 1 回ごとに当たり外れがあるため。2026-10-21 実機)
-pub const ENROLL_CONFIRMS: u8 = 2;
-/// 本番の登録で置く回数の合計 (撮影 + 確認)。`EVT VEIN PLACE <n> <合計>` の合計
-pub const ENROLL_PLACEMENTS: u8 = ENROLL_TEMPLATES_PRODUCTION + ENROLL_CONFIRMS;
-/// 置き直しの前に指が離れるのを見る間隔と回数 (仕様書 §5.7: 照合の後、FINGER_STATUS で
-/// 指が離れるのを待ってから次の照合)。200ms × 50 = 10 秒で離れなければ [`VeinError::Timeout`]
-pub const RELEASE_POLL_MS: u32 = 200;
-pub const RELEASE_POLLS: usize = 50;
+/// 本番の登録で置く回数の合計 (= 撮影の本数。登録の後の確認の照合はしない — 仕様は「最初の登録は
+/// 4 回置く」)。`EVT VEIN PLACE <n> <合計>` の合計
+pub const ENROLL_PLACEMENTS: u8 = ENROLL_TEMPLATES_PRODUCTION;
 /// `VEIN RECORD` 1 行に載せる記録のバイト数 (16 進で 2048 文字)。最長の行
 /// (`VEIN RECORD 100 7168 ` + 2048 文字 = 2069 文字) が、実機で通っている `VEIN CHARA`
 /// (2203 文字) より短くなる大きさ
@@ -272,8 +266,8 @@ pub enum Prompt {
     /// 中身はそのエラーコード
     Retry(u8),
     /// `VEIN ENROLL` で置き直してもらう。中身は何回目に置くか (撮影からの通し番号): 撮影の 2 枚目以降は
-    /// モジュールが次の指を待ち始めたとき、確認の照合は指が離れたのを見たとき。撮影
-    /// [`ENROLL_TEMPLATES_PRODUCTION`] 回 + 確認 [`ENROLL_CONFIRMS`] 回なら 2 から両者の和まで
+    /// モジュールが次の指を待ち始めたとき、撮影
+    /// [`ENROLL_TEMPLATES_PRODUCTION`] 回なら 2 からその数まで
     Replace(u8),
 }
 
@@ -317,8 +311,6 @@ pub enum VeinError {
     ReadFail,
     /// コマンド非対応 (`01 10`)。VERIFY・指の状態で、この機種では通らないと分かった
     Unsupported,
-    /// `VEIN ENROLL`: 登録の後の置き直し照合が外れた。登録は消したので撮り直す
-    Retake,
     /// `VEIN SYNC WRITE`: offset が続いていない・組み立て中のものが無い・ID が違う
     WriteSeq,
     /// `VEIN SYNC WRITE`: 合計が [`CHARA_MAX`] を超える
@@ -338,7 +330,6 @@ impl VeinError {
             Self::NoFinger => "NO_FINGER".into(),
             Self::ReadFail => "READ_FAIL".into(),
             Self::Unsupported => "UNSUPPORTED".into(),
-            Self::Retake => "RETAKE".into(),
             Self::WriteSeq => "WRITE_SEQ".into(),
             Self::WriteTooBig => "WRITE_TOO_BIG".into(),
             Self::WriteHeader => "WRITE_HEADER".into(),
@@ -729,7 +720,7 @@ pub fn raw_queue_line(len: usize) -> String {
 /// 本番の口 (ippoan/alc-app#436 の M-b: 照合を端末のモジュールで行う)。結果は [`run`] が返す行
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// `VEIN ENROLL <id>`: 登録 → 置き直し照合 ×[`ENROLL_CONFIRMS`] → 全部当たれば記録全体を返す
+    /// `VEIN ENROLL <id>`: テンプレート [`ENROLL_TEMPLATES_PRODUCTION`] 本で登録 → 記録全体を返す
     Enroll(u32),
     /// `VEIN IDENTIFY`: 1:N 照合 (VERIFY 0)
     Identify,
@@ -1025,20 +1016,6 @@ fn write_enroll(port: &mut dyn Port, t: &Timeouts, id: u32, data: &[u8]) -> Resu
     Ok(())
 }
 
-/// 指が離れるまで待つ (接続済みであること。[`RELEASE_POLL_MS`] ごとに FINGER_STATUS、
-/// [`RELEASE_POLLS`] 回で離れなければ [`VeinError::Timeout`])。問い合わせの失敗はそのまま返す
-fn await_release(port: &mut dyn Port, t: &Timeouts) -> Result<(), VeinError> {
-    for _ in 0..RELEASE_POLLS {
-        match finger_state(port, t) {
-            FingerReply::Absent => return Ok(()),
-            FingerReply::Present => port.pause(RELEASE_POLL_MS),
-            FingerReply::Unsupported => return Err(VeinError::Unsupported),
-            FingerReply::Failed(e) => return Err(e),
-        }
-    }
-    Err(VeinError::Timeout)
-}
-
 /// ID `id` で 1 回照合する (接続済みであること。`0` は 1:N)。当たれば当たった ID
 /// (`bData[1..5]` LE)、不一致 (`01 0C`) は `None`。非対応 (`01 10`) は
 /// [`VeinError::Unsupported`]、他の失敗コードは [`VeinError::Rc`]
@@ -1058,12 +1035,12 @@ fn verify(
     }
 }
 
-/// 本番の登録 (`VEIN ENROLL <id>`): 接続 → ID を空けて登録 → (指が離れるのを待つ →
-/// 置き直して VERIFY <id>) を [`ENROLL_CONFIRMS`] 回 → 全部当たれば登録データ (記録全体) を
-/// 読んで返す。置き直しのたびに [`Prompt::Replace`] を `on_prompt` へ渡す。
+/// 本番の登録 (`VEIN ENROLL <id>`): 接続 → ID を空けてテンプレート
+/// [`ENROLL_TEMPLATES_PRODUCTION`] 本を撮って登録 → 登録データ (記録全体) を読んで返す。
+/// 撮影の 2 枚目以降は [`Prompt::Replace`] を `on_prompt` へ渡す。登録の後の確認の照合はしない
+/// (同じ指かはモジュールが撮影ごとに見る、`01 09`)。
 ///
-/// 登録の後で失敗したら (外れ = [`VeinError::Retake`]、ほかの失敗はそのまま) ID を消してから
-/// 返す — 確かめていない登録をモジュールに残さない
+/// 登録の後で読み出しに失敗したら ID を消してから返す — 渡せない登録をモジュールに残さない
 pub fn enroll(
     port: &mut dyn Port,
     t: &Timeouts,
@@ -1072,31 +1049,13 @@ pub fn enroll(
 ) -> Result<Vec<u8>, VeinError> {
     connect(port, t)?;
     enroll_id(port, t, id, ENROLL_TEMPLATES_PRODUCTION, on_prompt)?;
-    let got = confirm_and_read(port, t, id, ENROLL_TEMPLATES_PRODUCTION, on_prompt);
+    let got = read_enroll(port, t, id);
     if got.is_err() {
         let _ = exchange(port, t, CMD_CLEAR_ENROLL, &id.to_le_bytes());
     }
     got
 }
 
-/// [`enroll`] の登録の後: 置き直し照合と読み出し
-fn confirm_and_read(
-    port: &mut dyn Port,
-    t: &Timeouts,
-    id: u32,
-    templates: u8,
-    on_prompt: &mut dyn FnMut(Prompt),
-) -> Result<Vec<u8>, VeinError> {
-    // 置き直しの番号は登録の撮影から通し (撮影 3 回なら確認は 4・5 回目)
-    for n in 0..ENROLL_CONFIRMS {
-        await_release(port, t)?;
-        on_prompt(Prompt::Replace(templates + n + 1));
-        if verify(port, t, id, on_prompt)?.is_none() {
-            return Err(VeinError::Retake);
-        }
-    }
-    read_enroll(port, t, id)
-}
 
 /// `VEIN ENROLL` の成功の行: 記録を [`RECORD_LINE_MAX`] バイトずつ
 /// `VEIN RECORD <id> <offset> <大文字 16 進>` にし、最後に `VEIN RECORD <id> END <総バイト数>`
@@ -2667,26 +2626,17 @@ mod tests {
         (r, port, prompts)
     }
 
-    /// 接続 → 削除 → 登録 → 1 回目の置き直し照合 (当たり) までの台本
-    fn enroll_head(id: u32) -> Vec<Option<Vec<u8>>> {
-        vec![connected(), cleared(), enrolled(), finger(Some(0)), verified(Some(id))]
-    }
-
     #[test]
-    fn enroll_confirms_twice_then_reads_the_record() {
+    fn enroll_takes_the_templates_then_reads_the_record() {
         let data = sample_chara(1100);
-        let mut script = vec![connected(), cleared(), enrolled_production()];
-        // 1 回目: まだ置かれている → 離れた → 照合
-        script.extend([finger(Some(1)), finger(Some(0)), verified(Some(17))]);
-        // 2 回目: すぐ離れている → 照合
-        script.extend([finger(Some(0)), verified(Some(17)), size(1100)]);
+        let mut script = vec![connected(), cleared(), enrolled_production(), size(1100)];
         for (off, len) in chunks(1100) {
             script.push(Some(chunk(&data[off..off + len])));
         }
         let (r, port, prompts) = run_enroll(script, 17);
         assert_eq!(r, Ok(data));
         // 撮影: 2 枚目以降の「置いて」は置き直し (2, 3, …)。撮り直しの後の「置いて」は同じ回なのでそのまま。
-        // 確認の照合は撮影からの通し番号で続く
+        // 登録の後の確認の照合はしない
         let n = ENROLL_TEMPLATES_PRODUCTION;
         let mut want = vec![Prompt::Place, Prompt::Release];
         for k in 2..=n {
@@ -2696,80 +2646,36 @@ mod tests {
             }
             want.push(Prompt::Release);
         }
-        for c in 1..=ENROLL_CONFIRMS {
-            want.extend([Prompt::Replace(n + c), Prompt::Place, Prompt::Release]);
-        }
         assert_eq!(prompts, want);
-        // 接続 → 削除 → 登録 → 指 ×2 → 照合 → 指 → 照合 → READ_ENROLL → READ_DATA ×3。最後の削除はしない
-        assert_eq!(port.sent.len(), 12);
+        assert_eq!(ENROLL_PLACEMENTS, n);
+        // 接続 → 削除 → 登録 → READ_ENROLL → READ_DATA ×3。最後の削除はしない
+        assert_eq!(port.sent.len(), 7);
         assert_eq!(&port.sent[2][3..10], &[CMD_ENROLL, 0, 12, 17, 0, 0, 0]);
-        // 本番の登録はテンプレート 3 本 (bData[5])、撮り直し 2 (bData[10])
+        // 本番の登録はテンプレート ENROLL_TEMPLATES_PRODUCTION 本 (bData[5])、撮り直し 2 (bData[10])
         assert_eq!(port.sent[2][6 + 5], ENROLL_TEMPLATES_PRODUCTION);
         assert_eq!(port.sent[2][6 + 10], ENROLL_RETRIES);
-        assert_eq!(port.sent[3], command(CMD_FINGER_STATE, &[]).to_vec());
-        assert_eq!(port.sent[5], command(CMD_VERIFY, &[17, 0, 0, 0]).to_vec());
-        assert_eq!(port.sent[7], command(CMD_VERIFY, &[17, 0, 0, 0]).to_vec());
-        assert_eq!(&port.sent[8][3..10], &[CMD_READ_ENROLL, 0, 4, 17, 0, 0, 0]);
-        // 置かれている間だけ 200ms 待った
-        assert_eq!(port.pauses, vec![RELEASE_POLL_MS]);
+        assert_eq!(&port.sent[3][3..10], &[CMD_READ_ENROLL, 0, 4, 17, 0, 0, 0]);
+        assert_eq!(port.pauses, Vec::<u32>::new());
     }
 
     #[test]
-    fn enroll_miss_clears_the_id_and_asks_to_retake() {
+    fn enroll_read_failure_after_registering_clears_the_id() {
         let clear_17 = command(CMD_CLEAR_ENROLL, &[17, 0, 0, 0]).to_vec();
-        // 1 回目で外れ
-        let script = vec![connected(), cleared(), enrolled(), finger(Some(0)), verified(None), cleared_ok()];
-        let (r, port, prompts) = run_enroll(script, 17);
-        assert_eq!(r, Err(VeinError::Retake));
-        assert_eq!(port.sent.len(), 6);
-        assert_eq!(port.sent[5], clear_17);
-        assert_eq!(prompts.last(), Some(&Prompt::Release));
-        // 2 回目で外れ
-        let mut script = enroll_head(17);
-        script.extend([finger(Some(0)), verified(None), cleared_ok()]);
-        let (r, port, _) = run_enroll(script, 17);
-        assert_eq!(r, Err(VeinError::Retake));
-        assert_eq!(port.sent.len(), 8);
-        assert_eq!(port.sent[7], clear_17);
-    }
-
-    #[test]
-    fn enroll_failures_after_registering_clear_the_id() {
-        let clear_17 = command(CMD_CLEAR_ENROLL, &[17, 0, 0, 0]).to_vec();
-        // 指が離れないまま 10 秒
-        let mut script = vec![connected(), cleared(), enrolled()];
-        script.extend((0..RELEASE_POLLS).map(|_| finger(Some(1))));
-        script.push(cleared_ok());
-        let (r, port, _) = run_enroll(script, 17);
-        assert_eq!(r, Err(VeinError::Timeout));
-        assert_eq!(port.pauses.len(), RELEASE_POLLS);
-        assert_eq!(port.sent.last(), Some(&clear_17));
-        // 指の状態が非対応 / 応答が無い
-        let unsupported = Some(reply(CMD_FINGER_STATE, &[XG_ERR_FAIL, XG_ERR_NO_SUPPORT]));
-        let (r, port, _) = run_enroll(vec![connected(), cleared(), enrolled(), unsupported, cleared_ok()], 17);
-        assert_eq!(r, Err(VeinError::Unsupported));
-        assert_eq!(port.sent.last(), Some(&clear_17));
-        let (r, _, _) = run_enroll(vec![connected(), cleared(), enrolled(), None, cleared_ok()], 17);
-        assert_eq!(r, Err(VeinError::Timeout));
-        // 置き直しで指が来ない
-        let timeout = Some(reply(CMD_VERIFY, &[XG_ERR_FAIL, XG_ERR_TIME_OUT]));
-        let script = vec![connected(), cleared(), enrolled(), finger(Some(0)), timeout, cleared_ok()];
-        let (r, port, _) = run_enroll(script, 17);
-        assert_eq!(r, Err(VeinError::NoFinger));
-        assert_eq!(port.sent.last(), Some(&clear_17));
-        // 照合は通ったが記録が読めない
-        let mut script = enroll_head(17);
-        script.extend([finger(Some(0)), verified(Some(17))]);
-        script.extend([Some(reply(CMD_READ_ENROLL, &[XG_ERR_FAIL, 0x0A])), cleared_ok()]);
+        let script = vec![
+            connected(),
+            cleared(),
+            enrolled(),
+            Some(reply(CMD_READ_ENROLL, &[XG_ERR_FAIL, 0x0A])),
+            cleared_ok(),
+        ];
         let (r, port, _) = run_enroll(script, 17);
         assert_eq!(r, Err(VeinError::Rc(0x0A)));
         assert_eq!(port.sent.last(), Some(&clear_17));
-        // 外れの後の削除が送れなくても、返すのは外れ (7 回目の送信 = 削除)
-        let script = vec![connected(), cleared(), enrolled(), finger(Some(1)), finger(Some(0)), verified(None)];
-        let mut port = FailAt(FakePort::new(script), 7);
-        assert_eq!(enroll(&mut port, &Timeouts::DEFAULT, 17, &mut |_| {}), Err(VeinError::Retake));
+        // 削除が送れなくても、返すのは読み出しの失敗 (5 回目の送信 = 削除)
+        let script = vec![connected(), cleared(), enrolled(), Some(reply(CMD_READ_ENROLL, &[XG_ERR_FAIL, 0x0A]))];
+        let mut port = FailAt(FakePort::new(script), 5);
+        assert_eq!(enroll(&mut port, &Timeouts::DEFAULT, 17, &mut |_| {}), Err(VeinError::Rc(0x0A)));
         assert_eq!(port.0.sent.last(), Some(&clear_17));
-        assert_eq!(port.0.pauses, vec![RELEASE_POLL_MS]);
     }
 
     #[test]
@@ -2826,6 +2732,10 @@ mod tests {
         assert_eq!(identify(&mut port, &t, &mut |_| {}), Ok(None));
         assert_eq!(port.pauses, vec![SETTLE_POLL_MS; 3]);
         assert_eq!(port.sent.last(), Some(&command(CMD_VERIFY, &[0, 0, 0, 0]).to_vec()));
+        // 包んだポート越しでも同じ順 (置ききるのを待ってから VERIFY)
+        let mut port = FailAt(FakePort::new(vec![connected(), finger(Some(1)), verified(Some(7))]), 99);
+        assert_eq!(identify(&mut port, &Timeouts::DEFAULT, &mut |_| {}), Ok(Some(7)));
+        assert_eq!(port.0.pauses, vec![IDENTIFY_SETTLE_MS]);
     }
 
     #[test]
@@ -2837,7 +2747,6 @@ mod tests {
         assert_eq!(verify_line(42, Some(42)), "VEIN VERIFIED 42");
         assert_eq!(verify_line(42, None), "VEIN NOMATCH");
         assert_eq!(sync_info_line(3, 100), "VEIN SYNC INFO USERS=3 MAX=100");
-        assert_eq!(ENROLL_PLACEMENTS, ENROLL_TEMPLATES_PRODUCTION + ENROLL_CONFIRMS);
     }
 
     #[test]
@@ -2885,8 +2794,7 @@ mod tests {
     #[test]
     fn run_returns_the_lines_of_each_command() {
         let data = sample_chara(4);
-        let mut script = enroll_head(19);
-        script.extend([finger(Some(0)), verified(Some(19)), size(4), Some(chunk(&data))]);
+        let script = vec![connected(), cleared(), enrolled(), size(4), Some(chunk(&data))];
         assert_eq!(
             run_t(Command::Enroll(19), script),
             vec!["VEIN RECORD 19 0 DEEDDEED".to_string(), "VEIN RECORD 19 END 4".to_string()]
@@ -2911,8 +2819,8 @@ mod tests {
         );
         // 失敗は ERR の 1 行だけ (記録は出さない)
         assert_eq!(run_t(Command::SyncClear(15), vec![None]), vec!["ERR VEIN NO_MODULE"]);
-        let script = vec![connected(), cleared(), enrolled(), finger(Some(0)), verified(None), cleared_ok()];
-        assert_eq!(run_t(Command::Enroll(19), script), vec!["ERR VEIN RETAKE"]);
+        let script = vec![connected(), cleared(), Some(reply(CMD_ENROLL, &[XG_ERR_FAIL, XG_ERR_TIME_OUT]))];
+        assert_eq!(run_t(Command::Enroll(19), script), vec!["ERR VEIN NO_FINGER"]);
         // run は渡された組み立て中のものを使う
         let mut slot = None;
         run_in(&mut slot, Command::SyncWrite(chunk_cmd(5, 0, &TEMPLATE_MAGIC)), vec![]);
@@ -2928,7 +2836,6 @@ mod tests {
         for bad in ["1", "2", "9", "0", "101", "", "-10", "+10", "10a", " 10", "99999999999"] {
             assert_eq!(parse_module_id(bad), None, "{bad:?}");
         }
-        assert_eq!(err_line(VeinError::Retake), "ERR VEIN RETAKE");
     }
 
     /// 組み立て済みの slot (WRITE_LINE_MAX ずつ足した)
