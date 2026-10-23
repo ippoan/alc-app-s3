@@ -203,6 +203,14 @@ pub enum Sound {
     /// 既存の [`Sound::Registered`] を使う**ので、ここには無い
     #[cfg(feature = "vein")]
     VeinFailed,
+    /// 1 枚撮れた (モジュールの「離して」) とき: 撮れた合図のビープ ([`Sound::BeepOk`]) に続けて
+    /// 「指を離してください」。登録で 4 回置くとき、離さないまま次を待たないように (ippoan/alc-app#436)
+    #[cfg(feature = "vein")]
+    VeinRelease,
+    /// 撮れなかった (モジュールの撮り直し) とき:「指を離して、置き直してください」。モジュールは撮り直しの
+    /// 間に指が離れるのを待たないので、乗せたまま次の撮影に入って続けて失敗しないよう、離すことを促す
+    #[cfg(feature = "vein")]
+    VeinRetry,
 }
 
 // 指静脈の案内音声 (`vein` feature のときだけ埋め込む — 3 本で ~210KB)。
@@ -215,6 +223,10 @@ const VEIN_PLACE: &[u8] = include_bytes!("../assets/vein_place_24k_s16le.raw");
 const VEIN_AGAIN: &[u8] = include_bytes!("../assets/vein_again_24k_s16le.raw");
 #[cfg(feature = "vein")]
 const VEIN_FAILED: &[u8] = include_bytes!("../assets/vein_failed_24k_s16le.raw");
+#[cfg(feature = "vein")]
+const VEIN_RELEASE: &[u8] = include_bytes!("../assets/vein_release_24k_s16le.raw");
+#[cfg(feature = "vein")]
+const VEIN_RETRY: &[u8] = include_bytes!("../assets/vein_retry_24k_s16le.raw");
 
 /// 再生専用スレッドを立て、送信ハンドルを返す (issue #102)。
 /// I2S の write はブロッキングのため、NFC ポーリング等の呼び出し元スレッドで
@@ -246,6 +258,12 @@ pub fn start_player(mut speaker: Speaker) -> Result<std::sync::mpsc::Sender<Soun
                     Sound::VeinAgain => speaker.play_pcm_24k_mono(VEIN_AGAIN),
                     #[cfg(feature = "vein")]
                     Sound::VeinFailed => speaker.play_pcm_24k_mono(VEIN_FAILED),
+                    #[cfg(feature = "vein")]
+                    Sound::VeinRelease => speaker
+                        .beep(2000.0, 40)
+                        .and_then(|()| speaker.play_pcm_24k_mono(VEIN_RELEASE)),
+                    #[cfg(feature = "vein")]
+                    Sound::VeinRetry => speaker.play_pcm_24k_mono(VEIN_RETRY),
                 };
                 if let Err(e) = r {
                     log::warn!("speaker: 再生失敗: {e:#}");
