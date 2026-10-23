@@ -115,6 +115,12 @@ pub const ENROLL_TEMPLATES_PRODUCTION: u8 = 4;
 /// 撮像に失敗したときにモジュールが撮り直す回数 (`bData[10]`)。1 回の待ちは最大 5 秒なので、
 /// ホスト (alc-app `useVeinSerial` の `CAPTURE_TIMEOUT_MS` = 20 秒) に収まる回数にする
 pub const ENROLL_RETRIES: u8 = 2;
+/// 本番の登録 (テンプレートを複数撮る) で、**1 回置くごとに**撮り直す回数 (`bData[10]`)。
+/// 1 枚撮れた「離して」で数え直す ([`send_and_await_final`])。[`ENROLL_RETRIES`] の 2 回で
+/// 4 回置く登録の全体を数えていたので、4 回のどこかで撮り直しが 3 回目に入ると登録ごと
+/// `RC=11` (静脈が写らない) で終わっていた (ippoan/alc-app#436)。照合・読み取りは 2 回のまま
+/// (撮り直しのたびに指を最長 15 秒待つので、増やすと待ちが長くなる)
+pub const ENROLL_PLACEMENT_RETRIES: u8 = 5;
 
 /// 試験用コマンド (`VEIN TEST …`) が使える ID の範囲。**1 は読み取りの作業用 ([`SCRATCH_ID`])
 /// で毎回消されるので使わない**
@@ -489,7 +495,9 @@ fn enroll_id(
     let mut req = [0u8; 12];
     req[..4].copy_from_slice(&id);
     req[5] = templates;
-    req[10] = ENROLL_RETRIES;
+    // 1 枚だけ撮る読み取り (作業用) は今までどおり。複数撮る本番の登録は 1 回置くごとに多めに
+    let retries = if templates > 1 { ENROLL_PLACEMENT_RETRIES } else { ENROLL_RETRIES };
+    req[10] = retries;
     // テンプレートを複数撮るとき、1 枚撮れる (「離して」) たびにモジュールは次の指を待ち直す
     // (`XG_INPUT_FINGER`)。その「置いて」を [`Prompt::Replace`] (n 回目に置く) に替えて、端末が
     // 「もう一度置いてください」を鳴らせるようにする。撮れた直後に決め打ちの間で鳴らすと早すぎる
@@ -509,7 +517,7 @@ fn enroll_id(
         }
         _ => on_prompt(pr),
     };
-    let p = send_and_await_final(port, t, CMD_ENROLL, &req, &mut relay)?;
+    let p = send_and_await_final(port, t, CMD_ENROLL, &req, retries, &mut relay)?;
     // 途中経過は send_and_await_final が読み切っているので、ここに届くのは成功か失敗だけ。
     // 失敗のコードは `01 xx` なら xx、知らない `bData[0]` ならその値 ([`enroll_reply`] と同じ)
     if p.data[0] == XG_ERR_SUCCESS {
@@ -526,14 +534,15 @@ fn enroll_id(
 /// 最終の応答を待つ。ENROLL と VERIFY が共有する。
 ///
 /// 返すのは途中経過でない最初の応答 (成功も失敗コードもそのまま。意味づけは呼び出し側)。
-/// 指が置かれず時間切れ (`01 0B`) は [`VeinError::NoFinger`]、撮り直しが
-/// [`ENROLL_RETRIES`] 回を超えたら [`VeinError::Rc`]、途中経過が [`MAX_PROMPTS`] を超えて
-/// 続いたら [`VeinError::ReadFail`]
+/// 指が置かれず時間切れ (`01 0B`) は [`VeinError::NoFinger`]、1 回置く間の撮り直しが
+/// `max_retries` 回を超えたら [`VeinError::Rc`] (1 枚撮れた「離して」で数え直す)、
+/// 途中経過が [`MAX_PROMPTS`] を超えて続いたら [`VeinError::ReadFail`]
 fn send_and_await_final(
     port: &mut dyn Port,
     t: &Timeouts,
     cmd: u8,
     req: &[u8],
+    max_retries: u8,
     on_prompt: &mut dyn FnMut(Prompt),
 ) -> Result<Packet, VeinError> {
     port.discard_input();
@@ -551,12 +560,17 @@ fn send_and_await_final(
         }
         match enroll_reply(&p) {
             EnrollReply::Prompt(Prompt::Retry(code)) => {
-                // 撮り直しはモジュールが ENROLL_RETRIES 回まで続ける。それを超えて届いたら終わり
+                // 撮り直しはモジュールが max_retries 回まで続ける。それを超えて届いたら終わり
                 retries += 1;
-                if retries > ENROLL_RETRIES {
+                if retries > max_retries {
                     return Err(VeinError::Rc(code));
                 }
                 on_prompt(Prompt::Retry(code));
+            }
+            EnrollReply::Prompt(Prompt::Release) => {
+                // 1 枚撮れた: 次に置く回の撮り直しは数え直す
+                retries = 0;
+                on_prompt(Prompt::Release);
             }
             EnrollReply::Prompt(x) => on_prompt(x),
             EnrollReply::Failed(XG_ERR_TIME_OUT) => return Err(VeinError::NoFinger),
@@ -819,7 +833,7 @@ pub fn test_verify(
     on_prompt: &mut dyn FnMut(Prompt),
 ) -> Result<[u8; DATA_LEN], VeinError> {
     connect(port, t)?;
-    let p = send_and_await_final(port, t, CMD_VERIFY, &id.to_le_bytes(), on_prompt)?;
+    let p = send_and_await_final(port, t, CMD_VERIFY, &id.to_le_bytes(), ENROLL_RETRIES, on_prompt)?;
     if p.data[0] == XG_ERR_FAIL && p.data[1] == XG_ERR_NO_SUPPORT {
         return Err(VeinError::Unsupported);
     }
@@ -886,7 +900,7 @@ pub fn test_image(
     on_prompt: &mut dyn FnMut(Prompt),
 ) -> Result<(u16, u16, Vec<u8>), VeinError> {
     connect(port, t)?;
-    let p = send_and_await_final(port, t, CMD_READ_IMAGE, &[0u8; 6], on_prompt)?;
+    let p = send_and_await_final(port, t, CMD_READ_IMAGE, &[0u8; 6], ENROLL_RETRIES, on_prompt)?;
     match (p.data[0], p.data[1]) {
         (XG_ERR_SUCCESS, _) => {}
         (XG_ERR_FAIL, XG_ERR_NO_SUPPORT) => return Err(VeinError::Unsupported),
@@ -1025,7 +1039,7 @@ fn verify(
     id: u32,
     on_prompt: &mut dyn FnMut(Prompt),
 ) -> Result<Option<u32>, VeinError> {
-    let p = send_and_await_final(port, t, CMD_VERIFY, &id.to_le_bytes(), on_prompt)?;
+    let p = send_and_await_final(port, t, CMD_VERIFY, &id.to_le_bytes(), ENROLL_RETRIES, on_prompt)?;
     match (p.data[0], p.data[1]) {
         (XG_ERR_SUCCESS, _) => Ok(Some(u32::from_le_bytes([p.data[1], p.data[2], p.data[3], p.data[4]]))),
         (XG_ERR_FAIL, XG_ERR_VERIFY) => Ok(None),
@@ -2050,6 +2064,41 @@ mod tests {
     }
 
     #[test]
+    fn production_enroll_counts_retries_per_placement() {
+        // 1 枚目で上限ちょうどの撮り直し → 撮れる (離して) → 2 枚目でも上限ちょうど → 撮れる → 完了。
+        // 全体で数えていたら 2 枚目の途中で RC になっていた。1 枚目と 2 枚目の間の「置いて」は置き直しの案内
+        let mut e = Vec::new();
+        for _ in 0..2 {
+            for _ in 0..ENROLL_PLACEMENT_RETRIES {
+                e.extend(reply(CMD_ENROLL, &[XG_ERR_FAIL, XG_ERR_NO_VEIN]));
+            }
+            e.extend(reply(CMD_ENROLL, &[XG_RELEASE_FINGER]));
+        }
+        e.extend(reply(CMD_ENROLL, &[XG_ERR_SUCCESS, 2]));
+        let mut port = FakePort::new(vec![cleared(), Some(e)]);
+        let mut retries = 0;
+        let got = enroll_id(&mut port, &Timeouts::DEFAULT, 10, 2, &mut |p| {
+            if matches!(p, Prompt::Retry(_)) {
+                retries += 1;
+            }
+        });
+        assert_eq!(got, Ok(()));
+        assert_eq!(retries, 2 * usize::from(ENROLL_PLACEMENT_RETRIES));
+        // 本番の登録は bData[10] に 1 回置くごとの回数を渡す
+        assert_eq!(port.sent[1][6 + 10], ENROLL_PLACEMENT_RETRIES);
+    }
+
+    #[test]
+    fn production_enroll_gives_up_when_one_placement_exceeds_the_retries() {
+        let e: Vec<u8> = (0..=ENROLL_PLACEMENT_RETRIES)
+            .flat_map(|_| reply(CMD_ENROLL, &[XG_ERR_FAIL, XG_ERR_NO_VEIN]))
+            .collect();
+        let mut port = FakePort::new(vec![cleared(), Some(e)]);
+        let got = enroll_id(&mut port, &Timeouts::DEFAULT, 10, 2, &mut |_| {});
+        assert_eq!(got, Err(VeinError::Rc(XG_ERR_NO_VEIN)));
+    }
+
+    #[test]
     fn capture_gives_up_after_too_many_retries() {
         let e: Vec<u8> = (0..=ENROLL_RETRIES)
             .flat_map(|_| reply(CMD_ENROLL, &[XG_ERR_FAIL, XG_ERR_NO_SAME_FINGER]))
@@ -2651,9 +2700,9 @@ mod tests {
         // 接続 → 削除 → 登録 → READ_ENROLL → READ_DATA ×3。最後の削除はしない
         assert_eq!(port.sent.len(), 7);
         assert_eq!(&port.sent[2][3..10], &[CMD_ENROLL, 0, 12, 17, 0, 0, 0]);
-        // 本番の登録はテンプレート ENROLL_TEMPLATES_PRODUCTION 本 (bData[5])、撮り直し 2 (bData[10])
+        // 本番の登録はテンプレート ENROLL_TEMPLATES_PRODUCTION 本 (bData[5])、撮り直しは 1 回置くごとに ENROLL_PLACEMENT_RETRIES (bData[10])
         assert_eq!(port.sent[2][6 + 5], ENROLL_TEMPLATES_PRODUCTION);
-        assert_eq!(port.sent[2][6 + 10], ENROLL_RETRIES);
+        assert_eq!(port.sent[2][6 + 10], ENROLL_PLACEMENT_RETRIES);
         assert_eq!(&port.sent[3][3..10], &[CMD_READ_ENROLL, 0, 4, 17, 0, 0, 0]);
         assert_eq!(port.pauses, Vec::<u32>::new());
     }
