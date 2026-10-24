@@ -43,8 +43,9 @@ use alc_hub_core::uplink::{
     auth_header_line, command_action, command_bus5v_mode, command_gw_url, command_log_max_bytes,
     command_log_offset, command_ota_url, command_print_chunk, command_print_url,
     command_result_frame, credential_changed, jitter_ms, measurement_frame, ota_guard,
-    parse_downlink, reconnect_backoff, should_wait_for_clock, token_needs_mint, Downlink,
-    DroppedEntry, OtaGuard, UplinkQueue, PING_FRAME, RECONNECT_BACKOFF_MAX_MS, RECONNECT_FAST_MS,
+    parse_downlink, reconnect_backoff, should_wait_for_clock, test_record_payload,
+    test_record_result, token_needs_mint, Downlink,
+    DroppedEntry, OtaGuard, UplinkQueue, PING_FRAME, TEST_RECORD_KIND, RECONNECT_BACKOFF_MAX_MS, RECONNECT_FAST_MS,
     RECONNECT_SLOW_MS,
 };
 use anyhow::Result;
@@ -286,9 +287,9 @@ fn run(
         // --- 1. 測定の受け取り (500ms でタイムアウトしループを回す) ---
         match rx.recv_timeout(core::time::Duration::from_millis(500)) {
             Ok(rec) => {
-                enqueue(&mut queue, &settings, &rec, boot_id);
+                let _ = enqueue(&mut queue, &settings, &rec, boot_id);
                 while let Ok(rec) = rx.try_recv() {
-                    enqueue(&mut queue, &settings, &rec, boot_id);
+                    let _ = enqueue(&mut queue, &settings, &rec, boot_id);
                 }
                 publish_status(&status, &queue, conn.as_ref().is_some_and(|c| c.connected));
                 last_flush = 0; // 新規測定は即送信
@@ -358,6 +359,7 @@ fn run(
                         &ev_tx,
                         &bp_unbond_flag,
                         &mut machine_required,
+                        boot_id,
                     ) {
                         send_unsent = true;
                     }
@@ -857,7 +859,8 @@ fn mark_disconnected(conn: &mut Option<Conn>, reason: &str, queue: &UplinkQueue)
 
 /// 測定をキューへ積み NVS へ永続化する。記録時の稼働時間と boot_id も持たせ、
 /// NTP 未同期で記録した時刻を送信時に補正できるようにする (fix_unsynced_times)
-fn enqueue(queue: &mut UplinkQueue, settings: &Settings, rec: &UplinkRecord, boot_id: u32) {
+/// 積めたら seq を返す (試験記録の応答に使う)
+fn enqueue(queue: &mut UplinkQueue, settings: &Settings, rec: &UplinkRecord, boot_id: u32) -> Option<u64> {
     let result = queue.push_record(
         rec.kind,
         rec.recorded_at_ms,
@@ -876,8 +879,14 @@ fn enqueue(queue: &mut UplinkQueue, settings: &Settings, rec: &UplinkRecord, boo
         alc_hub_common::evtlog::emit(&format!("EVT WS_DROPPED {seq} {kind}"));
     }
     match result {
-        Ok(_) => persist(settings, queue),
-        Err(failed) => log::error!("ws_uplink: 測定を保存できません: {}", failed.reason),
+        Ok(pushed) => {
+            persist(settings, queue);
+            Some(pushed.seq)
+        }
+        Err(failed) => {
+            log::error!("ws_uplink: 測定を保存できません: {}", failed.reason);
+            None
+        }
     }
 }
 
@@ -909,6 +918,7 @@ fn handle_downlink(
     ev_tx: &mpsc::Sender<WsEvent>,
     bp_unbond_flag: &BpUnbondFlag,
     machine_required: &mut bool,
+    boot_id: u32,
 ) -> bool {
     match parse_downlink(text) {
         Ok(Downlink::Ack { seq }) => {
@@ -1277,6 +1287,40 @@ fn handle_downlink(
                         settings.set_ws_last_seq(queue.last_seq());
                         std::thread::sleep(core::time::Duration::from_millis(300));
                         unsafe { esp_idf_svc::sys::esp_restart() };
+                    }
+                }
+                // 開発用の試験記録 (auth-worker の MCP create_test_record、Refs ippoan/alc-cam#2)。
+                // 普段の測定と同じキューに kind=test を 1 件積み、積んだ seq を返す (送信は次の周回の
+                // flush_queue = 普段どおり)。recorder が開発の軸へ転送するので本番の記録簿には出ない。
+                // OTA 中と点呼中は断る (reboot と同じ判定)
+                Some("test_record") => {
+                    let busy = status
+                        .lock()
+                        .map_or(false, |st| st.ota_active || st.session_id.is_some());
+                    if busy {
+                        send_command_result(conn, &id, r#"{"ok":false,"error":"busy"}"#);
+                    } else {
+                        let rec = UplinkRecord {
+                            kind: TEST_RECORD_KIND,
+                            payload: test_record_payload(
+                                &id,
+                                alc_hub_common::config::firmware_version(),
+                            ),
+                            recorded_at_ms: epoch_ms(),
+                            at_ms: now_ms(),
+                            session_id: None,
+                        };
+                        match enqueue(queue, settings, &rec, boot_id) {
+                            Some(seq) => {
+                                log::info!("ws_uplink: 試験記録を積んだ seq={seq}");
+                                send_command_result(conn, &id, &test_record_result(seq));
+                            }
+                            None => send_command_result(
+                                conn,
+                                &id,
+                                r#"{"ok":false,"error":"enqueue_failed"}"#,
+                            ),
+                        }
                     }
                 }
                 // 未知の action も従来どおり空 result で ack する
