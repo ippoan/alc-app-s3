@@ -116,14 +116,16 @@ use alc_hub_common::{
     settings::Settings,
     status::{epoch_ms, now_ms, HubStatus, SharedStatus},
 };
+#[cfg(not(feature = "porta-taken"))]
+use alc_hub_drivers::nfc;
 use alc_hub_drivers::nfc::NfcEvent;
-use alc_hub_drivers::speaker::Sound;
-use alc_hub_drivers::timecard::Punch;
-use alc_hub_drivers::{crashlog, es8311, heap, nfc, ota, recorder, speaker};
 #[cfg(feature = "station")]
 use alc_hub_drivers::rs232;
+use alc_hub_drivers::speaker::Sound;
+use alc_hub_drivers::timecard::Punch;
 #[cfg(feature = "vein")]
 use alc_hub_drivers::vein;
+use alc_hub_drivers::{crashlog, es8311, heap, ota, recorder, speaker};
 #[cfg(not(feature = "station"))]
 use alc_hub_drivers::{eth_w5500, ntp, ws_uplink};
 use anyhow::Result;
@@ -140,9 +142,13 @@ use esp_idf_svc::hal::{
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use std::sync::{mpsc, Arc, Mutex};
 
+#[cfg(all(feature = "vein-gps", feature = "vein-porta"))]
+compile_error!("vein-gps と vein-porta はどちらも Grove PORT.A を使う");
+
 /// nfc_shim (C++ 側) に立てさせる I2C ポート。本機は他に I2C を使わないので
 /// I2C_NUM_0 (atoms3-nfc のベンチと同値、実機確認済み)。CoreS3 は内部バスが
 /// I2C_NUM_0 を使うので向こうは 1
+#[cfg(not(feature = "porta-taken"))]
 const I2C_PORT_NFC: i32 = 0;
 
 fn main() -> Result<()> {
@@ -324,7 +330,21 @@ fn main() -> Result<()> {
     let ws_for_bp = ws_meas_tx.clone();
 
     // Unit NFC (ST25R3916): Grove Port A (SDA=G2 / SCL=G1)。読み取りループは
-    // hub-drivers/src/nfc.rs (CoreS3 と共有)。**ここに NFC のコードを書かない**
+    // hub-drivers/src/nfc.rs (CoreS3 と共有)。**ここに NFC のコードを書かない**。
+    // PORT.A を NFC 以外が握る版 (`porta-taken`) では起動しない
+    #[cfg(feature = "porta-taken")]
+    {
+        let _ = (&ws_meas_tx, &speaker_tx);
+        alc_hub_common::evtlog::emit(if cfg!(feature = "vein-gps") {
+            "EVT NFC_DISABLED port=A_used_by_gps"
+        } else {
+            "EVT NFC_DISABLED port=A_used"
+        });
+    }
+    // Unit GPS (Vein Base の PORT.A、#514)。RX は G1 を先に試し、来なければ G2
+    #[cfg(feature = "vein-gps")]
+    alc_hub_drivers::gps::start(p.uart0, p.pins.gpio1.into(), p.pins.gpio2.into())?;
+    #[cfg(not(feature = "porta-taken"))]
     nfc::start(
         I2C_PORT_NFC,
         p.pins.gpio2.into(),
@@ -446,6 +466,7 @@ fn main() -> Result<()> {
 /// **`card_id` は生値のまま**送る (接頭辞を付けると punch のカード照合が
 /// 必ず外れる — alc_hub_core::timecard の doc 参照)。`session_id` は
 /// 点呼ではないので付けない。
+#[cfg_attr(feature = "porta-taken", allow(dead_code))]
 fn on_card(
     event: &NfcEvent,
     ws_tx: &mpsc::Sender<UplinkRecord>,

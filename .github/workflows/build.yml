@@ -152,6 +152,10 @@ jobs:
           - { name: atoms3-timecard-vein,
               cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard cargo check --release --locked -p alc-hub-atoms3-timecard --features vein",
               cache_key: build-timecard-s3r }
+          # `vein` の GPS 版 (ippoan/alc-app#514): Grove PORT.A を Unit GPS が使い、NFC は起こさない
+          - { name: atoms3-timecard-vein-gps,
+              cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard cargo check --release --locked -p alc-hub-atoms3-timecard --features vein-gps",
+              cache_key: build-timecard-s3r }
           # 点呼端末の警告デバイス (#135)。同じ本番機 (Atom VoiceS3R) だが
           # sdkconfig は timecard とも違う (W5500 と BLE を持たず、音・PSRAM・
           # Unit NFC の legacy 衝突回避だけ) ため cache_key は timecard と**別**。
@@ -420,6 +424,15 @@ jobs:
             bin: alc-hub-atoms3-timecard
             build_env: 'ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard'
             cargo_args: '--features vein'
+            flash_size: 8mb
+            partition_table: crates/atoms3-timecard/partitions.csv
+            cache_key: build-timecard-s3r
+          # `vein` の GPS 版 (ippoan/alc-app#514)。NFC 版と同じ配線で、Grove PORT.A に
+          # Unit NFC の代わりに Unit GPS をつなぐ。bin 名が同じなので `-vein-gps-` を挟んで分ける
+          - name: atoms3-timecard-vein-gps
+            bin: alc-hub-atoms3-timecard
+            build_env: 'ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard'
+            cargo_args: '--features vein-gps'
             flash_size: 8mb
             partition_table: crates/atoms3-timecard/partitions.csv
             cache_key: build-timecard-s3r
@@ -797,6 +810,14 @@ jobs:
           done
           ls -la ${{ matrix.bin }}-vein-*.bin
 
+      - name: Rename outputs (Vein Station + 指静脈 GPS 版 leg)
+        if: matrix.name == 'atoms3-timecard-vein-gps'
+        run: |
+          for f in ${{ matrix.bin }}-*.bin; do
+            mv "$f" "${f/${{ matrix.bin }}-/${{ matrix.bin }}-vein-gps-}"
+          done
+          ls -la ${{ matrix.bin }}-vein-gps-*.bin
+
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
@@ -890,6 +911,11 @@ jobs:
           cp alc-hub-atoms3-timecard-vein-main.bin _site/firmware/
           cp alc-hub-atoms3-timecard-vein-merged.bin _site/firmware/
           cp alc-hub-atoms3-timecard-vein-app.bin _site/firmware/
+          # GPS 版 (ippoan/alc-app#514)
+          cp alc-hub-atoms3-timecard-vein-gps-boot.bin _site/firmware/
+          cp alc-hub-atoms3-timecard-vein-gps-main.bin _site/firmware/
+          cp alc-hub-atoms3-timecard-vein-gps-merged.bin _site/firmware/
+          cp alc-hub-atoms3-timecard-vein-gps-app.bin _site/firmware/
           cp alc-hub-atoms3-alarm-boot.bin _site/firmware/
           cp alc-hub-atoms3-alarm-main.bin _site/firmware/
           cp alc-hub-atoms3-alarm-merged.bin _site/firmware/
@@ -929,6 +955,10 @@ jobs:
           # station と同じ crate なので version は timecard_version を共有する
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.timecard_version }}+$SHORT_SHA\"/" \
             docs/manifest-timecard-vein-r12-b.json > _site/manifest-timecard-vein-r12-b.json
+          # GPS 版。同じ crate なので version は timecard_version を共有する (パス固定:
+          # シリアル OTA で運行者 PC のブラウザがこの URL を直に読む)
+          sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.timecard_version }}+$SHORT_SHA\"/" \
+            docs/manifest-timecard-vein-gps.json > _site/manifest-timecard-vein-gps.json
           # 点呼端末の警告デバイス (#135)。timecard と同じく **dev チャネルは出さない**
           sed "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.alarm_version }}+$SHORT_SHA\"/" \
             docs/manifest-alarm.json > _site/manifest-alarm.json
@@ -940,7 +970,7 @@ jobs:
           # Pages は max-age=600。path が毎回同じだとブラウザの HTTP キャッシュの古い bin を
           # 書くため、配布ごとに URL を変える (Refs ippoan/alc-app#436)
           sed -i 's#"path": "\(firmware/[^"]*\.bin\)"#"path": "\1?v='"$SHORT_SHA"'"#' _site/manifest*.json
-          cat _site/manifest.json _site/manifest-dev.json _site/manifest-wifi.json _site/manifest-atoms3-print.json _site/manifest-timecard.json _site/manifest-timecard-station.json _site/manifest-timecard-vein-r12-b.json _site/manifest-alarm.json _site/manifest-nfc.json
+          cat _site/manifest.json _site/manifest-dev.json _site/manifest-wifi.json _site/manifest-atoms3-print.json _site/manifest-timecard.json _site/manifest-timecard-station.json _site/manifest-timecard-vein-r12-b.json _site/manifest-timecard-vein-gps.json _site/manifest-alarm.json _site/manifest-nfc.json
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

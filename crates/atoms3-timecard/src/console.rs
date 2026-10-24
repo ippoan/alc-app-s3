@@ -40,8 +40,10 @@ use alc_hub_drivers::vein;
 use anyhow::Result;
 
 /// ビルド種別の語 (`DEVICE … FLAVOR=<語>`、`OTA SERIAL` の照合、Refs #279)。
-/// `vein` は `station` を含むので先に見る
-pub const FLAVOR: &str = if cfg!(feature = "vein") {
+/// `vein-gps` は `vein` を、`vein` は `station` を含むので、含む側を先に見る
+pub const FLAVOR: &str = if cfg!(feature = "vein-gps") {
+    "timecard-vein-gps"
+} else if cfg!(feature = "vein") {
     "timecard-vein"
 } else if cfg!(feature = "station") {
     "timecard-station"
