@@ -1,0 +1,11 @@
+# alc-hub-atom-gps (M5Stack ATOM Lite / Matrix、ESP32-PICO-D4、4MB flash)
+#
+# Wi-Fi も BLE も使わない UART だけのベンチ機。コンソールは UART0
+# (本体の USB-シリアル変換、ESP-IDF の既定) のまま。
+
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+# std 込みの Rust バイナリは既定の 1MB factory に収まらないことがあるため 1.5MB 版
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_FREERTOS_HZ=1000

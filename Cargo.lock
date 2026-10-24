@@ -23,6 +23,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "alc-hub-atom-gps"
+version = "0.1.0"
+dependencies = [
+ "alc-hub-core",
+ "anyhow",
+ "embuild",
+ "esp-idf-svc",
+ "log",
+]
+
+[[package]]
 name = "alc-hub-atoms3-alarm"
 version = "0.1.0"
 dependencies = [

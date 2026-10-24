@@ -47,6 +47,10 @@ path = "crates/hub-core/src/fc1200.rs"
 type = "unit"
 
 [[file]]
+path = "crates/hub-core/src/gps.rs"
+type = "unit"
+
+[[file]]
 path = "crates/hub-core/src/gw.rs"
 type = "unit"
 
