@@ -17,6 +17,8 @@ speaker = []
 # 登録・照合の案内音声 3 本 (assets/vein_*.raw、計 ~210KB) を足す。**音声はこの
 # feature のときだけ埋め込む** — 他の機の image を大きくしない
 vein = ["speaker"]
+# Unit GPS の UART 読み (Vein Base の PORT.A、ippoan/alc-app#514)。gps.rs
+gps = []
 
 [dependencies]
 alc-hub-core = { path = "../hub-core" }

@@ -19,6 +19,8 @@ pub mod crashlog;
 // 新しい機を足すときは、W5500 が無くてもこの crate がビルドできる状態を保つこと
 #[cfg(esp_idf_eth_spi_ethernet_w5500)]
 pub mod eth_w5500;
+#[cfg(feature = "gps")]
+pub mod gps;
 pub mod gw_link;
 pub mod heap;
 pub mod host_link;

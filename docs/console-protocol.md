@@ -86,6 +86,7 @@ CoreS3 だけ (`crates/hub-core/src/board.rs`)。板種は起動後に変わら�
 | `timecard` | タイムカード端末 (LAN 版) |
 | `timecard-station` | 同 `station` feature (Vein Station、LAN 無し) |
 | `timecard-vein` | 同 `vein` feature (`station` + 指静脈) |
+| `timecard-vein-gps` | 同 `vein-gps` feature (`vein` の PORT.A を Unit NFC でなく Unit GPS にした版。NFC なし。起動時に `EVT NFC_DISABLED port=A_used_by_gps`、NMEA を受けると `EVT GPS FIX …` / `EVT GPS NOFIX …` を出す) |
 | `alarm` | 警告デバイス |
 | `bp-station` | 測定台 |
 

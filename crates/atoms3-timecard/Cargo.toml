@@ -48,6 +48,13 @@ station = []
 # 出す。登録・照合の案内音声 3 本もこの feature のときだけ埋め込む。
 # **`station` だけのビルドの挙動は変えない** (FC-1200 の実機試験が進行中、#272)
 vein = ["station", "alc-hub-drivers/vein"]
+# Grove PORT.A (G1/G2) を NFC 以外が握る印 (内部 feature)。main.rs の NFC はこの 1 種類で
+# ゲートする。`vein-gps` と、別 PR の `vein-porta` (指静脈 Unit) がこれを含む
+porta-taken = []
+# Vein Base + Unit GPS (ippoan/alc-app#514)。PORT.A に Unit GPS をつなぐ版 — NFC 版
+# (`vein`) と書き込み時に選ぶ。Unit NFC は起動しない。点呼の記録に位置を付けるため、
+# UART0 / 115200bps で NMEA を読み、`EVT GPS …` の行を USB へ出す
+vein-gps = ["vein", "porta-taken", "alc-hub-drivers/gps"]
 
 [build-dependencies]
 embuild = "0.33"
