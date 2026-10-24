@@ -1,0 +1,50 @@
+# M5Stack ATOM (Lite / Matrix、ESP32-PICO-D4) + Unit GPS のベンチ検証機。
+#
+# Unit GPS の NMEA を UART で読み、1 秒ごとに `EVT GPS …` の 1 行を USB シリアルへ
+# 出すだけの独立バイナリ。NMEA の解釈は alc_hub_core::gps が正本で、本 crate は
+# UART の配線 (ピンとボーレートの自動判別) だけを持つ。
+#
+# **この機は ESP32 (S3 ではない)。** ワークスペースの既定 target は
+# xtensa-esp32s3-espidf なので、ビルドは target と MCU を両方上書きする:
+#
+#   CARGO_TARGET_XTENSA_ESP32_ESPIDF_LINKER=ldproxy \
+#   CARGO_TARGET_XTENSA_ESP32_ESPIDF_RUSTFLAGS="--cfg espidf_time64" \
+#   ESP_IDF_SYS_ROOT_CRATE=alc-hub-atom-gps MCU=esp32 \
+#     cargo build --release -p alc-hub-atom-gps --target xtensa-esp32-espidf
+#   espflash flash --monitor target/xtensa-esp32-espidf/release/alc-hub-atom-gps
+#
+# linker / rustflags は .cargo/config.toml に esp32s3 の分しか無いので env で渡す
+# (config.toml を変えると CI の target キャッシュの key が全部変わるため触らない)。
+# CI の check 行列には入れていない — CI の esp ツールチェーンは esp32s3 だけを
+# 入れてキャッシュしており、esp32 の ESP-IDF を毎回 cold でビルドすることになる。
+#
+# ESP_IDF_SYS_ROOT_CRATE を付け忘れると CoreS3 の sdkconfig (16MB flash / PSRAM)
+# でビルドが走る (atoms3-print と同じ理由)。
+[package]
+name = "alc-hub-atom-gps"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "M5Stack ATOM + Unit GPS ベンチ検証機 — 測位結果を EVT GPS 行でシリアルに出す"
+
+[[bin]]
+name = "alc-hub-atom-gps"
+harness = false
+
+[dependencies]
+alc-hub-core = { path = "../hub-core" }
+anyhow = "1"
+log = "0.4"
+esp-idf-svc = { version = "0.52", default-features = false, features = [
+    "native",
+    "std",
+    "alloc",
+    "binstart",
+] }
+
+[build-dependencies]
+embuild = "0.33"
+
+[package.metadata.esp-idf-sys]
+# 相対パスはワークスペースルート基準で解決される (atoms3-print と同じ仕様)
+esp_idf_sdkconfig_defaults = "crates/atom-gps/sdkconfig.defaults"

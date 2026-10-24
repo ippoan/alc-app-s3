@@ -16,6 +16,7 @@ pub mod crashlog;
 pub mod desfire;
 pub mod device;
 pub mod fc1200;
+pub mod gps;
 pub mod gw;
 pub mod ieee11073;
 pub mod improv;
