@@ -22,6 +22,7 @@ pub mod gw;
 pub mod ieee11073;
 pub mod improv;
 pub mod layout;
+pub mod machine_token;
 pub mod nfc_login;
 pub mod nfc_sticky;
 pub mod nfc_tap;

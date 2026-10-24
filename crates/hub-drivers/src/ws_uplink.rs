@@ -26,6 +26,9 @@
 //! | `EVT WS_DROPPED <seq> <kind>` | 保存先が一杯で最古の未送信測定を破棄 |
 //! | `EVT WS_TOKEN_ROTATED` | 期限が近づいた device JWT を、接続を保ったまま差し替えた (Refs ippoan/rust-alc-api#644) |
 //! | `EVT WS_TOKEN_STALE fails=<n>` | 同 差し替えが n 回続けて失敗している。**このまま期限が切れると再接続が 401 で失敗する** |
+//! | `EVT MACHINE_TOKEN NG <no_key\|rejected\|transient>` | 機体の鍵の証明 (用途 hub-record) を取れなかった。証明なしで繋ぎ、記録は hub の ID で入る (理由が変わったときだけ出す。Refs ippoan/alc-cam#2) |
+//! | `EVT MACHINE_TOKEN OK` | 取れなかった証明が取れるようになった |
+//! | `EVT MACHINE_TOKEN REQUIRED` | サーバーが「鍵の証明が無いので受けない」と返した。証明を取り直して繋ぎ直す |
 //! | `EVT AUTH_CHANGED` | 鍵 (credential) が書き換わった / 消えたのを見つけ、device JWT を捨てて WS を畳んだ。新しい鍵で繋ぎ直す (Refs ippoan/alc-app#387) |
 //! | `EVT PUNCHQ <mode> count=<n>` | 送信キューの保存先と未送信件数 (punchq.rs) |
 //! | `EVT OTA_ROLLED_BACK free_int=<n> min_int=<n> reason=<語>` | 前の起動で OTA 直後の image を戻した (戻った先の起動で出る。Refs #217) |
@@ -35,6 +38,7 @@ use std::io::Write;
 use std::net::TcpStream;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
+use alc_hub_core::machine_token::{self, MintFailure};
 use alc_hub_core::uplink::{
     auth_header_line, command_action, command_bus5v_mode, command_gw_url, command_log_max_bytes,
     command_log_offset, command_ota_url, command_print_chunk, command_print_url,
@@ -158,6 +162,26 @@ struct Token {
     device_id: String,
 }
 
+/// 機体の鍵の証明 (用途 hub-record) の JWT (Refs ippoan/alc-cam#2)。WSS ハンドシェイクに
+/// `X-Machine-Token` で添え、サーバーは記録の device_id を鍵の ID (`alarm:<fp>`) にする。
+struct MachineToken {
+    jwt: String,
+    /// 失効時刻 (稼働 ms)
+    expires_at: u64,
+    /// 取ったときの鍵 (seed)。書き換わったら捨てて繋ぎ直す
+    seed: [u8; 32],
+}
+
+/// 証明の状態。取れなくても接続は止めない (証明なしで繋ぐ)。
+#[derive(Default)]
+struct MachineState {
+    token: Option<MachineToken>,
+    /// 次に取りに行ってよい時刻 (稼働 ms)。取れなかった回の待ち
+    retry_at: u64,
+    /// 直近の失敗の理由 (同じ理由のイベントを繰り返さないため)
+    last_failure: Option<MintFailure>,
+}
+
 /// WS push 印刷 (#38) の TcpStream 書き込みタイムアウト。fetch_and_send と同値
 const PRINT_IO_TIMEOUT_S: u64 = 30;
 
@@ -227,6 +251,9 @@ fn run(
     let mut reconnect_fails: u32 = 0;
     // device JWT と失効時刻 (稼働 ms)、mint に使った credential の device_id
     let mut token: Option<Token> = None;
+    // 機体の鍵の証明 (Refs ippoan/alc-cam#2)。サーバーが「要る」と返したら繋ぎ直す
+    let mut machine = MachineState::default();
+    let mut machine_required = false;
     // **transport に今載っているトークン**の失効時刻 (稼働 ms)。
     //
     // `token` の失効時刻とは**別に持つ**。一緒にすると「再 mint に成功して
@@ -330,6 +357,7 @@ fn run(
                         &status,
                         &ev_tx,
                         &bp_unbond_flag,
+                        &mut machine_required,
                     ) {
                         send_unsent = true;
                     }
@@ -399,12 +427,16 @@ fn run(
         let auth_changed = token.as_ref().is_some_and(|t| {
             let current = settings.device_credential().map(|(id, _)| id);
             credential_changed(Some(&t.device_id), current.as_deref())
+        }) || machine.token.as_ref().is_some_and(|m| {
+            // 機体の鍵が書き換わった / 消えた (前の鍵の ID で記録し続けない)
+            machine_token::key_changed(Some(&m.seed), settings.alarm_sk().as_ref())
         });
         if auth_changed {
             // **device_id は載せない** — 残すのは事実だけ
             log::warn!("ws_uplink: 鍵が書き換わったため device JWT を捨てて繋ぎ直します");
             alc_hub_common::evtlog::emit("EVT AUTH_CHANGED");
             token = None;
+            machine = MachineState::default();
             header_expires_at = 0;
             let was_connected = conn.as_ref().is_some_and(|c| c.connected);
             discard_conn(&mut conn);
@@ -418,6 +450,27 @@ fn run(
             // 印刷中なら未完なので破棄 (切断時と同じ)
             print_session = None;
             // 新しい client は SLOW から始まる (`connect`)
+            reconnect_fast = false;
+            publish_status(&status, &queue, false);
+        }
+
+        // --- 鍵の証明が要ると返された (Refs ippoan/alc-cam#2) ---
+        // サーバーが証明の無い測定を受けない段に入った。証明を取り直せる時刻なら接続を畳み、
+        // 下の `connect` で取り直して繋ぎ直す (取れない間は待ち = 測定はキューに残る)。
+        // 待ちの間は畳まない — 畳んでも同じ証明なしの接続を張り直すだけになる
+        if std::mem::take(&mut machine_required)
+            && conn.is_some()
+            && machine_token::mint_due(now, machine.retry_at)
+        {
+            log::warn!("ws_uplink: 鍵の証明が要ると返されたため、取り直して繋ぎ直します");
+            alc_hub_common::evtlog::emit("EVT MACHINE_TOKEN REQUIRED");
+            let was_connected = conn.as_ref().is_some_and(|c| c.connected);
+            discard_conn(&mut conn);
+            if was_connected {
+                alc_hub_common::evtlog::emit("EVT WS_DISCONNECTED");
+            }
+            while ev_rx.try_recv().is_ok() {}
+            print_session = None;
             reconnect_fast = false;
             publish_status(&status, &queue, false);
         }
@@ -488,11 +541,11 @@ fn run(
             if !heap_headroom_ok(now, &mut heap_log_at) {
                 stall = "heap_gate";
             } else {
-                match connect(&settings, &mut token, ev_tx.clone(), now) {
-                    Ok(c) => {
+                match connect(&settings, &mut token, &mut machine, ev_tx.clone(), now) {
+                    Ok((c, expires_at)) => {
                         conn = Some(c);
-                        // このハンドシェイクに載せたトークンが transport に残る
-                        header_expires_at = token.as_ref().map_or(0, |t| t.expires_at);
+                        // このハンドシェイクに載せたトークン (と証明) が transport に残る
+                        header_expires_at = expires_at;
                         token_swap_fails = 0;
                         token_swap_alerted = false;
                         // 接続を始めた。Connected が来なければここで止まっている
@@ -537,7 +590,7 @@ fn run(
             && heap_headroom_ok(now, &mut heap_log_at)
         {
             token_swap_retry_at = now + TOKEN_SWAP_RETRY_MS;
-            match swap_auth_header(&settings, &mut token, &conn, now) {
+            match swap_auth_header(&settings, &mut token, &mut machine, &conn, now) {
                 Ok(expires_at) => {
                     header_expires_at = expires_at;
                     token_swap_fails = 0;
@@ -855,6 +908,7 @@ fn handle_downlink(
     status: &SharedStatus,
     ev_tx: &mpsc::Sender<WsEvent>,
     bp_unbond_flag: &BpUnbondFlag,
+    machine_required: &mut bool,
 ) -> bool {
     match parse_downlink(text) {
         Ok(Downlink::Ack { seq }) => {
@@ -868,6 +922,10 @@ fn handle_downlink(
         Ok(Downlink::ServerError { seq, message }) => {
             // キューに残して次の再送周期で送り直す
             log::warn!("ws_uplink: サーバエラー seq={seq:?}: {message}");
+            // 鍵の証明が無いので受けない (Refs ippoan/alc-cam#2)。run ループが繋ぎ直す
+            if machine_token::is_machine_token_required(&message) {
+                *machine_required = true;
+            }
         }
         Ok(Downlink::Command { id, payload }) => {
             println!("EVT WS_COMMAND {id} {payload}");
@@ -1255,9 +1313,10 @@ fn send_command_result(conn: &mut Option<Conn>, id: &str, payload: &str) {
 fn auth_header(
     settings: &Settings,
     token: &mut Option<Token>,
+    machine: &mut MachineState,
     now: u64,
     margin_s: u64,
-) -> Result<String, String> {
+) -> Result<(String, u64), String> {
     if token_needs_mint(now, token.as_ref().map(|t| t.expires_at), margin_s) {
         let (id, secret) = settings
             .device_credential()
@@ -1277,9 +1336,72 @@ fn auth_header(
             device_id: id,
         });
     }
-    Ok(auth_header_line(
-        &token.as_ref().expect("token minted above").jwt,
-    ))
+    let hub = token.as_ref().expect("token minted above");
+    ensure_machine_token(settings, machine, now, margin_s);
+    let mut headers = auth_header_line(&hub.jwt);
+    if let Some(m) = &machine.token {
+        headers.push_str(&machine_token::machine_header_line(&m.jwt));
+    }
+    let expires_at = machine_token::headers_expire_at(
+        hub.expires_at,
+        machine.token.as_ref().map(|m| m.expires_at),
+    );
+    Ok((headers, expires_at))
+}
+
+/// 機体の鍵の証明を確保する (残りが `margin_s` を切っていたら取り直す。Refs ippoan/alc-cam#2)。
+///
+/// **取れなくても接続は止めない** — 鍵が無い・未登録・通信の失敗のどれでも証明なしで繋ぎ、
+/// 記録は hub の ID で入る (サーバーの受け入れ期間)。取れなかった回は理由ごとの間隔だけ
+/// 待ってから取り直す。`mint_machine_token` は TLS を 2 本張るので、`auth_header` と同じく
+/// 呼び側のゲート (ヒープ・BLE) の内側でだけ呼ばれる
+fn ensure_machine_token(settings: &Settings, machine: &mut MachineState, now: u64, margin_s: u64) {
+    let Some(seed) = settings.alarm_sk() else {
+        machine.token = None;
+        note_machine_failure(machine, MintFailure::NoKey, now);
+        return;
+    };
+    let expires_at = machine.token.as_ref().map(|m| m.expires_at);
+    if !token_needs_mint(now, expires_at, margin_s) {
+        return;
+    }
+    if !machine_token::mint_due(now, machine.retry_at) {
+        // 待ちの間に切れた証明は載せない (載せると再接続が 401 になる)
+        if token_needs_mint(now, expires_at, 0) {
+            machine.token = None;
+        }
+        return;
+    }
+    match auth_link::mint_machine_token(&settings.auth_url(), &seed) {
+        Ok(t) => {
+            machine.token = Some(MachineToken {
+                jwt: t.access_token,
+                expires_at: now + t.expires_in_s * 1000,
+                seed,
+            });
+            if machine.last_failure.take().is_some() {
+                alc_hub_common::evtlog::emit("EVT MACHINE_TOKEN OK");
+            }
+        }
+        Err(failure) => {
+            machine.token = None;
+            note_machine_failure(machine, failure, now);
+        }
+    }
+}
+
+/// 証明を取れなかった回の記録 (待ちの設定と、理由が変わったときだけのイベント)。
+fn note_machine_failure(machine: &mut MachineState, failure: MintFailure, now: u64) {
+    machine.retry_at = now + machine_token::retry_after_ms(failure);
+    if machine.last_failure != Some(failure) {
+        // **JWT も鍵も載せない** — 残すのは理由の語だけ
+        log::warn!(
+            "ws_uplink: 機体の鍵の証明を取れず、証明なしで繋ぎます ({})",
+            failure.label()
+        );
+        alc_hub_common::evtlog::emit(&format!("EVT MACHINE_TOKEN NG {}", failure.label()));
+        machine.last_failure = Some(failure);
+    }
 }
 
 /// 接続を保ったまま、transport の Authorization ヘッダを新しい device JWT へ
@@ -1292,12 +1414,13 @@ fn auth_header(
 fn swap_auth_header(
     settings: &Settings,
     token: &mut Option<Token>,
+    machine: &mut MachineState,
     conn: &Option<Conn>,
     now: u64,
 ) -> Result<u64, String> {
     let c = conn.as_ref().ok_or("接続がない")?;
-    let headers = auth_header(settings, token, now, TOKEN_HEADER_SWAP_MARGIN_S)?;
-    let expires_at = token.as_ref().map_or(0, |t| t.expires_at);
+    let (headers, expires_at) =
+        auth_header(settings, token, machine, now, TOKEN_HEADER_SWAP_MARGIN_S)?;
     let line =
         std::ffi::CString::new(headers).map_err(|_| "ヘッダに NUL が混じった".to_string())?;
     // SAFETY: handle は生きている client のもので、line は呼び出しの間だけ生存
@@ -1315,10 +1438,11 @@ fn swap_auth_header(
 fn connect(
     settings: &Settings,
     token: &mut Option<Token>,
+    machine: &mut MachineState,
     ev_tx: mpsc::Sender<WsEvent>,
     now: u64,
-) -> Result<Conn, String> {
-    let headers = auth_header(settings, token, now, TOKEN_REFRESH_MARGIN_S)?;
+) -> Result<(Conn, u64), String> {
+    let (headers, expires_at) = auth_header(settings, token, machine, now, TOKEN_REFRESH_MARGIN_S)?;
     let config = EspWebSocketClientConfig {
         crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
         headers: Some(&headers),
@@ -1353,10 +1477,13 @@ fn connect(
     )
     .map_err(|e| format!("WS 接続開始に失敗: {e:?}"))?;
 
-    Ok(Conn {
-        client,
-        connected: false,
-        connected_at: None,
-        disconnected_at: None,
-    })
+    Ok((
+        Conn {
+            client,
+            connected: false,
+            connected_at: None,
+            disconnected_at: None,
+        },
+        expires_at,
+    ))
 }

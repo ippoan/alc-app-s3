@@ -71,6 +71,10 @@ path = "crates/hub-core/src/layout.rs"
 type = "unit"
 
 [[file]]
+path = "crates/hub-core/src/machine_token.rs"
+type = "unit"
+
+[[file]]
 path = "crates/hub-core/src/nfc_login.rs"
 type = "unit"
 
