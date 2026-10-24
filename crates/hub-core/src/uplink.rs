@@ -298,6 +298,21 @@ pub fn command_result_frame(id: &str, payload: &str) -> Result<String, String> {
     Ok(json!({ "type": "command_result", "id": id, "payload": payload }).to_string())
 }
 
+/// 開発用の試験記録の kind (auth-worker の MCP `create_test_record` が `test_record` command で
+/// 作らせる、Refs ippoan/alc-cam#2)。cf-alc-recorder は接続に関わらず開発の軸へ転送し、
+/// rust-alc-api は開発の軸のときだけ受ける。
+pub const TEST_RECORD_KIND: &str = "test";
+
+/// 試験記録の payload。`command_id` は MCP が行を見つける鍵、`fw` はどの版で作ったかの控え
+pub fn test_record_payload(command_id: &str, fw: &str) -> String {
+    json!({ "type": TEST_RECORD_KIND, "command_id": command_id, "fw": fw }).to_string()
+}
+
+/// `test_record` command への応答 (積んだ seq)
+pub fn test_record_result(seq: u64) -> String {
+    json!({ "ok": true, "seq": seq }).to_string()
+}
+
 /// 必須の文字列フィールドを取り出す
 fn str_field(obj: &Map<String, Value>, key: &str) -> Result<String, String> {
     obj.get(key)
@@ -1092,6 +1107,20 @@ mod tests {
         assert!(parse_downlink(r#"{"seq":1}"#).is_err());
         assert!(parse_downlink(r#"{"type":"ack"}"#).is_err());
     }
+    #[test]
+    fn test_record_payload_and_result_are_json() {
+        let p: Value = serde_json::from_str(&test_record_payload("cmd-\"1", "1.2.3")).unwrap();
+        assert_eq!(p, json!({"type": "test", "command_id": "cmd-\"1", "fw": "1.2.3"}));
+        let r: Value = serde_json::from_str(&test_record_result(42)).unwrap();
+        assert_eq!(r, json!({"ok": true, "seq": 42}));
+        // キューに積める形 (payload_object を通る)
+        let (mut q, _) = UplinkQueue::open(0, Box::new(MemStore::new(4)), 2);
+        let pushed = q
+            .push_record(TEST_RECORD_KIND, 1, &test_record_payload("c", "v"), None, Some(1), Some(1))
+            .unwrap();
+        assert_eq!(pushed.seq, 1);
+    }
+
     #[test]
     fn command_action_lowercases_and_rejects() {
         assert_eq!(
