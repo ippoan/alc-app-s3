@@ -19,6 +19,7 @@
 //! | `EVT AUTH_TOKEN OK <expires_in_s>` | `AUTH TOKEN` 自己診断成功 |
 //! | `EVT AUTH_TOKEN NG <理由>` | 同 失敗 |
 
+use alc_hub_core::machine_token;
 use alc_hub_core::pairing::{
     hub_token_request_body, introspect_request_body, parse_claim_ticket_response,
     parse_hub_token_response, parse_introspect_response, parse_token_response, token_request_body,
@@ -104,6 +105,33 @@ pub fn mint_token(base: &str, device_id: &str, device_secret: &str) -> Result<De
     .and_then(|(_, body)| parse_token_response(&body))
 }
 
+/// 機体の鍵の証明 (用途 hub-record) の JWT を取る (Refs ippoan/alc-cam#2)。
+///
+/// `GET /device/alarm-nonce?usage=hub-record` → 機体の鍵で nonce に署名 →
+/// `POST /device/alarm-token`。TLS を 2 本張るので、**呼び側は `mint_token` と同じく
+/// ヒープと BLE のゲートを通してから呼ぶこと**。失敗は取り直しの間隔を決める種類で返す
+/// (`machine_token::MintFailure`)。JWT と鍵はログにもホストにも出さない。
+pub fn mint_machine_token(
+    base: &str,
+    seed: &[u8; 32],
+) -> Result<DeviceToken, machine_token::MintFailure> {
+    use machine_token::MintFailure;
+    let (status, body) =
+        get_plain(&machine_token::alarm_nonce_url(base)).map_err(|_| MintFailure::Transient)?;
+    if !(200..300).contains(&status) {
+        return Err(machine_token::classify_status(status));
+    }
+    let nonce = machine_token::parse_nonce_response(&body).map_err(|_| MintFailure::Transient)?;
+    let req =
+        machine_token::token_request_body(seed, &nonce).map_err(|_| MintFailure::Transient)?;
+    let (status, body) = post_json(&machine_token::alarm_token_url(base), &req)
+        .map_err(|_| MintFailure::Transient)?;
+    if !(200..300).contains(&status) {
+        return Err(machine_token::classify_status(status));
+    }
+    parse_token_response(&body).map_err(|_| MintFailure::Transient)
+}
+
 /// GW の `auth_challenge` nonce を束縛した短命 hub-token を mint する
 /// (ippoan/alc-app-s3#83、ippoan/auth-worker#406)。gw_link がハンドシェイクの
 /// 「自分の hub-token を用意する」段で同期的に呼ぶ。
@@ -181,6 +209,20 @@ fn post_json(url: &str, body: &str) -> Result<(u16, String)> {
     )
     .context("リクエスト送信に失敗")?;
     conn.write_all(body.as_bytes()).context("本文送信に失敗")?;
+    conn.initiate_response().context("応答受信に失敗")?;
+    read_response(conn)
+}
+
+/// 本文無しの GET (blocking)。応答の (HTTP status, body) を返す (`mint_machine_token` の nonce 取得)。
+fn get_plain(url: &str) -> Result<(u16, String)> {
+    let mut conn = EspHttpConnection::new(&HttpConfiguration {
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        timeout: Some(core::time::Duration::from_secs(HTTP_TIMEOUT_S)),
+        ..Default::default()
+    })
+    .context("HTTP 接続の初期化に失敗")?;
+    conn.initiate_request(Method::Get, url, &[])
+        .context("リクエスト送信に失敗")?;
     conn.initiate_response().context("応答受信に失敗")?;
     read_response(conn)
 }
