@@ -50,7 +50,7 @@ use std::time::Duration;
 
 use alc_hub_core::{
     device::{
-        match_device_name, omron_addr_from_name, omron_adv, omron_adv_from_mfg,
+        conn_evt_name, match_device_name, omron_addr_from_name, omron_adv, omron_adv_from_mfg,
         should_remember_bp_bond, BpBondSite, DeviceKind, OmronAdv,
     },
     ieee11073::{parse_blood_pressure, parse_temperature},
@@ -464,12 +464,12 @@ async fn task(
         }
 
         println!("{{\"type\":\"found\",\"device\":\"{}\"}}", kind.json_name());
-        // 非 Omron の血圧計 (ニプロ NBP-1 等) は evtlog を 1 行も出しておらず、
-        // 実機で測ってもハブが血圧計を見つけたのかどうかログから判定できなかった
-        // (Refs #252)。Omron 経路は EVT OMRON_* が既に出すので二重に出さない
-        let bp_nonomron = kind == DeviceKind::BloodPressure && omron.is_none();
-        if bp_nonomron {
-            alc_hub_common::evtlog::emit("EVT BP_CONN try");
+        // 非 Omron の血圧計 (ニプロ NBP-1 等) と体温計は evtlog を 1 行も出しておらず、
+        // 実機で測ってもハブが機器を見つけたのかどうかログから判定できなかった
+        // (Refs #252)。出す機器と名前は hub-core の 1 本が決める
+        let conn_evt = conn_evt_name(kind, omron.is_some());
+        if let Some(name) = conn_evt {
+            alc_hub_common::evtlog::emit(&format!("EVT {name}_CONN try"));
         }
         // 接続開始を UI へ通知 → 点呼画面のラベル横に取得中スピナーを表示
         let _ = ui_tx.send(UiCommand::BleAcquiring { device: kind });
@@ -477,12 +477,13 @@ async fn task(
         let mut client = device.new_client();
         let result = handle_device(&mut client, addr, kind, omron, &status, &meas_tx).await;
         // 測定を受け取れたか / 受け取れずに終わったか (Refs #252)
-        if bp_nonomron {
-            alc_hub_common::evtlog::emit(match &result {
-                Ok(true) => "EVT BP_RX ok",
-                Ok(false) => "EVT BP_RX none",
-                Err(_) => "EVT BP_RX err",
-            });
+        if let Some(name) = conn_evt {
+            let outcome = match &result {
+                Ok(true) => "ok",
+                Ok(false) => "none",
+                Err(_) => "err",
+            };
+            alc_hub_common::evtlog::emit(&format!("EVT {name}_RX {outcome}"));
         }
         // 血圧の特性まで到達した経路だけ「血圧計としてボンド」に載せる
         // (Refs #252 / #269)。非 Omron 機はここまで記録を書く経路が無く、
