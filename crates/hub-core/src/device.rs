@@ -24,6 +24,20 @@ impl DeviceKind {
     }
 }
 
+/// 接続の試行 (`EVT <名>_CONN try`) と結果 (`EVT <名>_RX ok|none|err`) をイベントログへ
+/// 出す機器の `<名>`。Omron の経路は `EVT OMRON_*` が既に出すので None (二重に出さない)。
+///
+/// 非 Omron の血圧計 (Refs #252) に続いて体温計も出す: 体温が PC に届かなかった回に、
+/// 体温計が送ってこなかったのかハブが受け損ねたのかをリングから判定できなかった
+/// (ble の `log::warn` / `println!` はリングに乗らない)
+pub fn conn_evt_name(kind: DeviceKind, omron: bool) -> Option<&'static str> {
+    match kind {
+        DeviceKind::Thermometer => Some("THERMO"),
+        DeviceKind::BloodPressure if !omron => Some("BP"),
+        DeviceKind::BloodPressure => None,
+    }
+}
+
 /// Omron の BLE 機器 (HEM-6231T / HCR-1901T2) の広告がどちらの状態か。
 /// HEM-6231T は service UUID を広告せず名前で見分ける (Refs #237、Linux で実測)。
 /// HCR-1901T2 は本体広告のメーカーデータで見分ける ([`omron_adv_from_mfg`])。
@@ -325,6 +339,13 @@ pub fn should_remember_bp_bond(site: BpBondSite) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn conn_evt_name_by_kind() {
+        assert_eq!(conn_evt_name(DeviceKind::Thermometer, false), Some("THERMO"));
+        assert_eq!(conn_evt_name(DeviceKind::BloodPressure, false), Some("BP"));
+        assert_eq!(conn_evt_name(DeviceKind::BloodPressure, true), None);
+    }
     use super::*;
 
     const BP: [u8; 6] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
