@@ -22,12 +22,12 @@ extern "C" {
 int nfc_shim_init(int i2c_port, int sda_gpio, int scl_gpio);
 
 /**
- * ST25R3916 (0x50) が sda_gpio / scl_gpio の向きで ack を返すかだけを見る。
- * その場でバスを立てて probe し、すぐ消す — nfc_shim_init より前に呼ぶこと
- * (init が同じポートにバスを立てた後は -1)。配線の向き (SDA と SCL の逆挿し) の判定用。
- * 戻り値: 1=ack あり、0=ack なし、負=バスを立てられない。
+ * sda_gpio / scl_gpio の向きで I2C の 0x08..0x77 を走査する。その場でバスを立てて消す —
+ * nfc_shim_init より前に呼ぶこと (init がバスを立てた後は -1)。配線の向きと、何が居るかの判定用。
+ * found に応答したアドレスを cap 個まで入れ、st25_err に 0x50 (ST25R3916) の probe の esp_err_t を入れる。
+ * 戻り値: 応答したアドレスの数、負=バスを立てられない。
  */
-int nfc_shim_probe(int i2c_port, int sda_gpio, int scl_gpio);
+int nfc_shim_scan(int i2c_port, int sda_gpio, int scl_gpio, unsigned char* found, int cap, int* st25_err);
 
 /**
  * 交通系IC (Suica/PASMO 等, NFC-F) を1回ポーリングする。

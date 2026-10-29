@@ -39,7 +39,14 @@ use alc_hub_core::nfc_tap::{TapGate, TapOutcome, DEFAULT_COMMIT_WINDOW_MS};
 
 extern "C" {
     fn nfc_shim_init(i2c_port: i32, sda_gpio: i32, scl_gpio: i32) -> i32;
-    fn nfc_shim_probe(i2c_port: i32, sda_gpio: i32, scl_gpio: i32) -> i32;
+    fn nfc_shim_scan(
+        i2c_port: i32,
+        sda_gpio: i32,
+        scl_gpio: i32,
+        found: *mut u8,
+        cap: i32,
+        st25_err: *mut i32,
+    ) -> i32;
     fn nfc_shim_poll_felica_idm(out_hex: *mut u8, out_cap: i32) -> i32;
     fn nfc_shim_poll_nfca_uid(out_hex: *mut u8, out_cap: i32) -> i32;
     fn nfc_shim_read_license_expiry(
@@ -226,40 +233,80 @@ pub fn start(
     Ok(())
 }
 
-/// SDA / SCL の向きを ST25R3916 の ack で決める。渡された向きで ack が無く、逆なら
-/// ack があるときだけ入れ替える (Grove の 1 番ピンを SDA とするか SCL とするかが
-/// 基板・ケーブルで食い違うため。中継基板の J6 で実際に応答しなかった)。
-/// どちらも ack が無ければ (未接続・電源断) 渡された向きのまま返す
-fn resolve_pins(i2c_port: i32, sda_num: i32, scl_num: i32) -> (i32, i32) {
-    let fwd = unsafe { nfc_shim_probe(i2c_port, sda_num, scl_num) };
-    if fwd == 1 {
-        return (sda_num, scl_num);
-    }
-    let rev = unsafe { nfc_shim_probe(i2c_port, scl_num, sda_num) };
-    // 外のプルアップ (基板の抵抗か Unit 側) が線に来ているか。内部プルダウンで読んで 1 なら
-    // 線はつながっている、0 なら J6 から先が浮いている
-    let (pu_sda, pu_scl) = (pulled_up(sda_num), pulled_up(scl_num));
-    alc_hub_common::evtlog::emit(&format!(
-        "EVT NFC_PROBE sda={sda_num} scl={scl_num} ack={fwd} swapped_ack={rev} ext_pullup={pu_sda},{pu_scl}"
-    ));
-    if rev == 1 {
-        (scl_num, sda_num)
-    } else {
-        (sda_num, scl_num)
+/// I2C を走査した結果 (応答したアドレスと、0x50 の probe の esp_err_t)
+fn scan(i2c_port: i32, sda: i32, scl: i32) -> (Vec<u8>, i32) {
+    let mut found = [0u8; 8];
+    let mut st25_err = 0i32;
+    let n = unsafe { nfc_shim_scan(i2c_port, sda, scl, found.as_mut_ptr(), 8, &mut st25_err) };
+    let n = n.clamp(0, found.len() as i32) as usize;
+    (found[..n].to_vec(), st25_err)
+}
+
+/// SDA / SCL の向きを ST25R3916 (0x50) の ack で決める。**応答するまで 2 秒ごとに両方の向きで
+/// 走査し続ける** — 起動時に 1 回だけだと、後から電源が来た・挿し直した Unit を逆の向きの
+/// まま初期化し続ける (中継基板の J6 で踏んだ)。Grove の 1 番ピンを SDA とするか SCL とするかは
+/// 基板・ケーブルで食い違うので、どちらの向きでも受ける。線の状態が変わったときだけ
+/// `EVT NFC_PROBE` を 1 行出す。応答が無い間は `EVT NFC_INIT_NG rc=-3` も 1 回だけ出す
+/// (alc-app の診断が拾う行。従来は初期化の失敗で出ていた)
+fn resolve_pins(i2c_port: i32, sda_num: i32, scl_num: i32, status: &SharedStatus) -> (i32, i32) {
+    let mut last = String::new();
+    loop {
+        let (fwd, fwd_err) = scan(i2c_port, sda_num, scl_num);
+        if fwd.contains(&0x50) {
+            return (sda_num, scl_num);
+        }
+        let (rev, rev_err) = scan(i2c_port, scl_num, sda_num);
+        // 外のプルアップ (基板の抵抗か Unit 側) が線に来ているか。内部プルダウンで読んで 1 なら
+        // 線はつながっている、0 なら J6 から先が浮いている。
+        // 内部プルアップで読んで 0 なら、浮いているのではなく GND (か何かの出力) に強く引かれている
+        let (pu_sda, pu_scl) = (level_with(sda_num, false), level_with(scl_num, false));
+        let (hi_sda, hi_scl) = (level_with(sda_num, true), level_with(scl_num, true));
+        let line = format!(
+            "EVT NFC_PROBE sda={sda_num} scl={scl_num} found={fwd:02X?} st25_err={fwd_err} \
+             swapped_found={rev:02X?} swapped_st25_err={rev_err} \
+             ext_pullup={pu_sda},{pu_scl} with_int_pullup={hi_sda},{hi_scl}"
+        );
+        // 電源の来ていない Unit がぶら下がると、線のノイズで毎回違うアドレスが見える。
+        // 出すかどうかは見つかったアドレスではなく線の状態で決める (2 秒ごとに出し続けない)
+        let key = format!("{pu_sda}{pu_scl}{hi_sda}{hi_scl}{fwd_err}{rev_err}");
+        if key != last {
+            if last.is_empty() {
+                alc_hub_common::evtlog::emit("EVT NFC_INIT_NG rc=-3");
+                push_event(
+                    status,
+                    &format!("NFC 応答なし (配線/電源 sda={sda_num} scl={scl_num} を確認) — 2s ごとに探す"),
+                );
+            }
+            alc_hub_common::evtlog::emit(&line);
+            last = key;
+        }
+        if rev.contains(&0x50) {
+            return (scl_num, sda_num);
+        }
+        FreeRtos::delay_ms(2000);
     }
 }
 
-/// 内部プルダウンにして読んだレベル (1 = 外のプルアップが勝っている)。読んだ後はピンを戻す
-fn pulled_up(gpio: i32) -> i32 {
+/// 内部プルダウン (`pullup = false`) か内部プルアップにして読んだレベル。
+/// プルダウンで 1 = 外のプルアップが勝っている、プルアップで 0 = 外で強く Low に引かれている。
+/// 読んだ後はピンを戻す
+fn level_with(gpio: i32, pullup: bool) -> i32 {
     use esp_idf_svc::sys::{
         gpio_get_level, gpio_mode_t_GPIO_MODE_INPUT, gpio_pull_mode_t_GPIO_PULLDOWN_ONLY,
-        gpio_reset_pin, gpio_set_direction, gpio_set_pull_mode,
+        gpio_pull_mode_t_GPIO_PULLUP_ONLY, gpio_reset_pin, gpio_set_direction, gpio_set_pull_mode,
     };
     // SAFETY: まだ誰も握っていない (I2C バスを立てる前の) ピンを読むだけ
     unsafe {
         gpio_reset_pin(gpio);
         gpio_set_direction(gpio, gpio_mode_t_GPIO_MODE_INPUT);
-        gpio_set_pull_mode(gpio, gpio_pull_mode_t_GPIO_PULLDOWN_ONLY);
+        gpio_set_pull_mode(
+            gpio,
+            if pullup {
+                gpio_pull_mode_t_GPIO_PULLUP_ONLY
+            } else {
+                gpio_pull_mode_t_GPIO_PULLDOWN_ONLY
+            },
+        );
         FreeRtos::delay_ms(2);
         let level = gpio_get_level(gpio);
         gpio_reset_pin(gpio);
@@ -276,7 +323,7 @@ fn run(
     status: SharedStatus,
     mut sink: impl NfcSink,
 ) {
-    let (sda_num, scl_num) = resolve_pins(i2c_port, sda_num, scl_num);
+    let (sda_num, scl_num) = resolve_pins(i2c_port, sda_num, scl_num, &status);
     if !init_with_retry(i2c_port, sda_num, scl_num, &status) {
         return;
     }
