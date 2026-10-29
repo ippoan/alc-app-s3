@@ -194,7 +194,8 @@ bool sw_ok(const uint8_t* rx, uint16_t rx_len)
 
 }  // namespace
 
-extern "C" int nfc_shim_probe(int i2c_port, int sda_gpio, int scl_gpio)
+extern "C" int nfc_shim_scan(int i2c_port, int sda_gpio, int scl_gpio, unsigned char* found, int cap,
+                             int* st25_err)
 {
     if (g_bus != nullptr) {
         return -1;
@@ -210,9 +211,24 @@ extern "C" int nfc_shim_probe(int i2c_port, int sda_gpio, int scl_gpio)
     if (i2c_new_master_bus(&bus_cfg, &bus) != ESP_OK) {
         return -2;
     }
-    const bool ack = i2c_master_probe(bus, 0x50, /*xfer_timeout_ms=*/50) == ESP_OK;
+    // 応答の無いアドレスごとに i2c.master が E を吐くので、走査の間だけ黙らせる
+    const esp_log_level_t prev = esp_log_level_get("i2c.master");
+    esp_log_level_set("i2c.master", ESP_LOG_NONE);
+    int n = 0;
+    *st25_err = 0;
+    for (uint16_t addr = 0x08; addr <= 0x77; ++addr) {
+        const esp_err_t err = i2c_master_probe(bus, addr, /*xfer_timeout_ms=*/20);
+        if (addr == 0x50) {
+            *st25_err = err;
+        }
+        if (err == ESP_OK && n < cap) {
+            found[n] = static_cast<unsigned char>(addr);
+        }
+        n += err == ESP_OK ? 1 : 0;
+    }
+    esp_log_level_set("i2c.master", prev);
     i2c_del_master_bus(bus);
-    return ack ? 1 : 0;
+    return n;
 }
 
 extern "C" int nfc_shim_init(int i2c_port, int sda_gpio, int scl_gpio)
