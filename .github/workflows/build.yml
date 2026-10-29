@@ -152,7 +152,7 @@ jobs:
           - { name: atoms3-timecard-vein,
               cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard cargo check --release --locked -p alc-hub-atoms3-timecard --features vein",
               cache_key: build-timecard-s3r }
-          # `vein` の GPS 版 (ippoan/alc-app#514): Grove PORT.A を Unit GPS が使い、NFC は起こさない
+          # `vein` の NFC + GPS 版 (ippoan/alc-app#514): Grove PORT.A を Unit GPS、NFC は J6 (G38 / G39)
           - { name: atoms3-timecard-vein-gps,
               cmd: "ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard cargo check --release --locked -p alc-hub-atoms3-timecard --features vein-gps",
               cache_key: build-timecard-s3r }
@@ -427,8 +427,8 @@ jobs:
             flash_size: 8mb
             partition_table: crates/atoms3-timecard/partitions.csv
             cache_key: build-timecard-s3r
-          # `vein` の GPS 版 (ippoan/alc-app#514)。NFC 版と同じ配線で、Grove PORT.A に
-          # Unit NFC の代わりに Unit GPS をつなぐ。bin 名が同じなので `-vein-gps-` を挟んで分ける
+          # `vein` の NFC + GPS 版 (ippoan/alc-app#514)。Grove PORT.A に Unit GPS、Unit NFC は
+          # 中継基板の J6 (G38 / G39)。bin 名が同じなので `-vein-gps-` を挟んで分ける
           - name: atoms3-timecard-vein-gps
             bin: alc-hub-atoms3-timecard
             build_env: 'ESP_IDF_SYS_ROOT_CRATE=alc-hub-atoms3-timecard'

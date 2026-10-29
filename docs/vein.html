@@ -80,8 +80,8 @@
             <li><strong>書き込みが終わったら、ボタンから指を離して USB を挿し直す</strong> —
                 押したままだと起動のたびにダウンロードモードに入り、
                 <strong>焼けているのにアプリが動きません</strong></li>
-            <li>NFC 版: シリアルに <code>EVT NFC_READY</code> が出れば NFC は使えます。
-                GPS 版: Unit GPS をつないで屋外 (窓際) に置くと <code>EVT GPS FIX …</code> が出ます。
+            <li>シリアルに <code>EVT NFC_READY</code> が出れば NFC は使えます。
+                NFC + GPS 版: Unit GPS をつないで屋外 (窓際) に置くと <code>EVT GPS FIX …</code> が出ます。
                 <code>VEIN CAPTURE</code> で指静脈モジュールの読み取りを確かめられます</li>
         </ol>
         <div class="warning">
@@ -90,8 +90,8 @@
                <code>boot:0x30 (DOWNLOAD(USB/UART0))</code> が出ていたら、
                <strong>ダウンロードモードに入ったままです</strong>。ボタンから指を離して挿し直してください
                (書き込みは成功しています)。</p>
-            <p><strong>Unit GPS を使う GPS 版は NFC が使えません</strong> (Grove Port A を GPS が使うため)。
-               カードで本人確認するときは NFC 版を書いてください。</p>
+            <p><strong>NFC + GPS 版は Unit NFC を中継基板の J6 に挿します</strong> (Grove Port A は GPS が使うため)。
+               Unit NFC を Grove Port A に挿す旧構成のときは「NFC 版 (旧構成)」を書いてください。</p>
             <p><strong>Unit NFC は電源を入れる前に挿しておいてください。</strong>
                起動時に挿さっていないと <code>EVT NFC_INIT_NG</code> が出て、
                <strong>後から挿しても再起動するまで復帰しません</strong>。</p>
@@ -112,15 +112,15 @@
         <label for="board" style="display: block; margin-bottom: 8px;">ボード</label>
         <!-- 選択肢を足すときは option と install-* の button を 1 組ずつ足す (manifest も 1 本ずつ) -->
         <select id="board" class="board-select">
-            <option value="r12-b" selected>NFC 版 (カードで本人確認)</option>
-            <option value="r12-b-gps">GPS 版 (位置を記録。NFC なし)</option>
+            <option value="r12-b-gps" selected>NFC + GPS 版 (NFC = J6、GPS = Grove)</option>
+            <option value="r12-b">NFC 版 (旧構成: NFC = Grove、GPS なし)</option>
         </select>
         <p class="board-note" data-board="r12-b">
             指静脈 = 中継基板 J3 (G5 / G6)、FC-1200 = DB9 (G7 / G8)、NFC = Grove Port A (G2 / G1)
         </p>
         <p class="board-note" data-board="r12-b-gps">
             指静脈 = 中継基板 J3 (G5 / G6)、FC-1200 = DB9 (G7 / G8)、
-            Unit GPS = Grove Port A (NFC は使えません)。点呼の記録に位置が付きます
+            NFC = 中継基板 J6 (G38 / G39)、Unit GPS = Grove Port A。点呼の記録に位置が付きます
         </p>
         <esp-web-install-button data-board="r12-b" manifest="manifest-timecard-vein-r12-b.json">
             <button slot="activate">Install alc-hub Vein Station (r12 + B)</button>
@@ -131,7 +131,7 @@
             <span slot="not-allowed">シリアルポートへのアクセスが許可されていません。</span>
         </esp-web-install-button>
         <esp-web-install-button data-board="r12-b-gps" manifest="manifest-timecard-vein-gps.json">
-            <button slot="activate">Install alc-hub Vein Station (GPS 版)</button>
+            <button slot="activate">Install alc-hub Vein Station (NFC + GPS 版)</button>
             <span slot="unsupported">
                 お使いのブラウザは Web Serial API に対応していません。<br>
                 Chrome, Edge, または Opera をお使いください。
