@@ -116,7 +116,7 @@ use alc_hub_common::{
     settings::Settings,
     status::{epoch_ms, now_ms, HubStatus, SharedStatus},
 };
-#[cfg(not(feature = "porta-taken"))]
+#[cfg(any(not(feature = "porta-taken"), feature = "nfc-j6"))]
 use alc_hub_drivers::nfc;
 use alc_hub_drivers::nfc::NfcEvent;
 #[cfg(feature = "station")]
@@ -148,7 +148,7 @@ compile_error!("vein-gps と vein-porta はどちらも Grove PORT.A を使う")
 /// nfc_shim (C++ 側) に立てさせる I2C ポート。本機は他に I2C を使わないので
 /// I2C_NUM_0 (atoms3-nfc のベンチと同値、実機確認済み)。CoreS3 は内部バスが
 /// I2C_NUM_0 を使うので向こうは 1
-#[cfg(not(feature = "porta-taken"))]
+#[cfg(any(not(feature = "porta-taken"), feature = "nfc-j6"))]
 const I2C_PORT_NFC: i32 = 0;
 
 fn main() -> Result<()> {
@@ -329,26 +329,26 @@ fn main() -> Result<()> {
     // ws_meas_tx 本体を move する**ので、ここで clone を取っておく
     let ws_for_bp = ws_meas_tx.clone();
 
-    // Unit NFC (ST25R3916): Grove Port A (SDA=G2 / SCL=G1)。読み取りループは
-    // hub-drivers/src/nfc.rs (CoreS3 と共有)。**ここに NFC のコードを書かない**。
-    // PORT.A を NFC 以外が握る版 (`porta-taken`) では起動しない
-    #[cfg(feature = "porta-taken")]
+    // Unit NFC (ST25R3916): Grove Port A (SDA=G2 / SCL=G1)、`nfc-j6` なら中継基板の
+    // J6 (SDA=G38 / SCL=G39)。読み取りループは hub-drivers/src/nfc.rs (CoreS3 と共有)。
+    // **ここに NFC のコードを書かない**。PORT.A を NFC 以外が握り J6 も無い版では起動しない
+    #[cfg(all(feature = "porta-taken", not(feature = "nfc-j6")))]
     {
         let _ = (&ws_meas_tx, &speaker_tx);
-        alc_hub_common::evtlog::emit(if cfg!(feature = "vein-gps") {
-            "EVT NFC_DISABLED port=A_used_by_gps"
-        } else {
-            "EVT NFC_DISABLED port=A_used"
-        });
+        alc_hub_common::evtlog::emit("EVT NFC_DISABLED port=A_used");
     }
     // Unit GPS (Vein Base の PORT.A、#514)。RX は G1 を先に試し、来なければ G2
     #[cfg(feature = "vein-gps")]
     alc_hub_drivers::gps::start(p.uart0, p.pins.gpio1.into(), p.pins.gpio2.into())?;
-    #[cfg(not(feature = "porta-taken"))]
+    #[cfg(feature = "nfc-j6")]
+    let (nfc_sda, nfc_scl) = (p.pins.gpio38.into(), p.pins.gpio39.into());
+    #[cfg(not(any(feature = "porta-taken", feature = "nfc-j6")))]
+    let (nfc_sda, nfc_scl) = (p.pins.gpio2.into(), p.pins.gpio1.into());
+    #[cfg(any(not(feature = "porta-taken"), feature = "nfc-j6"))]
     nfc::start(
         I2C_PORT_NFC,
-        p.pins.gpio2.into(),
-        p.pins.gpio1.into(),
+        nfc_sda,
+        nfc_scl,
         // B 先行 + B 粘着 (#155 step 4)。理由は nfc::PollOrder の doc
         nfc::PollOrder::LicenseFirst,
         // 存在検知をゲートに使わず待機中も B を回す (#175)。本番機では免許証を上から置いても
@@ -466,7 +466,7 @@ fn main() -> Result<()> {
 /// **`card_id` は生値のまま**送る (接頭辞を付けると punch のカード照合が
 /// 必ず外れる — alc_hub_core::timecard の doc 参照)。`session_id` は
 /// 点呼ではないので付けない。
-#[cfg_attr(feature = "porta-taken", allow(dead_code))]
+#[cfg_attr(all(feature = "porta-taken", not(feature = "nfc-j6")), allow(dead_code))]
 fn on_card(
     event: &NfcEvent,
     ws_tx: &mpsc::Sender<UplinkRecord>,

@@ -51,10 +51,13 @@ vein = ["station", "alc-hub-drivers/vein"]
 # Grove PORT.A (G1/G2) を NFC 以外が握る印 (内部 feature)。main.rs の NFC はこの 1 種類で
 # ゲートする。`vein-gps` と、別 PR の `vein-porta` (指静脈 Unit) がこれを含む
 porta-taken = []
-# Vein Base + Unit GPS (ippoan/alc-app#514)。PORT.A に Unit GPS をつなぐ版 — NFC 版
-# (`vein`) と書き込み時に選ぶ。Unit NFC は起動しない。点呼の記録に位置を付けるため、
-# UART0 / 115200bps で NMEA を読み、`EVT GPS …` の行を USB へ出す
-vein-gps = ["vein", "porta-taken", "alc-hub-drivers/gps"]
+# Unit NFC を中継基板の J6 (G38 SDA / G39 SCL、vein-base `pcb/station_board` の
+# print_b ほか。プルアップは基板側) で起こす印 (内部 feature)。`porta-taken` でも NFC を止めない
+nfc-j6 = []
+# Vein Base + Unit GPS (ippoan/alc-app#514)。PORT.A に Unit GPS をつなぎ、Unit NFC は
+# 中継基板の J6 へ移す版 — 書き込み画面の既定。旧構成 (NFC = PORT.A、`vein`) と書き込み時に
+# 選ぶ。点呼の記録に位置を付けるため、UART0 / 115200bps で NMEA を読み、`EVT GPS …` の行を USB へ出す
+vein-gps = ["vein", "porta-taken", "nfc-j6", "alc-hub-drivers/gps"]
 
 [build-dependencies]
 embuild = "0.33"
