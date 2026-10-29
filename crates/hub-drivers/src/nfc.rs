@@ -39,6 +39,7 @@ use alc_hub_core::nfc_tap::{TapGate, TapOutcome, DEFAULT_COMMIT_WINDOW_MS};
 
 extern "C" {
     fn nfc_shim_init(i2c_port: i32, sda_gpio: i32, scl_gpio: i32) -> i32;
+    fn nfc_shim_probe(i2c_port: i32, sda_gpio: i32, scl_gpio: i32) -> i32;
     fn nfc_shim_poll_felica_idm(out_hex: *mut u8, out_cap: i32) -> i32;
     fn nfc_shim_poll_nfca_uid(out_hex: *mut u8, out_cap: i32) -> i32;
     fn nfc_shim_read_license_expiry(
@@ -225,6 +226,26 @@ pub fn start(
     Ok(())
 }
 
+/// SDA / SCL の向きを ST25R3916 の ack で決める。渡された向きで ack が無く、逆なら
+/// ack があるときだけ入れ替える (Grove の 1 番ピンを SDA とするか SCL とするかが
+/// 基板・ケーブルで食い違うため。中継基板の J6 で実際に応答しなかった)。
+/// どちらも ack が無ければ (未接続・電源断) 渡された向きのまま返す
+fn resolve_pins(i2c_port: i32, sda_num: i32, scl_num: i32) -> (i32, i32) {
+    let fwd = unsafe { nfc_shim_probe(i2c_port, sda_num, scl_num) };
+    if fwd == 1 {
+        return (sda_num, scl_num);
+    }
+    let rev = unsafe { nfc_shim_probe(i2c_port, scl_num, sda_num) };
+    alc_hub_common::evtlog::emit(&format!(
+        "EVT NFC_PROBE sda={sda_num} scl={scl_num} ack={fwd} swapped_ack={rev}"
+    ));
+    if rev == 1 {
+        (scl_num, sda_num)
+    } else {
+        (sda_num, scl_num)
+    }
+}
+
 fn run(
     i2c_port: i32,
     sda_num: i32,
@@ -234,6 +255,7 @@ fn run(
     status: SharedStatus,
     mut sink: impl NfcSink,
 ) {
+    let (sda_num, scl_num) = resolve_pins(i2c_port, sda_num, scl_num);
     if !init_with_retry(i2c_port, sda_num, scl_num, &status) {
         return;
     }
