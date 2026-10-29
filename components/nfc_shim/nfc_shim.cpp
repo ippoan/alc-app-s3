@@ -194,6 +194,27 @@ bool sw_ok(const uint8_t* rx, uint16_t rx_len)
 
 }  // namespace
 
+extern "C" int nfc_shim_probe(int i2c_port, int sda_gpio, int scl_gpio)
+{
+    if (g_bus != nullptr) {
+        return -1;
+    }
+    i2c_master_bus_config_t bus_cfg{};
+    bus_cfg.i2c_port                     = static_cast<i2c_port_t>(i2c_port);
+    bus_cfg.sda_io_num                   = static_cast<gpio_num_t>(sda_gpio);
+    bus_cfg.scl_io_num                   = static_cast<gpio_num_t>(scl_gpio);
+    bus_cfg.clk_source                   = I2C_CLK_SRC_DEFAULT;
+    bus_cfg.glitch_ignore_cnt            = 7;
+    bus_cfg.flags.enable_internal_pullup = true;
+    i2c_master_bus_handle_t bus = nullptr;
+    if (i2c_new_master_bus(&bus_cfg, &bus) != ESP_OK) {
+        return -2;
+    }
+    const bool ack = i2c_master_probe(bus, 0x50, /*xfer_timeout_ms=*/50) == ESP_OK;
+    i2c_del_master_bus(bus);
+    return ack ? 1 : 0;
+}
+
 extern "C" int nfc_shim_init(int i2c_port, int sda_gpio, int scl_gpio)
 {
     // 起動時から B で begin() する (issue #96: 当面の主用途が免許証読み取りのため。

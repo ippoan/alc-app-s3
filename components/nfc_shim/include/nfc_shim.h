@@ -22,6 +22,14 @@ extern "C" {
 int nfc_shim_init(int i2c_port, int sda_gpio, int scl_gpio);
 
 /**
+ * ST25R3916 (0x50) が sda_gpio / scl_gpio の向きで ack を返すかだけを見る。
+ * その場でバスを立てて probe し、すぐ消す — nfc_shim_init より前に呼ぶこと
+ * (init が同じポートにバスを立てた後は -1)。配線の向き (SDA と SCL の逆挿し) の判定用。
+ * 戻り値: 1=ack あり、0=ack なし、負=バスを立てられない。
+ */
+int nfc_shim_probe(int i2c_port, int sda_gpio, int scl_gpio);
+
+/**
  * 交通系IC (Suica/PASMO 等, NFC-F) を1回ポーリングする。
  * 検出した場合 IDm を16進文字列(小文字なし、大文字16桁、終端NUL込み)で out_hex に書き込み、
  * 書き込んだ文字数 (NUL抜き) を返す。未検出は 0、エラーは負値。
