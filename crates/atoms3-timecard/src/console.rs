@@ -25,6 +25,10 @@
 //! | `VEIN SAY PLACE\|AGAIN\|ENROLLED\|FAILED` | 案内音声 (`vein` feature)。`OK VEIN SAY <x>` |
 //! | `VEIN FINGER?` | 指の有無を 1 回問い合わせる (`vein` feature)。`VEIN FINGER 0\|1` / `ERR VEIN UNSUPPORTED` / `ERR VEIN <reason>` |
 //! | `VEIN ENROLL <id>` / `VEIN IDENTIFY` / `VEIN SYNC WRITE\|CLEAR …` | 照合をモジュールで行う本番の口 (`vein` feature、ippoan/alc-app#436)。行の形は docs/console-protocol.md |
+//! | `HB OK` / `HB NG <reason>` (末尾 `call=0\|1` / `grace=<秒>`) | 警告デバイスの heartbeat (`vein` feature)。**返信しない**。初回で武装し、途切れたら鳴る (main.rs の「警告デバイスを兼ねる」節) |
+//! | `HB OFF` | 監視停止 (`vein` feature)。`OK HB OFF` |
+//!
+//! `vein` feature の `STATUS` は行末に ` ALARM=<state>/<cause>/…` を足す (CoreS3 の host_link と同じ欄)。
 
 use alc_hub_common::{
     config,
@@ -32,8 +36,12 @@ use alc_hub_common::{
     settings::Settings,
     status::{epoch_ms, SharedStatus},
 };
+#[cfg(feature = "vein")]
+use alc_hub_core::alarm::SharedMonitor;
 use alc_hub_core::protocol::{parse_line, HostCommand, HostKind};
 use alc_hub_core::uplink::MIN_SYNCED_MS;
+#[cfg(feature = "vein")]
+use alc_hub_drivers::alarm;
 use alc_hub_drivers::console;
 #[cfg(feature = "vein")]
 use alc_hub_drivers::vein;
@@ -56,6 +64,7 @@ pub fn start(
     settings: Settings,
     pair_flag: PairFlag,
     #[cfg(feature = "vein")] vein: vein::Link,
+    #[cfg(feature = "vein")] monitor: SharedMonitor,
 ) -> Result<()> {
     // シリアル OTA を受けるので、USB の受信リングは広い方 (チャンクを丸ごと受ける。
     // Refs ippoan/alc-app#425)
@@ -68,6 +77,8 @@ pub fn start(
             &pair_flag,
             #[cfg(feature = "vein")]
             &vein,
+            #[cfg(feature = "vein")]
+            &monitor,
         )
     })
 }
@@ -78,6 +89,7 @@ fn handle_line(
     settings: &Settings,
     pair_flag: &PairFlag,
     #[cfg(feature = "vein")] vein: &vein::Link,
+    #[cfg(feature = "vein")] monitor: &SharedMonitor,
 ) {
     let command = match parse_line(line, 0) {
         Ok(Some(command)) => command,
@@ -123,7 +135,8 @@ fn handle_line(
             // DB 側で NULL にもならない)。判定は送信側と同じ MIN_SYNCED_MS を
             // 使う — ここだけ別の閾値にすると「CLOCK=1 なのに補正が走る」がありうる
             let epoch = epoch_ms();
-            println!(
+            #[allow(unused_mut)]
+            let mut line = format!(
                 "STATUS LAN={} IP={} VER={} CLOCK={} EPOCH={}",
                 u8::from(lan),
                 if ip.is_empty() { "-" } else { &ip },
@@ -131,6 +144,27 @@ fn handle_line(
                 u8::from(epoch >= MIN_SYNCED_MS),
                 epoch,
             );
+            // 警告デバイスの状態 (`vein`)。CoreS3 の host_link と同じ欄を行末に足す
+            #[cfg(feature = "vein")]
+            alarm::with_monitor(monitor, |m, now| {
+                line.push(' ');
+                line.push_str(&m.status_field(now));
+            });
+            println!("{line}");
+        }
+        // 警告デバイスの heartbeat (`vein`)。**応答を返さない** — 3 秒ごとに来る。
+        // 状態遷移はここでは起こさず、鳴動ループ (alarm_loop.rs) の tick が判定する
+        #[cfg(feature = "vein")]
+        HostCommand::Heartbeat {
+            ok,
+            reason,
+            call,
+            grace,
+        } => alarm::apply_heartbeat(monitor, ok, reason.as_deref(), call, grace),
+        #[cfg(feature = "vein")]
+        HostCommand::HeartbeatOff => {
+            alarm::disarm(monitor);
+            println!("OK HB OFF");
         }
         // オンラインアップデート (進捗・結果は EVT OTA_*)
         HostCommand::Ota { url } => console::handle_ota_lan_guarded(url, status),
