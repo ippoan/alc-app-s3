@@ -38,6 +38,44 @@ pub fn conn_evt_name(kind: DeviceKind, omron: bool) -> Option<&'static str> {
     }
 }
 
+/// BLE の接続パラメータ (単位は NimBLE と同じ: 間隔 1.25ms・監視タイムアウト 10ms)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnParams {
+    pub min_itvl: u16,
+    pub max_itvl: u16,
+    pub latency: u16,
+    pub timeout: u16,
+}
+
+/// Omron 機の送信接続で、暗号化のあとに頼む接続間隔 (15〜30ms、監視 2 秒)。
+/// 購読は 1 本ごとに記述子の探索と書き込みで 3 往復かかり、往復の長さは接続間隔で決まる。
+/// 機器の言いなりの間隔では購読 1 本に 0.4 秒前後かかっていた (2026-10-30 実測)
+pub const OMRON_FAST_CONN: ConnParams = ConnParams {
+    min_itvl: 12,
+    max_itvl: 24,
+    latency: 0,
+    timeout: 200,
+};
+
+/// 接続パラメータの実測を出す行 (`EVT OMRON_CONNP at=<段> itvl=<ms> lat=<回> to=<ms>`)。
+/// 間隔は 1.25ms 単位なので 0.01ms まで出す
+pub fn conn_params_evt(at: &str, itvl: u16, latency: u16, timeout: u16) -> String {
+    let itvl_x100 = u32::from(itvl) * 125;
+    format!(
+        "EVT OMRON_CONNP at={at} itvl={}.{:02}ms lat={latency} to={}ms",
+        itvl_x100 / 100,
+        itvl_x100 % 100,
+        u32::from(timeout) * 10
+    )
+}
+
+/// 速い接続間隔を頼んだ送信接続のあと、次からも頼み続けるか。
+/// 記録が 1 件も届かず時間切れで終わった回は、機器が間隔の変更を嫌った疑いがあるので
+/// 以後は頼まない (起動し直すまで。Linux で記録が届いた回は間隔を変えていなかった)
+pub fn keep_omron_fast_conn(by_timeout: bool, received: usize) -> bool {
+    !(by_timeout && received == 0)
+}
+
 /// Omron の BLE 機器 (HEM-6231T / HCR-1901T2) の広告がどちらの状態か。
 /// HEM-6231T は service UUID を広告せず名前で見分ける (Refs #237、Linux で実測)。
 /// HCR-1901T2 は本体広告のメーカーデータで見分ける ([`omron_adv_from_mfg`])。
@@ -339,6 +377,35 @@ pub fn should_remember_bp_bond(site: BpBondSite) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn conn_params_evt_shows_milliseconds() {
+        assert_eq!(
+            conn_params_evt("enc", 24, 0, 200),
+            "EVT OMRON_CONNP at=enc itvl=30.00ms lat=0 to=2000ms"
+        );
+        assert_eq!(
+            conn_params_evt("sub", 39, 4, 600),
+            "EVT OMRON_CONNP at=sub itvl=48.75ms lat=4 to=6000ms"
+        );
+    }
+
+    #[test]
+    fn omron_fast_conn_is_15_to_30ms() {
+        assert_eq!(OMRON_FAST_CONN.min_itvl * 125 / 100, 15);
+        assert_eq!(OMRON_FAST_CONN.max_itvl * 125 / 100, 30);
+        assert_eq!(OMRON_FAST_CONN.latency, 0);
+        assert_eq!(OMRON_FAST_CONN.timeout, 200);
+    }
+
+    #[test]
+    fn fast_conn_is_dropped_only_after_an_empty_timeout() {
+        assert!(!keep_omron_fast_conn(true, 0));
+        assert!(keep_omron_fast_conn(true, 1));
+        assert!(keep_omron_fast_conn(false, 0));
+        assert!(keep_omron_fast_conn(false, 2));
+    }
+
 
     #[test]
     fn conn_evt_name_by_kind() {

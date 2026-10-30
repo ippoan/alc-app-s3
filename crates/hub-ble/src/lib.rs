@@ -50,8 +50,9 @@ use std::time::Duration;
 
 use alc_hub_core::{
     device::{
-        conn_evt_name, match_device_name, omron_addr_from_name, omron_adv, omron_adv_from_mfg,
-        should_remember_bp_bond, BpBondSite, DeviceKind, OmronAdv,
+        conn_evt_name, conn_params_evt, keep_omron_fast_conn, match_device_name,
+        omron_addr_from_name, omron_adv, omron_adv_from_mfg, should_remember_bp_bond, BpBondSite,
+        DeviceKind, OmronAdv, OMRON_FAST_CONN,
     },
     ieee11073::{parse_blood_pressure, parse_temperature},
 };
@@ -98,6 +99,9 @@ const OMRON_SERVICE: BleUuid = uuid128!("ecbe3980-c9a2-11e1-b1bd-0002a5d5c51b");
 /// bond だけで標準 BLS (0x2A35) を流す (Windows で実測)。この service が在るかで
 /// ペアリングの手順を分ける
 const OMRON_SERVICE_16: u16 = 0xFE4A;
+/// Omron 機の送信接続で速い接続間隔 ([`OMRON_FAST_CONN`]) を頼むか。記録が届かず時間切れで
+/// 終わった回に下ろし、起動し直すまで頼まない ([`keep_omron_fast_conn`])
+static OMRON_FAST_CONN_ON: AtomicBool = AtomicBool::new(true);
 /// 全 0 アドレスで届いた Omron の本体広告の状態と時刻。名前を持つ scan response と
 /// 突き合わせて接続先アドレスを起こすために置く ([`match_target`] を参照)
 static OMRON_ZERO_ADV: Mutex<Option<(u64, OmronAdv)>> = Mutex::new(None);
@@ -674,6 +678,8 @@ async fn handle_device(
         omron_unbond(&addr);
     }
 
+    // この接続で速い接続間隔を頼んだか (記録が届かなかった回に以後は頼まないため)
+    let mut fast_conn = false;
     // Arduino 版と同様に最大 3 回リトライ
     let mut attempt = 0;
     // Omron の送信広告への接続では、接続ができた瞬間に暗号化を始める
@@ -747,7 +753,8 @@ async fn handle_device(
             let retry = early.map_or(0, |e| e.retry);
             match res {
                 Ok(Ok(())) => {
-                    alc_hub_common::evtlog::emit(&format!("EVT OMRON_ENC ok retry={retry}"))
+                    alc_hub_common::evtlog::emit(&format!("EVT OMRON_ENC ok retry={retry}"));
+                    omron_request_fast_conn(client, &mut fast_conn);
                 }
                 Ok(Err(e)) => {
                     log::warn!("ble: Omron 暗号化失敗: {e:?}");
@@ -835,6 +842,7 @@ async fn handle_device(
         // 1 本ごとに送信を見る
         let n = omron_subscribe_all(client, &disconnected, &mut send_omron).await?;
         alc_hub_common::evtlog::emit(&format!("EVT OMRON_SUB n={n}"));
+        emit_conn_params(client, "sub");
     } else if characteristic.can_indicate() {
         characteristic
             .subscribe_indicate(cccd_response)
@@ -884,6 +892,10 @@ async fn handle_device(
             let n = buffer.lock().map(|b| b.len()).unwrap_or(0);
             if by == "timeout" && n == 0 {
                 alc_hub_common::evtlog::emit("EVT OMRON_RX timeout");
+            }
+            if fast_conn && !keep_omron_fast_conn(by == "timeout", n) {
+                OMRON_FAST_CONN_ON.store(false, Ordering::SeqCst);
+                alc_hub_common::evtlog::emit("EVT OMRON_CONNP off");
             }
             alc_hub_common::evtlog::emit(&format!("EVT OMRON_END by={by} n={n}"));
             println!(
@@ -1511,6 +1523,35 @@ async fn omron_subscribe_all(
             anyhow::Ok(n)
         })
         .await?
+}
+
+/// 接続パラメータの実測を `EVT OMRON_CONNP at=<段> …` で出す (取れなければ出さない)
+fn emit_conn_params(client: &BLEClient, at: &str) {
+    if let Ok(desc) = client.desc() {
+        alc_hub_common::evtlog::emit(&conn_params_evt(
+            at,
+            desc.interval(),
+            desc.latency(),
+            desc.timeout(),
+        ));
+    }
+}
+
+/// 暗号化のあと、購読の前に、Omron 機へ速い接続間隔を頼む。頼む前の間隔を出しておく。
+/// 暗号化と同時に頼むと LL の手順がぶつかるので、暗号化が済んでから頼む
+fn omron_request_fast_conn(client: &mut BLEClient, fast_conn: &mut bool) {
+    emit_conn_params(client, "enc");
+    if !OMRON_FAST_CONN_ON.load(Ordering::SeqCst) {
+        return;
+    }
+    let p = OMRON_FAST_CONN;
+    match client.update_conn_params(p.min_itvl, p.max_itvl, p.latency, p.timeout) {
+        Ok(()) => *fast_conn = true,
+        Err(e) => {
+            log::warn!("ble: Omron の接続間隔の変更を頼めなかった: {e:?}");
+            alc_hub_common::evtlog::emit("EVT OMRON_CONNP req err");
+        }
+    }
 }
 
 /// on_disconnect で立つ印。立ったら待っている future を起こす。
