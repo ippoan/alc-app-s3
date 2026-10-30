@@ -50,9 +50,8 @@ use std::time::Duration;
 
 use alc_hub_core::{
     device::{
-        conn_evt_name, conn_params_evt, keep_omron_fast_conn, match_device_name,
-        omron_addr_from_name, omron_adv, omron_adv_from_mfg, should_remember_bp_bond, BpBondSite,
-        DeviceKind, OmronAdv, OMRON_FAST_CONN,
+        conn_evt_name, conn_params_evt, match_device_name, omron_addr_from_name, omron_adv,
+        omron_adv_from_mfg, should_remember_bp_bond, BpBondSite, DeviceKind, OmronAdv,
     },
     ieee11073::{parse_blood_pressure, parse_temperature},
 };
@@ -99,9 +98,6 @@ const OMRON_SERVICE: BleUuid = uuid128!("ecbe3980-c9a2-11e1-b1bd-0002a5d5c51b");
 /// bond だけで標準 BLS (0x2A35) を流す (Windows で実測)。この service が在るかで
 /// ペアリングの手順を分ける
 const OMRON_SERVICE_16: u16 = 0xFE4A;
-/// Omron 機の送信接続で速い接続間隔 ([`OMRON_FAST_CONN`]) を頼むか。記録が届かず時間切れで
-/// 終わった回に下ろし、起動し直すまで頼まない ([`keep_omron_fast_conn`])
-static OMRON_FAST_CONN_ON: AtomicBool = AtomicBool::new(true);
 /// 全 0 アドレスで届いた Omron の本体広告の状態と時刻。名前を持つ scan response と
 /// 突き合わせて接続先アドレスを起こすために置く ([`match_target`] を参照)
 static OMRON_ZERO_ADV: Mutex<Option<(u64, OmronAdv)>> = Mutex::new(None);
@@ -129,6 +125,15 @@ const OMRON_SET_KEY_WAIT_MS: u64 = 3_000;
 /// Omron 機への secure_connection の上限。保存済みの鍵で暗号化を始めて機器が応じないと、
 /// ENC_CHANGE も切断も来ずに止まる (S3R で実測)
 const OMRON_SECURE_TIMEOUT_MS: u64 = 10_000;
+/// Omron 機への接続 (接続の確立〜MTU の交換。送信接続では暗号化の開始も含む) の上限。
+/// 接続が切れて張り直されると (`EVT OMRON_ENC start … retry=<n>`)、esp32-nimble の connect は
+/// MTU の完了も切断も知らされずに戻らなくなることがある。接続が張られたままなので機器は
+/// 広告を止め (BLE マークが消え)、USB を抜き差しするまで体温も血圧も取れなかった (2026-10-30)。
+/// 正常な回は見つけてから 1 秒前後で暗号化まで済む
+const OMRON_CONNECT_TIMEOUT_MS: u64 = 10_000;
+/// 打ち切った接続が消えるのを待つ上限と、見る間隔
+const OMRON_TERMINATE_WAIT_MS: u32 = 2_000;
+const OMRON_TERMINATE_POLL_MS: u32 = 50;
 /// early start のあと、この時間暗号化されなければ暗号化を始め直す
 const OMRON_ENC_RESTART_MS: u64 = 3_000;
 /// early start 後のサービス探索で、見つかった数がこの時間変わらなければ完了とみなす
@@ -300,7 +305,10 @@ async fn task(
         let ota_active = status
             .lock()
             .map(|mut st| {
-                st.ble_loop_beat_ms = Some(now_ms());
+                let now = now_ms();
+                st.ble_loop_beat_ms = Some(now);
+                st.ble_stage = "scan";
+                st.ble_stage_ms = Some(now);
                 st.ota_active
             })
             .unwrap_or(false);
@@ -478,6 +486,7 @@ async fn task(
         // 接続開始を UI へ通知 → 点呼画面のラベル横に取得中スピナーを表示
         let _ = ui_tx.send(UiCommand::BleAcquiring { device: kind });
 
+        set_ble_stage(&status, "connect");
         let mut client = device.new_client();
         let result = handle_device(&mut client, addr, kind, omron, &status, &meas_tx).await;
         // 測定を受け取れたか / 受け取れずに終わったか (Refs #252)
@@ -678,8 +687,6 @@ async fn handle_device(
         omron_unbond(&addr);
     }
 
-    // この接続で速い接続間隔を頼んだか (記録が届かなかった回に以後は頼まないため)
-    let mut fast_conn = false;
     // Arduino 版と同様に最大 3 回リトライ
     let mut attempt = 0;
     // Omron の送信広告への接続では、接続ができた瞬間に暗号化を始める
@@ -694,7 +701,24 @@ async fn handle_device(
             addr,
             omron == Some(OmronAdv::Transfer),
         );
-        let res = disconnected.until(connect).await.map(|(res, early)| {
+        // Omron 機は上限を付けて待つ。時間切れは張りかけの接続を切ってから諦める
+        // (リトライしない — 機器はまだつながっていると思っているため)
+        let res = if omron.is_some() {
+            match disconnected
+                .until_timeout(connect, OMRON_CONNECT_TIMEOUT_MS)
+                .await
+            {
+                Err(e) if !disconnected.is_set() => {
+                    omron_abort_connect(&addr);
+                    alc_hub_common::evtlog::emit("EVT OMRON_CONN err stage=connect timeout");
+                    return Err(e.context("Omron 接続の打ち切り"));
+                }
+                res => res,
+            }
+        } else {
+            disconnected.until(connect).await
+        }
+        .map(|(res, early)| {
             early_enc = early;
             res
         });
@@ -732,6 +756,7 @@ async fn handle_device(
             }
         },
         Some(OmronAdv::Transfer) => {
+            set_ble_stage(status, "enc");
             // Omron 機はニプロ機と違い、保存済み bond で先に暗号化しないと 0x2A35 を
             // 送らない (Linux で実測)。時刻 (0x2A2B) は書かない — 書くと記録が独自形式の
             // 別 characteristic に移る
@@ -754,7 +779,7 @@ async fn handle_device(
             match res {
                 Ok(Ok(())) => {
                     alc_hub_common::evtlog::emit(&format!("EVT OMRON_ENC ok retry={retry}"));
-                    omron_request_fast_conn(client, &mut fast_conn);
+                    emit_conn_params(client, "enc");
                 }
                 Ok(Err(e)) => {
                     log::warn!("ble: Omron 暗号化失敗: {e:?}");
@@ -835,6 +860,7 @@ async fn handle_device(
             alc_hub_common::evtlog::emit(&format!("EVT OMRON_SENT n={sent_n}"));
         }
     };
+    set_ble_stage(status, "sub");
     if omron.is_some() {
         // Omron 機は 0x2A35 だけの購読では記録を送らない。Linux で記録が届いた回と同じく、
         // 全 service の notify / indicate を GATT の並び順に全部購読する
@@ -875,6 +901,7 @@ async fn handle_device(
     // Omron 機は受信しても S3R から切らず、機器が切断するまで (上限 OMRON_SESSION_TIMEOUT_MS) 待つ。
     // 機器が「送信済み」と見なすのは切断の後なので切らないが、値は届いた時点で (購読の途中でも)
     // 最新 1 件を先に送る (切断を待つと画面に出るまで 5 秒ほど余計にかかる)
+    set_ble_stage(status, "session");
     let wait_start = now_ms();
     loop {
         if omron.is_some() {
@@ -892,10 +919,6 @@ async fn handle_device(
             let n = buffer.lock().map(|b| b.len()).unwrap_or(0);
             if by == "timeout" && n == 0 {
                 alc_hub_common::evtlog::emit("EVT OMRON_RX timeout");
-            }
-            if fast_conn && !keep_omron_fast_conn(by == "timeout", n) {
-                OMRON_FAST_CONN_ON.store(false, Ordering::SeqCst);
-                alc_hub_common::evtlog::emit("EVT OMRON_CONNP off");
             }
             alc_hub_common::evtlog::emit(&format!("EVT OMRON_END by={by} n={n}"));
             println!(
@@ -1431,7 +1454,7 @@ fn wait_omron_ack(
 }
 
 /// Omron 機の notify / indicate を全部 Write Request で購読する。購読できた数を返す
-/// (失敗した 1 本は飛ばす)。順番は固定: 0x2A35 → 他の service (並び順) → 0x2A2B を最後。
+/// (失敗した 1 本は飛ばす)。順番は固定: 0x2A35 → unlock → 他の service (並び順) → 0x2A2B を最後。
 /// Linux で記録が届いた接続は 0x2A35 の CCCD を 0x2A2B より先に書いていて、逆順 (ESP32 の
 /// ハンドル順) の接続では 0x2A2B の notify すら来なかった。機器は 0x2A2B の購読を送信開始の
 /// 合図にしていて、そのとき 0x2A35 が未購読だと何も送らないと読める (Refs #237)。
@@ -1477,7 +1500,23 @@ async fn omron_subscribe_all(
             n += log_sub(bpm_uuid, &res);
             on_each();
 
-            // 2. 0x1810 と 0x1805 以外を並び順に
+            // 2. unlock (b305b680) を 2 番目に。記録はこの購読の直後に届く (3 回とも。
+            //    2026-10-30 実測) ので、他の購読を待たせない。unlock は 128bit の
+            //    OMRON_SERVICE にも 16bit の 0xFE4A にも在るので、service を問わず探す。
+            //    見つからない機種は従来どおり 3. の並び順で購読する
+            let mut unlock_done = false;
+            let services: Vec<_> = client.get_services().await?.collect();
+            for svc in services {
+                if let Ok(chr) = svc.get_characteristic(OMRON_UNLOCK).await {
+                    let res = chr.subscribe_notify(true).await;
+                    n += log_sub(OMRON_UNLOCK, &res);
+                    on_each();
+                    unlock_done = res.is_ok();
+                    break;
+                }
+            }
+
+            // 3. 0x1810 と 0x1805 以外を並び順に (先に購読した unlock は飛ばす)
             let services: Vec<_> = client.get_services().await?.collect();
             for svc in services {
                 let svc_uuid = svc.uuid();
@@ -1495,6 +1534,9 @@ async fn omron_subscribe_all(
                     if !(chr.can_indicate() || chr.can_notify()) {
                         continue;
                     }
+                    if unlock_done && chr.uuid() == OMRON_UNLOCK {
+                        continue;
+                    }
                     let chr_uuid = chr.uuid();
                     let res = if chr.can_indicate() {
                         chr.subscribe_indicate(true).await
@@ -1506,7 +1548,7 @@ async fn omron_subscribe_all(
                 }
             }
 
-            // 3. 0x2A2B を最後に
+            // 4. 0x2A2B を最後に
             let res = async {
                 client
                     .get_service(cts_uuid)
@@ -1525,6 +1567,14 @@ async fn omron_subscribe_all(
         .await?
 }
 
+/// BLE ループが今いる段を控える (`BLE PING` が返す)
+fn set_ble_stage(status: &SharedStatus, stage: &'static str) {
+    if let Ok(mut st) = status.lock() {
+        st.ble_stage = stage;
+        st.ble_stage_ms = Some(now_ms());
+    }
+}
+
 /// 接続パラメータの実測を `EVT OMRON_CONNP at=<段> …` で出す (取れなければ出さない)
 fn emit_conn_params(client: &BLEClient, at: &str) {
     if let Ok(desc) = client.desc() {
@@ -1537,20 +1587,36 @@ fn emit_conn_params(client: &BLEClient, at: &str) {
     }
 }
 
-/// 暗号化のあと、購読の前に、Omron 機へ速い接続間隔を頼む。頼む前の間隔を出しておく。
-/// 暗号化と同時に頼むと LL の手順がぶつかるので、暗号化が済んでから頼む
-fn omron_request_fast_conn(client: &mut BLEClient, fast_conn: &mut bool) {
-    emit_conn_params(client, "enc");
-    if !OMRON_FAST_CONN_ON.load(Ordering::SeqCst) {
-        return;
+/// 張りかけ・張ったままの Omron 機への接続を打ち切り、消えるまで待つ。
+/// 張り直された接続は esp32-nimble の client が知らない handle を持つことがあり、
+/// client を捨てたあとにその接続のイベントが client へ届かないよう、先にコールバックを外す
+fn omron_abort_connect(addr: &BLEAddress) {
+    let peer: esp_idf_svc::sys::ble_addr_t = (*addr).into();
+    // 接続の確立待ちなら取り消す (無ければエラーが返るだけ)
+    unsafe {
+        esp_idf_svc::sys::ble_gap_conn_cancel();
     }
-    let p = OMRON_FAST_CONN;
-    match client.update_conn_params(p.min_itvl, p.max_itvl, p.latency, p.timeout) {
-        Ok(()) => *fast_conn = true,
-        Err(e) => {
-            log::warn!("ble: Omron の接続間隔の変更を頼めなかった: {e:?}");
-            alc_hub_common::evtlog::emit("EVT OMRON_CONNP req err");
+    let mut waited = 0;
+    loop {
+        let mut desc = esp_idf_svc::sys::ble_gap_conn_desc::default();
+        let found = unsafe { esp_idf_svc::sys::ble_gap_conn_find_by_addr(&peer, &mut desc) } == 0;
+        if !found || waited >= OMRON_TERMINATE_WAIT_MS {
+            if found {
+                log::warn!("ble: Omron 機の接続が打ち切っても消えない");
+            }
+            break;
         }
+        if waited == 0 {
+            unsafe {
+                esp_idf_svc::sys::ble_gap_set_event_cb(desc.conn_handle, None, core::ptr::null_mut());
+                esp_idf_svc::sys::ble_gap_terminate(
+                    desc.conn_handle,
+                    esp_idf_svc::sys::ble_error_codes_BLE_ERR_REM_USER_CONN_TERM as _,
+                );
+            }
+        }
+        FreeRtos::delay_ms(OMRON_TERMINATE_POLL_MS);
+        waited += OMRON_TERMINATE_POLL_MS;
     }
 }
 

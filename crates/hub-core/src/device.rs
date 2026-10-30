@@ -38,24 +38,23 @@ pub fn conn_evt_name(kind: DeviceKind, omron: bool) -> Option<&'static str> {
     }
 }
 
-/// BLE の接続パラメータ (単位は NimBLE と同じ: 間隔 1.25ms・監視タイムアウト 10ms)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConnParams {
-    pub min_itvl: u16,
-    pub max_itvl: u16,
-    pub latency: u16,
-    pub timeout: u16,
-}
+/// BLE ループの段が、この時間より長く同じ段のままなら止まっているとみなす。
+/// 正常な段の最長は Omron の送信接続の待ち (20 秒) と接続・暗号化の上限 (各 10 秒)
+pub const BLE_STAGE_STUCK_MS: u64 = 30_000;
 
-/// Omron 機の送信接続で、暗号化のあとに頼む接続間隔 (15〜30ms、監視 2 秒)。
-/// 購読は 1 本ごとに記述子の探索と書き込みで 3 往復かかり、往復の長さは接続間隔で決まる。
-/// 機器の言いなりの間隔では購読 1 本に 0.4 秒前後かかっていた (2026-10-30 実測)
-pub const OMRON_FAST_CONN: ConnParams = ConnParams {
-    min_itvl: 12,
-    max_itvl: 24,
-    latency: 0,
-    timeout: 200,
-};
+/// `BLE PING` への応答。`BLE PONG run=<0|1> stage=<段> age=<ms|-> stuck=<0|1>`。
+/// `run=0` は BLE を積まない・起こさない機。`age` は今の段に入ってからの時間で、
+/// [`BLE_STAGE_STUCK_MS`] を超えたら `stuck=1` (ブラウザは画面に出す)
+pub fn ble_pong_line(running: bool, stage: &str, stage_age_ms: Option<u64>) -> String {
+    let stage = if stage.is_empty() { "-" } else { stage };
+    let age = stage_age_ms.map_or_else(|| "-".to_string(), |ms| ms.to_string());
+    let stuck = running && stage_age_ms.is_some_and(|ms| ms > BLE_STAGE_STUCK_MS);
+    format!(
+        "BLE PONG run={} stage={stage} age={age} stuck={}",
+        u8::from(running),
+        u8::from(stuck)
+    )
+}
 
 /// 接続パラメータの実測を出す行 (`EVT OMRON_CONNP at=<段> itvl=<ms> lat=<回> to=<ms>`)。
 /// 間隔は 1.25ms 単位なので 0.01ms まで出す
@@ -67,13 +66,6 @@ pub fn conn_params_evt(at: &str, itvl: u16, latency: u16, timeout: u16) -> Strin
         itvl_x100 % 100,
         u32::from(timeout) * 10
     )
-}
-
-/// 速い接続間隔を頼んだ送信接続のあと、次からも頼み続けるか。
-/// 記録が 1 件も届かず時間切れで終わった回は、機器が間隔の変更を嫌った疑いがあるので
-/// 以後は頼まない (起動し直すまで。Linux で記録が届いた回は間隔を変えていなかった)
-pub fn keep_omron_fast_conn(by_timeout: bool, received: usize) -> bool {
-    !(by_timeout && received == 0)
 }
 
 /// Omron の BLE 機器 (HEM-6231T / HCR-1901T2) の広告がどちらの状態か。
@@ -379,6 +371,28 @@ pub fn should_remember_bp_bond(site: BpBondSite) -> bool {
 mod tests {
 
     #[test]
+    fn ble_pong_line_reports_stage_and_stuck() {
+        assert_eq!(
+            ble_pong_line(true, "connect", Some(1_200)),
+            "BLE PONG run=1 stage=connect age=1200 stuck=0"
+        );
+        assert_eq!(
+            ble_pong_line(true, "connect", Some(BLE_STAGE_STUCK_MS)),
+            "BLE PONG run=1 stage=connect age=30000 stuck=0"
+        );
+        assert_eq!(
+            ble_pong_line(true, "connect", Some(BLE_STAGE_STUCK_MS + 1)),
+            "BLE PONG run=1 stage=connect age=30001 stuck=1"
+        );
+        assert_eq!(ble_pong_line(true, "", None), "BLE PONG run=1 stage=- age=- stuck=0");
+        assert_eq!(
+            ble_pong_line(false, "scan", Some(99_999)),
+            "BLE PONG run=0 stage=scan age=99999 stuck=0"
+        );
+    }
+
+
+    #[test]
     fn conn_params_evt_shows_milliseconds() {
         assert_eq!(
             conn_params_evt("enc", 24, 0, 200),
@@ -389,23 +403,6 @@ mod tests {
             "EVT OMRON_CONNP at=sub itvl=48.75ms lat=4 to=6000ms"
         );
     }
-
-    #[test]
-    fn omron_fast_conn_is_15_to_30ms() {
-        assert_eq!(OMRON_FAST_CONN.min_itvl * 125 / 100, 15);
-        assert_eq!(OMRON_FAST_CONN.max_itvl * 125 / 100, 30);
-        assert_eq!(OMRON_FAST_CONN.latency, 0);
-        assert_eq!(OMRON_FAST_CONN.timeout, 200);
-    }
-
-    #[test]
-    fn fast_conn_is_dropped_only_after_an_empty_timeout() {
-        assert!(!keep_omron_fast_conn(true, 0));
-        assert!(keep_omron_fast_conn(true, 1));
-        assert!(keep_omron_fast_conn(false, 0));
-        assert!(keep_omron_fast_conn(false, 2));
-    }
-
 
     #[test]
     fn conn_evt_name_by_kind() {

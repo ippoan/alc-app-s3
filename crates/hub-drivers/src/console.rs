@@ -320,6 +320,20 @@ pub fn handle_common(
 ) -> Option<HostCommand> {
     match command {
         HostCommand::Ping => println!("PONG"),
+        HostCommand::BlePing => {
+            let line = status
+                .lock()
+                .map(|st| {
+                    alc_hub_core::device::ble_pong_line(
+                        st.ble_running,
+                        st.ble_stage,
+                        st.ble_stage_ms
+                            .map(|t| alc_hub_common::status::now_ms().saturating_sub(t)),
+                    )
+                })
+                .unwrap_or_else(|_| "ERR BLE: 状態を読めません".to_string());
+            println!("{line}");
+        }
         // 機種の名乗り (Refs ippoan/alc-app#353)。ブラウザ側の機種識別は
         // これ 1 本に集約する — `STATUS` の応答は機種ごとに違うので識別には
         // 使わない。`BOARD=` (板種) は元 `STATUS` にあったが、板種は不変なので
