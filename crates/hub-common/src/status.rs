@@ -77,6 +77,13 @@ pub struct HubStatus {
     /// `ble_running` (起動したか) とは別 — あちらはループが止まっても true のまま
     pub ble_loop_beat_ms: Option<u64>,
 
+    /// BLE ループが今いる段 (`scan` / `connect` / `enc` / `sub` / `session`) と、その段に
+    /// 入った時刻 [ms]。`BLE PING` が返す ([`alc_hub_core::device::ble_pong_line`])。
+    /// 先頭の拍 (`ble_loop_beat_ms`) は接続の間は進まないので、接続の中で止まったかは
+    /// こちらで見る (2026-10-30: 接続の途中で止まり USB の抜き差しまで戻らなかった)
+    pub ble_stage: &'static str,
+    pub ble_stage_ms: Option<u64>,
+
     /// 進行中の点呼セッションの識別子 (Refs #112)。点呼画面 (Measuring) に
     /// いる間だけ Some で、待機画面へ戻ると None に戻る。**発番と更新は UI
     /// スレッドだけが行い、recorder は読むだけ** — 点呼の開始/終了を知って

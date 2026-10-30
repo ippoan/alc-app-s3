@@ -138,6 +138,9 @@ pub enum HostCommand {
     WifiTest,
     /// BLE の全ボンド消去 → 次接続で再ペアリング (血圧計の暗号化接続復旧)
     BlePair,
+    /// BLE ループの生存確認 (`BLE PONG …`、[`crate::device::ble_pong_line`])。
+    /// 血圧の画面が 1 秒ごとに送り、BLE だけが止まった回を見つける
+    BlePing,
     /// 血圧計として記録した 1 台分のボンドだけを外す (`BP UNBOND`、Refs ippoan/alc-app#401)。
     /// WS 下り command `bp_unbond` と同じ依頼の USB の口 — 他の機器のボンドは残し、
     /// ペアリング受付も開かない (`PAIR` との違い)。**CoreS3 だけが受ける**
@@ -696,7 +699,8 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
         "PAIR" => HostCommand::BlePair,
         "BLE" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
             Some("PAIR") => HostCommand::BlePair,
-            _ => return Err("ERR BLE: PAIR が必要です".into()),
+            Some("PING") => HostCommand::BlePing,
+            _ => return Err("ERR BLE: PAIR|PING が必要です".into()),
         },
         // 血圧計 1 台分のボンドを外す (Refs ippoan/alc-app#401)
         "BP" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
@@ -1116,6 +1120,8 @@ mod tests {
     fn ble_pair() {
         assert_eq!(parse_line("PAIR", T), Ok(Some(HostCommand::BlePair)));
         assert_eq!(parse_line("ble pair", T), Ok(Some(HostCommand::BlePair)));
+        assert_eq!(parse_line("BLE PING", T), Ok(Some(HostCommand::BlePing)));
+        assert_eq!(parse_line("ble ping", T), Ok(Some(HostCommand::BlePing)));
         assert!(parse_line("BLE", T).is_err());
         assert!(parse_line("BLE SCAN", T).is_err());
     }
