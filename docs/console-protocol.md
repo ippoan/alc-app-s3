@@ -107,7 +107,7 @@ CoreS3 だけ (`crates/hub-core/src/board.rs`)。板種は起動後に変わら�
 |---|---|
 | `cores3` | `STATUS LAN=0 RS232=1 BLE=0 WIFI=0 ROT=0 ALARM=idle/none/-/0` |
 | `atoms3-print` | `STATUS LAN=1 IP=192.168.x.x PRINTER=host:9100 VER=…` |
-| `timecard` | `STATUS LAN=1 IP=192.168.x.x VER=… CLOCK=1 EPOCH=…` |
+| `timecard` | `STATUS LAN=1 IP=192.168.x.x VER=… CLOCK=1 EPOCH=…` (`vein` build は行末に ` ALARM=idle/none/-/0` を足す。下の ★) |
 | `alarm` | `STATUS alarm state=idle cause=none hb_age_ms=1200 VER=…` |
 | `bp-station` | 持たない — `ERR UNSUPPORTED (bp-station)` |
 
@@ -115,6 +115,12 @@ CoreS3 だけ (`crates/hub-core/src/board.rs`)。板種は起動後に変わら�
 使われていた名残り**。互換のため文字列は変えていないが、**識別は上の
 `DEVICE` を見ること** — 新しい判定コードを `STATUS` の中身に依存させないこと。
 CoreS3 の `STATUS LAN=…` も同様 (行頭は互換のため変えない)。
+
+★ Vein Base (`timecard` の `vein` build) は、運行管理者席で Atom VoiceS3R の代わりに
+**警告デバイスを兼ねる**。`HB OK` / `HB NG <reason>` / `HB OFF` に CoreS3 と同じく答え
+(初回の `HB OK` で武装し、途切れたら鳴る。`HB OFF` は `OK HB OFF`、他は返信しない)、
+鳴動の状態は `STATUS` 行末の `ALARM=…` (CoreS3 と同じ欄) で渡す。`EVT ALARM` の行は出さない。
+heartbeat を受けない機体 (キオスクの Vein Station) は武装しないので鳴らない
 
 ## 4. 共通コマンド (どの機種が何に答えるか)
 
@@ -336,7 +342,7 @@ USB でつながる警告デバイス (`alarm`、Refs ippoan/alc-app#425) を、
 - **受信中はホストが他の行を送れない** (`HB OK` も生バイトとして読まれる)。CoreS3 の
   沈黙警告は heartbeat が 10 秒途切れると鳴るので、ホストは `OTA SERIAL` の前に
   `HB OFF` で監視を止める (または `HB OK grace=<秒>` で締切を延ばす) こと
-- **警告デバイス (`alarm`) も同じ**: ホストは `OTA SERIAL` の前に heartbeat の見張りを
+- **警告デバイス (`alarm`) と、警告デバイスを兼ねる Vein Base (`timecard` の `vein` build) も同じ**: ホストは `OTA SERIAL` の前に heartbeat の見張りを
   休ませる (`HB OFF` か `HB OK grace=<秒>`)。休ませないと、受信中は `HB OK` が届かず
   10 秒でブザーが鳴る。警告デバイスは `ws_uplink` を持たないので、確定の口は
   `OTA CONFIRM` だけ (来なければ 10 分で前の image へ戻る)

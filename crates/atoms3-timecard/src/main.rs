@@ -99,6 +99,22 @@
 //! **中継基板 (vein-base) は未発注で変わりうる**。G5/G6 は PoE 版では W5500 の
 //! SCLK/CS だが、`station` は W5500 を起こさないので空いている。
 //!
+//! # 警告デバイスを兼ねる (`vein` feature)
+//!
+//! Vein Base を運行管理者席に置くとき、Atom VoiceS3R の代わりに警告デバイスにもなる。
+//! 管理者のブラウザの `HB OK` (3 秒ごと) が途切れたら、自分の判断で内蔵スピーカーを鳴らす。
+//! 判定は VoiceS3R・CoreS3 と同じ `alc_hub_core::alarm`、音とリングへの記録は
+//! `alc_hub_drivers::alarm`。**ここに判定を書かない** ([`alarm_loop`])。
+//!
+//! - **武装方式** (CoreS3 と同じ `with_boot_grace(None)`): **初回 `HB OK` を受けるまで鳴らない**。
+//!   キオスクの Vein Station には heartbeat が来ないので、一度も鳴らない
+//! - USB/JTAG 起因の reset で前回が武装済み (`.noinit` のフラグ) なら、武装済みで戻す
+//!   (CoreS3 と同じ、#194)。管理者のタブを閉じたときのチップ reset で「閉じたのに鳴らない」を防ぐ。
+//!   heartbeat を一度も受けていない機体はフラグが立たないので、キオスクでは戻らない
+//! - `EVT ALARM` の行は出さない (CoreS3 と同じ `emit_lines = false`)。鳴動の状態は `STATUS`
+//!   の行末の `ALARM=…` で渡す。Vein のポートは指静脈とキオスクの鍵の署名でも使うので、行を増やさない
+//! - 本体ボタン G41 で黙らせる / 鳴動へ戻す (VoiceS3R と同じトグル)
+//!
 //! # 起動順 (変えてはいけない)
 //!
 //! `crashlog::init` → `Settings::new` → `heap::start` → (`vein` なら `vein::start`) → `console::start` →
@@ -108,6 +124,8 @@
 //! `heap::start` より前**。配線漏れで `.noinit` のゴミ帳簿に書いて boot loop に
 //! なった実害が 2026-07-14 にある。
 
+#[cfg(feature = "vein")]
+mod alarm_loop;
 mod console;
 
 use alc_hub_common::{
@@ -157,7 +175,8 @@ fn main() -> Result<()> {
     config::set_firmware_version(env!("CARGO_PKG_VERSION"));
     // 前回リセットの解析 + ログ捕捉 hook (CoreS3 と同じ crashlog 基盤 #43)。
     // heap.rs の note() がリングに書くため、heap::start より前に必ず呼ぶこと
-    let (_, crash) = crashlog::init();
+    #[cfg_attr(not(feature = "vein"), allow(unused_variables))]
+    let (reset_code, crash) = crashlog::init();
     log::info!(
         "alc-hub-atoms3-timecard v{} 起動",
         config::firmware_version_full()
@@ -212,12 +231,18 @@ fn main() -> Result<()> {
     // 血圧計 1 台分のボンドを外す要求のフラグ。ws_uplink (`bp_unbond`) が立て、
     // BLE ループが消費する。こちらも**両方に同じものを渡す**
     let bp_unbond_flag = alc_hub_common::control::new_bp_unbond_flag();
+    // 警告デバイスの判定器 (`vein`。冒頭の「警告デバイスを兼ねる」節)。console (HB / STATUS) と
+    // 鳴動ループで共有する
+    #[cfg(feature = "vein")]
+    let alarm_monitor = alarm_loop::new_monitor(reset_code);
     console::start(
         Arc::clone(&status),
         settings.clone(),
         Arc::clone(&pair_flag),
         #[cfg(feature = "vein")]
         vein.clone(),
+        #[cfg(feature = "vein")]
+        Arc::clone(&alarm_monitor),
     )?;
     // シリアル OTA で入れた image の確定待ち (Refs #279)。印が無ければ何もしない
     ota::spawn_serial_confirm_watch(settings.clone());
@@ -324,6 +349,10 @@ fn main() -> Result<()> {
     if let Some(tx) = &speaker_tx {
         vein.set_speaker(tx.clone());
     }
+    // 警告の鳴動ループ (`vein`)。音は打刻音・案内音声と同じ再生キューへ積む。
+    // 音の初期化に失敗した機体でも回す (判定と `STATUS` の `ALARM=` は動く)
+    #[cfg(feature = "vein")]
+    alarm_loop::start(alarm_monitor, speaker_tx.clone(), p.pins.gpio41)?;
 
     // 血圧の上り経路も打刻と同じ送信キューへ積む。**下の nfc::start が
     // ws_meas_tx 本体を move する**ので、ここで clone を取っておく
