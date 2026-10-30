@@ -129,8 +129,9 @@ const OMRON_SECURE_TIMEOUT_MS: u64 = 10_000;
 /// 接続が切れて張り直されると (`EVT OMRON_ENC start … retry=<n>`)、esp32-nimble の connect は
 /// MTU の完了も切断も知らされずに戻らなくなることがある。接続が張られたままなので機器は
 /// 広告を止め (BLE マークが消え)、USB を抜き差しするまで体温も血圧も取れなかった (2026-10-30)。
-/// 正常な回は見つけてから 1 秒前後で暗号化まで済む
-const OMRON_CONNECT_TIMEOUT_MS: u64 = 10_000;
+/// 正常な回は見つけてから 1 秒前後で暗号化まで済む (張り直し 1 回の回も 1 秒。2026-10-30 実測)。
+/// 止まった回は 10 秒待っても戻らなかったので、待つだけ損 — 3 秒で切ってつなぎ直す
+const OMRON_CONNECT_TIMEOUT_MS: u64 = 3_000;
 /// 打ち切った接続が消えるのを待つ上限と、見る間隔
 const OMRON_TERMINATE_WAIT_MS: u32 = 2_000;
 const OMRON_TERMINATE_POLL_MS: u32 = 50;
