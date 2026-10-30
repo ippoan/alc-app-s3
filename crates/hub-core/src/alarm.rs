@@ -73,8 +73,10 @@ pub const BANNER_MS: u64 = 5_000;
 /// ボタンで黙らせているあいだ、短い合図 ([`Action::PlayMutedTick`]) を出す周期。
 /// **完全な無音にすると異常が続いていることを忘れられる** — 実機で鳴らした
 /// ユーザーの要望 (2026-09-09)。鳴動の周期 (`ALERT_PERIOD_MS`) より長く取り、
-/// 「鳴っている」ではなく「まだ直っていない」と伝わる間隔にしてある
-pub const MUTED_TICK_MS: u64 = 5_000;
+/// 「鳴っている」ではなく「まだ直っていない」と伝わる間隔にしてある。
+/// 5 秒では沈黙の 2 連 ([`SILENCE_TICK_MS`]) と同じ間隔で「止まらない」と聞こえたので、
+/// 60 秒に延ばした (2026-10-30、Vein Base の実機確認でのユーザーの要望)
+pub const MUTED_TICK_MS: u64 = 60_000;
 
 /// 沈黙 (heartbeat が来ない = USB 抜け / ブラウザを閉じた / 運行管理者タブから離れた)
 /// で鳴動中に短い 2 連 ([`Action::PlaySilenceTick`]) を出す周期。
@@ -566,6 +568,14 @@ mod tests {
         Action::Emit(format!("EVT ALARM state={state} cause={cause}"))
     }
 
+    /// 音の Action だけ (バナーの `Emit` は時刻の重なり方で混ざるので外す)
+    fn sounds(actions: Vec<Action>) -> Vec<Action> {
+        actions
+            .into_iter()
+            .filter(|a| !matches!(a, Action::Emit(_)))
+            .collect()
+    }
+
     #[test]
     fn boot_grace_delays_the_first_silence_alarm() {
         let mut m = AlarmMonitor::new();
@@ -724,28 +734,30 @@ mod tests {
     }
 
     #[test]
-    fn muted_beeps_a_short_reminder_every_five_seconds() {
+    fn muted_beeps_a_short_reminder_every_muted_tick() {
         let mut m = AlarmMonitor::new();
         m.on_heartbeat(0, true, None, true);
         assert_eq!(m.tick(0), vec![Action::PlayAlert, emit("alarming", "call")]);
         assert_eq!(m.on_button(0), vec![emit("muted", "call")]);
-        // 1ms 足りないうちは出ない
+        // 1ms 足りないうちは出ない (バナーは BANNER_MS ごとに出るので音だけ見る)
         m.on_heartbeat(MUTED_TICK_MS - 1, true, None, true);
-        assert_eq!(m.tick(MUTED_TICK_MS - 1), vec![]);
-        // 5 秒でバナーと重なる。Action の順は PlayMutedTick → Emit
+        assert_eq!(sounds(m.tick(MUTED_TICK_MS - 1)), vec![]);
         m.on_heartbeat(MUTED_TICK_MS, true, None, true);
-        assert_eq!(
-            m.tick(MUTED_TICK_MS),
-            vec![Action::PlayMutedTick, emit("muted", "call")]
-        );
-        // 2 回目もその 5 秒後
+        assert_eq!(sounds(m.tick(MUTED_TICK_MS)), vec![Action::PlayMutedTick]);
+        // 2 回目もその MUTED_TICK_MS 後
         m.on_heartbeat(2 * MUTED_TICK_MS - 1, true, None, true);
-        assert_eq!(m.tick(2 * MUTED_TICK_MS - 1), vec![]);
+        assert_eq!(sounds(m.tick(2 * MUTED_TICK_MS - 1)), vec![]);
         m.on_heartbeat(2 * MUTED_TICK_MS, true, None, true);
         assert_eq!(
-            m.tick(2 * MUTED_TICK_MS),
-            vec![Action::PlayMutedTick, emit("muted", "call")]
+            sounds(m.tick(2 * MUTED_TICK_MS)),
+            vec![Action::PlayMutedTick]
         );
+    }
+
+    #[test]
+    fn muted_tick_is_longer_than_the_silence_tick() {
+        // 黙らせ中の合図が沈黙の 2 連と同じ間隔だと「止まらない」と聞こえる (2026-10-30)
+        assert!(MUTED_TICK_MS > SILENCE_TICK_MS);
     }
 
     #[test]
@@ -764,7 +776,9 @@ mod tests {
             "STATUS alarm state=alarming cause=call hb_age_ms=1000"
         );
         // 戻った後は、黙らせていたときのカウンタが来ても短い合図は出ない
-        assert_eq!(m.tick(MUTED_TICK_MS), vec![Action::PlayAlert]);
+        // (heartbeat は続いている = 沈黙ではなく着信のまま)
+        m.on_heartbeat(MUTED_TICK_MS, true, None, true);
+        assert_eq!(sounds(m.tick(MUTED_TICK_MS)), vec![Action::PlayAlert]);
     }
 
     #[test]
