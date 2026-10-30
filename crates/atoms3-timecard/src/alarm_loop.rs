@@ -44,7 +44,7 @@ pub fn new_monitor(reset_code: i32) -> SharedMonitor {
 pub fn start(
     monitor: SharedMonitor,
     speaker: Option<Sender<Sound>>,
-    button_pin: Gpio41,
+    button_pin: Gpio41<'static>,
 ) -> Result<()> {
     // 本体ボタン G41 (active-low)。内部プルアップは `input` の第 2 引数で入れる
     let button = PinDriver::input(button_pin, Pull::Up)?;
