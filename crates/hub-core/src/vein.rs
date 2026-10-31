@@ -1191,20 +1191,21 @@ pub enum MatchVia {
 pub struct MatchScore {
     /// `<id>->A:<id>, <n>,<点数>` の点数
     pub score: u32,
-    /// `USER:<id>, th[s0, s1, s2]` の 3 つ。**どれが何かは未確認** (s0 を合格線として `TH=` に出す)
+    /// `USER:<id>, th[s0, s1, s2]` の 3 つ。**どれが合否かは未確定** (`TH=` には真ん中を出す)。静脈が不一致なら 0, 0, 0
     pub th: [u32; 3],
     pub via: MatchVia,
 }
 
 impl MatchScore {
-    /// ` SCORE=<n> TH=<s0> VIA=FV|FP THS=<s0>,<s1>,<s2>` (先頭に空白。応答行の後ろに付ける)
+    /// ` SCORE=<n> TH=<s1> VIA=FV|FP THS=<s0>,<s1>,<s2>` (先頭に空白。応答行の後ろに付ける)。
+    /// 3 段のどれで合否を決めているかは未確定 (実機で 68 点が th[57, 67, 78] で静脈で通った) ので、`TH` は真ん中
     fn suffix(&self) -> String {
         let via = match self.via {
             MatchVia::Fv => "FV",
             MatchVia::Fp => "FP",
         };
         let [a, b, c] = self.th;
-        format!(" SCORE={} TH={a} VIA={via} THS={a},{b},{c}", self.score)
+        format!(" SCORE={} TH={b} VIA={via} THS={a},{b},{c}", self.score)
     }
 }
 
@@ -1254,24 +1255,30 @@ fn via_of(line: &str, id: u32) -> Option<MatchVia> {
     }
 }
 
+/// 記録の中で照合 1 回ぶんの塊が始まる行 (撮影した特徴量を作った行)。この行より後が最後の照合
+const MATCH_BLOCK_START: &str = "PS_GenChar OK";
+
 /// モジュールの動作記録 (文字) から、当たった ID `id` の**最後の**照合の点数を読む。
 ///
-/// 見る行 (それぞれ記録の中で `id` に当たる最後の行。照合のたびに追記される前提):
-/// - `1:1->A:<id>, 6,<点数>`: 点数 = 最後のコンマの後ろ (1:N も `->A:` の形と推測)
-/// - `USER:<id>, th[s0, s1, s2]`: 3 つの閾値
-/// - `PS_Search OK:FV=<id>,FP=<id>`: FV が `id` なら [`MatchVia::Fv`]、FP だけなら [`MatchVia::Fp`]。
-///   この行が無ければ点数 >= s0 で FV、未満なら FP
+/// 記録は起動からの追記なので、最後の `PS_GenChar OK` の行より後 (最後の照合の塊) だけを見る
+/// (塊の外を見ると、静脈が不一致で `->A:` の行が出なかった回に前の回の点数を拾う)。実機の塊:
+/// - 静脈で一致: `Match.User:<id>, 0` / `1:1->A:<id>, <n>,<t0>,<t1>,<t2>,<点数>` /
+///   `PS_Search OK:FV=<id>(<id>),FP=<id>` / `USER:<id>, th[t0, t1, t2], ...`
+/// - 指紋互換だけで一致: `->A:` の行が無く、`PS_Search OK:FV=0(0),FP=<id>` / `USER:<id>, th[0, 0, 0], ...`
 ///
-/// 点数か閾値のどちらかが読めなければ `None` (応答に付け足さない)。**実機の記録で形を
-/// 確かめていない** — 上の形は ippoan/alc-app#436 の `VEIN TEST RAW` で読んだ行の書き写し
+/// 点数は塊の `->A:` の行の最後のフィールド (無ければ 0 = 静脈は不一致)。閾値は塊の `USER:` の行。
+/// 経路は塊の `PS_Search OK:` の行 (無ければ点数 >= t1 で FV)。塊が無い・閾値が読めなければ `None`
 pub fn parse_match_log(text: &str, id: u32) -> Option<MatchScore> {
-    let lines = || text.split(['\n', '\r', '\0']);
-    let score = lines().rev().find_map(|l| score_of(l, id))?;
-    let th = lines().rev().find_map(|l| th_of(l, id))?;
-    let via = lines()
+    let all: Vec<&str> = text.split(['\n', '\r', '\0']).collect();
+    let start = all.iter().rposition(|l| l.contains(MATCH_BLOCK_START))?;
+    let block = &all[start + 1..];
+    let score = block.iter().rev().find_map(|l| score_of(l, id)).unwrap_or(0);
+    let th = block.iter().rev().find_map(|l| th_of(l, id))?;
+    let via = block
+        .iter()
         .rev()
         .find_map(|l| via_of(l, id))
-        .unwrap_or(if score >= th[0] { MatchVia::Fv } else { MatchVia::Fp });
+        .unwrap_or(if score >= th[1] { MatchVia::Fv } else { MatchVia::Fp });
     Some(MatchScore { score, th, via })
 }
 
@@ -1302,7 +1309,7 @@ fn read_match_score(port: &mut dyn Port, t: &Timeouts, id: u32) -> Option<MatchS
     score
 }
 
-/// `VEIN VERIFIED <id>` (点数が読めたら ` SCORE=<n> TH=<n> VIA=FV|FP THS=<s0>,<s1>,<s2>` が続く) /
+/// `VEIN VERIFIED <id>` (点数が読めたら ` SCORE=<n> TH=<s1> VIA=FV|FP THS=<s0>,<s1>,<s2>` が続く) /
 /// `VEIN NOMATCH`
 pub fn verify_line(id: u32, hit: Option<u32>, score: Option<MatchScore>) -> String {
     match hit {
@@ -1316,7 +1323,7 @@ pub fn sync_info_line(users: u32, max: u32) -> String {
     format!("VEIN SYNC INFO USERS={users} MAX={max}")
 }
 
-/// `VEIN IDENTIFIED <id>` (点数が読めたら ` SCORE=<n> TH=<n> VIA=FV|FP THS=<s0>,<s1>,<s2>` が続く) /
+/// `VEIN IDENTIFIED <id>` (点数が読めたら ` SCORE=<n> TH=<s1> VIA=FV|FP THS=<s0>,<s1>,<s2>` が続く) /
 /// `VEIN NOMATCH`
 pub fn identify_line(hit: Option<u32>, score: Option<MatchScore>) -> String {
     match hit {
@@ -2959,51 +2966,58 @@ mod tests {
 
     // ---- 照合の点数 (動作記録 GET_DEBUG 0x26) ----
 
-    /// 1:1 で FV が通ったときの記録 (古い照合 → 今の照合の順)
-    const LOG_FV: &str = "Match.User:15\r\n1:1->A:15, 6,40\r\nPS_Search OK:FV=15,FP=0\r\nUSER:15, th[50, 60, 70]\r\n\
-                          Match.User:15\r\n1:1->A:15, 6,66\r\nPS_Search OK:FV=15,FP=15\r\nUSER:15, th[50, 60, 70]\r\n";
-    /// FV の点数が 0 で FP が通ったときの記録
-    const LOG_FP: &str = "Match.User:15\n1:1->A:15, 6,0\nPS_Search OK:FV=0,FP=15\nUSER:15, th[50, 60, 70]\n\0\0\0";
+    /// 実機 (2026-10-31、Vein Base) の照合 1 回ぶん: 静脈で一致した塊
+    const BLOCK_FV: &str = "CONNECT[1]OK!\r\n0-Gray:127\r\n[0]-Ir:29,40 Gray:105\r\nbH=1760\r\nXG_Create:0,842,125\r\n\
+                            PS_GenChar OK:175\r\nMatch.User:15, 0\r\n1:1->A:15, 7,57,67,78,68\r\n\
+                            PS_Search OK:FV=15(15),FP=15\r\nUSER:15, th[57, 67, 78], U15, R7, MS:221\r\nCONNECT[1]OK!\r\n";
+    /// 同: 指紋互換だけで一致した塊 (`->A:` の行が無い)
+    const BLOCK_FP: &str = "CONNECT[1]OK!\n0-Gray:112\nbH=3755\nXG_Create:0,949,125\nPS_GenChar OK:179\n\
+                            Match.User:15, 0\nPS_Search OK:FV=0(0),FP=15\nUSER:15, th[0, 0, 0], U0, R0, MS:349\n\0\0\0";
+    /// 前の回は静脈で一致、最後の回は指紋互換だけ (起動からの追記)
+    const LOG_FV: &str = BLOCK_FV;
+    const LOG_FP: &str = BLOCK_FP;
 
     #[test]
-    fn parse_match_log_reads_the_last_match_of_the_id() {
-        let s = parse_match_log(LOG_FV, 15).unwrap();
-        assert_eq!(s, MatchScore { score: 66, th: [50, 60, 70], via: MatchVia::Fv });
-        // FP で通った (FV の点数は 0)。NUL の埋めがあっても読める
-        let s = parse_match_log(LOG_FP, 15).unwrap();
-        assert_eq!(s, MatchScore { score: 0, th: [50, 60, 70], via: MatchVia::Fp });
+    fn parse_match_log_reads_only_the_last_match_block() {
+        assert_eq!(parse_match_log(BLOCK_FV, 15).unwrap(), MatchScore { score: 68, th: [57, 67, 78], via: MatchVia::Fv });
+        // 静脈は不一致 (点数 0)、指紋互換で通った。NUL の埋めがあっても読める
+        assert_eq!(parse_match_log(BLOCK_FP, 15).unwrap(), MatchScore { score: 0, th: [0, 0, 0], via: MatchVia::Fp });
+        // ★ 前の回の `->A:` を拾わない (最後の塊に無ければ 0)
+        let log = format!("{BLOCK_FV}{BLOCK_FP}");
+        assert_eq!(parse_match_log(&log, 15).unwrap(), MatchScore { score: 0, th: [0, 0, 0], via: MatchVia::Fp });
+        let log = format!("{BLOCK_FP}{BLOCK_FV}");
+        assert_eq!(parse_match_log(&log, 15).unwrap().score, 68);
         // 1:N (別の ID の行が混じる) は当たった ID の行だけを見る
-        let log = "1:N->A:20, 6,99\nUSER:20, th[1, 2, 3]\nPS_Search OK:FV=20,FP=20\n\
-                   1:N->A:15, 6,58\nUSER:15, th[50, 60, 70]\nPS_Search OK:FV=15,FP=0\nUSER:20, th[1, 2, 3]\n";
+        let log = "PS_GenChar OK:1\n1:N->A:20, 7,1,2,3,99\nUSER:20, th[1, 2, 3]\n\
+                   1:N->A:15, 7,50,60,70,58\nUSER:15, th[50, 60, 70]\nPS_Search OK:FV=15(15),FP=0\n";
         assert_eq!(parse_match_log(log, 15).unwrap(), MatchScore { score: 58, th: [50, 60, 70], via: MatchVia::Fv });
-        // PS_Search の行が無ければ点数と s0 の比べ方で決める
-        let log = "1:1->A:7, 6,50\nUSER:7, th[50, 0, 0]\n";
-        assert_eq!(parse_match_log(log, 7).unwrap().via, MatchVia::Fv);
-        let log = "1:1->A:7, 6,49\nUSER:7, th[50, 0, 0]\n";
-        assert_eq!(parse_match_log(log, 7).unwrap().via, MatchVia::Fp);
-        // PS_Search の行が別の ID だけなら (読めないので) 点数で決める
-        let log = "1:1->A:7, 6,60\nUSER:7, th[50, 0, 0]\nPS_Search OK:FV=8,FP=-1\n";
-        assert_eq!(parse_match_log(log, 7).unwrap().via, MatchVia::Fv);
+        // PS_Search の行が無い / 別の ID だけなら、点数と真ん中の閾値で決める
+        assert_eq!(parse_match_log("PS_GenChar OK\n1:1->A:7, 7,1,50,9,50\nUSER:7, th[1, 50, 9]\n", 7).unwrap().via, MatchVia::Fv);
+        assert_eq!(parse_match_log("PS_GenChar OK\n1:1->A:7, 7,1,50,9,49\nUSER:7, th[1, 50, 9]\n", 7).unwrap().via, MatchVia::Fp);
+        assert_eq!(parse_match_log("PS_GenChar OK\n1:1->A:7, 7,1,50,9,60\nUSER:7, th[1, 50, 9]\nPS_Search OK:FV=8,FP=-1\n", 7).unwrap().via, MatchVia::Fv);
+        // 応答の付け足し (TH は真ん中)
+        assert_eq!(parse_match_log(BLOCK_FV, 15).unwrap().suffix(), " SCORE=68 TH=67 VIA=FV THS=57,67,78");
     }
 
     #[test]
     fn parse_match_log_gives_none_when_unreadable() {
         assert_eq!(parse_match_log("", 15), None);
-        // ID が違う
-        assert_eq!(parse_match_log(LOG_FV, 16), None);
-        // 点数の行だけ / 閾値の行だけ
-        assert_eq!(parse_match_log("1:1->A:15, 6,66\n", 15), None);
-        assert_eq!(parse_match_log("USER:15, th[50, 60, 70]\n", 15), None);
-        // 点数が数字でない・コンマの後ろが無い
-        assert_eq!(parse_match_log("1:1->A:15, 6,xx\nUSER:15, th[1, 2, 3]\n", 15), None);
-        assert_eq!(parse_match_log("1:1->A:15\nUSER:15, th[1, 2, 3]\n", 15), None);
-        assert_eq!(parse_match_log("1:1->A:x, 6,5\nUSER:15, th[1, 2, 3]\n", 15), None);
+        // 照合の塊が無い (PS_GenChar OK の行が無い)
+        assert_eq!(parse_match_log("1:1->A:15, 7,1,2,3,66\nUSER:15, th[1, 2, 3]\n", 15), None);
+        // ID が違う (閾値の行が無い)
+        assert_eq!(parse_match_log(BLOCK_FV, 16), None);
+        // 閾値の行が塊の前にしか無い
+        assert_eq!(parse_match_log("USER:15, th[1, 2, 3]\nPS_GenChar OK\n1:1->A:15, 7,1,2,3,5\n", 15), None);
+        // 点数が数字でない・コンマの後ろが無い・ID が数字でない行は点数 0 として扱う
+        assert_eq!(parse_match_log("PS_GenChar OK\n1:1->A:15, 7,xx\nUSER:15, th[1, 2, 3]\n", 15).unwrap().score, 0);
+        assert_eq!(parse_match_log("PS_GenChar OK\n1:1->A:15\nUSER:15, th[1, 2, 3]\n", 15).unwrap().score, 0);
+        assert_eq!(parse_match_log("PS_GenChar OK\n1:1->A:x, 7,5\nUSER:15, th[1, 2, 3]\n", 15).unwrap().score, 0);
         // 閾値が 3 つでない・数字でない・閉じていない・th が無い
         for th in ["th[1, 2]", "th[1, 2, 3, 4]", "th[1, 2, x]", "th[1, 2, 3", "x"] {
-            let log = format!("1:1->A:15, 6,5\nUSER:15, {th}\n");
+            let log = format!("PS_GenChar OK\n1:1->A:15, 7,1,2,3,5\nUSER:15, {th}\n");
             assert_eq!(parse_match_log(&log, 15), None, "{th}");
         }
-        assert_eq!(parse_match_log("1:1->A:15, 6,5\nUSER:x, th[1, 2, 3]\n", 15), None);
+        assert_eq!(parse_match_log("PS_GenChar OK\n1:1->A:15, 7,1,2,3,5\nUSER:x, th[1, 2, 3]\n", 15), None);
     }
 
     /// GET_DEBUG の応答 (大きさ) と READ_DATA の塊 (512 バイトごと) の台本
@@ -3024,12 +3038,12 @@ mod tests {
         let script = with_debug(vec![connected(), finger(Some(1)), verified(Some(15))], LOG_FV);
         assert_eq!(
             run_t(Command::Identify, script),
-            vec!["VEIN IDENTIFIED 15 SCORE=66 TH=50 VIA=FV THS=50,60,70"]
+            vec!["VEIN IDENTIFIED 15 SCORE=68 TH=67 VIA=FV THS=57,67,78"]
         );
         let script = with_debug(vec![connected(), finger(Some(1)), verified(Some(15))], LOG_FP);
         assert_eq!(
             run_t(Command::Verify(15), script),
-            vec!["VEIN VERIFIED 15 SCORE=0 TH=50 VIA=FP THS=50,60,70"]
+            vec!["VEIN VERIFIED 15 SCORE=0 TH=0 VIA=FP THS=0,0,0"]
         );
         // 4096 バイトまで複数の塊で読む
         let mut big = " ".repeat(DEBUG_LOG_MAX - LOG_FV.len());
@@ -3037,7 +3051,7 @@ mod tests {
         let script = with_debug(vec![connected(), finger(Some(1)), verified(Some(15))], &big);
         assert_eq!(
             run_t(Command::Identify, script),
-            vec!["VEIN IDENTIFIED 15 SCORE=66 TH=50 VIA=FV THS=50,60,70"]
+            vec!["VEIN IDENTIFIED 15 SCORE=68 TH=67 VIA=FV THS=57,67,78"]
         );
         // 要求は GET_DEBUG (データ無し) → READ_DATA 種別 0x26
         let mut port = FakePort::new(with_debug(vec![connected(), finger(Some(1)), verified(Some(15))], LOG_FV));
@@ -3099,8 +3113,8 @@ mod tests {
         script.extend(debug_script(LOG_FP.as_bytes()));
         let mut port = FakePort::new(script);
         let lines = test_debug(&mut port, &Timeouts::DEFAULT).unwrap();
-        assert_eq!(lines[0], "VEIN TEST DEBUG Match.User:15");
-        assert_eq!(lines.last().unwrap(), "VEIN TEST DEBUG END 4");
+        assert_eq!(lines[0], "VEIN TEST DEBUG CONNECT[1]OK!");
+        assert_eq!(lines.last().unwrap(), "VEIN TEST DEBUG END 8");
         assert_eq!(port.sent[1], command(CMD_GET_DEBUG, &[]).to_vec());
         // 接続できない / 記録が読めない
         assert_eq!(test_debug(&mut FakePort::new(vec![None]), &Timeouts::DEFAULT), Err(VeinError::NoModule));
