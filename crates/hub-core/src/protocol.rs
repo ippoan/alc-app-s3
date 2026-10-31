@@ -285,6 +285,7 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
     const BAD_CAPACITY: &str = "ERR VEIN: CAPACITY に引数は要りません";
     const BAD_SYSINFO: &str = "ERR VEIN: SYSINFO に引数は要りません";
     const BAD_DEBUG: &str = "ERR VEIN: DEBUG に引数は要りません";
+    const BAD_READ: &str = "ERR VEIN: READ の ID は 2〜100 の数字だけです";
     const BAD_IMAGE: &str = "ERR VEIN: IMAGE に引数は要りません";
     const BAD_RAW: &str = "ERR VEIN: RAW <待ち ms (0〜30000)> <16 進 (1〜192 バイト)> です";
     const BAD_RAWQ: &str = "ERR VEIN: RAWQ <16 進 (1〜192 バイト)> です";
@@ -308,6 +309,11 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
         (Some("SYSINFO"), _) => Err(BAD_SYSINFO.into()),
         (Some("DEBUG"), []) => Ok(HostCommand::VeinTest(TestCommand::Debug)),
         (Some("DEBUG"), _) => Err(BAD_DEBUG.into()),
+        (Some("READ"), [id]) => parse_test_id(id)
+            .or_else(|| parse_module_id(id))
+            .map(|id| HostCommand::VeinTest(TestCommand::Read(id)))
+            .ok_or_else(|| BAD_READ.into()),
+        (Some("READ"), _) => Err(BAD_READ.into()),
         (Some("IMAGE"), []) => Ok(HostCommand::VeinTest(TestCommand::Image)),
         (Some("IMAGE"), _) => Err(BAD_IMAGE.into()),
         (Some("RAW"), [wait, hex]) => wait
@@ -1666,6 +1672,11 @@ mod tests {
             Err("ERR VEIN: SYSINFO に引数は要りません".into())
         );
         assert_eq!(parse_line("vein test debug", T), Ok(Some(HostCommand::VeinTest(TestCommand::Debug))));
+        assert_eq!(parse_line("VEIN TEST READ 10", T), Ok(Some(HostCommand::VeinTest(TestCommand::Read(10)))));
+        assert_eq!(parse_line("VEIN TEST READ 2", T), Ok(Some(HostCommand::VeinTest(TestCommand::Read(2)))));
+        for bad in ["VEIN TEST READ", "VEIN TEST READ 1", "VEIN TEST READ 101", "VEIN TEST READ x", "VEIN TEST READ 10 11"] {
+            assert_eq!(parse_line(bad, T), Err("ERR VEIN: READ の ID は 2〜100 の数字だけです".into()), "{bad}");
+        }
         assert_eq!(parse_line("VEIN TEST DEBUG 1", T), Err("ERR VEIN: DEBUG に引数は要りません".into()));
         assert_eq!(parse_line("VEIN TEST IMAGE", T), Ok(Some(HostCommand::VeinTest(TestCommand::Image))));
         assert_eq!(

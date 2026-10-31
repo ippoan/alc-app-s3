@@ -681,6 +681,9 @@ pub enum TestCommand {
     /// `VEIN TEST DEBUG`: モジュールの動作記録 (GET_DEBUG → READ_DATA 0x26) を行ごとに返す ([`test_debug`])。
     /// 点数の取り方 ([`parse_match_log`]) を実機の行で確かめるため
     Debug,
+    /// `VEIN TEST READ <id>`: ID の登録データ (READ_ENROLL → READ_DATA) をそのまま読み、`VEIN RECORD` 行で返す
+    /// ([`test_read`])。照合を重ねるとモジュールが記録 (学習記録を含む) を書き換えるかを、前後で比べて確かめるため
+    Read(u32),
     /// `VEIN TEST RAW <待ち ms> <16 進>`: バイト列をそのまま UART へ送り、返ってきたバイトをそのまま返す
     /// ([`test_raw`])。仕様書にない命令 (指紋互換の EF01 形式、GET_DEBUG 0x26 など) が通じるかを
     /// ホスト側で組み立てて確かめるため (ippoan/alc-app#436)
@@ -940,6 +943,13 @@ pub fn test_debug(port: &mut dyn Port, t: &Timeouts) -> Result<Vec<String>, Vein
     connect(port, t)?;
     let raw = read_debug_log(port, t)?;
     Ok(debug_lines(&String::from_utf8_lossy(&raw)))
+}
+
+/// 試験: 接続して ID `id` の登録データを読み、[`record_lines`] の行 (`VEIN RECORD <id> …` / `… END <総バイト数>`) にする。
+/// 送るのは接続と READ_ENROLL / READ_DATA だけ (仕様書の命令。登録の [`enroll`] の読み出しと同じ)。書き換えはしない
+pub fn test_read(port: &mut dyn Port, t: &Timeouts, id: u32) -> Result<Vec<String>, VeinError> {
+    connect(port, t)?;
+    Ok(record_lines(id, &read_enroll(port, t, id)?))
 }
 
 /// [`test_debug`] の行づくり
@@ -3105,6 +3115,23 @@ mod tests {
         let long = "あ".repeat(DEBUG_LINE_MAX + 5);
         let l = &debug_lines(&long)[0];
         assert_eq!(l.chars().count(), "VEIN TEST DEBUG ".len() + DEBUG_LINE_MAX);
+    }
+
+    #[test]
+    fn test_read_connects_then_returns_the_record_lines() {
+        let rec: Vec<u8> = (0..700u32).map(|i| i as u8).collect();
+        let mut script = vec![connected(), size(rec.len())];
+        script.extend(rec.chunks(UART_DATA_PACKET_MAX).map(|c| Some(chunk(c))));
+        let mut port = FakePort::new(script);
+        let lines = test_read(&mut port, &Timeouts::DEFAULT, 10).unwrap();
+        assert_eq!(lines, record_lines(10, &rec));
+        assert_eq!(&port.sent[1][3..10], &[CMD_READ_ENROLL, 0, 4, 10, 0, 0, 0]);
+        // 接続できない / 未登録 (失敗コード) / 大きさが範囲外
+        assert_eq!(test_read(&mut FakePort::new(vec![None]), &Timeouts::DEFAULT, 10), Err(VeinError::NoModule));
+        let mut port = FakePort::new(vec![connected(), Some(reply(CMD_READ_ENROLL, &[XG_ERR_FAIL, 0x07]))]);
+        assert_eq!(test_read(&mut port, &Timeouts::DEFAULT, 10), Err(VeinError::Rc(0x07)));
+        let mut port = FakePort::new(vec![connected(), size(0)]);
+        assert_eq!(test_read(&mut port, &Timeouts::DEFAULT, 10), Err(VeinError::ReadFail));
     }
 
     #[test]

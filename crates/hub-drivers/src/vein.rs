@@ -279,6 +279,7 @@ pub fn start(
                             proto::test_sysinfo(&mut port, t).map(|data| one(proto::test_sysinfo_line(&data)))
                         }
                         proto::TestCommand::Debug => proto::test_debug(&mut port, t),
+                        proto::TestCommand::Read(id) => proto::test_read(&mut port, t, id),
                         proto::TestCommand::Image => proto::test_image(&mut port, t, &mut on_prompt)
                             .map(|(w, h, img)| proto::image_lines(w, h, &img)),
                         proto::TestCommand::Raw { wait_ms, bytes } => {
