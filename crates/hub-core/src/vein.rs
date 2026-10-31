@@ -78,6 +78,17 @@ pub const CMD_WRITE_ENROLL: u8 = 0x23;
 /// 試験用 (`VEIN TEST CAPACITY`) だけが使う
 pub const CMD_GET_ENROLL_INFO: u8 = 0x14;
 
+/// モジュールの動作記録 (文字) の大きさを返す (GET_DEBUG)。中身は READ_DATA の種別 `0x26` で読む。
+/// 照合のたびに `Match.User:` / `->A:` / `PS_Search OK:` / `USER:` の行が残る ([`parse_match_log`])。
+/// **仕様書に節は無いが、`VEIN TEST RAW` で実機に通じることを確かめてある** (ippoan/alc-app#436)。
+/// 応答の読み方は READ_ENROLL と同じ形 (`bData[1] + bData[2] * 256` が大きさ) と**推測**している。
+/// 照合の成功の直後に 1 回だけ使う ([`read_match_score`])
+pub const CMD_GET_DEBUG: u8 = 0x26;
+/// 動作記録の大きさの上限 (実機は 4096 バイト)。これを超える大きさは応答の破損とみなす
+pub const DEBUG_LOG_MAX: usize = 4096;
+/// 動作記録を読む 1 回の待ち (ミリ秒)。点数は付け足しなので、返らなければ短く諦める
+pub const DEBUG_READ_MS: u32 = 300;
+
 /// モジュールの設定を読む (GET_SYSTEM_INFO、送る `bData` は無し)。試験用 (`VEIN TEST SYSINFO`) だけが使う。
 /// **番号と応答の並びは推測** — 仕様書の本文が repo に無い。XG 系では版・機器番号・照合の厳しさ (安全レベル) などの
 /// 設定値が応答のデータ部に並ぶのが通例なので、データ部をそのまま返して実機で読む (ippoan/alc-app#436)
@@ -1140,10 +1151,136 @@ fn verify_settled(
     verify(port, t, id, on_prompt)
 }
 
-/// `VEIN VERIFIED <id>` / `VEIN NOMATCH`
-pub fn verify_line(id: u32, hit: Option<u32>) -> String {
+/// 照合が通った経路
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchVia {
+    /// 静脈 (FV)
+    Fv,
+    /// 指紋互換 (FP)。FV の点数が 0 でも FP で通ることがある
+    Fp,
+}
+
+/// 動作記録から読んだ、直近の照合の点数
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatchScore {
+    /// `<id>->A:<id>, <n>,<点数>` の点数
+    pub score: u32,
+    /// `USER:<id>, th[s0, s1, s2]` の 3 つ。**どれが何かは未確認** (s0 を合格線として `TH=` に出す)
+    pub th: [u32; 3],
+    pub via: MatchVia,
+}
+
+impl MatchScore {
+    /// ` SCORE=<n> TH=<s0> VIA=FV|FP THS=<s0>,<s1>,<s2>` (先頭に空白。応答行の後ろに付ける)
+    fn suffix(&self) -> String {
+        let via = match self.via {
+            MatchVia::Fv => "FV",
+            MatchVia::Fp => "FP",
+        };
+        let [a, b, c] = self.th;
+        format!(" SCORE={} TH={a} VIA={via} THS={a},{b},{c}", self.score)
+    }
+}
+
+fn parse_u32(s: &str) -> Option<u32> {
+    s.trim().parse().ok()
+}
+
+/// `s` の先頭の数字の並び (符号なし)。数字で始まらなければ `None`
+fn leading_u32(s: &str) -> Option<u32> {
+    let s = s.trim_start();
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    s[..end].parse().ok()
+}
+
+/// 行の `key` の直後の数字 (`FV=12` → 12)。`-1` などの数字でないものは `None`
+fn field_after(line: &str, key: &str) -> Option<u32> {
+    leading_u32(&line[line.find(key)? + key.len()..])
+}
+
+/// `1:1->A:<id>, 6,<点数>` (1:N も `->A:` の形) → 点数。最後のコンマの後ろ
+fn score_of(line: &str, id: u32) -> Option<u32> {
+    let rest = &line[line.find("->A:")? + 4..];
+    let mut fields = rest.split(',');
+    (leading_u32(fields.next()?) == Some(id)).then_some(())?;
+    parse_u32(fields.next_back()?)
+}
+
+/// `USER:<id>, th[s0, s1, s2]` → 3 つ
+fn th_of(line: &str, id: u32) -> Option<[u32; 3]> {
+    let rest = &line[line.find("USER:")? + 5..];
+    (leading_u32(rest) == Some(id)).then_some(())?;
+    let inner = &rest[rest.find("th[")? + 3..];
+    let mut v = inner[..inner.find(']')?].split(',').map(parse_u32);
+    let th = [v.next()??, v.next()??, v.next()??];
+    v.next().is_none().then_some(th)
+}
+
+/// `PS_Search OK:FV=<id>,FP=<id>` → 通った経路 (FV が当たった ID と同じなら FV、FP だけが同じなら FP)
+fn via_of(line: &str, id: u32) -> Option<MatchVia> {
+    line.contains("PS_Search OK:").then_some(())?;
+    if field_after(line, "FV=") == Some(id) {
+        Some(MatchVia::Fv)
+    } else if field_after(line, "FP=") == Some(id) {
+        Some(MatchVia::Fp)
+    } else {
+        None
+    }
+}
+
+/// モジュールの動作記録 (文字) から、当たった ID `id` の**最後の**照合の点数を読む。
+///
+/// 見る行 (それぞれ記録の中で `id` に当たる最後の行。照合のたびに追記される前提):
+/// - `1:1->A:<id>, 6,<点数>`: 点数 = 最後のコンマの後ろ (1:N も `->A:` の形と推測)
+/// - `USER:<id>, th[s0, s1, s2]`: 3 つの閾値
+/// - `PS_Search OK:FV=<id>,FP=<id>`: FV が `id` なら [`MatchVia::Fv`]、FP だけなら [`MatchVia::Fp`]。
+///   この行が無ければ点数 >= s0 で FV、未満なら FP
+///
+/// 点数か閾値のどちらかが読めなければ `None` (応答に付け足さない)。**実機の記録で形を
+/// 確かめていない** — 上の形は ippoan/alc-app#436 の `VEIN TEST RAW` で読んだ行の書き写し
+pub fn parse_match_log(text: &str, id: u32) -> Option<MatchScore> {
+    let lines = || text.split(['\n', '\r', '\0']);
+    let score = lines().rev().find_map(|l| score_of(l, id))?;
+    let th = lines().rev().find_map(|l| th_of(l, id))?;
+    let via = lines()
+        .rev()
+        .find_map(|l| via_of(l, id))
+        .unwrap_or(if score >= th[0] { MatchVia::Fv } else { MatchVia::Fp });
+    Some(MatchScore { score, th, via })
+}
+
+/// 動作記録 (GET_DEBUG → READ_DATA 種別 0x26) を読む。接続済みであること
+fn read_debug_log(port: &mut dyn Port, t: &Timeouts) -> Result<Vec<u8>, VeinError> {
+    let p = exchange(port, t, CMD_GET_DEBUG, &[])?;
+    if p.data[0] != XG_ERR_SUCCESS {
+        return Err(VeinError::Rc(p.data[1]));
+    }
+    let size = usize::from(p.data[1]) + usize::from(p.data[2]) * 256;
+    if !(1..=DEBUG_LOG_MAX).contains(&size) {
+        return Err(VeinError::ReadFail);
+    }
+    read_data(port, t, CMD_GET_DEBUG, size)
+}
+
+/// 照合が通った直後に、当たった ID `id` の点数を動作記録から読む。**付け足しなので何があっても
+/// `None`** (時間切れ・壊れた応答・読めない形) — 応答は点数なしの今までの行のまま。待ちは
+/// [`DEBUG_READ_MS`] に縮め、失敗したら入力を捨てて次の照合に残さない
+fn read_match_score(port: &mut dyn Port, t: &Timeouts, id: u32) -> Option<MatchScore> {
+    let quick = Timeouts { connect_ms: DEBUG_READ_MS, data_ms: DEBUG_READ_MS, ..*t };
+    let score = read_debug_log(port, &quick)
+        .ok()
+        .and_then(|raw| parse_match_log(&String::from_utf8_lossy(&raw), id));
+    if score.is_none() {
+        port.discard_input();
+    }
+    score
+}
+
+/// `VEIN VERIFIED <id>` (点数が読めたら ` SCORE=<n> TH=<n> VIA=FV|FP THS=<s0>,<s1>,<s2>` が続く) /
+/// `VEIN NOMATCH`
+pub fn verify_line(id: u32, hit: Option<u32>, score: Option<MatchScore>) -> String {
     match hit {
-        Some(_) => format!("VEIN VERIFIED {id}"),
+        Some(_) => format!("VEIN VERIFIED {id}{}", score.map(|s| s.suffix()).unwrap_or_default()),
         None => "VEIN NOMATCH".into(),
     }
 }
@@ -1153,10 +1290,11 @@ pub fn sync_info_line(users: u32, max: u32) -> String {
     format!("VEIN SYNC INFO USERS={users} MAX={max}")
 }
 
-/// `VEIN IDENTIFIED <id>` / `VEIN NOMATCH`
-pub fn identify_line(hit: Option<u32>) -> String {
+/// `VEIN IDENTIFIED <id>` (点数が読めたら ` SCORE=<n> TH=<n> VIA=FV|FP THS=<s0>,<s1>,<s2>` が続く) /
+/// `VEIN NOMATCH`
+pub fn identify_line(hit: Option<u32>, score: Option<MatchScore>) -> String {
     match hit {
-        Some(id) => format!("VEIN IDENTIFIED {id}"),
+        Some(id) => format!("VEIN IDENTIFIED {id}{}", score.map(|s| s.suffix()).unwrap_or_default()),
         None => "VEIN NOMATCH".into(),
     }
 }
@@ -1205,8 +1343,14 @@ pub fn run(
 ) -> Vec<String> {
     let lines = match cmd {
         Command::Enroll(id) => enroll(port, t, id, on_prompt).map(|rec| record_lines(id, &rec)),
-        Command::Identify => identify(port, t, on_prompt).map(|hit| vec![identify_line(hit)]),
-        Command::Verify(id) => verify_id(port, t, id, on_prompt).map(|hit| vec![verify_line(id, hit)]),
+        Command::Identify => identify(port, t, on_prompt).map(|hit| {
+            let score = hit.and_then(|id| read_match_score(port, t, id));
+            vec![identify_line(hit, score)]
+        }),
+        Command::Verify(id) => verify_id(port, t, id, on_prompt).map(|hit| {
+            let score = hit.and_then(|id| read_match_score(port, t, id));
+            vec![verify_line(id, hit, score)]
+        }),
         Command::SyncWrite(w) => sync_write(slot, port, t, w).map(|line| vec![line]),
         Command::SyncClear(id) => clear(port, t, id).map(|()| vec![format!("VEIN SYNC CLEARED {id}")]),
         Command::SyncInfo => test_capacity(port, t).map(|(users, max)| vec![sync_info_line(users, max)]),
@@ -2755,8 +2899,8 @@ mod tests {
         assert_eq!(port.pauses, vec![IDENTIFY_SETTLE_MS]);
         let (r, _) = run_identify(vec![connected(), finger(Some(1)), verified(None)]);
         assert_eq!(r, Ok(None));
-        assert_eq!(identify_line(Some(42)), "VEIN IDENTIFIED 42");
-        assert_eq!(identify_line(None), "VEIN NOMATCH");
+        assert_eq!(identify_line(Some(42), None), "VEIN IDENTIFIED 42");
+        assert_eq!(identify_line(None, None), "VEIN NOMATCH");
     }
 
     #[test]
@@ -2787,14 +2931,138 @@ mod tests {
         assert_eq!(port.0.pauses, vec![IDENTIFY_SETTLE_MS]);
     }
 
+    // ---- 照合の点数 (動作記録 GET_DEBUG 0x26) ----
+
+    /// 1:1 で FV が通ったときの記録 (古い照合 → 今の照合の順)
+    const LOG_FV: &str = "Match.User:15\r\n1:1->A:15, 6,40\r\nPS_Search OK:FV=15,FP=0\r\nUSER:15, th[50, 60, 70]\r\n\
+                          Match.User:15\r\n1:1->A:15, 6,66\r\nPS_Search OK:FV=15,FP=15\r\nUSER:15, th[50, 60, 70]\r\n";
+    /// FV の点数が 0 で FP が通ったときの記録
+    const LOG_FP: &str = "Match.User:15\n1:1->A:15, 6,0\nPS_Search OK:FV=0,FP=15\nUSER:15, th[50, 60, 70]\n\0\0\0";
+
+    #[test]
+    fn parse_match_log_reads_the_last_match_of_the_id() {
+        let s = parse_match_log(LOG_FV, 15).unwrap();
+        assert_eq!(s, MatchScore { score: 66, th: [50, 60, 70], via: MatchVia::Fv });
+        // FP で通った (FV の点数は 0)。NUL の埋めがあっても読める
+        let s = parse_match_log(LOG_FP, 15).unwrap();
+        assert_eq!(s, MatchScore { score: 0, th: [50, 60, 70], via: MatchVia::Fp });
+        // 1:N (別の ID の行が混じる) は当たった ID の行だけを見る
+        let log = "1:N->A:20, 6,99\nUSER:20, th[1, 2, 3]\nPS_Search OK:FV=20,FP=20\n\
+                   1:N->A:15, 6,58\nUSER:15, th[50, 60, 70]\nPS_Search OK:FV=15,FP=0\nUSER:20, th[1, 2, 3]\n";
+        assert_eq!(parse_match_log(log, 15).unwrap(), MatchScore { score: 58, th: [50, 60, 70], via: MatchVia::Fv });
+        // PS_Search の行が無ければ点数と s0 の比べ方で決める
+        let log = "1:1->A:7, 6,50\nUSER:7, th[50, 0, 0]\n";
+        assert_eq!(parse_match_log(log, 7).unwrap().via, MatchVia::Fv);
+        let log = "1:1->A:7, 6,49\nUSER:7, th[50, 0, 0]\n";
+        assert_eq!(parse_match_log(log, 7).unwrap().via, MatchVia::Fp);
+        // PS_Search の行が別の ID だけなら (読めないので) 点数で決める
+        let log = "1:1->A:7, 6,60\nUSER:7, th[50, 0, 0]\nPS_Search OK:FV=8,FP=-1\n";
+        assert_eq!(parse_match_log(log, 7).unwrap().via, MatchVia::Fv);
+    }
+
+    #[test]
+    fn parse_match_log_gives_none_when_unreadable() {
+        assert_eq!(parse_match_log("", 15), None);
+        // ID が違う
+        assert_eq!(parse_match_log(LOG_FV, 16), None);
+        // 点数の行だけ / 閾値の行だけ
+        assert_eq!(parse_match_log("1:1->A:15, 6,66\n", 15), None);
+        assert_eq!(parse_match_log("USER:15, th[50, 60, 70]\n", 15), None);
+        // 点数が数字でない・コンマの後ろが無い
+        assert_eq!(parse_match_log("1:1->A:15, 6,xx\nUSER:15, th[1, 2, 3]\n", 15), None);
+        assert_eq!(parse_match_log("1:1->A:15\nUSER:15, th[1, 2, 3]\n", 15), None);
+        assert_eq!(parse_match_log("1:1->A:x, 6,5\nUSER:15, th[1, 2, 3]\n", 15), None);
+        // 閾値が 3 つでない・数字でない・閉じていない・th が無い
+        for th in ["th[1, 2]", "th[1, 2, 3, 4]", "th[1, 2, x]", "th[1, 2, 3", "x"] {
+            let log = format!("1:1->A:15, 6,5\nUSER:15, {th}\n");
+            assert_eq!(parse_match_log(&log, 15), None, "{th}");
+        }
+        assert_eq!(parse_match_log("1:1->A:15, 6,5\nUSER:x, th[1, 2, 3]\n", 15), None);
+    }
+
+    /// GET_DEBUG の応答 (大きさ) と READ_DATA の塊 (512 バイトごと) の台本
+    fn debug_script(log: &[u8]) -> Vec<Option<Vec<u8>>> {
+        let n = log.len() as u16;
+        let mut v = vec![Some(reply(CMD_GET_DEBUG, &[XG_ERR_SUCCESS, n as u8, (n >> 8) as u8]))];
+        v.extend(log.chunks(UART_DATA_PACKET_MAX).map(|c| Some(chunk(c))));
+        v
+    }
+
+    fn with_debug(mut head: Vec<Option<Vec<u8>>>, log: &str) -> Vec<Option<Vec<u8>>> {
+        head.extend(debug_script(log.as_bytes()));
+        head
+    }
+
+    #[test]
+    fn identify_and_verify_append_the_score_when_the_log_is_readable() {
+        let script = with_debug(vec![connected(), finger(Some(1)), verified(Some(15))], LOG_FV);
+        assert_eq!(
+            run_t(Command::Identify, script),
+            vec!["VEIN IDENTIFIED 15 SCORE=66 TH=50 VIA=FV THS=50,60,70"]
+        );
+        let script = with_debug(vec![connected(), finger(Some(1)), verified(Some(15))], LOG_FP);
+        assert_eq!(
+            run_t(Command::Verify(15), script),
+            vec!["VEIN VERIFIED 15 SCORE=0 TH=50 VIA=FP THS=50,60,70"]
+        );
+        // 4096 バイトまで複数の塊で読む
+        let mut big = " ".repeat(DEBUG_LOG_MAX - LOG_FV.len());
+        big.push_str(LOG_FV);
+        let script = with_debug(vec![connected(), finger(Some(1)), verified(Some(15))], &big);
+        assert_eq!(
+            run_t(Command::Identify, script),
+            vec!["VEIN IDENTIFIED 15 SCORE=66 TH=50 VIA=FV THS=50,60,70"]
+        );
+        // 要求は GET_DEBUG (データ無し) → READ_DATA 種別 0x26
+        let mut port = FakePort::new(with_debug(vec![connected(), finger(Some(1)), verified(Some(15))], LOG_FV));
+        super::run(Command::Identify, &mut None, &mut port, &Timeouts::DEFAULT, &mut |_| {});
+        assert_eq!(port.sent[3], command(CMD_GET_DEBUG, &[]).to_vec());
+        assert_eq!(port.sent[4], read_data_request(CMD_READ_DATA, CMD_GET_DEBUG, 0, LOG_FV.len() as u32).to_vec());
+    }
+
+    #[test]
+    fn identify_falls_back_to_the_plain_line_when_the_log_fails() {
+        let head = || vec![connected(), finger(Some(1)), verified(Some(15))];
+        let plain = vec!["VEIN IDENTIFIED 15"];
+        // 返事が無い
+        assert_eq!(run_t(Command::Identify, head()), plain);
+        // GET_DEBUG が失敗 (非対応) / 大きさが 0・上限超え
+        let mut s = head();
+        s.push(Some(reply(CMD_GET_DEBUG, &[XG_ERR_FAIL, XG_ERR_NO_SUPPORT])));
+        assert_eq!(run_t(Command::Identify, s), plain);
+        for n in [0u16, DEBUG_LOG_MAX as u16 + 1] {
+            let mut s = head();
+            s.push(Some(reply(CMD_GET_DEBUG, &[XG_ERR_SUCCESS, n as u8, (n >> 8) as u8])));
+            assert_eq!(run_t(Command::Identify, s), plain);
+        }
+        // 記録が読めない形 / 塊が途中で途切れる
+        assert_eq!(run_t(Command::Identify, with_debug(head(), "no match here")), plain);
+        let mut s = head();
+        s.push(Some(reply(CMD_GET_DEBUG, &[XG_ERR_SUCCESS, 0, 1])));
+        s.push(Some(vec![0u8; 10]));
+        assert_eq!(run_t(Command::Identify, s), plain);
+        // 失敗したら入力を捨てて次の照合に残さない
+        let mut port = FakePort::new(head());
+        let discards = port.discards;
+        let lines = super::run(Command::Identify, &mut None, &mut port, &Timeouts::DEFAULT, &mut |_| {});
+        assert_eq!(lines, plain);
+        assert_eq!(port.sent.len(), 4);
+        assert!(port.discards > discards + 3);
+        // 不一致は記録を読まない
+        let mut port = FakePort::new(with_debug(vec![connected(), finger(Some(1)), verified(None)], LOG_FV));
+        let lines = super::run(Command::Verify(15), &mut None, &mut port, &Timeouts::DEFAULT, &mut |_| {});
+        assert_eq!(lines, vec!["VEIN NOMATCH"]);
+        assert_eq!(port.sent.len(), 3);
+    }
+
     #[test]
     fn verify_id_is_verify_with_the_id_after_settling() {
         let mut port = FakePort::new(vec![connected(), finger(Some(1)), verified(Some(42))]);
         assert_eq!(verify_id(&mut port, &Timeouts::DEFAULT, 42, &mut |_| {}), Ok(Some(42)));
         assert_eq!(port.sent[2], command(CMD_VERIFY, &[42, 0, 0, 0]).to_vec());
         assert_eq!(port.pauses, vec![IDENTIFY_SETTLE_MS]);
-        assert_eq!(verify_line(42, Some(42)), "VEIN VERIFIED 42");
-        assert_eq!(verify_line(42, None), "VEIN NOMATCH");
+        assert_eq!(verify_line(42, Some(42), None), "VEIN VERIFIED 42");
+        assert_eq!(verify_line(42, None, None), "VEIN NOMATCH");
         assert_eq!(sync_info_line(3, 100), "VEIN SYNC INFO USERS=3 MAX=100");
     }
 
