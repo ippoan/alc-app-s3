@@ -678,6 +678,9 @@ pub enum TestCommand {
     SysInfo,
     /// `VEIN TEST IMAGE`: 撮影して生画像を返す (READ_IMAGE、[`CMD_READ_IMAGE`])
     Image,
+    /// `VEIN TEST DEBUG`: モジュールの動作記録 (GET_DEBUG → READ_DATA 0x26) を行ごとに返す ([`test_debug`])。
+    /// 点数の取り方 ([`parse_match_log`]) を実機の行で確かめるため
+    Debug,
     /// `VEIN TEST RAW <待ち ms> <16 進>`: バイト列をそのまま UART へ送り、返ってきたバイトをそのまま返す
     /// ([`test_raw`])。仕様書にない命令 (指紋互換の EF01 形式、GET_DEBUG 0x26 など) が通じるかを
     /// ホスト側で組み立てて確かめるため (ippoan/alc-app#436)
@@ -925,6 +928,29 @@ pub fn test_image(
         return Err(VeinError::ReadFail);
     }
     Ok((w, h, read_data(port, t, CMD_READ_IMAGE, size)?))
+}
+
+/// `VEIN TEST DEBUG` の 1 行の長さの上限 (文字)。これを超える行は切る
+pub const DEBUG_LINE_MAX: usize = 200;
+
+/// 試験: 接続して動作記録を読み、`VEIN TEST DEBUG <行>` の列と
+/// `VEIN TEST DEBUG END <行数>` にする (NUL は落とし、空行は飛ばし、長い行は [`DEBUG_LINE_MAX`] 文字で切る)。
+/// 送るのは接続と GET_DEBUG 0x26 / READ_DATA 0x26 だけ ([`read_match_score`] と同じ)
+pub fn test_debug(port: &mut dyn Port, t: &Timeouts) -> Result<Vec<String>, VeinError> {
+    connect(port, t)?;
+    let raw = read_debug_log(port, t)?;
+    Ok(debug_lines(&String::from_utf8_lossy(&raw)))
+}
+
+/// [`test_debug`] の行づくり
+pub fn debug_lines(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = text
+        .split(['\n', '\r', '\0'])
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| format!("VEIN TEST DEBUG {}", l.chars().take(DEBUG_LINE_MAX).collect::<String>()))
+        .collect();
+    lines.push(format!("VEIN TEST DEBUG END {}", lines.len()));
+    lines
 }
 
 /// `VEIN TEST IMAGE` の成功の行: 画素を [`RECORD_LINE_MAX`] バイトずつ
@@ -3053,6 +3079,33 @@ mod tests {
         let lines = super::run(Command::Verify(15), &mut None, &mut port, &Timeouts::DEFAULT, &mut |_| {});
         assert_eq!(lines, vec!["VEIN NOMATCH"]);
         assert_eq!(port.sent.len(), 3);
+    }
+
+    #[test]
+    fn debug_lines_split_clean_and_cut() {
+        assert_eq!(debug_lines(""), vec!["VEIN TEST DEBUG END 0"]);
+        assert_eq!(
+            debug_lines("a b\r\n\n  \nUSER:1, th[1, 2, 3]\0\0\0"),
+            vec!["VEIN TEST DEBUG a b", "VEIN TEST DEBUG USER:1, th[1, 2, 3]", "VEIN TEST DEBUG END 2"]
+        );
+        let long = "あ".repeat(DEBUG_LINE_MAX + 5);
+        let l = &debug_lines(&long)[0];
+        assert_eq!(l.chars().count(), "VEIN TEST DEBUG ".len() + DEBUG_LINE_MAX);
+    }
+
+    #[test]
+    fn test_debug_connects_then_reads_the_log() {
+        let mut script = vec![connected()];
+        script.extend(debug_script(LOG_FP.as_bytes()));
+        let mut port = FakePort::new(script);
+        let lines = test_debug(&mut port, &Timeouts::DEFAULT).unwrap();
+        assert_eq!(lines[0], "VEIN TEST DEBUG Match.User:15");
+        assert_eq!(lines.last().unwrap(), "VEIN TEST DEBUG END 4");
+        assert_eq!(port.sent[1], command(CMD_GET_DEBUG, &[]).to_vec());
+        // 接続できない / 記録が読めない
+        assert_eq!(test_debug(&mut FakePort::new(vec![None]), &Timeouts::DEFAULT), Err(VeinError::NoModule));
+        let mut port = FakePort::new(vec![connected(), Some(reply(CMD_GET_DEBUG, &[XG_ERR_FAIL, XG_ERR_NO_SUPPORT]))]);
+        assert_eq!(test_debug(&mut port, &Timeouts::DEFAULT), Err(VeinError::Rc(XG_ERR_NO_SUPPORT)));
     }
 
     #[test]
