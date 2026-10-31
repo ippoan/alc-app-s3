@@ -1235,12 +1235,14 @@ fn field_after(line: &str, key: &str) -> Option<u32> {
     leading_u32(&line[line.find(key)? + key.len()..])
 }
 
-/// `1:1->A:<id>, 6,<点数>` (1:N も `->A:` の形) → 点数。最後のコンマの後ろ
+/// `->A:` の行 → 点数。ID の後ろの 5 つ目 (`<n>,<t0>,<t1>,<t2>,<点数>`)。1:1 は
+/// `1:1->A:<id>, <n>,<t0>,<t1>,<t2>,<点数>`、1:N は `1:N->A:<id>, <n>,<t0>,<t1>,<t2>,<点数>,<1>` と
+/// 点数の後ろにもう 1 つ付くので、最後のフィールドではなく位置で取る (実機 2026-10-31)
 fn score_of(line: &str, id: u32) -> Option<u32> {
     let rest = &line[line.find("->A:")? + 4..];
     let mut fields = rest.split(',');
     (leading_u32(fields.next()?) == Some(id)).then_some(())?;
-    parse_u32(fields.next_back()?)
+    parse_u32(fields.nth(4)?)
 }
 
 /// `USER:<id>, th[s0, s1, s2]` → 3 つ
@@ -1276,7 +1278,7 @@ const MATCH_BLOCK_START: &str = "PS_GenChar OK";
 ///   `PS_Search OK:FV=<id>(<id>),FP=<id>` / `USER:<id>, th[t0, t1, t2], ...`
 /// - 指紋互換だけで一致: `->A:` の行が無く、`PS_Search OK:FV=0(0),FP=<id>` / `USER:<id>, th[0, 0, 0], ...`
 ///
-/// 点数は塊の `->A:` の行の最後のフィールド (無ければ 0 = 静脈は不一致)。閾値は塊の `USER:` の行。
+/// 点数は塊の `->A:` の行の ID の後ろの 5 つ目 (無ければ 0 = 静脈は不一致)。閾値は塊の `USER:` の行。
 /// 経路は塊の `PS_Search OK:` の行 (無ければ点数 >= t1 で FV)。塊が無い・閾値が読めなければ `None`
 pub fn parse_match_log(text: &str, id: u32) -> Option<MatchScore> {
     let all: Vec<&str> = text.split(['\n', '\r', '\0']).collect();
@@ -2997,9 +2999,17 @@ mod tests {
         assert_eq!(parse_match_log(&log, 15).unwrap(), MatchScore { score: 0, th: [0, 0, 0], via: MatchVia::Fp });
         let log = format!("{BLOCK_FP}{BLOCK_FV}");
         assert_eq!(parse_match_log(&log, 15).unwrap().score, 68);
+        // 1:N は点数の後ろにもう 1 つ付く (実機の塊)。最後のフィールドではなく位置で取る
+        let log = "PS_GenChar OK:175\n1:N->A:15, 3,60,71,78,68,1\nPS_Search OK:FV=15(15),FP=15\n\
+                   USER:15, th[60, 71, 78], U15, R3, MS:399\n";
+        assert_eq!(parse_match_log(log, 15).unwrap(), MatchScore { score: 68, th: [60, 71, 78], via: MatchVia::Fv });
+        // 1:N で静脈は外れ、指紋互換で通った塊 (`###1:USER` / `GUESS USER` の行が付く)
+        let log = "PS_GenChar OK:175\n###1:USER:15, 97, 57, 55, 72, 3, 0\nGUESS USER:15\n\
+                   PS_Search OK:FV=0(15),FP=15\nUSER:15, th[0, 0, 0], U0, R0, MS:906\n";
+        assert_eq!(parse_match_log(log, 15).unwrap(), MatchScore { score: 0, th: [0, 0, 0], via: MatchVia::Fp });
         // 1:N (別の ID の行が混じる) は当たった ID の行だけを見る
-        let log = "PS_GenChar OK:1\n1:N->A:20, 7,1,2,3,99\nUSER:20, th[1, 2, 3]\n\
-                   1:N->A:15, 7,50,60,70,58\nUSER:15, th[50, 60, 70]\nPS_Search OK:FV=15(15),FP=0\n";
+        let log = "PS_GenChar OK:1\n1:N->A:20, 7,1,2,3,99,1\nUSER:20, th[1, 2, 3]\n\
+                   1:N->A:15, 7,50,60,70,58,1\nUSER:15, th[50, 60, 70]\nPS_Search OK:FV=15(15),FP=0\n";
         assert_eq!(parse_match_log(log, 15).unwrap(), MatchScore { score: 58, th: [50, 60, 70], via: MatchVia::Fv });
         // PS_Search の行が無い / 別の ID だけなら、点数と真ん中の閾値で決める
         assert_eq!(parse_match_log("PS_GenChar OK\n1:1->A:7, 7,1,50,9,50\nUSER:7, th[1, 50, 9]\n", 7).unwrap().via, MatchVia::Fv);
