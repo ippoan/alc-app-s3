@@ -284,6 +284,7 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
     const BAD_VERIFY: &str = "ERR VEIN: VERIFY の ID は 0 か 2〜100 の数字だけです";
     const BAD_CAPACITY: &str = "ERR VEIN: CAPACITY に引数は要りません";
     const BAD_SYSINFO: &str = "ERR VEIN: SYSINFO に引数は要りません";
+    const BAD_DEBUG: &str = "ERR VEIN: DEBUG に引数は要りません";
     const BAD_IMAGE: &str = "ERR VEIN: IMAGE に引数は要りません";
     const BAD_RAW: &str = "ERR VEIN: RAW <待ち ms (0〜30000)> <16 進 (1〜192 バイト)> です";
     const BAD_RAWQ: &str = "ERR VEIN: RAWQ <16 進 (1〜192 バイト)> です";
@@ -305,6 +306,8 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
         (Some("CAPACITY"), _) => Err(BAD_CAPACITY.into()),
         (Some("SYSINFO"), []) => Ok(HostCommand::VeinTest(TestCommand::SysInfo)),
         (Some("SYSINFO"), _) => Err(BAD_SYSINFO.into()),
+        (Some("DEBUG"), []) => Ok(HostCommand::VeinTest(TestCommand::Debug)),
+        (Some("DEBUG"), _) => Err(BAD_DEBUG.into()),
         (Some("IMAGE"), []) => Ok(HostCommand::VeinTest(TestCommand::Image)),
         (Some("IMAGE"), _) => Err(BAD_IMAGE.into()),
         (Some("RAW"), [wait, hex]) => wait
@@ -332,7 +335,7 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
             parse_test_id(id).map(|id| HostCommand::VeinTest(make(id))).ok_or_else(|| BAD_ID.into())
         }
         (Some("ENROLL" | "CLEAR"), _) => Err(BAD_ID.into()),
-        _ => Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|CAPACITY|SYSINFO|IMAGE|RAW|RAWQ|RAWGAP が必要です".into()),
+        _ => Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|CAPACITY|SYSINFO|IMAGE|DEBUG|RAW|RAWQ|RAWGAP が必要です".into()),
     }
 }
 
@@ -1662,6 +1665,8 @@ mod tests {
             parse_line("VEIN TEST SYSINFO 1", T),
             Err("ERR VEIN: SYSINFO に引数は要りません".into())
         );
+        assert_eq!(parse_line("vein test debug", T), Ok(Some(HostCommand::VeinTest(TestCommand::Debug))));
+        assert_eq!(parse_line("VEIN TEST DEBUG 1", T), Err("ERR VEIN: DEBUG に引数は要りません".into()));
         assert_eq!(parse_line("VEIN TEST IMAGE", T), Ok(Some(HostCommand::VeinTest(TestCommand::Image))));
         assert_eq!(
             parse_line("VEIN TEST RAW 1500 ef01FFff", T),
@@ -1788,7 +1793,7 @@ mod tests {
         for gone in ["VEIN TEST INFO 2", "VEIN TEST COPY 2 3", "VEIN TEST REBUILD 2 3", "VEIN TEST WRITE 3 END"] {
             assert_eq!(
                 parse_line(gone, T),
-                Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|CAPACITY|SYSINFO|IMAGE|RAW|RAWQ|RAWGAP が必要です".into()),
+                Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|CAPACITY|SYSINFO|IMAGE|DEBUG|RAW|RAWQ|RAWGAP が必要です".into()),
                 "{gone}"
             );
         }
