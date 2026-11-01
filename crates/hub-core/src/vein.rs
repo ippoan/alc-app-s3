@@ -82,7 +82,7 @@ pub const CMD_GET_ENROLL_INFO: u8 = 0x14;
 /// 照合のたびに `Match.User:` / `->A:` / `PS_Search OK:` / `USER:` の行が残る ([`parse_match_log`])。
 /// **仕様書に節は無いが、`VEIN TEST RAW` で実機に通じることを確かめてある** (ippoan/alc-app#436)。
 /// 応答の読み方は READ_ENROLL と同じ形 (`bData[1] + bData[2] * 256` が大きさ) と**推測**している。
-/// 照合の成功の直後に 1 回だけ使う ([`read_match_score`])
+/// 照合の直後に 1 回だけ使う ([`read_match_log`])
 pub const CMD_GET_DEBUG: u8 = 0x26;
 /// 動作記録の大きさの上限 (実機は 4096 バイト)。これを超える大きさは応答の破損とみなす
 pub const DEBUG_LOG_MAX: usize = 4096;
@@ -938,7 +938,7 @@ pub const DEBUG_LINE_MAX: usize = 200;
 
 /// 試験: 接続して動作記録を読み、`VEIN TEST DEBUG <行>` の列と
 /// `VEIN TEST DEBUG END <行数>` にする (NUL は落とし、空行は飛ばし、長い行は [`DEBUG_LINE_MAX`] 文字で切る)。
-/// 送るのは接続と GET_DEBUG 0x26 / READ_DATA 0x26 だけ ([`read_match_score`] と同じ)
+/// 送るのは接続と GET_DEBUG 0x26 / READ_DATA 0x26 だけ ([`read_match_log`] と同じ)
 pub fn test_debug(port: &mut dyn Port, t: &Timeouts) -> Result<Vec<String>, VeinError> {
     connect(port, t)?;
     let raw = read_debug_log(port, t)?;
@@ -1281,9 +1281,7 @@ const MATCH_BLOCK_START: &str = "PS_GenChar OK";
 /// 点数は塊の `->A:` の行の ID の後ろの 5 つ目 (無ければ 0 = 静脈は不一致)。閾値は塊の `USER:` の行。
 /// 経路は塊の `PS_Search OK:` の行 (無ければ点数 >= t1 で FV)。塊が無い・閾値が読めなければ `None`
 pub fn parse_match_log(text: &str, id: u32) -> Option<MatchScore> {
-    let all: Vec<&str> = text.split(['\n', '\r', '\0']).collect();
-    let start = all.iter().rposition(|l| l.contains(MATCH_BLOCK_START))?;
-    let block = &all[start + 1..];
+    let block = last_match_block(text)?;
     let score = block.iter().rev().find_map(|l| score_of(l, id)).unwrap_or(0);
     let th = block.iter().rev().find_map(|l| th_of(l, id))?;
     let via = block
@@ -1292,6 +1290,76 @@ pub fn parse_match_log(text: &str, id: u32) -> Option<MatchScore> {
         .find_map(|l| via_of(l, id))
         .unwrap_or(if score >= th[1] { MatchVia::Fv } else { MatchVia::Fp });
     Some(MatchScore { score, th, via })
+}
+
+/// 不一致だった照合の塊で、静脈の点数が付いた候補のうち最も高いもの (`->A:` の行。どの ID でも)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissBest {
+    pub id: u32,
+    pub score: u32,
+    /// `->A:` の行の点数の前の 3 つ (当たった回の `USER:` の `th[..]` と同じ値が並ぶ)
+    pub th: [u32; 3],
+}
+
+/// 不一致の応答に付ける点数。塊はあったが静脈の点数が 1 つも付かなかったなら `best` は `None`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissScore {
+    pub best: Option<MissBest>,
+}
+
+impl MissScore {
+    /// ` BEST=<id> SCORE=<n> THS=<s0>,<s1>,<s2>` / ` SCORE=0` (点数の段階まで進まなかった)
+    fn suffix(&self) -> String {
+        match self.best {
+            Some(MissBest { id, score, th: [a, b, c] }) => format!(" BEST={id} SCORE={score} THS={a},{b},{c}"),
+            None => " SCORE=0".into(),
+        }
+    }
+}
+
+/// `->A:<id>, <n>,<t0>,<t1>,<t2>,<点数>` → 候補 1 つ (読めない行は `None`)
+fn candidate_of(line: &str) -> Option<MissBest> {
+    let rest = &line[line.find("->A:")? + 4..];
+    let mut fields = rest.split(',');
+    let id = leading_u32(fields.next()?)?;
+    fields.next()?;
+    let th = [parse_u32(fields.next()?)?, parse_u32(fields.next()?)?, parse_u32(fields.next()?)?];
+    let score = parse_u32(fields.next()?)?;
+    Some(MissBest { id, score, th })
+}
+
+/// 最後の照合の塊 (最後の `PS_GenChar OK` の行より後) の行。塊が無ければ `None`
+fn last_match_block(text: &str) -> Option<Vec<&str>> {
+    let all: Vec<&str> = text.split(['\n', '\r', '\0']).collect();
+    let start = all.iter().rposition(|l| l.contains(MATCH_BLOCK_START))?;
+    Some(all[start + 1..].iter().copied().filter(|l| !l.trim().is_empty()).collect())
+}
+
+/// 不一致だった照合の、最後の塊の点数を読む ([`parse_match_log`] の不一致版)。塊が無ければ `None`。
+/// 不一致の塊の形は実機で確かめきれていないので、`->A:` の行をどの ID でも拾い、最も点数の高いものを出す
+pub fn parse_miss_log(text: &str) -> Option<MissScore> {
+    let block = last_match_block(text)?;
+    let best = block.iter().filter_map(|l| candidate_of(l)).max_by_key(|c| c.score);
+    Some(MissScore { best })
+}
+
+/// [`match_log_line`] の本文の上限 (文字数)
+pub const MATCH_LOG_LINE_MAX: usize = 400;
+
+/// `VEIN MATCHLOG <最後の塊の行を ` | ` でつないだもの>` (表示できる ASCII だけ、[`MATCH_LOG_LINE_MAX`] で切る)。
+/// 不一致と指紋互換だけで当たった回に、照合の応答の前に出す (塊の形を後から読むため)。塊が無ければ `None`
+pub fn match_log_line(text: &str) -> Option<String> {
+    let block = last_match_block(text)?;
+    let body: String = block
+        .iter()
+        .map(|l| l.trim())
+        .collect::<Vec<_>>()
+        .join(" | ")
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(MATCH_LOG_LINE_MAX)
+        .collect();
+    Some(format!("VEIN MATCHLOG {body}"))
 }
 
 /// 動作記録 (GET_DEBUG → READ_DATA 種別 0x26) を読む。接続済みであること
@@ -1307,18 +1375,30 @@ fn read_debug_log(port: &mut dyn Port, t: &Timeouts) -> Result<Vec<u8>, VeinErro
     read_data(port, t, CMD_GET_DEBUG, size)
 }
 
-/// 照合が通った直後に、当たった ID `id` の点数を動作記録から読む。**付け足しなので何があっても
-/// `None`** (時間切れ・壊れた応答・読めない形) — 応答は点数なしの今までの行のまま。待ちは
-/// [`DEBUG_READ_MS`] に縮め、失敗したら入力を捨てて次の照合に残さない
-fn read_match_score(port: &mut dyn Port, t: &Timeouts, id: u32) -> Option<MatchScore> {
+/// 照合の直後 (当たっても外れても) に動作記録を読む。**付け足しなので何があっても `None`**
+/// (時間切れ・壊れた応答) — 応答は点数なしの今までの行のまま。待ちは [`DEBUG_READ_MS`] に縮め、
+/// 失敗したら入力を捨てて次の照合に残さない
+fn read_match_log(port: &mut dyn Port, t: &Timeouts) -> Option<String> {
     let quick = Timeouts { connect_ms: DEBUG_READ_MS, data_ms: DEBUG_READ_MS, ..*t };
-    let score = read_debug_log(port, &quick)
-        .ok()
-        .and_then(|raw| parse_match_log(&String::from_utf8_lossy(&raw), id));
-    if score.is_none() {
+    let text = read_debug_log(port, &quick).ok().map(|raw| String::from_utf8_lossy(&raw).into_owned());
+    if text.is_none() {
         port.discard_input();
     }
-    score
+    text
+}
+
+/// 照合 1 回の応答の行。`log` は直後に読んだ動作記録 (読めなければ `None`)、`line` は応答の行を組む関数
+/// ([`identify_line`] / [`verify_line`])。当たりは点数 ([`parse_match_log`]) を、不一致は `VEIN NOMATCH` の
+/// 後ろに点数 ([`parse_miss_log`]) を付ける。不一致と指紋互換だけで当たった回は、その前に [`match_log_line`] を出す
+fn match_lines(hit: Option<u32>, log: Option<&str>, line: impl Fn(Option<u32>, Option<MatchScore>) -> String) -> Vec<String> {
+    let score = hit.zip(log).and_then(|(id, l)| parse_match_log(l, id));
+    let miss = hit.is_none().then(|| log.and_then(parse_miss_log)).flatten();
+    let mut lines = Vec::new();
+    if hit.is_none() || score.is_some_and(|s| s.via == MatchVia::Fp) {
+        lines.extend(log.and_then(match_log_line));
+    }
+    lines.push(format!("{}{}", line(hit, score), miss.map(|m| m.suffix()).unwrap_or_default()));
+    lines
 }
 
 /// `VEIN VERIFIED <id>` (点数が読めたら ` SCORE=<n> TH=<s1> VIA=FV|FP THS=<s0>,<s1>,<s2>` が続く) /
@@ -1389,12 +1469,12 @@ pub fn run(
     let lines = match cmd {
         Command::Enroll(id) => enroll(port, t, id, on_prompt).map(|rec| record_lines(id, &rec)),
         Command::Identify => identify(port, t, on_prompt).map(|hit| {
-            let score = hit.and_then(|id| read_match_score(port, t, id));
-            vec![identify_line(hit, score)]
+            let log = read_match_log(port, t);
+            match_lines(hit, log.as_deref(), identify_line)
         }),
         Command::Verify(id) => verify_id(port, t, id, on_prompt).map(|hit| {
-            let score = hit.and_then(|id| read_match_score(port, t, id));
-            vec![verify_line(id, hit, score)]
+            let log = read_match_log(port, t);
+            match_lines(hit, log.as_deref(), |hit, score| verify_line(id, hit, score))
         }),
         Command::SyncWrite(w) => sync_write(slot, port, t, w).map(|line| vec![line]),
         Command::SyncClear(id) => clear(port, t, id).map(|()| vec![format!("VEIN SYNC CLEARED {id}")]),
@@ -3062,8 +3142,8 @@ mod tests {
         );
         let script = with_debug(vec![connected(), finger(Some(1)), verified(Some(15))], LOG_FP);
         assert_eq!(
-            run_t(Command::Verify(15), script),
-            vec!["VEIN VERIFIED 15 SCORE=0 TH=0 VIA=FP THS=0,0,0"]
+            run_t(Command::Verify(15), script).last().unwrap(),
+            "VEIN VERIFIED 15 SCORE=0 TH=0 VIA=FP THS=0,0,0"
         );
         // 4096 バイトまで複数の塊で読む
         let mut big = " ".repeat(DEBUG_LOG_MAX - LOG_FV.len());
@@ -3108,11 +3188,68 @@ mod tests {
         assert_eq!(lines, plain);
         assert_eq!(port.sent.len(), 4);
         assert!(port.discards > discards + 3);
-        // 不一致は記録を読まない
-        let mut port = FakePort::new(with_debug(vec![connected(), finger(Some(1)), verified(None)], LOG_FV));
-        let lines = super::run(Command::Verify(15), &mut None, &mut port, &Timeouts::DEFAULT, &mut |_| {});
-        assert_eq!(lines, vec!["VEIN NOMATCH"]);
-        assert_eq!(port.sent.len(), 3);
+        // 不一致で記録が読めなければ今までの行のまま
+        assert_eq!(run_t(Command::Verify(15), vec![connected(), finger(Some(1)), verified(None)]), vec!["VEIN NOMATCH"]);
+    }
+
+    /// 実機 (2026-11-01、Vein Station) で落ちた回の点数 (73・80 が閾値 66〜85 をまたいだ) に似せた不一致の塊
+    const BLOCK_MISS: &str = "CONNECT[1]OK!\r\n0-Gray:120\r\nXG_Create:0,900,125\r\nPS_GenChar OK:170\r\n\
+                              1:N->A:10, 6,61,85,83,80,1\r\n1:N->A:12, 6,50,60,70,41,1\r\nPS_Search FAIL\r\n\0\0";
+
+    #[test]
+    fn parse_miss_log_reads_the_best_candidate_of_the_last_block() {
+        let best = |id, score, th| Some(MissScore { best: Some(MissBest { id, score, th }) });
+        assert_eq!(parse_miss_log(BLOCK_MISS), best(10, 80, [61, 85, 83]));
+        // 塊はあるが点数の段階まで進まなかった
+        assert_eq!(parse_miss_log("PS_GenChar OK:1\nMatch.User:0, 0\nPS_Search FAIL\n"), Some(MissScore { best: None }));
+        // 前の回の `->A:` を拾わない
+        assert_eq!(parse_miss_log(&format!("{BLOCK_MISS}PS_GenChar OK:2\nPS_Search FAIL\n")), Some(MissScore { best: None }));
+        // 1:1 の形・壊れた行は飛ばす
+        assert_eq!(parse_miss_log("PS_GenChar OK\n1:1->A:15, 7,57,67,78,55\n1:1->A:x, 7,1,2,3,99\n1:1->A:16, 7,1,2\n"), best(15, 55, [57, 67, 78]));
+        // 塊が無い
+        assert_eq!(parse_miss_log(""), None);
+        assert_eq!(parse_miss_log("1:N->A:10, 6,61,85,83,80,1\n"), None);
+        // 応答の付け足し
+        assert_eq!(parse_miss_log(BLOCK_MISS).unwrap().suffix(), " BEST=10 SCORE=80 THS=61,85,83");
+        assert_eq!(MissScore { best: None }.suffix(), " SCORE=0");
+    }
+
+    #[test]
+    fn match_log_line_joins_the_last_block() {
+        assert_eq!(
+            match_log_line(BLOCK_MISS).unwrap(),
+            "VEIN MATCHLOG 1:N->A:10, 6,61,85,83,80,1 | 1:N->A:12, 6,50,60,70,41,1 | PS_Search FAIL"
+        );
+        assert_eq!(match_log_line("no block"), None);
+        // 表示できない文字は落とし、長さを切る
+        let long = format!("PS_GenChar OK\n\u{1}{}\n", "x".repeat(1000));
+        let line = match_log_line(&long).unwrap();
+        assert_eq!(line, format!("VEIN MATCHLOG {}", "x".repeat(MATCH_LOG_LINE_MAX)));
+    }
+
+    #[test]
+    fn nomatch_and_fp_hits_carry_the_block() {
+        let miss = || vec![connected(), finger(Some(1)), verified(None)];
+        assert_eq!(
+            run_t(Command::Identify, with_debug(miss(), BLOCK_MISS)),
+            vec![
+                "VEIN MATCHLOG 1:N->A:10, 6,61,85,83,80,1 | 1:N->A:12, 6,50,60,70,41,1 | PS_Search FAIL",
+                "VEIN NOMATCH BEST=10 SCORE=80 THS=61,85,83",
+            ]
+        );
+        assert_eq!(
+            run_t(Command::Verify(15), with_debug(miss(), "PS_GenChar OK:1\nPS_Search FAIL\n")),
+            vec!["VEIN MATCHLOG PS_Search FAIL", "VEIN NOMATCH SCORE=0"]
+        );
+        // 記録に塊が無ければ点数も塊も付けない
+        assert_eq!(run_t(Command::Identify, with_debug(miss(), "no block")), vec!["VEIN NOMATCH"]);
+        // 指紋互換だけで当たった回は塊を前に出す。静脈で当たった回は出さない
+        let hit = || vec![connected(), finger(Some(1)), verified(Some(15))];
+        let lines = run_t(Command::Verify(15), with_debug(hit(), LOG_FP));
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("VEIN MATCHLOG Match.User:15, 0 | PS_Search OK:FV=0(0),FP=15"));
+        assert_eq!(lines[1], "VEIN VERIFIED 15 SCORE=0 TH=0 VIA=FP THS=0,0,0");
+        assert_eq!(run_t(Command::Identify, with_debug(hit(), LOG_FV)).len(), 1);
     }
 
     #[test]
