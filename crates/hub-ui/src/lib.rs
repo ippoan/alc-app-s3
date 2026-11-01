@@ -255,9 +255,14 @@ pub fn run(
             (st.lan_link || st.wifi_connected, st.clock_synced_at, st.rtc_present)
         });
         if online && !was_online {
-            // SAFETY: 引数なし。SNTP が動いていなければ false が返るだけ
-            let restarted = unsafe { esp_idf_svc::sys::esp_sntp_restart() };
-            alc_hub_common::evtlog::emit(&format!("EVT CLOCK_SNTP_RESTART ok={}", u8::from(restarted)));
+            // 止めてかけ直す (ESP-IDF の esp_sntp_restart と同じ。bindings に無いので 2 つを呼ぶ)。
+            // サーバ名と同期の通知は main.rs の EspSntp が持ち続けているので残る。
+            // SAFETY: どちらも引数なし。esp_sntp_* は lwip のロックを取る版
+            unsafe {
+                esp_idf_svc::sys::esp_sntp_stop();
+                esp_idf_svc::sys::esp_sntp_init();
+            }
+            alc_hub_common::evtlog::emit("EVT CLOCK_SNTP_RESTART");
         }
         was_online = online;
         if rtc_present && alc_hub_core::rtc::should_write(synced_at, rtc_written_at) {

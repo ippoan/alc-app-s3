@@ -129,7 +129,7 @@ crates/hub-core/src/improv.rs)。
 | `EVT WS_CLOCK_WAIT` | WS は繋がったが時計が未同期で、補正できる測定があるため送信を最大 60 秒待っている (NTP 同期後に補正して送る) |
 | `EVT WS_TIME_FIXED <n>` | NTP 未同期 (ネットワーク無し) で記録した測定 n 件の `recorded_at_ms` を、送信時に稼働時間の差で実時刻へ補正した (同じ起動の分だけ。再起動をまたいだ分は 1970 起点のまま送る) |
 | `EVT CLOCK_RTC set=<unix 秒> rc=<0>` / `invalid` / `read_err=<e>` | 起動時に RTC (BM8563、CoreS3 だけ) の時刻をシステム時刻に入れた / 書いたことが無いか電池切れ (VL) で使わなかった / 読めなかった。SNTP が合うまでの測定・打刻が 1970 起点で送られないため |
-| `EVT CLOCK_SNTP_RESTART ok=<0\|1>` | 回線 (LAN / Wi-Fi) が通った瞬間に SNTP をやり直させた。SNTP は回線が通る前に始まり、初回の失敗で問い合わせの間隔が延びているため (やり直さないと同期まで分単位かかった、2026-11-01) |
+| `EVT CLOCK_SNTP_RESTART` | 回線 (LAN / Wi-Fi) が通った瞬間に SNTP をやり直させた。SNTP は回線が通る前に始まり、初回の失敗で問い合わせの間隔が延びているため (やり直さないと同期まで分単位かかった、2026-11-01) |
 | `EVT CLOCK_SNTP` | SNTP で時刻が合った |
 | `EVT CLOCK_RTC_WRITE <unix 秒>` / `err=<e>` | SNTP で合った時刻を RTC へ書き戻した (同期のたびに 1 回) |
 | `EVT CRASH <reason> log_bytes=<n>` | 前回リセットがクラッシュ由来 (panic/WDT/brownout 等)。panic 前ログを kind=crash_log で自動送信 |
