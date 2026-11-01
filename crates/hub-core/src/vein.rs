@@ -1428,12 +1428,14 @@ fn read_match_log(port: &mut dyn Port, t: &Timeouts) -> Option<String> {
 
 /// 照合 1 回の応答の行。`log` は直後に読んだ動作記録 (読めなければ `None`)、`line` は応答の行を組む関数
 /// ([`identify_line`] / [`verify_line`])。当たりは点数 ([`parse_match_log`]) を、不一致は `VEIN NOMATCH` の
-/// 後ろに点数 ([`parse_miss_log`]) を付ける。不一致と指紋互換だけで当たった回は、その前に [`match_log_line`] を出す
+/// 後ろに点数 ([`parse_miss_log`]) を付ける。不一致・指紋互換だけで当たった回・点数が読めなかった回は、
+/// その前に [`match_log_line`] を出す
 fn match_lines(hit: Option<u32>, log: Option<&str>, line: impl Fn(Option<u32>, Option<MatchScore>) -> String) -> Vec<String> {
     let score = hit.zip(log).and_then(|(id, l)| parse_match_log(l, id));
     let miss = hit.is_none().then(|| log.and_then(parse_miss_log)).flatten();
     let mut lines = Vec::new();
-    if hit.is_none() || score.is_some_and(|s| s.via == MatchVia::Fp) {
+    // 静脈で当たっても点数が 0 (`->A:` の行が読めない形) なら塊を出す — 記録の形の違いを後から読んで直すため
+    if hit.is_none() || score.is_none_or(|s| s.via == MatchVia::Fp || s.score == 0) {
         lines.extend(log.and_then(match_log_line));
     }
     lines.push(format!("{}{}", line(hit, score), miss.map(|m| m.suffix()).unwrap_or_default()));
@@ -3294,6 +3296,17 @@ mod tests {
         assert!(lines[0].starts_with("VEIN MATCHLOG Match.User:15, 0 | PS_Search OK:FV=0(0),FP=15"));
         assert_eq!(lines[1], "VEIN VERIFIED 15 SCORE=0 TH=0 VIA=FP THS=0,0,0");
         assert_eq!(run_t(Command::Identify, with_debug(hit(), LOG_FV)).len(), 1);
+        // 静脈で当たったが点数の行が読めない塊 (実機 2026-11-02、Vein Base の 1:N) は塊も出す
+        let unread = "PS_GenChar OK:1\nIDENTT1->:10, 1, 72, 0\nPS_Search OK:FV=10(10),FP=10\nUSER:10, th[67, 61, 76], U10, R1, MS:200\n";
+        assert_eq!(
+            run_t(Command::Identify, with_debug(hit(), &unread.replace("10", "15"))),
+            vec![
+                "VEIN MATCHLOG IDENTT1->:15, 1, 72, 0 | PS_Search OK:FV=15(15),FP=15 | USER:15, th[67, 61, 76], U15, R1, MS:200",
+                "VEIN IDENTIFIED 15 SCORE=0 TH=61 VIA=FV THS=67,61,76",
+            ]
+        );
+        // 記録が読めなければ今までの行のまま (塊も出さない)
+        assert_eq!(run_t(Command::Identify, with_debug(hit(), "no block")), vec!["VEIN IDENTIFIED 15"]);
     }
 
     #[test]
