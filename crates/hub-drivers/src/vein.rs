@@ -235,6 +235,11 @@ pub fn start(
                     emit_whole_line(&line);
                     continue;
                 }
+                // `EVT VEIN PLACE <n> <合計>` の合計 = この登録で撮る本数 (`VEIN ENROLL <id> <本数>`)
+                let place_total = match &req {
+                    Request::Run(proto::Command::Enroll(_, n)) => *n,
+                    _ => proto::ENROLL_PLACEMENTS,
+                };
                 let mut on_prompt = |p: proto::Prompt| {
                     // 「離して」はビープ + 「指を離してください」、撮り直しは「指を離して、置き直してください」、
                     // 登録の置き直しは「もう一度置いてください」。
@@ -252,7 +257,7 @@ pub fn start(
                         proto::Prompt::Replace(n) => {
                             // 画面が文言と進み具合に使う (生体データなし)
                             // 合計も名乗る (画面の「n/合計」を、ファームの本数と食い違わせない)
-                            alc_hub_common::evtlog::emit(&format!("EVT VEIN PLACE {n} {}", proto::ENROLL_PLACEMENTS));
+                            alc_hub_common::evtlog::emit(&format!("EVT VEIN PLACE {n} {place_total}"));
                             Some(Sound::VeinAgain)
                         }
                         proto::Prompt::Place => None,
