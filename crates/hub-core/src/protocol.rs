@@ -699,10 +699,21 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
             },
             Some("FINGER?") => HostCommand::VeinFingerQuery,
             Some("TEST") => parse_vein_test(&mut it)?,
-            Some("ENROLL") => match (it.next().and_then(crate::vein::parse_module_id), it.next()) {
-                (Some(id), None) => HostCommand::Vein(crate::vein::Command::Enroll(id)),
-                _ => return Err("ERR VEIN: ENROLL の ID は 10〜100 の数字だけです".into()),
-            },
+            // 本数は省略で既定 (4)。1〜6 を選べる (この機種の 1 人あたりの枠)
+            Some("ENROLL") => {
+                let id = it.next().and_then(crate::vein::parse_module_id);
+                let templates = match it.next() {
+                    None => Some(crate::vein::ENROLL_TEMPLATES_PRODUCTION),
+                    Some(n) if n.len() == 1 => {
+                        n.parse::<u8>().ok().filter(|n| (1..=crate::vein::ENROLL_TEMPLATES_MAX).contains(n))
+                    }
+                    Some(_) => None,
+                };
+                match (id, templates, it.next()) {
+                    (Some(id), Some(templates), None) => HostCommand::Vein(crate::vein::Command::Enroll(id, templates)),
+                    _ => return Err("ERR VEIN: ENROLL は <ID 10〜100> [<本数 1〜6>] です".into()),
+                }
+            }
             Some("IDENTIFY") => match it.next() {
                 None => HostCommand::Vein(crate::vein::Command::Identify),
                 Some(_) => return Err("ERR VEIN: IDENTIFY に引数は要りません".into()),
@@ -1772,8 +1783,10 @@ mod tests {
     fn vein_production_commands_parse() {
         use crate::vein::{Command, WriteCommand, WRITE_LINE_MAX};
         let ok = |c: Command| Ok(Some(HostCommand::Vein(c)));
-        assert_eq!(parse_line("VEIN ENROLL 10", T), ok(Command::Enroll(10)));
-        assert_eq!(parse_line("vein enroll 100", T), ok(Command::Enroll(100)));
+        assert_eq!(parse_line("VEIN ENROLL 10", T), ok(Command::Enroll(10, crate::vein::ENROLL_TEMPLATES_PRODUCTION)));
+        assert_eq!(parse_line("vein enroll 100", T), ok(Command::Enroll(100, crate::vein::ENROLL_TEMPLATES_PRODUCTION)));
+        assert_eq!(parse_line("VEIN ENROLL 10 6", T), ok(Command::Enroll(10, 6)));
+        assert_eq!(parse_line("VEIN ENROLL 10 1", T), ok(Command::Enroll(10, 1)));
         assert_eq!(parse_line("VEIN IDENTIFY", T), ok(Command::Identify));
         assert_eq!(parse_line("VEIN VERIFY 10", T), ok(Command::Verify(10)));
         assert_eq!(parse_line("vein verify 100", T), ok(Command::Verify(100)));
@@ -1805,8 +1818,11 @@ mod tests {
         ));
         let over = format!("VEIN SYNC WRITE 19 0 {}", "ab".repeat(WRITE_LINE_MAX + 1));
         assert!(parse_line(&over, T).is_err());
-        const BAD_ENROLL: &str = "ERR VEIN: ENROLL の ID は 10〜100 の数字だけです";
-        for bad in ["VEIN ENROLL", "VEIN ENROLL 1", "VEIN ENROLL 2", "VEIN ENROLL 9", "VEIN ENROLL 101", "VEIN ENROLL x", "VEIN ENROLL 10 11"] {
+        const BAD_ENROLL: &str = "ERR VEIN: ENROLL は <ID 10〜100> [<本数 1〜6>] です";
+        for bad in [
+            "VEIN ENROLL", "VEIN ENROLL 1", "VEIN ENROLL 2", "VEIN ENROLL 9", "VEIN ENROLL 101", "VEIN ENROLL x",
+            "VEIN ENROLL 10 11", "VEIN ENROLL 10 0", "VEIN ENROLL 10 7", "VEIN ENROLL 10 06", "VEIN ENROLL 10 x", "VEIN ENROLL 10 4 4",
+        ] {
             assert_eq!(parse_line(bad, T), Err(BAD_ENROLL.into()), "{bad}");
         }
         assert_eq!(parse_line("VEIN IDENTIFY 2", T), Err("ERR VEIN: IDENTIFY に引数は要りません".into()));

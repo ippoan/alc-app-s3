@@ -131,6 +131,8 @@ pub const ENROLL_TEMPLATES: u8 = 1;
 /// で別の端末の記録が 1:1 で 2/4 通るようになったので、4 本を試す。仕様書は「最大 3 本」と書くが、
 /// この機種 (XG-NV7S、1 人 6 本まで) は 4 本・6 本の登録を受け付けた (ippoan/alc-app#436)
 pub const ENROLL_TEMPLATES_PRODUCTION: u8 = 4;
+/// `VEIN ENROLL <id> <本数>` で選べる本数の上限 (この機種の 1 人あたりの枠。記録は本数によらず 8156 バイト)
+pub const ENROLL_TEMPLATES_MAX: u8 = 6;
 /// 撮像に失敗したときにモジュールが撮り直す回数 (`bData[10]`)。1 回の待ちは最大 5 秒なので、
 /// ホスト (alc-app `useVeinSerial` の `CAPTURE_TIMEOUT_MS` = 20 秒) に収まる回数にする
 pub const ENROLL_RETRIES: u8 = 2;
@@ -759,8 +761,9 @@ pub fn raw_queue_line(len: usize) -> String {
 /// 本番の口 (ippoan/alc-app#436 の M-b: 照合を端末のモジュールで行う)。結果は [`run`] が返す行
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// `VEIN ENROLL <id>`: テンプレート [`ENROLL_TEMPLATES_PRODUCTION`] 本で登録 → 記録全体を返す
-    Enroll(u32),
+    /// `VEIN ENROLL <id> [<本数>]`: テンプレートを本数 (省略は [`ENROLL_TEMPLATES_PRODUCTION`]、
+    /// 1〜[`ENROLL_TEMPLATES_MAX`]) だけ撮って登録 → 記録全体を返す
+    Enroll(u32, u8),
     /// `VEIN IDENTIFY`: 1:N 照合 (VERIFY 0)
     Identify,
     /// `VEIN VERIFY <id>`: 1:1 照合 (VERIFY <id>)。免許証で本人が決まった後に使う
@@ -1135,8 +1138,8 @@ fn verify(
     }
 }
 
-/// 本番の登録 (`VEIN ENROLL <id>`): 接続 → ID を空けてテンプレート
-/// [`ENROLL_TEMPLATES_PRODUCTION`] 本を撮って登録 → 登録データ (記録全体) を読んで返す。
+/// 本番の登録 (`VEIN ENROLL <id> [<本数>]`): 接続 → ID を空けてテンプレート `templates` 本
+/// (既定 [`ENROLL_TEMPLATES_PRODUCTION`]) を撮って登録 → 登録データ (記録全体) を読んで返す。
 /// 撮影の 2 枚目以降は [`Prompt::Replace`] を `on_prompt` へ渡す。登録の後の確認の照合はしない
 /// (同じ指かはモジュールが撮影ごとに見る、`01 09`)。
 ///
@@ -1145,10 +1148,11 @@ pub fn enroll(
     port: &mut dyn Port,
     t: &Timeouts,
     id: u32,
+    templates: u8,
     on_prompt: &mut dyn FnMut(Prompt),
 ) -> Result<Vec<u8>, VeinError> {
     connect(port, t)?;
-    enroll_id(port, t, id, ENROLL_TEMPLATES_PRODUCTION, on_prompt)?;
+    enroll_id(port, t, id, templates, on_prompt)?;
     let got = read_enroll(port, t, id);
     if got.is_err() {
         let _ = exchange(port, t, CMD_CLEAR_ENROLL, &id.to_le_bytes());
@@ -1508,7 +1512,7 @@ pub fn run(
     on_prompt: &mut dyn FnMut(Prompt),
 ) -> Vec<String> {
     let lines = match cmd {
-        Command::Enroll(id) => enroll(port, t, id, on_prompt).map(|rec| record_lines(id, &rec)),
+        Command::Enroll(id, templates) => enroll(port, t, id, templates, on_prompt).map(|rec| record_lines(id, &rec)),
         Command::Identify => identify(port, t, on_prompt).map(|hit| {
             let log = read_match_log(port, t);
             match_lines(hit, log.as_deref(), identify_line)
@@ -1852,8 +1856,13 @@ mod tests {
 
     /// 本番の登録 ([`ENROLL_TEMPLATES_PRODUCTION`] 本) の応答。2 枚目で 1 回撮り直しが入る
     fn enrolled_production() -> Option<Vec<u8>> {
+        enrolled_n(ENROLL_TEMPLATES_PRODUCTION)
+    }
+
+    /// 本数 `n` の登録の応答。2 枚目で 1 回撮り直しが入る
+    fn enrolled_n(n: u8) -> Option<Vec<u8>> {
         let mut v = Vec::new();
-        for k in 0..ENROLL_TEMPLATES_PRODUCTION {
+        for k in 0..n {
             v.extend(reply(CMD_ENROLL, &[XG_INPUT_FINGER, k]));
             if k == 1 {
                 v.extend(reply(CMD_ENROLL, &[XG_ERR_FAIL, XG_ERR_NO_VEIN]));
@@ -1861,7 +1870,7 @@ mod tests {
             }
             v.extend(reply(CMD_ENROLL, &[XG_RELEASE_FINGER, k]));
         }
-        v.extend(reply(CMD_ENROLL, &[XG_ERR_SUCCESS, ENROLL_TEMPLATES_PRODUCTION]));
+        v.extend(reply(CMD_ENROLL, &[XG_ERR_SUCCESS, n]));
         Some(v)
     }
 
@@ -2986,8 +2995,25 @@ mod tests {
     fn run_enroll(script: Vec<Option<Vec<u8>>>, id: u32) -> (Result<Vec<u8>, VeinError>, FakePort, Vec<Prompt>) {
         let mut port = FakePort::new(script);
         let mut prompts = Vec::new();
-        let r = enroll(&mut port, &Timeouts::DEFAULT, id, &mut |p| prompts.push(p));
+        let r = enroll(&mut port, &Timeouts::DEFAULT, id, ENROLL_TEMPLATES_PRODUCTION, &mut |p| prompts.push(p));
         (r, port, prompts)
+    }
+
+    #[test]
+    fn enroll_takes_the_chosen_number_of_templates() {
+        // `VEIN ENROLL <id> 6`: bData[5] に 6 本、置き直しの合図は 2〜6
+        let data = sample_chara(1100);
+        let mut script = vec![connected(), cleared(), enrolled_n(ENROLL_TEMPLATES_MAX), size(1100)];
+        for (off, len) in chunks(1100) {
+            script.push(Some(chunk(&data[off..off + len])));
+        }
+        let mut port = FakePort::new(script);
+        let mut prompts = Vec::new();
+        let r = enroll(&mut port, &Timeouts::DEFAULT, 17, ENROLL_TEMPLATES_MAX, &mut |p| prompts.push(p));
+        assert_eq!(r, Ok(data));
+        assert_eq!(port.sent[2][6 + 5], ENROLL_TEMPLATES_MAX);
+        let replaced: Vec<u8> = prompts.iter().filter_map(|p| if let Prompt::Replace(k) = p { Some(*k) } else { None }).collect();
+        assert_eq!(replaced, (2..=ENROLL_TEMPLATES_MAX).collect::<Vec<_>>());
     }
 
     #[test]
@@ -3038,7 +3064,7 @@ mod tests {
         // 削除が送れなくても、返すのは読み出しの失敗 (5 回目の送信 = 削除)
         let script = vec![connected(), cleared(), enrolled(), Some(reply(CMD_READ_ENROLL, &[XG_ERR_FAIL, 0x0A]))];
         let mut port = FailAt(FakePort::new(script), 5);
-        assert_eq!(enroll(&mut port, &Timeouts::DEFAULT, 17, &mut |_| {}), Err(VeinError::Rc(0x0A)));
+        assert_eq!(enroll(&mut port, &Timeouts::DEFAULT, 17, ENROLL_TEMPLATES_PRODUCTION, &mut |_| {}), Err(VeinError::Rc(0x0A)));
         assert_eq!(port.0.sent.last(), Some(&clear_17));
     }
 
@@ -3411,7 +3437,7 @@ mod tests {
         let data = sample_chara(4);
         let script = vec![connected(), cleared(), enrolled(), size(4), Some(chunk(&data))];
         assert_eq!(
-            run_t(Command::Enroll(19), script),
+            run_t(Command::Enroll(19, ENROLL_TEMPLATES_PRODUCTION), script),
             vec!["VEIN RECORD 19 0 DEEDDEED".to_string(), "VEIN RECORD 19 END 4".to_string()]
         );
         assert_eq!(run_t(Command::Identify, vec![connected(), finger(Some(1)), verified(Some(3))]), vec!["VEIN IDENTIFIED 3"]);
@@ -3454,7 +3480,7 @@ mod tests {
         // 失敗は ERR の 1 行だけ (記録は出さない)
         assert_eq!(run_t(Command::SyncClear(15), vec![None]), vec!["ERR VEIN NO_MODULE"]);
         let script = vec![connected(), cleared(), Some(reply(CMD_ENROLL, &[XG_ERR_FAIL, XG_ERR_TIME_OUT]))];
-        assert_eq!(run_t(Command::Enroll(19), script), vec!["ERR VEIN NO_FINGER"]);
+        assert_eq!(run_t(Command::Enroll(19, ENROLL_TEMPLATES_PRODUCTION), script), vec!["ERR VEIN NO_FINGER"]);
         // run は渡された組み立て中のものを使う
         let mut slot = None;
         run_in(&mut slot, Command::SyncWrite(chunk_cmd(5, 0, &TEMPLATE_MAGIC)), vec![]);
