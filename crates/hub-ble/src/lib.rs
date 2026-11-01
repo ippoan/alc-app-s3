@@ -846,9 +846,11 @@ async fn handle_device(
     }
 
     // 体温計/血圧計の Measurement は indication ベースの機器が多い
-    // (Arduino 版は canIndicate() 優先で登録)。CCCD はニプロ機では応答なしの書き込み、
-    // Omron 機は応答あり (Write Request) でないと購読を無視する (Refs #237)
-    let cccd_response = omron.is_some();
+    // (Arduino 版は canIndicate() 優先で登録)。CCCD は Omron 機と体温計 (ニプロ NT-100B) は
+    // 応答あり (Write Request)。Omron 機は応答なしだと購読を無視する (Refs #237)。NT-100B は
+    // 応答なしで書くと購読は通るのに 1 回目の測定を送らず、2 回目の測定で初めて送る。Linux (BlueZ、
+    // 応答あり) では 1 回目で送ってきた (2026-11-01 開発機)。非 Omron の血圧計は今までどおり応答なし
+    let cccd_response = omron.is_some() || kind == DeviceKind::Thermometer;
     // Omron 機の送信。バッファに前回より新しい記録があれば最新 1 件を recorder へ送る。
     // 購読の途中と購読後の待ちの両方から呼ぶ (on_notify は nimble_host タスクでスタックが
     // 小さいので、そこからは呼ばない)
