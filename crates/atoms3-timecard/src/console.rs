@@ -69,7 +69,10 @@ pub fn start(
     // シリアル OTA を受けるので、USB の受信リングは広い方 (チャンクを丸ごと受ける。
     // Refs ippoan/alc-app#425)
     let rx = console::USB_RX_BUFFER_SERIAL_OTA_BYTES;
-    console::spawn_reader_rx(c"console", 8 * 1024, rx, move |line| {
+    // スタックは 16 KB。指静脈の命令 (`VEIN …`) を足すにつれて 1 行の処理が深くなり、8 KB では
+    // `AUTH SIGN` (ed25519) で console のスタックがあふれて再起動していた (2026-11-01 実機。
+    // 起動直後は通り、BLE が動き出した後の署名で `stack overflow in task console` → 再起動)
+    console::spawn_reader_rx(c"console", 16 * 1024, rx, move |line| {
         handle_line(
             line,
             &status,
