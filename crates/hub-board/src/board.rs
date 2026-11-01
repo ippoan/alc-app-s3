@@ -26,6 +26,25 @@ fn acks(i2c: &mut I2cDriver, addr: u8) -> bool {
     i2c.write_read(addr, &[0x00], &mut buf, BLOCK).is_ok()
 }
 
+/// BM8563 の時刻レジスタの先頭 (秒) と長さ。中身の解釈は `alc_hub_core::rtc`
+const BM8563_TIME_REG: u8 = 0x02;
+const BM8563_TIME_LEN: usize = 7;
+
+/// BM8563 の時刻レジスタ (秒〜年の 7 バイト) を読む。RTC の無い SE ではエラー
+pub fn rtc_read(i2c: &mut I2cDriver) -> Result<[u8; BM8563_TIME_LEN], esp_idf_svc::sys::EspError> {
+    let mut regs = [0u8; BM8563_TIME_LEN];
+    i2c.write_read(BM8563_ADDR, &[BM8563_TIME_REG], &mut regs, BLOCK)?;
+    Ok(regs)
+}
+
+/// BM8563 の時刻レジスタへ書く (秒から 7 バイト。VL も消える)
+pub fn rtc_write(i2c: &mut I2cDriver, regs: &[u8; BM8563_TIME_LEN]) -> Result<(), esp_idf_svc::sys::EspError> {
+    let mut frame = [0u8; BM8563_TIME_LEN + 1];
+    frame[0] = BM8563_TIME_REG;
+    frame[1..].copy_from_slice(regs);
+    i2c.write(BM8563_ADDR, &frame, BLOCK)
+}
+
 /// 内部 I2C (G12/G11) を probe する。power::init の後 (周辺電源 ON 後) に呼ぶ
 pub fn probe(i2c: &mut I2cDriver) -> Probe {
     Probe {

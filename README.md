@@ -128,6 +128,10 @@ crates/hub-core/src/improv.rs)。
 | `EVT PUNCHQ migrated <n>` | 旧形式 (既定 nvs の文字列) に残っていた n 件を punchq へ移した |
 | `EVT WS_CLOCK_WAIT` | WS は繋がったが時計が未同期で、補正できる測定があるため送信を最大 60 秒待っている (NTP 同期後に補正して送る) |
 | `EVT WS_TIME_FIXED <n>` | NTP 未同期 (ネットワーク無し) で記録した測定 n 件の `recorded_at_ms` を、送信時に稼働時間の差で実時刻へ補正した (同じ起動の分だけ。再起動をまたいだ分は 1970 起点のまま送る) |
+| `EVT CLOCK_RTC set=<unix 秒> rc=<0>` / `invalid` / `read_err=<e>` | 起動時に RTC (BM8563、CoreS3 だけ) の時刻をシステム時刻に入れた / 書いたことが無いか電池切れ (VL) で使わなかった / 読めなかった。SNTP が合うまでの測定・打刻が 1970 起点で送られないため |
+| `EVT CLOCK_SNTP_RESTART` | 回線 (LAN / Wi-Fi) が通った瞬間に SNTP をやり直させた。SNTP は回線が通る前に始まり、初回の失敗で問い合わせの間隔が延びているため (やり直さないと同期まで分単位かかった、2026-11-01) |
+| `EVT CLOCK_SNTP` | SNTP で時刻が合った |
+| `EVT CLOCK_RTC_WRITE <unix 秒>` / `err=<e>` | SNTP で合った時刻を RTC へ書き戻した (同期のたびに 1 回) |
 | `EVT CRASH <reason> log_bytes=<n>` | 前回リセットがクラッシュ由来 (panic/WDT/brownout 等)。panic 前ログを kind=crash_log で自動送信 |
 | `EVT CRASH_INFO core=<n> exc=<種類> cause=<exccause> pc=0x… a0=0x… a1=0x… vaddr=0x… reason="…" detail="…"` | 前の起動が **C 側の異常** (CPU 例外 / `abort()` / assert / スタック溢れ / watchdog) で落ちたときの要点 (Refs ippoan/alc-app#403)。ESP-IDF の panic handler の入口で内部 RAM の `.noinit` に書き残し (`src/panic_capture.rs`)、次の起動で 1 回だけ出す — リング上では落ちた起動の末尾 (`--- BOOT … ---` の前) に入り、crash_log にも載る。`exc` = `fault` (CPU 例外。`reason` に種類、`pc` が落ちた命令、`vaddr` が触ろうとした番地) / `abort` (`detail` に assert の文言・スタック溢れのメッセージ等。`pc` は手掛かりにならない) / `int_wdt` / `task_wdt` / `debug`。Rust の panic も最後は `abort()` なので、`PANIC:` の行に加えて `exc=abort` で出る。**`pc` / `a0` を関数名に戻すには、その版の ELF が要る** (いまの CI は ELF を保存していない)。**CoreS3 のみ** |
 | `CFG <json>` | `CFG GET` の応答 |
