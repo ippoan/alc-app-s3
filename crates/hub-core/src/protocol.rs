@@ -197,6 +197,10 @@ pub enum HostCommand {
     TenkoBp { enabled: bool },
     /// 点呼構成の問い合わせ (`TENKO BP=0` を応答)
     TenkoStatus,
+    /// 画面 (運行者 PWA) が始めた測定の id (`TENKO MID <uuid>`、`OK TENKO MID` を応答)。点呼中に送る体温・血圧・
+    /// アルコールの記録の payload に `measurement_id` として載せ、サーバが測定に結ぶ。点呼を抜ける・`STAGE NFC`・
+    /// `RESET` で消える。NVS には保存しない
+    TenkoMeasurement { id: String },
     /// Omron 血圧計 (HEM-6231T) を拾うか (`OMRON BP ON|OFF`。NVS 保存、既定 OFF)
     OmronBp { enabled: bool },
     /// Omron 構成の問い合わせ (`OMRON BP=0` を応答)
@@ -601,7 +605,13 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                 Some("OFF") | Some("0") => HostCommand::TenkoBp { enabled: false },
                 _ => return Err("ERR TENKO: BP には ON|OFF が必要です".into()),
             },
-            _ => return Err("ERR TENKO: BP|STATUS が必要です".into()),
+            Some("MID") => match it.next() {
+                Some(id) if crate::session::is_valid_measurement_id(id) => HostCommand::TenkoMeasurement {
+                    id: id.to_ascii_lowercase(),
+                },
+                _ => return Err("ERR TENKO: MID には測定の id (uuid) が必要です".into()),
+            },
+            _ => return Err("ERR TENKO: BP|STATUS|MID が必要です".into()),
         },
         // Omron 血圧計 (HEM-6231T) を拾うか (hub-ble)
         "OMRON" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
@@ -1384,6 +1394,16 @@ mod tests {
         assert!(parse_line("TENKO TEMP ON", T).is_err());
         assert!(parse_line("TENKO BP", T).is_err());
         assert!(parse_line("TENKO BP MAYBE", T).is_err());
+        assert!(parse_line("TENKO MID", T).is_err());
+        assert!(parse_line("TENKO MID not-a-uuid", T).is_err());
+    }
+
+    #[test]
+    fn tenko_measurement_id() {
+        let id = "0F8B2C4E-1A2B-4C3D-8E9F-0123456789AB";
+        let want = Ok(Some(HostCommand::TenkoMeasurement { id: id.to_ascii_lowercase() }));
+        assert_eq!(parse_line(&format!("TENKO MID {id}"), T), want);
+        assert_eq!(parse_line(&format!("tenko mid {}", id.to_ascii_lowercase()), T), want);
     }
 
     #[test]

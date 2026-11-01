@@ -65,9 +65,65 @@ pub fn is_valid_session_id(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// 画面 (運行者 PWA) が始めた測定の id として受理できる形か (`TENKO MID <id>`)。
+/// サーバの `measurements.id` (uuid) のハイフン区切りの 36 文字だけを受ける
+/// (people-worker の取り込みが列に書くのも同じ形だけ)。
+pub fn is_valid_measurement_id(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+/// 測定の payload (JSON の object の文字列) の末尾に `"measurement_id":"<id>"` を足す。
+/// id が無い・payload が object で終わらないときはそのまま返す (測定そのものは必ず送る)。
+/// id は [`is_valid_measurement_id`] を通ったものだけが来る前提 (エスケープは要らない)
+pub fn with_measurement_id(payload: String, measurement_id: Option<&str>) -> String {
+    let Some(id) = measurement_id else {
+        return payload;
+    };
+    match payload.strip_suffix('}') {
+        Some(head) if head.ends_with('{') => format!("{head}\"measurement_id\":\"{id}\"}}"),
+        Some(head) => format!("{head},\"measurement_id\":\"{id}\"}}"),
+        None => payload,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MID: &str = "0f8b2c4e-1a2b-4c3d-8e9f-0123456789ab";
+
+    #[test]
+    fn measurement_id_accepts_only_hyphenated_uuid() {
+        assert!(is_valid_measurement_id(MID));
+        assert!(is_valid_measurement_id(&MID.to_ascii_uppercase()));
+        assert!(!is_valid_measurement_id(&MID.replace('-', "")));
+        assert!(!is_valid_measurement_id(&MID[..35]));
+        assert!(!is_valid_measurement_id(&MID.replace('0', "g")));
+        assert!(!is_valid_measurement_id(
+            "0f8b2c4e_1a2b-4c3d-8e9f-0123456789ab"
+        ));
+    }
+
+    #[test]
+    fn with_measurement_id_appends_to_object() {
+        assert_eq!(
+            with_measurement_id(r#"{"type":"temperature","value":36.5}"#.into(), Some(MID)),
+            format!(r#"{{"type":"temperature","value":36.5,"measurement_id":"{MID}"}}"#)
+        );
+        assert_eq!(
+            with_measurement_id("{}".into(), Some(MID)),
+            format!(r#"{{"measurement_id":"{MID}"}}"#)
+        );
+        assert_eq!(with_measurement_id(r#"{"a":1}"#.into(), None), r#"{"a":1}"#);
+        assert_eq!(
+            with_measurement_id("not json".into(), Some(MID)),
+            "not json"
+        );
+    }
 
     #[test]
     fn next_is_monotonic_within_a_boot() {

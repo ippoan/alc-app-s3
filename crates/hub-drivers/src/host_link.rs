@@ -70,7 +70,7 @@ use std::sync::mpsc::Sender;
 
 use alc_hub_core::cfg::DeviceConfig;
 use alc_hub_core::improv as improv_proto;
-use alc_hub_core::protocol::{parse_crash_test, parse_line, CrashTest, HostCommand, HostKind};
+use alc_hub_core::protocol::{parse_crash_test, parse_line, CrashTest, HostCommand, HostKind, HostStage};
 use anyhow::Result;
 use esp_idf_svc::hal::delay::FreeRtos;
 
@@ -221,6 +221,13 @@ fn drain_buffer(
 }
 
 /// `CRASH TEST` の本体。応答を返してから、わざと落ちる (戻らない)。
+/// 画面が渡した測定の id を消す (`TENKO MID`。次の人の記録に前の人の id を載せない)
+fn clear_measurement_id(status: &SharedStatus) {
+    if let Ok(mut st) = status.lock() {
+        st.measurement_id = None;
+    }
+}
+
 fn crash_test(kind: CrashTest) -> ! {
     match kind {
         CrashTest::Abort => println!("OK CRASH TEST abort"),
@@ -333,10 +340,15 @@ fn handle_line(
             alc_hub_common::evtlog::emit("OK ERROR");
         }
         HostCommand::Reset => {
+            clear_measurement_id(status);
             let _ = tx.send(UiCommand::Reset);
             alc_hub_common::evtlog::emit("OK RESET");
         }
         HostCommand::Stage(stage) => {
+            // 待機 (NFC) へ戻るのは次の人の点呼の始まり。前の人の測定の id を残さない
+            if stage == HostStage::Nfc {
+                clear_measurement_id(status);
+            }
             let _ = tx.send(UiCommand::Stage(stage));
             alc_hub_common::evtlog::emit(&format!("OK STAGE {}", stage.label()));
         }
@@ -523,6 +535,13 @@ fn handle_line(
             }
         },
         HostCommand::TenkoStatus => println!("TENKO BP={}", u8::from(settings.tenko_bp())),
+        // 画面が始めた測定の id。点呼中の記録に recorder が載せる (NVS には保存しない)
+        HostCommand::TenkoMeasurement { id } => {
+            if let Ok(mut st) = status.lock() {
+                st.measurement_id = Some(id);
+            }
+            println!("OK TENKO MID");
+        }
         // OTA 更新 (進捗・結果は EVT OTA_* で届く。シリアル経路は WS 進捗 sink
         // 無し = None。ota.rs 参照)
         HostCommand::Ota { url } => {
