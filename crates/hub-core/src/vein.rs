@@ -93,6 +93,14 @@ pub const DEBUG_READ_MS: u32 = 300;
 /// **番号と応答の並びは推測** — 仕様書の本文が repo に無い。XG 系では版・機器番号・照合の厳しさ (安全レベル) などの
 /// 設定値が応答のデータ部に並ぶのが通例なので、データ部をそのまま返して実機で読む (ippoan/alc-app#436)
 pub const CMD_GET_SYSTEM_INFO: u8 = 0x03;
+/// GET_SYSTEM_INFO の応答のデータ部で、安全レベル (照合の厳しさ) が入る位置 (§2.2.3 の `bData[5]`)
+pub const SYSINFO_SECURITY_AT: usize = 5;
+/// 照合の厳しさ (安全レベル) を書く (XG_CMD_SET_SECURITYLEVEL、§2.2.7。`bData[0]` = レベル)。
+/// 0 が最も緩く (本人を落とす率 0.001%・他人を通す率 0.001%)、2 が最も厳しい (0.05%・0.0001%)。
+/// 動作記録の `USER:<id>, th[s0, s1, s2]` はレベル 0〜2 の閾値と見られる (実機の合否が s1 と合う = 既定は 1)
+pub const CMD_SET_SECURITY_LEVEL: u8 = 0x07;
+/// 書いてよい安全レベルの上限 (仕様書の API 例が 0, 1, 2)
+pub const SECURITY_LEVEL_MAX: u8 = 2;
 
 /// 撮影して生画像の幅と高さを返す (READ_IMAGE、仕様書の表に無い。送る `bData` は 6 バイトの 0)。
 /// 画像そのものは READ_DATA の種別 `0x24` で読む。320×240・8bit グレースケールのはず。
@@ -763,6 +771,8 @@ pub enum Command {
     SyncClear(u32),
     /// `VEIN SYNC INFO`: モジュールの登録人数と上限 (モジュールを入れ替えたかの見分けに使う)
     SyncInfo,
+    /// `VEIN SECURITY [<0-2>]`: 照合の厳しさ (安全レベル) を読む (`None`) / 書いて読み直す (`Some`)
+    Security(Option<u8>),
 }
 
 /// `VEIN SYNC WRITE …`。外から受けた登録データを ID へ書く。
@@ -866,6 +876,35 @@ pub fn clear(port: &mut dyn Port, t: &Timeouts, id: u32) -> Result<(), VeinError
         return Err(VeinError::Rc(p.data[1]));
     }
     Ok(())
+}
+
+/// 接続して安全レベル (照合の厳しさ) を読む (GET_SYSTEM_INFO の `bData[5]`)
+pub fn read_security(port: &mut dyn Port, t: &Timeouts) -> Result<u8, VeinError> {
+    connect(port, t)?;
+    let p = exchange(port, t, CMD_GET_SYSTEM_INFO, &[])?;
+    setting_ok(&p)?;
+    Ok(p.data[SYSINFO_SECURITY_AT])
+}
+
+/// 設定の読み書きの応答: 成功なら `Ok`、非対応 (`01 10`) は [`VeinError::Unsupported`]、ほかは [`VeinError::Rc`]
+fn setting_ok(p: &Packet) -> Result<(), VeinError> {
+    match (p.data[0], p.data[1]) {
+        (XG_ERR_SUCCESS, _) => Ok(()),
+        (XG_ERR_FAIL, XG_ERR_NO_SUPPORT) => Err(VeinError::Unsupported),
+        (_, code) => Err(VeinError::Rc(code)),
+    }
+}
+
+/// 接続して安全レベルを `level` (0〜[`SECURITY_LEVEL_MAX`]) に書き、読み直した値を返す
+pub fn write_security(port: &mut dyn Port, t: &Timeouts, level: u8) -> Result<u8, VeinError> {
+    connect(port, t)?;
+    setting_ok(&exchange(port, t, CMD_SET_SECURITY_LEVEL, &[level])?)?;
+    read_security(port, t)
+}
+
+/// `VEIN SECURITY <レベル>`
+pub fn security_line(level: u8) -> String {
+    format!("VEIN SECURITY {level}")
 }
 
 /// `VEIN TEST ENROLLED <id>`
@@ -1479,6 +1518,11 @@ pub fn run(
         Command::SyncWrite(w) => sync_write(slot, port, t, w).map(|line| vec![line]),
         Command::SyncClear(id) => clear(port, t, id).map(|()| vec![format!("VEIN SYNC CLEARED {id}")]),
         Command::SyncInfo => test_capacity(port, t).map(|(users, max)| vec![sync_info_line(users, max)]),
+        Command::Security(level) => match level {
+            None => read_security(port, t),
+            Some(level) => write_security(port, t, level),
+        }
+        .map(|level| vec![security_line(level)]),
     };
     lines.unwrap_or_else(|e| vec![err_line(e)])
 }
@@ -3375,6 +3419,25 @@ mod tests {
             run_t(Command::SyncInfo, vec![connected(), Some(reply(CMD_GET_ENROLL_INFO, &info))]),
             vec!["VEIN SYNC INFO USERS=3 MAX=100"]
         );
+        // 安全レベル: 読む (GET_SYSTEM_INFO の bData[5]) / 書いて読み直す
+        let sysinfo = |level: u8| Some(reply(CMD_GET_SYSTEM_INFO, &[XG_ERR_SUCCESS, 1, 2, 0, 1, level, 5, 0, 0]));
+        assert_eq!(run_t(Command::Security(None), vec![connected(), sysinfo(1)]), vec!["VEIN SECURITY 1"]);
+        let set_ok = || Some(reply(CMD_SET_SECURITY_LEVEL, &[XG_ERR_SUCCESS]));
+        assert_eq!(
+            run_t(Command::Security(Some(0)), vec![connected(), set_ok(), connected(), sysinfo(0)]),
+            vec!["VEIN SECURITY 0"]
+        );
+        let mut port = FakePort::new(vec![connected(), set_ok(), connected(), sysinfo(2)]);
+        assert_eq!(write_security(&mut port, &Timeouts::DEFAULT, 2), Ok(2));
+        assert_eq!(port.sent[1], command(CMD_SET_SECURITY_LEVEL, &[2]).to_vec());
+        assert_eq!(port.sent[3], command(CMD_GET_SYSTEM_INFO, &[]).to_vec());
+        // 失敗コードは ERR の 1 行
+        let fail = Some(reply(CMD_SET_SECURITY_LEVEL, &[XG_ERR_FAIL, XG_ERR_NO_SUPPORT]));
+        assert_eq!(run_t(Command::Security(Some(0)), vec![connected(), fail]), vec!["ERR VEIN UNSUPPORTED"]);
+        let fail = Some(reply(CMD_GET_SYSTEM_INFO, &[XG_ERR_FAIL, XG_ERR_NO_SUPPORT]));
+        assert_eq!(run_t(Command::Security(None), vec![connected(), fail]), vec!["ERR VEIN UNSUPPORTED"]);
+        let fail = Some(reply(CMD_GET_SYSTEM_INFO, &[XG_ERR_FAIL, 0x05]));
+        assert_eq!(run_t(Command::Security(None), vec![connected(), fail]), vec!["ERR VEIN RC=05"]);
         // 失敗は ERR の 1 行だけ (記録は出さない)
         assert_eq!(run_t(Command::SyncClear(15), vec![None]), vec!["ERR VEIN NO_MODULE"]);
         let script = vec![connected(), cleared(), Some(reply(CMD_ENROLL, &[XG_ERR_FAIL, XG_ERR_TIME_OUT]))];
