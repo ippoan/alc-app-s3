@@ -114,6 +114,12 @@ fn main() -> Result<()> {
         probe.rtc_present,
         probe.imu_present
     );
+    // RTC (BM8563) の時刻でシステム時刻を合わせる。SNTP が合うまで (回線が通ってから
+    // 分単位かかることがある) の測定・打刻が 1970 起点で送られないように。RTC は SNTP で
+    // 合うたびに hub-ui が書き戻す。書いたことが無い・電池切れ (VL) の RTC は使わない
+    if probe.rtc_present {
+        seed_clock_from_rtc(&mut i2c);
+    }
     // M-Bus 5V (AW9523 BUS_EN) は **起動時には出さない** (#202)。
     //
     // Base LAN PoE v1.2 のように自前で M-Bus 5V を供給するベースを履くと、Core も
@@ -157,6 +163,7 @@ fn main() -> Result<()> {
 
     let status: SharedStatus = Arc::new(Mutex::new(HubStatus {
         board: board_kind,
+        rtc_present: probe.rtc_present,
         // 点呼の構成 (血圧はオプション、既定 OFF)。`TENKO BP` で NVS ごと更新される
         tenko_bp: settings.tenko_bp(),
         // Omron 血圧計を拾うか (既定 OFF)。`OMRON BP` で NVS ごと更新される
@@ -556,8 +563,10 @@ fn main() -> Result<()> {
     )?;
     // NTP: ネットワーク接続後に時刻同期し、測定ログを日本時間で記録する。
     // EspSntp は drop すると同期が止まるため、UI ループ (戻らない) の間
-    // 生かし続ける。
-    let _sntp = ntp::start()?;
+    // 生かし続ける。回線が通る前に始まるので、通った時点で hub-ui が
+    // やり直させる (初回の失敗で次の問い合わせまでの間隔が延びているため)。
+    // 合ったら `clock_synced_at` が立ち、hub-ui が RTC へ書き戻す
+    let _sntp = ntp::start_notifying(Arc::clone(&status))?;
     // NT-100B / NBP-1BLE 読み取り。測定値は meas_tx で recorder へ送る。
     // 接続開始/終了は tx で UI へ通知 (点呼画面の取得中スピナー)。
     // Wi-Fi 接続/Improv セッション中は BLE スキャンを一時停止する (RadioCoex)
@@ -585,6 +594,30 @@ fn main() -> Result<()> {
         ui_meas_tx,
         alarm_monitor,
     )
+}
+
+/// RTC の時刻を読み、使えるならシステム時刻に入れる。結果は `EVT CLOCK_RTC` で残す
+fn seed_clock_from_rtc(i2c: &mut I2cDriver) {
+    let secs = match board::board::rtc_read(i2c) {
+        Ok(regs) => match alc_hub_core::rtc::decode(regs) {
+            Some(secs) => secs,
+            None => {
+                alc_hub_common::evtlog::emit("EVT CLOCK_RTC invalid");
+                return;
+            }
+        },
+        Err(e) => {
+            alc_hub_common::evtlog::emit(&format!("EVT CLOCK_RTC read_err={e}"));
+            return;
+        }
+    };
+    let tv = esp_idf_svc::sys::timeval {
+        tv_sec: secs as _,
+        tv_usec: 0,
+    };
+    // SAFETY: tv はこの関数の中で生きている。タイムゾーンは渡さない (NULL)
+    let rc = unsafe { esp_idf_svc::sys::settimeofday(&tv, core::ptr::null()) };
+    alc_hub_common::evtlog::emit(&format!("EVT CLOCK_RTC set={secs} rc={rc}"));
 }
 
 /// 点呼 (Measuring) の最中か。**打刻の画面表示を出すかどうかにだけ使う。**

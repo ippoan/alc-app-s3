@@ -182,6 +182,9 @@ pub fn run(
     // 自分の出力が残って見える) を読まないために控える
     let mut bus_in_judge = alc_hub_core::usb5v::BusInJudge::default();
     let mut bus5v_off_at: Option<u64> = None;
+    // 回線 (LAN / Wi-Fi) が通っていたか (通った瞬間に SNTP をやり直す) と、RTC へ書き戻した同期
+    let mut was_online = false;
+    let mut rtc_written_at: Option<u64> = None;
     let mut spin_phase = 0u8;
     let mut last_touch: Option<touch::TouchPoint> = None;
     // BLE で取得中の機器 (点呼画面のラベル横スピナー表示)。
@@ -241,6 +244,33 @@ pub fn run(
                 Err(e) => log::warn!("ui: バッテリー状態取得に失敗: {e:?}"),
             }
             last_batt = now;
+        }
+
+        // 時計: 回線が通った瞬間に SNTP をやり直させ、合ったら RTC へ書き戻す。
+        // SNTP は起動時 (回線が通る前) に始まっていて、初回の失敗で次の問い合わせまでの
+        // 間隔が延びている — やり直さないと、回線が通ってから合うまで分単位かかり、
+        // その間の測定・打刻が 1970 起点の時刻で送られる (2026-11-01 実機)。
+        // RTC は main.rs が起動時に読んでシステム時刻に入れる。i2c はこのループが所有している
+        let (online, synced_at, rtc_present) = status.lock().map_or((was_online, None, false), |st| {
+            (st.lan_link || st.wifi_connected, st.clock_synced_at, st.rtc_present)
+        });
+        if online && !was_online {
+            // SAFETY: 引数なし。SNTP が動いていなければ false が返るだけ
+            let restarted = unsafe { esp_idf_svc::sys::esp_sntp_restart() };
+            alc_hub_common::evtlog::emit(&format!("EVT CLOCK_SNTP_RESTART ok={}", u8::from(restarted)));
+        }
+        was_online = online;
+        if rtc_present && alc_hub_core::rtc::should_write(synced_at, rtc_written_at) {
+            rtc_written_at = synced_at;
+            let unix_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            if let Some(regs) = alc_hub_core::rtc::encode(unix_secs) {
+                match alc_hub_board::board::rtc_write(&mut i2c, &regs) {
+                    Ok(()) => alc_hub_common::evtlog::emit(&format!("EVT CLOCK_RTC_WRITE {unix_secs}")),
+                    Err(e) => alc_hub_common::evtlog::emit(&format!("EVT CLOCK_RTC_WRITE err={e}")),
+                }
+            }
         }
 
         // M-Bus 5V (AW9523 BUS_EN) を設定と USB ホストの有無から決める

@@ -6,12 +6,24 @@
 //!
 //! 返り値の EspSntp は drop すると同期が止まるため、呼び出し側で保持し続ける。
 
+use alc_hub_common::status::{now_ms, SharedStatus};
 use anyhow::Result;
-use esp_idf_svc::sntp::EspSntp;
+use esp_idf_svc::sntp::{EspSntp, SntpConf};
 
 /// SNTP クライアントを起動する。ネットワーク接続後に自動で同期する。
 pub fn start() -> Result<EspSntp<'static>> {
     Ok(EspSntp::new_default()?)
+}
+
+/// [`start`] と同じだが、時刻が合うたびに `HubStatus::clock_synced_at` を立てる (CoreS3)。
+/// hub-ui がこれを見て RTC へ書き戻す。通知は SNTP のタスクで呼ばれるので、ロックだけで抜ける
+pub fn start_notifying(status: SharedStatus) -> Result<EspSntp<'static>> {
+    Ok(EspSntp::new_with_callback(&SntpConf::default(), move |_| {
+        alc_hub_common::evtlog::emit("EVT CLOCK_SNTP");
+        if let Ok(mut st) = status.lock() {
+            st.clock_synced_at = Some(now_ms());
+        }
+    })?)
 }
 
 /// ネットワークが確立してから SNTP を起動する (メインループから毎周期呼ぶ)。

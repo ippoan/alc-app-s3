@@ -35,7 +35,7 @@ pub fn jst_yyyymmdd(unix_secs: i64) -> Option<String> {
 
 /// 1970-01-01 からの日数 → (年, 月, 日)。Howard Hinnant の civil_from_days。
 /// div_euclid を使い負値でも分岐なしで floor 除算する。
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097; // [0, 146096]
@@ -46,6 +46,17 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// (年, 月, 日) → 1970-01-01 からの日数。Howard Hinnant の days_from_civil ([`civil_from_days`] の逆)
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (m + 9) % 12; // 3 月 = 0 … 2 月 = 11
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
 }
 
 #[cfg(test)]

@@ -28,6 +28,10 @@ pub struct HubStatus {
     /// ボード種別 (CoreS3 / CoreS3 SE)。main.rs が起動時に内部 I2C を probe
     /// して確定する (`DEVICE … BOARD=` / Log 画面に表示)。SE はバッテリーが無い
     pub board: alc_hub_core::board::BoardKind,
+    /// RTC (BM8563) があるか (main.rs の probe)。SE には無い。hub-ui が SNTP の時刻を書き戻す
+    pub rtc_present: bool,
+    /// 直近に SNTP で時刻が合った稼働時間 [ms] (SNTP の通知で立つ)。hub-ui が RTC へ書き戻す目印
+    pub clock_synced_at: Option<u64>,
 
     /// OTA (firmware 更新) の実行中フラグ (Refs #116)。
     ///

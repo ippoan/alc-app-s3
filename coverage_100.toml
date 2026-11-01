@@ -111,6 +111,10 @@ path = "crates/hub-core/src/pwalog.rs"
 type = "unit"
 
 [[file]]
+path = "crates/hub-core/src/rtc.rs"
+type = "unit"
+
+[[file]]
 path = "crates/hub-core/src/session.rs"
 type = "unit"
 
