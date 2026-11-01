@@ -712,7 +712,15 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                 _ => return Err("ERR VEIN: VERIFY の ID は 10〜100 の数字だけです".into()),
             },
             Some("SYNC") => HostCommand::Vein(parse_vein_sync(&mut it)?),
-            _ => return Err("ERR VEIN: CAPTURE|SAY|FINGER?|ENROLL|IDENTIFY|VERIFY|SYNC|TEST が必要です".into()),
+            // 照合の厳しさ (安全レベル)。引数なしは読む、0〜2 は書く
+            Some("SECURITY") => match (it.next(), it.next()) {
+                (None, None) => HostCommand::Vein(crate::vein::Command::Security(None)),
+                (Some(v), None) if v.len() == 1 && v.bytes().all(|b| (b'0'..=b'0' + crate::vein::SECURITY_LEVEL_MAX).contains(&b)) => {
+                    HostCommand::Vein(crate::vein::Command::Security(Some(v.as_bytes()[0] - b'0')))
+                }
+                _ => return Err("ERR VEIN: SECURITY は引数なし (読む) か 0〜2 です".into()),
+            },
+            _ => return Err("ERR VEIN: CAPTURE|SAY|FINGER?|ENROLL|IDENTIFY|VERIFY|SYNC|SECURITY|TEST が必要です".into()),
         },
         // `PAIR` または `BLE PAIR`
         "PAIR" => HostCommand::BlePair,
@@ -1643,7 +1651,7 @@ mod tests {
         assert!(parse_line("VEIN SAY HELLO", T).is_err());
         assert_eq!(
             parse_line("VEIN", T),
-            Err("ERR VEIN: CAPTURE|SAY|FINGER?|ENROLL|IDENTIFY|VERIFY|SYNC|TEST が必要です".into())
+            Err("ERR VEIN: CAPTURE|SAY|FINGER?|ENROLL|IDENTIFY|VERIFY|SYNC|SECURITY|TEST が必要です".into())
         );
         assert!(parse_line("VEIN ENROLL", T).is_err());
         // 試験用 (モジュール自身の登録と照合)。ID は 2〜9 だけ
@@ -1773,6 +1781,12 @@ mod tests {
             assert_eq!(parse_line(bad, T), Err("ERR VEIN: VERIFY の ID は 10〜100 の数字だけです".into()), "{bad}");
         }
         assert_eq!(parse_line("VEIN SYNC INFO", T), ok(Command::SyncInfo));
+        assert_eq!(parse_line("VEIN SECURITY", T), ok(Command::Security(None)));
+        assert_eq!(parse_line("vein security 0", T), ok(Command::Security(Some(0))));
+        assert_eq!(parse_line("VEIN SECURITY 2", T), ok(Command::Security(Some(2))));
+        for bad in ["VEIN SECURITY 3", "VEIN SECURITY x", "VEIN SECURITY 00", "VEIN SECURITY -1", "VEIN SECURITY 1 2"] {
+            assert_eq!(parse_line(bad, T), Err("ERR VEIN: SECURITY は引数なし (読む) か 0〜2 です".into()), "{bad}");
+        }
         assert_eq!(parse_line("vein identify", T), ok(Command::Identify));
         assert_eq!(parse_line("VEIN SYNC CLEAR 55", T), ok(Command::SyncClear(55)));
         assert_eq!(parse_line("VEIN SYNC WRITE 13 END", T), ok(Command::SyncWrite(WriteCommand::End(13))));
