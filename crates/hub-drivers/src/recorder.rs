@@ -17,7 +17,7 @@ use alc_hub_common::{
     status::{event_timestamp, SharedStatus},
     ui_api::UiCommand,
 };
-use alc_hub_core::{fc1200, vitals};
+use alc_hub_core::{fc1200, session, vitals};
 use anyhow::Result;
 
 /// 現在の epoch ms (NTP 未同期時は 1970 起点の稼働時間になる — サーバ側は
@@ -36,6 +36,19 @@ fn epoch_ms() -> u64 {
 /// 失うだけで測定そのものは送る (fail-open)。
 fn current_session_id(status: &SharedStatus) -> Option<String> {
     status.lock().ok().and_then(|st| st.session_id.clone())
+}
+
+/// 進行中の点呼セッション ID と、画面が渡した測定の id (`TENKO MID`) を読む。
+/// 測定の id は点呼中 (session_id が Some) のときだけ返す — 待機画面の単発の測定を誰かの測定に結ばない
+fn current_session(status: &SharedStatus) -> (Option<String>, Option<String>) {
+    status
+        .lock()
+        .ok()
+        .map(|st| match &st.session_id {
+            Some(sid) => (Some(sid.clone()), st.measurement_id.clone()),
+            None => (None, None),
+        })
+        .unwrap_or((None, None))
 }
 
 pub fn start(
@@ -87,12 +100,14 @@ pub fn start(
                         };
                         println!("{json}");
                         // WS 送信 (cf-alc-recorder) と GW (alc-gw) へ同じ payload を fan-out
+                        // 点呼中なら画面が始めた測定の id を payload に載せる (USB に出す行には載せない)
+                        let (session_id, measurement_id) = current_session(&status);
                         let rec = UplinkRecord {
                             kind: "temperature",
-                            payload: json,
+                            payload: session::with_measurement_id(json, measurement_id.as_deref()),
                             recorded_at_ms: epoch_ms(),
                             at_ms,
-                            session_id: current_session_id(&status),
+                            session_id,
                         };
                         if let Some(gw_tx) = &gw_tx {
                             let _ = gw_tx.send(rec.clone());
@@ -129,12 +144,14 @@ pub fn start(
                             "{{\"type\":\"blood_pressure\",\"systolic\":{systolic:.0},\"diastolic\":{diastolic:.0}{pulse_part},\"unit\":\"mmHg\"{ts_part}}}"
                         );
                         println!("{json}");
+                        // 点呼中なら画面が始めた測定の id を payload に載せる (USB に出す行には載せない)
+                        let (session_id, measurement_id) = current_session(&status);
                         let rec = UplinkRecord {
                             kind: "blood_pressure",
-                            payload: json,
+                            payload: session::with_measurement_id(json, measurement_id.as_deref()),
                             recorded_at_ms: epoch_ms(),
                             at_ms,
-                            session_id: current_session_id(&status),
+                            session_id,
                         };
                         if let Some(gw_tx) = &gw_tx {
                             let _ = gw_tx.send(rec.clone());
@@ -182,12 +199,14 @@ pub fn start(
                         last_alc = Some(use_count);
                         let json = fc1200::payload_json(result, centi_mg_per_l, use_count);
                         println!("{json}");
+                        // 点呼中なら画面が始めた測定の id を payload に載せる (USB に出す行には載せない)
+                        let (session_id, measurement_id) = current_session(&status);
                         let rec = UplinkRecord {
                             kind: "alcohol",
-                            payload: json,
+                            payload: session::with_measurement_id(json, measurement_id.as_deref()),
                             recorded_at_ms: epoch_ms(),
                             at_ms,
-                            session_id: current_session_id(&status),
+                            session_id,
                         };
                         if let Some(gw_tx) = &gw_tx {
                             let _ = gw_tx.send(rec.clone());

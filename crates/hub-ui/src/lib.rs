@@ -707,6 +707,11 @@ pub fn run(
                 None
             };
             if let Ok(mut st) = status.lock() {
+                // 点呼を抜けたら画面が渡した測定の id も消す (入るときは消さない —
+                // 画面は点呼の段 (STAGE) より先に `TENKO MID` を送る)
+                if session_id.is_none() {
+                    st.measurement_id = None;
+                }
                 st.session_id = session_id;
             }
             // session_id を status に載せた後で送る (recorder はそれを読んで付ける)。

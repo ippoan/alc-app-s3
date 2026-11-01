@@ -90,6 +90,10 @@ pub struct HubStatus {
     /// いるのは画面状態機械のため。
     pub session_id: Option<String>,
 
+    /// 画面 (運行者 PWA) が始めた測定の id (`TENKO MID`)。recorder は点呼中 (`session_id` が Some) の記録にだけ
+    /// payload の `measurement_id` として載せる。点呼を抜けたとき (UI スレッド)・`STAGE NFC`・`RESET` (host_link) で消す
+    pub measurement_id: Option<String>,
+
     /// 直近 8 回の reset 理由の履歴 (NVS の詰め込み値そのまま、Refs #211)。
     /// main.rs が起動時に `Settings::push_reset_history` の戻り値を入れる。
     /// 既定 `None` は履歴を持たない機種 (VoiceS3R 等) 向け — get_log の応答に
