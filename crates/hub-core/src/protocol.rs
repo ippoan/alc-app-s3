@@ -205,6 +205,12 @@ pub enum HostCommand {
     OmronBp { enabled: bool },
     /// Omron 構成の問い合わせ (`OMRON BP=0` を応答)
     OmronStatus,
+    /// 体温計につなぐか (`THERMO ON|OFF`。**保存しない**、電源を入れたときは ON)。運行管理者の画面に
+    /// いる間はホストが OFF にし、同じ机の運行者の端末に体温計の値を譲る (体温計は最初につないだ
+    /// 1 台にだけ測定値を送る。Refs ippoan/alc-app-s3#352)
+    Thermo { enabled: bool },
+    /// 体温計につなぐかの問い合わせ (`THERMO=1` を応答)
+    ThermoStatus,
     /// 本体の LED (VoiceS3R の LP5562) の明るさ (`LED <赤> <緑> <青> [<白>]`、各 0〜255)。
     /// 試験用: 挿した複数台のどれかを見分ける (ippoan/alc-app#436)。`OK LED …` / `ERR LED: …` を応答
     Led { r: u8, g: u8, b: u8, w: u8 },
@@ -622,6 +628,13 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                 _ => return Err("ERR OMRON: BP には ON|OFF が必要です".into()),
             },
             _ => return Err("ERR OMRON: BP|STATUS が必要です".into()),
+        },
+        // 体温計につなぐか (hub-ble。保存しない)
+        "THERMO" => match it.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+            Some("STATUS") => HostCommand::ThermoStatus,
+            Some("ON") | Some("1") => HostCommand::Thermo { enabled: true },
+            Some("OFF") | Some("0") => HostCommand::Thermo { enabled: false },
+            _ => return Err("ERR THERMO: ON|OFF|STATUS が必要です".into()),
         },
         // 本体の LED (VoiceS3R の LP5562)。白は省略できる (0)
         "LED" => {
@@ -1427,6 +1440,13 @@ mod tests {
 
     #[test]
     fn omron_subcommands() {
+        assert_eq!(parse_line("THERMO STATUS", T), Ok(Some(HostCommand::ThermoStatus)));
+        assert_eq!(parse_line("thermo on", T), Ok(Some(HostCommand::Thermo { enabled: true })));
+        assert_eq!(parse_line("THERMO 1", T), Ok(Some(HostCommand::Thermo { enabled: true })));
+        assert_eq!(parse_line("THERMO OFF", T), Ok(Some(HostCommand::Thermo { enabled: false })));
+        assert_eq!(parse_line("THERMO 0", T), Ok(Some(HostCommand::Thermo { enabled: false })));
+        assert!(parse_line("THERMO", T).is_err());
+        assert!(parse_line("THERMO MAYBE", T).is_err());
         assert_eq!(parse_line("OMRON STATUS", T), Ok(Some(HostCommand::OmronStatus)));
         assert_eq!(
             parse_line("omron bp on", T),
