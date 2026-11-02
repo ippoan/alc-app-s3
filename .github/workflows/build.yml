@@ -990,6 +990,27 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@v4
 
+      # 開発端末 (alc-app の DevFirmwareAutoUpdate) に「新しいファームを出した」を知らせ、すぐ更新させる
+      # (Refs #352)。鍵 FIRMWARE_NOTIFY_TOKEN は recorder の POST /firmware-published 専用で、合図を
+      # 1 種類出すことしかできない。届かなくても配信は済んでいるので CI は落とさない (端末は 10 分おきにも見る)
+      - name: Notify dev devices (firmware published)
+        if: success()
+        continue-on-error: true
+        env:
+          FIRMWARE_NOTIFY_TOKEN: ${{ secrets.FIRMWARE_NOTIFY_TOKEN }}
+        run: |
+          if [ -z "$FIRMWARE_NOTIFY_TOKEN" ]; then
+            echo "FIRMWARE_NOTIFY_TOKEN が無いので知らせない"
+            exit 0
+          fi
+          for target in timecard-station cores3 alarm; do
+            curl -fsS --max-time 15 -X POST "https://alc-recorder.m-tama-ramu.workers.dev/firmware-published" \
+              -H "Authorization: Bearer $FIRMWARE_NOTIFY_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"target\":\"$target\"}"
+            echo " ($target)"
+          done
+
   auto-merge:
     name: Auto Merge
     needs: [coverage, check]
