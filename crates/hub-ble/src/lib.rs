@@ -399,6 +399,8 @@ async fn task(
         // Omron 血圧計を拾うか (NVS、既定 OFF)。ループ 1 周に 1 回だけ読む —
         // スキャンの callback は広告 1 件ごとに呼ばれるため、その中で lock しない
         let omron_enabled = status.lock().map(|st| st.omron_bp).unwrap_or(false);
+        // 体温計につなぐのを止めているか (`THERMO OFF`、運行管理者の画面の間)。同じく 1 周に 1 回
+        let thermo_paused = status.lock().map(|st| st.thermo_paused).unwrap_or(false);
 
         // ニプロ機器は測定時にアドバタイズを開始するため、短いスキャンを
         // 繰り返して発見次第すぐ接続する (Arduino 版 loop() と同じ運用)。
@@ -422,6 +424,7 @@ async fn task(
                     return None;
                 }
                 match target {
+                    Some((_, DeviceKind::Thermometer, _)) if thermo_paused => None,
                     Some((_, _, Some(_))) if !omron_enabled => None,
                     // 受付が開いていないペアリング待ちの広告は見送る (送信広告は拾う)
                     Some((_, _, Some(OmronAdv::Pairing))) if !pair_open => None,

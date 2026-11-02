@@ -320,6 +320,16 @@ pub fn handle_common(
 ) -> Option<HostCommand> {
     match command {
         HostCommand::Ping => println!("PONG"),
+        HostCommand::Thermo { enabled } => {
+            if let Ok(mut st) = status.lock() {
+                st.thermo_paused = !enabled;
+            }
+            println!("OK THERMO={}", u8::from(enabled));
+        }
+        HostCommand::ThermoStatus => {
+            let paused = status.lock().map(|st| st.thermo_paused).unwrap_or(false);
+            println!("THERMO={}", u8::from(!paused));
+        }
         HostCommand::BlePing => {
             let line = status
                 .lock()

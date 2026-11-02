@@ -21,6 +21,7 @@
 //! | `WS URL <url>` / `WS STATUS` | cf-alc-recorder 常時接続の URL 上書き / 状態 (共通実装) |
 //! | `PAIR` | 血圧計の再ペアリング (ボンド消去 + 120 秒のペアリング受付、共通実装)。Pages の「血圧計を再ペアリング」から届く |
 //! | `OMRON BP ON\|OFF` / `OMRON STATUS` | 血圧計 (HEM-6231T) を拾うか (共通実装、既定 OFF)。**ON にしたら再起動が要る** — main.rs 冒頭の「血圧計」節 |
+//! | `THERMO ON\|OFF` / `THERMO STATUS` | 体温計につなぐか (共通実装、保存しない・電源投入時は ON)。`OK THERMO=<0\|1>` / `THERMO=<0\|1>`。運行管理者の画面の間はホストが OFF にする |
 //! | `VEIN CAPTURE` | 指静脈を読む (`vein` feature)。`VEIN CHARA <hex>` / `ERR VEIN <reason>`。feature 無しは共通実装が `ERR VEIN: unsupported` |
 //! | `VEIN SAY PLACE\|AGAIN\|ENROLLED\|FAILED` | 案内音声 (`vein` feature)。`OK VEIN SAY <x>` |
 //! | `VEIN FINGER?` | 指の有無を 1 回問い合わせる (`vein` feature)。`VEIN FINGER 0\|1` / `ERR VEIN UNSUPPORTED` / `ERR VEIN <reason>` |
