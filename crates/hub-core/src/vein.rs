@@ -99,6 +99,10 @@ pub const SYSINFO_SECURITY_AT: usize = 5;
 /// 0 が最も緩く (本人を落とす率 0.001%・他人を通す率 0.001%)、2 が最も厳しい (0.05%・0.0001%)。
 /// 動作記録の `USER:<id>, th[s0, s1, s2]` はレベル 0〜2 の閾値と見られる (実機の合否が s1 と合う = 既定は 1)
 pub const CMD_SET_SECURITY_LEVEL: u8 = 0x07;
+/// 重複登録の検査 (0 / 1) を書く (§2.2.10)。`VEIN IDENTIFY KEEP` が撮る間だけ切る
+pub const CMD_SET_DUP_CHECK: u8 = 0x09;
+/// GET_SYSTEM_INFO の応答で重複登録の検査 (0 / 1) が入る位置 (§2.2.3 の `bData[7]`)
+pub const SYSINFO_DUP_CHECK_AT: usize = 7;
 /// 書いてよい安全レベルの上限 (仕様書の API 例が 0, 1, 2)
 pub const SECURITY_LEVEL_MAX: u8 = 2;
 
@@ -766,6 +770,9 @@ pub enum Command {
     Enroll(u32, u8),
     /// `VEIN IDENTIFY`: 1:N 照合 (VERIFY 0)
     Identify,
+    /// `VEIN IDENTIFY KEEP`: 置いた 1 回の指を作業用 ID に 1 本撮ってから、離さずに 1:N 照合する
+    /// ([`capture_identify`])。当たれば撮った記録も返す (照合でモジュールが撮った指は外へ出ないため)
+    IdentifyKeep,
     /// `VEIN VERIFY <id>`: 1:1 照合 (VERIFY <id>)。免許証で本人が決まった後に使う
     Verify(u32),
     /// `VEIN SYNC WRITE …`: サーバーの記録をモジュールの ID へ書く
@@ -1209,6 +1216,57 @@ pub fn identify(
     verify_settled(port, t, 0, on_prompt)
 }
 
+/// 本番の「撮って照合」(`VEIN IDENTIFY KEEP`): 接続 → 重複登録の検査を読み、入っていれば切る → 作業用 ID
+/// ([`SCRATCH_ID`]) に 1 本撮る → 読み出す → 作業用 ID を消す → **指を離させずに** 1:N 照合 (VERIFY 0) →
+/// 重複登録の検査を元に戻す (途中で失敗しても戻す)。返すのは (撮った記録, 当たった ID)。
+///
+/// - 撮影は置かれている指をそのまま撮る (2026-11-03 実機: 乗っている指から 1.0 秒)。照合は乗ったままの指を撮る
+///   (同 0.6 秒)。撮影と照合の間に別の命令 (読み出し・消去) を挟む — 挟まないと照合が次の置き直しを待つ
+/// - 重複登録の検査を切るのは、本人の記録がモジュールに入っていると撮影が `0A` (重複) で捨てられるため
+/// - 作業用 ID は照合の前に消す — 残すと照合が撮ったばかりの写しに当たる (同日の実機で再現)
+/// - **途中の「離して」(`Prompt::Release`) は `on_prompt` へ渡さない** (端末は離してを鳴らすので、照合の前に指が
+///   離れる)。当たったときだけ最後に 1 回渡す。外れたときに何を鳴らすかはホストが決める
+pub fn capture_identify(
+    port: &mut dyn Port,
+    t: &Timeouts,
+    on_prompt: &mut dyn FnMut(Prompt),
+) -> Result<(Vec<u8>, Option<u32>), VeinError> {
+    connect(port, t)?;
+    let info = exchange(port, t, CMD_GET_SYSTEM_INFO, &[])?;
+    setting_ok(&info)?;
+    let dup = info.data[SYSINFO_DUP_CHECK_AT];
+    if dup != 0 {
+        setting_ok(&exchange(port, t, CMD_SET_DUP_CHECK, &[0])?)?;
+    }
+    let mut quiet = |p: Prompt| {
+        if p != Prompt::Release {
+            on_prompt(p)
+        }
+    };
+    let got = capture_then_identify(port, t, &mut quiet);
+    if dup != 0 {
+        let _ = exchange(port, t, CMD_SET_DUP_CHECK, &[dup]);
+    }
+    if matches!(got, Ok((_, Some(_)))) {
+        on_prompt(Prompt::Release);
+    }
+    got
+}
+
+/// [`capture_identify`] の本体 (重複登録の検査を切った後)。作業用 ID は読み出しの成否にかかわらず照合の前に消す
+fn capture_then_identify(
+    port: &mut dyn Port,
+    t: &Timeouts,
+    on_prompt: &mut dyn FnMut(Prompt),
+) -> Result<(Vec<u8>, Option<u32>), VeinError> {
+    enroll_id(port, t, SCRATCH_ID, 1, on_prompt)?;
+    let record = read_enroll(port, t, SCRATCH_ID);
+    let _ = exchange(port, t, CMD_CLEAR_ENROLL, &SCRATCH_ID.to_le_bytes());
+    let record = record?;
+    let hit = verify(port, t, 0, on_prompt)?;
+    Ok((record, hit))
+}
+
 /// 本番の 1:1 照合 (`VEIN VERIFY <id>`): [`identify`] と同じ手順で VERIFY <id>
 pub fn verify_id(
     port: &mut dyn Port,
@@ -1513,6 +1571,13 @@ pub fn run(
 ) -> Vec<String> {
     let lines = match cmd {
         Command::Enroll(id, templates) => enroll(port, t, id, templates, on_prompt).map(|rec| record_lines(id, &rec)),
+        // 当たったときだけ撮った記録 (`VEIN RECORD 1 …`) を出し、続けて IDENTIFY と同じ結果の行
+        Command::IdentifyKeep => capture_identify(port, t, on_prompt).map(|(record, hit)| {
+            let log = read_match_log(port, t);
+            let mut lines = if hit.is_some() { record_lines(SCRATCH_ID, &record) } else { Vec::new() };
+            lines.extend(match_lines(hit, log.as_deref(), identify_line));
+            lines
+        }),
         Command::Identify => identify(port, t, on_prompt).map(|hit| {
             let log = read_match_log(port, t);
             match_lines(hit, log.as_deref(), identify_line)
@@ -3430,6 +3495,120 @@ mod tests {
 
     fn run_t(cmd: Command, script: Vec<Option<Vec<u8>>>) -> Vec<String> {
         run_in(&mut None, cmd, script)
+    }
+
+    /// GET_SYSTEM_INFO の応答 (重複登録の検査 `dup`)
+    fn sysinfo(dup: u8) -> Option<Vec<u8>> {
+        let mut d = [0u8; DATA_LEN];
+        d[SYSINFO_DUP_CHECK_AT] = dup;
+        Some(reply(CMD_GET_SYSTEM_INFO, &d))
+    }
+
+    fn set_dup_ok() -> Option<Vec<u8>> {
+        Some(reply(CMD_SET_DUP_CHECK, &[XG_ERR_SUCCESS]))
+    }
+
+    /// `VEIN IDENTIFY KEEP` の台本: 接続 → 設定を読む → 重複を切る → 作業用 ID を消す → 1 本撮る → 読む → 消す →
+    /// 照合 (`verify`) → 重複を戻す
+    fn keep_script(data: &[u8], verify: Option<Vec<u8>>) -> Vec<Option<Vec<u8>>> {
+        vec![
+            connected(),
+            sysinfo(1),
+            set_dup_ok(),
+            cleared(),
+            enrolled(),
+            size(data.len()),
+            Some(chunk(data)),
+            cleared_ok(),
+            verify,
+            set_dup_ok(),
+        ]
+    }
+
+    #[test]
+    fn identify_keep_captures_then_identifies_without_letting_go_and_restores_the_dup_check() {
+        let data = sample_chara(4);
+        let mut port = FakePort::new(keep_script(&data, verified(Some(15))));
+        let mut prompts = Vec::new();
+        let got = capture_identify(&mut port, &Timeouts::DEFAULT, &mut |p| prompts.push(p));
+        assert_eq!(got, Ok((data.clone(), Some(15))));
+        // 送った順: 接続 → 設定を読む → 重複を切る (0) → 作業用 ID 1 を消す → 1 本撮る → 読む ×2 → 作業用 ID を消す →
+        // 1:N 照合 (ID 0) → 重複を元 (1) に戻す
+        let cmds: Vec<u8> = port.sent.iter().map(|p| p[3]).collect();
+        assert_eq!(
+            cmds,
+            vec![CMD_CONNECTION, CMD_GET_SYSTEM_INFO, CMD_SET_DUP_CHECK, CMD_CLEAR_ENROLL, CMD_ENROLL, CMD_READ_ENROLL, CMD_READ_DATA, CMD_CLEAR_ENROLL, CMD_VERIFY, CMD_SET_DUP_CHECK]
+        );
+        assert_eq!(port.sent[2], command(CMD_SET_DUP_CHECK, &[0]).to_vec());
+        assert_eq!(&port.sent[4][6..11], &[1, 0, 0, 0, 0]);
+        assert_eq!(port.sent[4][6 + 5], 1);
+        assert_eq!(port.sent[7], command(CMD_CLEAR_ENROLL, &SCRATCH_ID.to_le_bytes()).to_vec());
+        assert_eq!(&port.sent[8][6..10], &[0, 0, 0, 0]);
+        assert_eq!(port.sent[9], command(CMD_SET_DUP_CHECK, &[1]).to_vec());
+        // 途中の「離して」は渡さず、当たった最後に 1 回だけ
+        assert_eq!(prompts, vec![Prompt::Place, Prompt::Place, Prompt::Release]);
+    }
+
+    #[test]
+    fn identify_keep_miss_does_not_say_release_and_skips_the_dup_toggle_when_it_is_off() {
+        let data = sample_chara(4);
+        // 重複登録の検査が元から切れていれば、切りも戻しもしない
+        let script = vec![connected(), sysinfo(0), cleared(), enrolled(), size(4), Some(chunk(&data)), cleared_ok(), verified(None)];
+        let mut port = FakePort::new(script);
+        let mut prompts = Vec::new();
+        let got = capture_identify(&mut port, &Timeouts::DEFAULT, &mut |p| prompts.push(p));
+        assert_eq!(got, Ok((data, None)));
+        assert!(port.sent.iter().all(|p| p[3] != CMD_SET_DUP_CHECK));
+        assert!(!prompts.contains(&Prompt::Release));
+    }
+
+    /// 途中経過を捨てて `VEIN IDENTIFY KEEP` の本体を回す (失敗の試験は途中経過が来る前に止まるものが多いので 1 つにまとめる)
+    fn keep(port: &mut FakePort) -> Result<(Vec<u8>, Option<u32>), VeinError> {
+        capture_identify(port, &Timeouts::DEFAULT, &mut |_| {})
+    }
+
+    #[test]
+    fn identify_keep_restores_the_dup_check_and_clears_the_scratch_id_on_failure() {
+        // 読み出しに失敗: 作業用 ID は消し、照合はせず、重複は戻す
+        let script = vec![
+            connected(),
+            sysinfo(1),
+            set_dup_ok(),
+            cleared(),
+            enrolled(),
+            Some(reply(CMD_READ_ENROLL, &[XG_ERR_FAIL, 0x0A])),
+            cleared_ok(),
+            set_dup_ok(),
+        ];
+        let mut port = FakePort::new(script);
+        let got = keep(&mut port);
+        assert_eq!(got, Err(VeinError::Rc(0x0A)));
+        let cmds: Vec<u8> = port.sent.iter().map(|p| p[3]).collect();
+        assert_eq!(cmds.last(), Some(&CMD_SET_DUP_CHECK));
+        assert!(!cmds.contains(&CMD_VERIFY));
+        assert_eq!(port.sent[6], command(CMD_CLEAR_ENROLL, &SCRATCH_ID.to_le_bytes()).to_vec());
+        // 撮影 (指待ちの時間切れ) で失敗しても戻す
+        let script = vec![connected(), sysinfo(1), set_dup_ok(), cleared(), Some(reply(CMD_ENROLL, &[XG_ERR_FAIL, XG_ERR_TIME_OUT])), set_dup_ok()];
+        let mut port = FakePort::new(script);
+        assert!(keep(&mut port).is_err());
+        assert_eq!(port.sent.last().unwrap(), &command(CMD_SET_DUP_CHECK, &[1]).to_vec());
+        // 設定を読めない・重複を切れないときは撮らない
+        let mut port = FakePort::new(vec![connected(), Some(reply(CMD_GET_SYSTEM_INFO, &[XG_ERR_FAIL, XG_ERR_NO_SUPPORT]))]);
+        assert_eq!(keep(&mut port), Err(VeinError::Unsupported));
+        let mut port = FakePort::new(vec![connected(), sysinfo(1), Some(reply(CMD_SET_DUP_CHECK, &[XG_ERR_FAIL, 0x05]))]);
+        assert_eq!(keep(&mut port), Err(VeinError::Rc(0x05)));
+        assert!(port.sent.iter().all(|p| p[3] != CMD_ENROLL));
+    }
+
+    #[test]
+    fn identify_keep_lines_carry_the_record_only_on_a_hit() {
+        let data = sample_chara(4);
+        assert_eq!(
+            run_t(Command::IdentifyKeep, keep_script(&data, verified(Some(15)))),
+            vec!["VEIN RECORD 1 0 DEEDDEED", "VEIN RECORD 1 END 4", "VEIN IDENTIFIED 15"]
+        );
+        assert_eq!(run_t(Command::IdentifyKeep, keep_script(&data, verified(None))), vec!["VEIN NOMATCH"]);
+        assert_eq!(run_t(Command::IdentifyKeep, vec![connected(), Some(reply(CMD_GET_SYSTEM_INFO, &[XG_ERR_FAIL, XG_ERR_NO_SUPPORT]))]), vec!["ERR VEIN UNSUPPORTED"]);
     }
 
     #[test]
