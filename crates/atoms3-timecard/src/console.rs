@@ -25,7 +25,7 @@
 //! | `VEIN CAPTURE` | 指静脈を読む (`vein` feature)。`VEIN CHARA <hex>` / `ERR VEIN <reason>`。feature 無しは共通実装が `ERR VEIN: unsupported` |
 //! | `VEIN SAY PLACE\|AGAIN\|ENROLLED\|FAILED` | 案内音声 (`vein` feature)。`OK VEIN SAY <x>` |
 //! | `VEIN FINGER?` | 指の有無を 1 回問い合わせる (`vein` feature)。`VEIN FINGER 0\|1` / `ERR VEIN UNSUPPORTED` / `ERR VEIN <reason>` |
-//! | `VEIN ENROLL <id>` / `VEIN IDENTIFY` / `VEIN SYNC WRITE\|CLEAR …` | 照合をモジュールで行う本番の口 (`vein` feature、ippoan/alc-app#436)。行の形は docs/console-protocol.md |
+//! | `VEIN ENROLL <id>` / `VEIN IDENTIFY [KEEP]` / `VEIN SYNC WRITE\|CLEAR …` | 照合をモジュールで行う本番の口 (`vein` feature、ippoan/alc-app#436)。行の形は docs/console-protocol.md |
 //! | `HB OK` / `HB NG <reason>` (末尾 `call=0\|1` / `grace=<秒>`) | 警告デバイスの heartbeat (`vein` feature)。**返信しない**。初回で武装し、途切れたら鳴る (main.rs の「警告デバイスを兼ねる」節) |
 //! | `HB OFF` | 監視停止 (`vein` feature)。`OK HB OFF` |
 //!
