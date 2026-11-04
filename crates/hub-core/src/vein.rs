@@ -103,6 +103,10 @@ pub const CMD_SET_SECURITY_LEVEL: u8 = 0x07;
 pub const CMD_SET_DUP_CHECK: u8 = 0x09;
 /// GET_SYSTEM_INFO の応答で重複登録の検査 (0 / 1) が入る位置 (§2.2.3 の `bData[7]`)
 pub const SYSINFO_DUP_CHECK_AT: usize = 7;
+/// UART の速度を番号 (0〜4、[`BAUD_RATES`]) で書く (§2.2.6)。応答は今の速度で返り、以後は新しい速度で話す
+pub const CMD_SET_BAUDRATE: u8 = 0x06;
+/// [`CMD_SET_BAUDRATE`] の番号と速度 (bps) の対応 (§2.2.3 の `bData[4]`)
+pub const BAUD_RATES: [u32; 5] = [9_600, 19_200, 38_400, 57_600, 115_200];
 /// 書いてよい安全レベルの上限 (仕様書の API 例が 0, 1, 2)
 pub const SECURITY_LEVEL_MAX: u8 = 2;
 
@@ -379,6 +383,8 @@ pub trait Port {
     fn recv(&mut self, buf: &mut [u8], timeout_ms: u32) -> usize;
     /// `ms` だけ待つ (指が離れるのを見る間隔。UART には触らない)
     fn pause(&mut self, ms: u32);
+    /// 端末の側の UART の速度を `bps` に替える ([`find_baud`] / [`switch_baud`])。既定は何もしない (速度を持たない口)
+    fn set_baud(&mut self, _bps: u32) {}
 }
 
 /// 待ち時間 (ミリ秒)。**実機で未確認の値** — 合わなければここだけ直す
@@ -396,7 +402,7 @@ pub struct Timeouts {
 }
 
 impl Timeouts {
-    /// 既定値。57600bps で 512 バイト + 2 は約 90ms、24 バイトは約 4ms
+    /// 既定値。57600bps (遅い方) で 512 バイト + 2 は約 90ms、24 バイトは約 4ms
     pub const DEFAULT: Self = Self {
         connect_ms: 500,
         finger_ms: 15_000,
@@ -711,6 +717,9 @@ pub enum TestCommand {
     /// 間隔 (0〜[`RAW_GAP_MAX_MS`])。指紋互換の DownChar は、データの枠を詰めて流すと 1 枠ずつ取りこぼし、
     /// 間が空きすぎると打ち切るので、通る間隔を探すため (ippoan/alc-app#436)
     RawGap(u32),
+    /// `VEIN TEST BAUD <0〜4>`: モジュールの UART の速度を [`BAUD_RATES`] の番号で書き ([`test_baud`])、
+    /// 端末の側も同じ速度に切り替えて接続し直す。記録の読み出し (8 KB) を速くできるかを確かめるため
+    Baud(u8),
 }
 
 /// `VEIN TEST RAW` で一度に送れるバイト数の上限 (SYNC WRITE の 1 行と同じ)
@@ -954,6 +963,85 @@ pub fn test_sysinfo(port: &mut dyn Port, t: &Timeouts) -> Result<[u8; DATA_LEN],
         return Err(VeinError::Unsupported);
     }
     Ok(p.data)
+}
+
+/// 試験: 接続してモジュールの UART の速度を番号 `idx` (0〜4、[`BAUD_RATES`]) で書く ([`CMD_SET_BAUDRATE`])。
+/// 応答は今の速度で返る。端末の側の速度を切り替えるのは呼び出し側
+pub fn test_baud(port: &mut dyn Port, t: &Timeouts, idx: u8) -> Result<(), VeinError> {
+    connect(port, t)?;
+    setting_ok(&exchange(port, t, CMD_SET_BAUDRATE, &[idx])?)
+}
+
+/// `VEIN TEST BAUD` の成功の行 (端末の側も切り替えて接続し直せた)
+pub fn test_baud_line(bps: u32) -> String {
+    format!("VEIN TEST BAUD OK BAUD={bps}")
+}
+
+/// 速い方の速度の番号 ([`BAUD_RATES`] の 115200)。8 KB の記録の読み出しが 57600 の 2.3 秒から 1.5 秒になる
+/// (`VEIN IDENTIFY KEEP` の通しで 4.9 → 3.8 秒、2026-11-04 実機)
+pub const BAUD_FAST_INDEX: u8 = 4;
+/// 速い方の速度 (bps)。端末の UART はこの速度で開く
+pub const BAUD_FAST: u32 = BAUD_RATES[BAUD_FAST_INDEX as usize];
+/// 速度を書いてから端末の側を切り替えるまでの間 (応答を出し切ったモジュールが切り替わるのを待つ)
+pub const BAUD_SETTLE_MS: u32 = 50;
+
+/// 今の速度 `bps` で接続を試し、答えなければほかの速度 (速い方から) を試す。話せた速度を返す。
+/// どれでも答えなければ `bps` に戻して `None`。
+/// モジュールは速度の設定を電源を切っても覚えている (2026-11-04 実機) ので、どの速度にいるかは分からない
+pub fn find_baud(port: &mut dyn Port, t: &Timeouts, bps: u32) -> Option<u32> {
+    if connect(port, t).is_ok() {
+        return Some(bps);
+    }
+    for &other in BAUD_RATES.iter().rev().filter(|b| **b != bps) {
+        port.set_baud(other);
+        if connect(port, t).is_ok() {
+            return Some(other);
+        }
+    }
+    port.set_baud(bps);
+    None
+}
+
+/// 今 `bps` で話しているモジュールの速度を番号 `idx` に書き、端末の側も切り替えて接続し直す。新しい速度を返す。
+/// 新しい速度で答えなければ端末の側を `bps` に戻して、その失敗を返す (呼び出し側が [`find_baud`] で探し直す)
+pub fn switch_baud(port: &mut dyn Port, t: &Timeouts, idx: u8, bps: u32) -> Result<u32, VeinError> {
+    let new = BAUD_RATES[usize::from(idx)];
+    test_baud(port, t, idx)?;
+    port.pause(BAUD_SETTLE_MS);
+    port.set_baud(new);
+    if let Err(e) = connect(port, t) {
+        port.set_baud(bps);
+        return Err(e);
+    }
+    Ok(new)
+}
+
+/// 起動時の速度合わせ ([`bring_up_baud`]) の結果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaudUp {
+    /// もう速い方 ([`BAUD_FAST`]) だった
+    Fast,
+    /// この速度 (bps) から速い方へ切り替えた
+    Switched(u32),
+    /// 切り替えられず、この速度 (bps) のまま
+    Kept(u32, VeinError),
+    /// どの速度でも答えない (モジュールが無い・電源が無い)
+    NoModule,
+}
+
+/// 起動時に 1 回: モジュールの速度を探し、速い方でなければ速い方へ切り替える。端末の側の今の速度と結果を返す。
+/// 端末の UART は [`BAUD_FAST`] で開いておく (切り替え済みの機体は 1 回目の接続で済む)
+pub fn bring_up_baud(port: &mut dyn Port, t: &Timeouts) -> (u32, BaudUp) {
+    let Some(now) = find_baud(port, t, BAUD_FAST) else {
+        return (BAUD_FAST, BaudUp::NoModule);
+    };
+    if now == BAUD_FAST {
+        return (now, BaudUp::Fast);
+    }
+    match switch_baud(port, t, BAUD_FAST_INDEX, now) {
+        Ok(new) => (new, BaudUp::Switched(now)),
+        Err(e) => (find_baud(port, t, now).unwrap_or(now), BaudUp::Kept(now, e)),
+    }
 }
 
 /// 試験: 接続して撮影し、生画像を読む ([`CMD_READ_IMAGE`] → READ_DATA 種別 `0x24`)。
@@ -1844,6 +1932,8 @@ mod tests {
         send_ok: bool,
         discards: usize,
         pauses: Vec<u32>,
+        /// [`Port::set_baud`] で切り替えた速度の並び
+        bauds: Vec<u32>,
     }
 
     impl FakePort {
@@ -1856,6 +1946,7 @@ mod tests {
                 send_ok: true,
                 discards: 0,
                 pauses: Vec::new(),
+                bauds: Vec::new(),
             }
         }
     }
@@ -1884,6 +1975,9 @@ mod tests {
         }
         fn pause(&mut self, ms: u32) {
             self.pauses.push(ms);
+        }
+        fn set_baud(&mut self, bps: u32) {
+            self.bauds.push(bps);
         }
     }
 
@@ -3739,5 +3833,124 @@ mod tests {
             port.sent[2],
             command(CMD_ENROLL, &[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 2, 0]).to_vec()
         );
+    }
+
+    fn baud_ok() -> Option<Vec<u8>> {
+        Some(reply(CMD_SET_BAUDRATE, &[XG_ERR_SUCCESS]))
+    }
+
+    #[test]
+    fn find_baud_keeps_the_current_speed_when_it_answers() {
+        let mut port = FakePort::new(vec![connected()]);
+        assert_eq!(find_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST), Some(BAUD_FAST));
+        assert!(port.bauds.is_empty());
+    }
+
+    #[test]
+    fn find_baud_tries_the_other_speeds_fastest_first() {
+        // 115200 が黙れば 57600、57600 も黙れば 38400 (残りを速い方から試す)
+        let mut port = FakePort::new(vec![None, connected()]);
+        assert_eq!(find_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST), Some(57_600));
+        assert_eq!(port.bauds, vec![57_600]);
+        let mut port = FakePort::new(vec![None, None, connected()]);
+        assert_eq!(find_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST), Some(38_400));
+        assert_eq!(port.bauds, vec![57_600, 38_400]);
+    }
+
+    #[test]
+    fn find_baud_goes_back_to_the_current_speed_when_nothing_answers() {
+        let mut port = FakePort::new(vec![]);
+        assert_eq!(find_baud(&mut port, &Timeouts::DEFAULT, 57_600), None);
+        assert_eq!(port.bauds, vec![115_200, 38_400, 19_200, 9_600, 57_600]);
+    }
+
+    #[test]
+    fn switch_baud_writes_the_index_then_switches_and_reconnects() {
+        let mut port = FakePort::new(vec![connected(), baud_ok(), connected()]);
+        assert_eq!(switch_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST_INDEX, 57_600), Ok(BAUD_FAST));
+        assert_eq!(port.sent[1], command(CMD_SET_BAUDRATE, &[4]).to_vec());
+        assert_eq!(port.pauses, vec![BAUD_SETTLE_MS]);
+        assert_eq!(port.bauds, vec![BAUD_FAST]);
+    }
+
+    #[test]
+    fn switch_baud_does_not_switch_when_the_module_refuses() {
+        let mut port = FakePort::new(vec![connected(), Some(reply(CMD_SET_BAUDRATE, &[XG_ERR_FAIL, 0x10]))]);
+        assert_eq!(
+            switch_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST_INDEX, 57_600),
+            Err(VeinError::Unsupported)
+        );
+        assert!(port.bauds.is_empty());
+        let mut port = FakePort::new(vec![connected(), Some(reply(CMD_SET_BAUDRATE, &[XG_ERR_FAIL, 0x02]))]);
+        assert_eq!(
+            switch_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST_INDEX, 57_600),
+            Err(VeinError::Rc(0x02))
+        );
+        let mut port = FakePort::new(vec![]);
+        assert_eq!(
+            switch_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST_INDEX, 57_600),
+            Err(VeinError::NoModule)
+        );
+    }
+
+    #[test]
+    fn switch_baud_goes_back_when_the_new_speed_is_silent() {
+        let mut port = FakePort::new(vec![connected(), baud_ok(), None]);
+        assert_eq!(
+            switch_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST_INDEX, 57_600),
+            Err(VeinError::NoModule)
+        );
+        assert_eq!(port.bauds, vec![BAUD_FAST, 57_600]);
+    }
+
+    #[test]
+    fn bring_up_baud_leaves_a_fast_module_alone() {
+        let mut port = FakePort::new(vec![connected()]);
+        assert_eq!(bring_up_baud(&mut port, &Timeouts::DEFAULT), (BAUD_FAST, BaudUp::Fast));
+        assert_eq!(port.sent.len(), 1);
+    }
+
+    #[test]
+    fn bring_up_baud_switches_a_factory_module_to_fast() {
+        // 115200 は黙る → 57600 で答える → 速度を書く → 115200 で答える
+        let mut port = FakePort::new(vec![None, connected(), connected(), baud_ok(), connected()]);
+        assert_eq!(bring_up_baud(&mut port, &Timeouts::DEFAULT), (BAUD_FAST, BaudUp::Switched(57_600)));
+        assert_eq!(port.bauds, vec![57_600, BAUD_FAST]);
+    }
+
+    #[test]
+    fn bring_up_baud_keeps_the_found_speed_when_switching_fails() {
+        // 57600 で見つかるが、115200 に替えると黙る → 57600 に戻して探し直す
+        let mut port = FakePort::new(vec![None, connected(), connected(), baud_ok(), None, connected()]);
+        assert_eq!(
+            bring_up_baud(&mut port, &Timeouts::DEFAULT),
+            (57_600, BaudUp::Kept(57_600, VeinError::NoModule))
+        );
+        // 探し直しでも答えなければ見つけた速度のまま
+        let mut port = FakePort::new(vec![None, connected(), connected(), baud_ok(), None]);
+        assert_eq!(
+            bring_up_baud(&mut port, &Timeouts::DEFAULT),
+            (57_600, BaudUp::Kept(57_600, VeinError::NoModule))
+        );
+    }
+
+    #[test]
+    fn bring_up_baud_reports_no_module() {
+        let mut port = FakePort::new(vec![]);
+        assert_eq!(bring_up_baud(&mut port, &Timeouts::DEFAULT), (BAUD_FAST, BaudUp::NoModule));
+    }
+
+    #[test]
+    fn set_baud_is_a_no_op_by_default() {
+        // 速度を持たない口 (既定の実装) でも探せる
+        let mut port = FailAt(FakePort::new(vec![None, connected()]), 0);
+        assert_eq!(find_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST), Some(57_600));
+        assert!(port.0.bauds.is_empty());
+    }
+
+    #[test]
+    fn test_baud_line_names_the_speed() {
+        assert_eq!(test_baud_line(115_200), "VEIN TEST BAUD OK BAUD=115200");
+        assert_eq!(BAUD_FAST, 115_200);
     }
 }

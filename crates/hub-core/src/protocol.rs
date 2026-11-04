@@ -300,6 +300,7 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
     const BAD_RAW: &str = "ERR VEIN: RAW <待ち ms (0〜30000)> <16 進 (1〜192 バイト)> です";
     const BAD_RAWQ: &str = "ERR VEIN: RAWQ <16 進 (1〜192 バイト)> です";
     const BAD_RAWGAP: &str = "ERR VEIN: RAWGAP <ms (0〜1000)> です";
+    const BAD_BAUD: &str = "ERR VEIN: BAUD <0〜4> です (0=9600 1=19200 2=38400 3=57600 4=115200)";
     let verb = it.next().map(|s| s.to_ascii_uppercase());
     let args: Vec<&str> = it.collect();
     match (verb.as_deref(), args.as_slice()) {
@@ -346,12 +347,19 @@ fn parse_vein_test<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<HostComm
             .map(|v| HostCommand::VeinTest(TestCommand::RawGap(v)))
             .ok_or_else(|| BAD_RAWGAP.into()),
         (Some("RAWGAP"), _) => Err(BAD_RAWGAP.into()),
+        (Some("BAUD"), [n]) => n
+            .parse::<u8>()
+            .ok()
+            .filter(|v| usize::from(*v) < crate::vein::BAUD_RATES.len() && n.len() == 1)
+            .map(|v| HostCommand::VeinTest(TestCommand::Baud(v)))
+            .ok_or_else(|| BAD_BAUD.into()),
+        (Some("BAUD"), _) => Err(BAD_BAUD.into()),
         (Some(v @ ("ENROLL" | "CLEAR")), [id]) => {
             let make: fn(u32) -> TestCommand = if v == "ENROLL" { TestCommand::Enroll } else { TestCommand::Clear };
             parse_test_id(id).map(|id| HostCommand::VeinTest(make(id))).ok_or_else(|| BAD_ID.into())
         }
         (Some("ENROLL" | "CLEAR"), _) => Err(BAD_ID.into()),
-        _ => Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|CAPACITY|SYSINFO|IMAGE|DEBUG|RAW|RAWQ|RAWGAP が必要です".into()),
+        _ => Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|CAPACITY|SYSINFO|IMAGE|DEBUG|RAW|RAWQ|RAWGAP|BAUD が必要です".into()),
     }
 }
 
@@ -1733,6 +1741,19 @@ mod tests {
             Err("ERR VEIN: SYSINFO に引数は要りません".into())
         );
         assert_eq!(parse_line("vein test debug", T), Ok(Some(HostCommand::VeinTest(TestCommand::Debug))));
+        for n in 0u8..=4 {
+            assert_eq!(
+                parse_line(&format!("VEIN TEST BAUD {n}"), T),
+                Ok(Some(HostCommand::VeinTest(TestCommand::Baud(n))))
+            );
+        }
+        for bad in ["VEIN TEST BAUD", "VEIN TEST BAUD 5", "VEIN TEST BAUD 04", "VEIN TEST BAUD x", "VEIN TEST BAUD 4 4"] {
+            assert_eq!(
+                parse_line(bad, T),
+                Err("ERR VEIN: BAUD <0〜4> です (0=9600 1=19200 2=38400 3=57600 4=115200)".into()),
+                "{bad}"
+            );
+        }
         assert_eq!(parse_line("VEIN TEST READ 10", T), Ok(Some(HostCommand::VeinTest(TestCommand::Read(10)))));
         assert_eq!(parse_line("VEIN TEST READ 2", T), Ok(Some(HostCommand::VeinTest(TestCommand::Read(2)))));
         for bad in ["VEIN TEST READ", "VEIN TEST READ 1", "VEIN TEST READ 101", "VEIN TEST READ x", "VEIN TEST READ 10 11"] {
@@ -1879,7 +1900,7 @@ mod tests {
         for gone in ["VEIN TEST INFO 2", "VEIN TEST COPY 2 3", "VEIN TEST REBUILD 2 3", "VEIN TEST WRITE 3 END"] {
             assert_eq!(
                 parse_line(gone, T),
-                Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|CAPACITY|SYSINFO|IMAGE|DEBUG|RAW|RAWQ|RAWGAP が必要です".into()),
+                Err("ERR VEIN: TEST には ENROLL|VERIFY|CLEAR|CAPACITY|SYSINFO|IMAGE|DEBUG|RAW|RAWQ|RAWGAP|BAUD が必要です".into()),
                 "{gone}"
             );
         }

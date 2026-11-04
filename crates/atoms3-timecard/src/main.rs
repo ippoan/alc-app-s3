@@ -92,7 +92,7 @@
 //! # 指静脈 (`vein` feature、ippoan/vein-match#20)
 //!
 //! `station` に Waveshare Finger Vein Module を足す。**UART2** (FC-1200 が
-//! UART1 を使うため) を TX=G5 / RX=G6、57600bps 8N1 で開き、`VEIN CAPTURE` で
+//! UART1 を使うため) を TX=G5 / RX=G6、115200bps 8N1 で開き (モジュールの工場出荷は 57600。起動時に探して切り替える、`vein::BAUD`)、`VEIN CAPTURE` で
 //! 登録データを読み、0xBDBD の特徴量 (0x448 バイト) を取り出して `VEIN CHARA <hex>` の 1 行で USB へ出す (手順は
 //! `alc_hub_core::vein`、UART は `alc_hub_drivers::vein`)。案内音声 (`VEIN SAY`)
 //! はホストが鳴らす。ピンは `main` の `let vein = …` の 1 か所だけで決める —
