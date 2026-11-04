@@ -274,7 +274,12 @@ pub fn start(
                             // 理由コード (11 = 静脈が写らない / 09 = 同じ指でない) も載せる — 毎回撮り直しに
                             // なるときの切り分けに要る (生体データではない)
                             alc_hub_common::evtlog::emit(&format!("EVT VEIN AGAIN {code:02X}"));
-                            Some(Sound::VeinRetry)
+                            // 静脈が写らない (明るさが外れた) は置き方で直るので「配置を確認してください」
+                            Some(if code == proto::XG_ERR_NO_VEIN {
+                                Sound::VeinCheckPlacement
+                            } else {
+                                Sound::VeinRetry
+                            })
                         }
                         proto::Prompt::Replace(n) => {
                             // 画面が文言と進み具合に使う (生体データなし)

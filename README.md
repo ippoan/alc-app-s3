@@ -354,9 +354,10 @@ NFC 読み取り時の音声「登録完了しました」は **VOICEVOX:四国�
 VOICEVOX 内部ネイティブレートのまま無加工で持ち、再生時に ×2 線形補間)。
 Vein Station (`atoms3-timecard` の `vein` feature) の案内音声「指を置いてください」
 「もう一度置いてください」「読み取れませんでした」「指を離してください」「指を離して、置き直してください」
-(`crates/hub-drivers/assets/vein_{place,again,failed,release,retry}_24k_s16le.raw`) も同じ
+「配置を確認してください」
+(`crates/hub-drivers/assets/vein_{place,again,failed,release,retry,check}_24k_s16le.raw`) も同じ
 VOICEVOX:四国めたん (ノーマル、話速 0.9) で同じ手順で作っている (前後の |s| <= 64 を
-無音として切る。この 5 本は `vein` feature のときだけ埋め込む)。この 5 本だけは
+無音として切る。この 6 本は `vein` feature のときだけ埋め込む)。この 6 本だけは
 聞こえる音量にするため、切った後にピークを 95% (31130) にそろえている (#298)。
 VOICEVOX の利用規約によりクレジット表記が必要 — 本製品を紹介する資料や
 配布物にも「VOICEVOX:四国めたん」を記載すること。

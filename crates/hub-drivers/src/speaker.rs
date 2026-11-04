@@ -211,9 +211,13 @@ pub enum Sound {
     /// 間に指が離れるのを待たないので、乗せたまま次の撮影に入って続けて失敗しないよう、離すことを促す
     #[cfg(feature = "vein")]
     VeinRetry,
+    /// 明るさが外れて撮れなかった (撮り直しの理由 `11` = 静脈が写らない) とき:「配置を確認してください」。
+    /// 置き方 (奥まで入っているか、浮いていないか) で明るさが大きく変わるため (2026-11-04 実機)
+    #[cfg(feature = "vein")]
+    VeinCheckPlacement,
 }
 
-// 指静脈の案内音声 (`vein` feature のときだけ埋め込む — 3 本で ~210KB)。
+// 指静脈の案内音声 (`vein` feature のときだけ埋め込む — 6 本で ~510KB)。
 // 作り方は play_registered と同じ: VOICEVOX:四国めたん (ノーマル、話速 0.9) を
 // `outputSamplingRate=24000` / `outputStereo=false` で合成し、前後の無音
 // (|s| <= 64) を切るだけ。正規化・ローパスは掛けない (README の再生成手順)
@@ -227,6 +231,8 @@ const VEIN_FAILED: &[u8] = include_bytes!("../assets/vein_failed_24k_s16le.raw")
 const VEIN_RELEASE: &[u8] = include_bytes!("../assets/vein_release_24k_s16le.raw");
 #[cfg(feature = "vein")]
 const VEIN_RETRY: &[u8] = include_bytes!("../assets/vein_retry_24k_s16le.raw");
+#[cfg(feature = "vein")]
+const VEIN_CHECK: &[u8] = include_bytes!("../assets/vein_check_24k_s16le.raw");
 
 /// 再生専用スレッドを立て、送信ハンドルを返す (issue #102)。
 /// I2S の write はブロッキングのため、NFC ポーリング等の呼び出し元スレッドで
@@ -264,6 +270,8 @@ pub fn start_player(mut speaker: Speaker) -> Result<std::sync::mpsc::Sender<Soun
                         .and_then(|()| speaker.play_pcm_24k_mono(VEIN_RELEASE)),
                     #[cfg(feature = "vein")]
                     Sound::VeinRetry => speaker.play_pcm_24k_mono(VEIN_RETRY),
+                    #[cfg(feature = "vein")]
+                    Sound::VeinCheckPlacement => speaker.play_pcm_24k_mono(VEIN_CHECK),
                 };
                 if let Err(e) = r {
                     log::warn!("speaker: 再生失敗: {e:#}");
