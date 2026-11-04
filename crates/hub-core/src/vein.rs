@@ -637,6 +637,72 @@ pub fn capture(
     Ok(out)
 }
 
+/// 撮って照合 ([`capture_identify`]) で読む記録の先頭の長さ: テンプレートの見出し 0x20 + AES の見出し (0xc か 8) +
+/// 記録の見出し 0x40 と 1 本目 ([`vein_match_search::ENTRY`]) を覆う暗号のブロック。1 本だけ撮った記録の 2〜6 本目の
+/// 枠は空なので、ここから先は読まない (8 KB を読むと 115200bps で 1.5 秒、この長さなら 3 塊)
+pub const FRESH_PREFIX_LEN: usize = 0x20 + 0xc + ((0x40 + vein_match_search::ENTRY + 15) & !15);
+
+/// ID `id` の登録データの**先頭だけ**を読み、1 本だけの記録に組み直す ([`complete_fresh_record`])。
+/// 組み直せない形 (AES のみの mode 1 でない等) なら全部を読み直す (先頭から READ_DATA。接続済みであること)
+fn read_fresh_record(port: &mut dyn Port, t: &Timeouts, id: u32) -> Result<Vec<u8>, VeinError> {
+    let p = exchange(port, t, CMD_READ_ENROLL, &id.to_le_bytes())?;
+    if p.data[0] != XG_ERR_SUCCESS {
+        return Err(VeinError::Rc(p.data[1]));
+    }
+    let size = usize::from(p.data[1]) + usize::from(p.data[2]) * 256;
+    if !(1..=CHARA_MAX).contains(&size) {
+        return Err(VeinError::ReadFail);
+    }
+    if size > FRESH_PREFIX_LEN {
+        let prefix = read_data(port, t, CMD_READ_ENROLL, FRESH_PREFIX_LEN)?;
+        if let Some(record) = complete_fresh_record(&prefix) {
+            return Ok(record);
+        }
+    }
+    read_data(port, t, CMD_READ_ENROLL, size)
+}
+
+/// 登録データ (テンプレート) の先頭 `prefix` から記録の見出しと 1 本目を取り出し、1 本だけの記録
+/// (mode 1、`vein_match_search::build_template`) に組み直す。AES は ECB (ブロックごとに独立) なので先頭だけ解ける。
+/// 件の中身には触らない (サーバーの `mix_templates` が件を写して並べ直すのと同じ)。学習記録は捨てる。
+/// 形が違えば `None`
+pub fn complete_fresh_record(prefix: &[u8]) -> Option<Vec<u8>> {
+    const HEAD: usize = 0x40;
+    if prefix.len() < 0x20 || !prefix.starts_with(&TEMPLATE_MAGIC) || prefix[6] != 1 {
+        return None;
+    }
+    let mut body = prefix[0x20..].to_vec();
+    let hdr_len = match body.get(..2) {
+        Some([0xea, 0xae]) => 0xc,
+        Some([0xee, 0xaa]) => 8,
+        _ => return None,
+    };
+    let blocks = body.len().checked_sub(hdr_len)? & !15;
+    body.truncate(hdr_len + blocks);
+    // 和は読んだ分だけで取り直す (元の和は 8 KB 全部の和)
+    let sum = body[hdr_len..].iter().fold(0u16, |a, &b| a.wrapping_add(u16::from(b)));
+    body[2..4].copy_from_slice(&sum.to_le_bytes());
+    let plain = vein_match_search::aes_unwrap(&body).ok()?;
+    let used = HEAD + vein_match_search::ENTRY;
+    if plain.len() < used
+        || u16::from_le_bytes([plain[0], plain[1]]) != vein_match_search::RECORD_MAGIC
+        || plain[3] != 2
+        || plain[0xd] == 0
+    {
+        return None;
+    }
+    let mut r = vec![0u8; vein_match_search::REC_SIZE];
+    r[..used].copy_from_slice(&plain[..used]);
+    r[0xd] = 1;
+    // 見出しの和はグループ (+0xc) を入れる前の値 (vein-match の make_record / mix_templates と同じ)
+    let group = r[0xc];
+    r[0xc] = 0;
+    r[2] = r[4..HEAD].iter().fold(0u8, |a, &b| a.wrapping_add(b));
+    r[0xc] = group;
+    let user = u32::from_le_bytes([r[8], r[9], r[10], r[11]]);
+    vein_match_search::build_template(&r, user, 1, &[]).ok()
+}
+
 /// ID `id` の登録データを読む (接続済みであること。READ_ENROLL → READ_DATA)。
 /// 読み取り ([`capture`]) と登録 ([`enroll`]) が共有する
 fn read_enroll(port: &mut dyn Port, t: &Timeouts, id: u32) -> Result<Vec<u8>, VeinError> {
@@ -1348,7 +1414,7 @@ fn capture_then_identify(
     on_prompt: &mut dyn FnMut(Prompt),
 ) -> Result<(Vec<u8>, Option<u32>), VeinError> {
     enroll_id(port, t, SCRATCH_ID, 1, on_prompt)?;
-    let record = read_enroll(port, t, SCRATCH_ID);
+    let record = read_fresh_record(port, t, SCRATCH_ID);
     let _ = exchange(port, t, CMD_CLEAR_ENROLL, &SCRATCH_ID.to_le_bytes());
     let record = record?;
     let hit = verify(port, t, 0, on_prompt)?;
@@ -3953,4 +4019,116 @@ mod tests {
         assert_eq!(test_baud_line(115_200), "VEIN TEST BAUD OK BAUD=115200");
         assert_eq!(BAUD_FAST, 115_200);
     }
+
+    /// 1 本だけの記録 (実機と同じ mode 1、グループ `group`)
+    fn fresh_template(seed: u8, group: u8) -> Vec<u8> {
+        let mut plane = [0u8; vein_match::PLANE_LEN];
+        for (i, b) in plane.iter_mut().enumerate() {
+            *b = (i as u32 * 31 + u32::from(seed) * 7).is_multiple_of(3) as u8;
+        }
+        let rec = vein_match_search::make_record(&[plane], 7, group).unwrap();
+        vein_match_search::build_template(&rec, 7, 1, &[]).unwrap()
+    }
+
+    /// `t` を [`chunks`] の塊に分けた READ_DATA の応答の並び
+    fn data_chunks(t: &[u8]) -> Vec<Option<Vec<u8>>> {
+        chunks(t.len()).map(|(off, len)| Some(chunk(&t[off..off + len]))).collect()
+    }
+
+    #[test]
+    fn complete_fresh_record_rebuilds_the_first_entry_from_the_prefix() {
+        for group in [0, 5] {
+            let t = fresh_template(3, group);
+            assert!(t.len() > FRESH_PREFIX_LEN);
+            let rebuilt = complete_fresh_record(&t[..FRESH_PREFIX_LEN]).unwrap();
+            assert_eq!(rebuilt.len(), t.len());
+            let (_, a) = vein_match_search::parse_template(&t).unwrap();
+            let (hdr, b) = vein_match_search::parse_template(&rebuilt).unwrap();
+            let used = 0x40 + vein_match_search::ENTRY;
+            assert_eq!(a[..used], b[..used]);
+            assert_eq!((hdr.mode, hdr.count, hdr.user, hdr.group), (1, 1, 7, group));
+            assert_eq!(
+                vein_match_search::template_to_charas(&rebuilt).unwrap(),
+                vein_match_search::template_to_charas(&t).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn complete_fresh_record_takes_the_old_aes_header_too() {
+        // 旧見出し 0xaaee (8 バイト): 0xaeea の見出し (0xc) の後ろ 4 バイトを落とした形
+        let t = fresh_template(4, 0);
+        let mut old = t[..0x20].to_vec();
+        old.extend_from_slice(&[0xee, 0xaa]);
+        old.extend_from_slice(&t[0x22..0x28]);
+        old.extend_from_slice(&t[0x2c..FRESH_PREFIX_LEN]);
+        let rebuilt = complete_fresh_record(&old).unwrap();
+        assert_eq!(
+            vein_match_search::template_to_charas(&rebuilt).unwrap(),
+            vein_match_search::template_to_charas(&t).unwrap()
+        );
+    }
+
+    #[test]
+    fn complete_fresh_record_rejects_other_shapes() {
+        let t = fresh_template(5, 0);
+        let p = &t[..FRESH_PREFIX_LEN];
+        // 短い / 見出しが違う / mode が 1 でない / AES の見出しが違う / AES の見出しより短い / 1 本目まで届かない
+        assert_eq!(complete_fresh_record(&p[..0x1f]), None);
+        let mut bad = p.to_vec();
+        bad[0] ^= 1;
+        assert_eq!(complete_fresh_record(&bad), None);
+        let mut bad = p.to_vec();
+        bad[6] = 3;
+        assert_eq!(complete_fresh_record(&bad), None);
+        let mut bad = p.to_vec();
+        bad[0x20] = 0;
+        assert_eq!(complete_fresh_record(&bad), None);
+        assert_eq!(complete_fresh_record(&p[..0x22]), None);
+        assert_eq!(complete_fresh_record(&p[..0x20 + 0xc + 0x40]), None);
+        // 記録の見出しが違う (magic / 版 / 件数 0)
+        for (at, v) in [(0usize, 0u8), (3, 1), (0xd, 0)] {
+            let mut rec = vein_match_search::make_record(&[[0u8; vein_match::PLANE_LEN]], 0, 0).unwrap();
+            rec[at] = v;
+            let t = vein_match_search::build_template(&rec, 0, 1, &[]).unwrap();
+            assert_eq!(complete_fresh_record(&t[..FRESH_PREFIX_LEN]), None, "{at}");
+        }
+    }
+
+    #[test]
+    fn read_fresh_record_reads_only_the_prefix() {
+        let t = fresh_template(6, 0);
+        let mut script = vec![size(t.len())];
+        script.extend(data_chunks(&t[..FRESH_PREFIX_LEN]));
+        let mut port = FakePort::new(script);
+        let got = read_fresh_record(&mut port, &Timeouts::DEFAULT, SCRATCH_ID).unwrap();
+        assert_eq!(complete_fresh_record(&t[..FRESH_PREFIX_LEN]), Some(got));
+        // READ_ENROLL 1 回 + 先頭の塊だけ (8 KB の 16 塊でなく 3 塊)
+        assert_eq!(port.sent.len(), 1 + chunks(FRESH_PREFIX_LEN).count());
+        assert_eq!(chunks(FRESH_PREFIX_LEN).count(), 3);
+    }
+
+    #[test]
+    fn read_fresh_record_falls_back_to_the_whole_record() {
+        // 組み直せない形 (見本の登録データ) なら、先頭を読んだ後に全部を読み直す
+        let data = sample_chara(2000);
+        let mut script = vec![size(data.len())];
+        script.extend(data_chunks(&data[..FRESH_PREFIX_LEN]));
+        script.extend(data_chunks(&data));
+        let mut port = FakePort::new(script);
+        assert_eq!(read_fresh_record(&mut port, &Timeouts::DEFAULT, SCRATCH_ID), Ok(data));
+    }
+
+    #[test]
+    fn read_fresh_record_errors() {
+        let t = |script| read_fresh_record(&mut FakePort::new(script), &Timeouts::DEFAULT, SCRATCH_ID);
+        assert_eq!(t(vec![Some(reply(CMD_READ_ENROLL, &[XG_ERR_FAIL, 0x07]))]), Err(VeinError::Rc(0x07)));
+        assert_eq!(t(vec![size(0)]), Err(VeinError::ReadFail));
+        assert_eq!(t(vec![size(CHARA_MAX + 1)]), Err(VeinError::ReadFail));
+        assert_eq!(t(vec![]), Err(VeinError::Timeout));
+        // 先頭の読み出しに失敗
+        assert_eq!(t(vec![size(3000)]), Err(VeinError::ReadFail));
+    }
 }
+
+
