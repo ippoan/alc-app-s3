@@ -848,6 +848,9 @@ pub enum Command {
     /// `VEIN IDENTIFY KEEP`: 置いた 1 回の指を作業用 ID に 1 本撮ってから、離さずに 1:N 照合する
     /// ([`capture_identify`])。当たれば撮った記録も返す (照合でモジュールが撮った指は外へ出ないため)
     IdentifyKeep,
+    /// `VEIN IDENTIFY KEEP ALL`: [`Command::IdentifyKeep`] と同じだが、外れても撮った記録を返す
+    /// (モジュールの判定とホストの照合を同じ 1 回の撮影で比べる試験用)
+    IdentifyKeepAll,
     /// `VEIN VERIFY <id>`: 1:1 照合 (VERIFY <id>)。免許証で本人が決まった後に使う
     Verify(u32),
     /// `VEIN SYNC WRITE …`: サーバーの記録をモジュールの ID へ書く
@@ -1726,9 +1729,10 @@ pub fn run(
     let lines = match cmd {
         Command::Enroll(id, templates) => enroll(port, t, id, templates, on_prompt).map(|rec| record_lines(id, &rec)),
         // 当たったときだけ撮った記録 (`VEIN RECORD 1 …`) を出し、続けて IDENTIFY と同じ結果の行
-        Command::IdentifyKeep => capture_identify(port, t, on_prompt).map(|(record, hit)| {
+        Command::IdentifyKeep | Command::IdentifyKeepAll => capture_identify(port, t, on_prompt).map(|(record, hit)| {
             let log = read_match_log(port, t);
-            let mut lines = if hit.is_some() { record_lines(SCRATCH_ID, &record) } else { Vec::new() };
+            let all = cmd == Command::IdentifyKeepAll;
+            let mut lines = if hit.is_some() || all { record_lines(SCRATCH_ID, &record) } else { Vec::new() };
             lines.extend(match_lines(hit, log.as_deref(), identify_line));
             lines
         }),
@@ -3768,6 +3772,10 @@ mod tests {
             vec!["VEIN RECORD 1 0 DEEDDEED", "VEIN RECORD 1 END 4", "VEIN IDENTIFIED 15"]
         );
         assert_eq!(run_t(Command::IdentifyKeep, keep_script(&data, verified(None))), vec!["VEIN NOMATCH"]);
+        assert_eq!(
+            run_t(Command::IdentifyKeepAll, keep_script(&data, verified(None))),
+            vec!["VEIN RECORD 1 0 DEEDDEED", "VEIN RECORD 1 END 4", "VEIN NOMATCH"]
+        );
         assert_eq!(run_t(Command::IdentifyKeep, vec![connected(), Some(reply(CMD_GET_SYSTEM_INFO, &[XG_ERR_FAIL, XG_ERR_NO_SUPPORT]))]), vec!["ERR VEIN UNSUPPORTED"]);
     }
 
