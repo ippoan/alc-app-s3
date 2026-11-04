@@ -849,7 +849,7 @@ pub enum Command {
     /// ([`capture_identify`])。当たれば撮った記録も返す (照合でモジュールが撮った指は外へ出ないため)
     IdentifyKeep,
     /// `VEIN IDENTIFY KEEP ALL`: [`Command::IdentifyKeep`] と同じだが、外れても撮った記録を返す
-    /// (モジュールの判定とホストの照合を同じ 1 回の撮影で比べる試験用)
+    /// (モジュールの判定とホストの照合を同じ 1 回の撮影で比べる。alc-app の影の照合が使う)
     IdentifyKeepAll,
     /// `VEIN VERIFY <id>`: 1:1 照合 (VERIFY <id>)。免許証で本人が決まった後に使う
     Verify(u32),
