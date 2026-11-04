@@ -48,8 +48,9 @@ use alc_hub_core::vein::{self as proto, Port, Timeouts, VeinError, VeinVoice};
 
 use crate::speaker::Sound;
 
-/// モジュールの UART 速度 (57600bps 8N1。Waveshare Wiki / vein-base README)
-pub const BAUD: u32 = 57_600;
+/// UART を開く速度 (115200bps 8N1)。モジュールの工場出荷は 57600 (Waveshare Wiki / vein-base README) で、
+/// 起動時に [`proto::bring_up_baud`] が探して 115200 へ切り替える (モジュールが覚える)
+pub const BAUD: u32 = proto::BAUD_FAST;
 
 /// console から読み取りスレッドへの依頼
 enum Request {
@@ -146,6 +147,12 @@ impl Port for UartPort {
     fn pause(&mut self, ms: u32) {
         std::thread::sleep(Duration::from_millis(u64::from(ms)));
     }
+
+    fn set_baud(&mut self, bps: u32) {
+        if let Err(e) = self.0.change_baudrate(Hertz(bps)) {
+            log::warn!("vein: UART の速度を {bps} にできない: {e:?}");
+        }
+    }
 }
 
 /// UART を開いて読み取りスレッドを立てる。ピンは呼び出し側 (main.rs) が
@@ -180,6 +187,21 @@ pub fn start(
         .stack_size(32 * 1024)
         .spawn(move || {
             let mut port = UartPort(driver);
+            // 端末の側の今の速度 (`VEIN TEST BAUD` で替わる)
+            let (mut baud, up) = proto::bring_up_baud(&mut port, &Timeouts::DEFAULT);
+            match up {
+                proto::BaudUp::Fast => log::info!("vein: UART {baud}bps"),
+                proto::BaudUp::Switched(from) => {
+                    log::info!("vein: UART を {from} から {baud}bps へ切り替えた");
+                    alc_hub_common::evtlog::emit(&format!("EVT VEIN BAUD {baud} FROM {from}"));
+                }
+                proto::BaudUp::Kept(now, e) => {
+                    log::warn!("vein: UART を切り替えられず {now}bps のまま: {e:?}");
+                    alc_hub_common::evtlog::emit(&format!("EVT VEIN BAUD {baud} KEPT {}", e.reason()));
+                }
+                // 答えないのは今までどおり (各命令が `ERR VEIN NO_MODULE` を返す)
+                proto::BaudUp::NoModule => log::warn!("vein: どの速度でもモジュールが答えない"),
+            }
             let mut watch = proto::FingerWatch::new();
             // 非対応と分かったら見張りをやめる (`VEIN FINGER?` と読み取りは受け続ける)
             let mut watching = true;
@@ -252,7 +274,12 @@ pub fn start(
                             // 理由コード (11 = 静脈が写らない / 09 = 同じ指でない) も載せる — 毎回撮り直しに
                             // なるときの切り分けに要る (生体データではない)
                             alc_hub_common::evtlog::emit(&format!("EVT VEIN AGAIN {code:02X}"));
-                            Some(Sound::VeinRetry)
+                            // 静脈が写らない (明るさが外れた) は置き方で直るので「配置を確認してください」
+                            Some(if code == proto::XG_ERR_NO_VEIN {
+                                Sound::VeinCheckPlacement
+                            } else {
+                                Sound::VeinRetry
+                            })
                         }
                         proto::Prompt::Replace(n) => {
                             // 画面が文言と進み具合に使う (生体データなし)
@@ -296,6 +323,16 @@ pub fn start(
                             raw_gap = ms;
                             Ok(one(proto::raw_gap_line(ms)))
                         }
+                        proto::TestCommand::Baud(idx) => match proto::switch_baud(&mut port, t, idx, baud) {
+                            Ok(new) => {
+                                baud = new;
+                                Ok(one(proto::test_baud_line(new)))
+                            }
+                            Err(e) => {
+                                baud = proto::find_baud(&mut port, t, baud).unwrap_or(baud);
+                                Err(e)
+                            }
+                        },
                         proto::TestCommand::RawQueue(bytes) => Ok(one(
                             raw_queue.push(&bytes).map(proto::raw_queue_line).unwrap_or_else(|e| e),
                         )),

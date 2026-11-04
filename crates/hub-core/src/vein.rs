@@ -103,6 +103,10 @@ pub const CMD_SET_SECURITY_LEVEL: u8 = 0x07;
 pub const CMD_SET_DUP_CHECK: u8 = 0x09;
 /// GET_SYSTEM_INFO の応答で重複登録の検査 (0 / 1) が入る位置 (§2.2.3 の `bData[7]`)
 pub const SYSINFO_DUP_CHECK_AT: usize = 7;
+/// UART の速度を番号 (0〜4、[`BAUD_RATES`]) で書く (§2.2.6)。応答は今の速度で返り、以後は新しい速度で話す
+pub const CMD_SET_BAUDRATE: u8 = 0x06;
+/// [`CMD_SET_BAUDRATE`] の番号と速度 (bps) の対応 (§2.2.3 の `bData[4]`)
+pub const BAUD_RATES: [u32; 5] = [9_600, 19_200, 38_400, 57_600, 115_200];
 /// 書いてよい安全レベルの上限 (仕様書の API 例が 0, 1, 2)
 pub const SECURITY_LEVEL_MAX: u8 = 2;
 
@@ -379,6 +383,8 @@ pub trait Port {
     fn recv(&mut self, buf: &mut [u8], timeout_ms: u32) -> usize;
     /// `ms` だけ待つ (指が離れるのを見る間隔。UART には触らない)
     fn pause(&mut self, ms: u32);
+    /// 端末の側の UART の速度を `bps` に替える ([`find_baud`] / [`switch_baud`])。既定は何もしない (速度を持たない口)
+    fn set_baud(&mut self, _bps: u32) {}
 }
 
 /// 待ち時間 (ミリ秒)。**実機で未確認の値** — 合わなければここだけ直す
@@ -396,7 +402,7 @@ pub struct Timeouts {
 }
 
 impl Timeouts {
-    /// 既定値。57600bps で 512 バイト + 2 は約 90ms、24 バイトは約 4ms
+    /// 既定値。57600bps (遅い方) で 512 バイト + 2 は約 90ms、24 バイトは約 4ms
     pub const DEFAULT: Self = Self {
         connect_ms: 500,
         finger_ms: 15_000,
@@ -631,6 +637,72 @@ pub fn capture(
     Ok(out)
 }
 
+/// 撮って照合 ([`capture_identify`]) で読む記録の先頭の長さ: テンプレートの見出し 0x20 + AES の見出し (0xc か 8) +
+/// 記録の見出し 0x40 と 1 本目 ([`vein_match_search::ENTRY`]) を覆う暗号のブロック。1 本だけ撮った記録の 2〜6 本目の
+/// 枠は空なので、ここから先は読まない (8 KB を読むと 115200bps で 1.5 秒、この長さなら 3 塊)
+pub const FRESH_PREFIX_LEN: usize = 0x20 + 0xc + ((0x40 + vein_match_search::ENTRY + 15) & !15);
+
+/// ID `id` の登録データの**先頭だけ**を読み、1 本だけの記録に組み直す ([`complete_fresh_record`])。
+/// 組み直せない形 (AES のみの mode 1 でない等) なら全部を読み直す (先頭から READ_DATA。接続済みであること)
+fn read_fresh_record(port: &mut dyn Port, t: &Timeouts, id: u32) -> Result<Vec<u8>, VeinError> {
+    let p = exchange(port, t, CMD_READ_ENROLL, &id.to_le_bytes())?;
+    if p.data[0] != XG_ERR_SUCCESS {
+        return Err(VeinError::Rc(p.data[1]));
+    }
+    let size = usize::from(p.data[1]) + usize::from(p.data[2]) * 256;
+    if !(1..=CHARA_MAX).contains(&size) {
+        return Err(VeinError::ReadFail);
+    }
+    if size > FRESH_PREFIX_LEN {
+        let prefix = read_data(port, t, CMD_READ_ENROLL, FRESH_PREFIX_LEN)?;
+        if let Some(record) = complete_fresh_record(&prefix) {
+            return Ok(record);
+        }
+    }
+    read_data(port, t, CMD_READ_ENROLL, size)
+}
+
+/// 登録データ (テンプレート) の先頭 `prefix` から記録の見出しと 1 本目を取り出し、1 本だけの記録
+/// (mode 1、`vein_match_search::build_template`) に組み直す。AES は ECB (ブロックごとに独立) なので先頭だけ解ける。
+/// 件の中身には触らない (サーバーの `mix_templates` が件を写して並べ直すのと同じ)。学習記録は捨てる。
+/// 形が違えば `None`
+pub fn complete_fresh_record(prefix: &[u8]) -> Option<Vec<u8>> {
+    const HEAD: usize = 0x40;
+    if prefix.len() < 0x20 || !prefix.starts_with(&TEMPLATE_MAGIC) || prefix[6] != 1 {
+        return None;
+    }
+    let mut body = prefix[0x20..].to_vec();
+    let hdr_len = match body.get(..2) {
+        Some([0xea, 0xae]) => 0xc,
+        Some([0xee, 0xaa]) => 8,
+        _ => return None,
+    };
+    let blocks = body.len().checked_sub(hdr_len)? & !15;
+    body.truncate(hdr_len + blocks);
+    // 和は読んだ分だけで取り直す (元の和は 8 KB 全部の和)
+    let sum = body[hdr_len..].iter().fold(0u16, |a, &b| a.wrapping_add(u16::from(b)));
+    body[2..4].copy_from_slice(&sum.to_le_bytes());
+    let plain = vein_match_search::aes_unwrap(&body).ok()?;
+    let used = HEAD + vein_match_search::ENTRY;
+    if plain.len() < used
+        || u16::from_le_bytes([plain[0], plain[1]]) != vein_match_search::RECORD_MAGIC
+        || plain[3] != 2
+        || plain[0xd] == 0
+    {
+        return None;
+    }
+    let mut r = vec![0u8; vein_match_search::REC_SIZE];
+    r[..used].copy_from_slice(&plain[..used]);
+    r[0xd] = 1;
+    // 見出しの和はグループ (+0xc) を入れる前の値 (vein-match の make_record / mix_templates と同じ)
+    let group = r[0xc];
+    r[0xc] = 0;
+    r[2] = r[4..HEAD].iter().fold(0u8, |a, &b| a.wrapping_add(b));
+    r[0xc] = group;
+    let user = u32::from_le_bytes([r[8], r[9], r[10], r[11]]);
+    vein_match_search::build_template(&r, user, 1, &[]).ok()
+}
+
 /// ID `id` の登録データを読む (接続済みであること。READ_ENROLL → READ_DATA)。
 /// 読み取り ([`capture`]) と登録 ([`enroll`]) が共有する
 fn read_enroll(port: &mut dyn Port, t: &Timeouts, id: u32) -> Result<Vec<u8>, VeinError> {
@@ -711,6 +783,9 @@ pub enum TestCommand {
     /// 間隔 (0〜[`RAW_GAP_MAX_MS`])。指紋互換の DownChar は、データの枠を詰めて流すと 1 枠ずつ取りこぼし、
     /// 間が空きすぎると打ち切るので、通る間隔を探すため (ippoan/alc-app#436)
     RawGap(u32),
+    /// `VEIN TEST BAUD <0〜4>`: モジュールの UART の速度を [`BAUD_RATES`] の番号で書き ([`test_baud`])、
+    /// 端末の側も同じ速度に切り替えて接続し直す。記録の読み出し (8 KB) を速くできるかを確かめるため
+    Baud(u8),
 }
 
 /// `VEIN TEST RAW` で一度に送れるバイト数の上限 (SYNC WRITE の 1 行と同じ)
@@ -773,6 +848,9 @@ pub enum Command {
     /// `VEIN IDENTIFY KEEP`: 置いた 1 回の指を作業用 ID に 1 本撮ってから、離さずに 1:N 照合する
     /// ([`capture_identify`])。当たれば撮った記録も返す (照合でモジュールが撮った指は外へ出ないため)
     IdentifyKeep,
+    /// `VEIN IDENTIFY KEEP ALL`: [`Command::IdentifyKeep`] と同じだが、外れても撮った記録を返す
+    /// (モジュールの判定とホストの照合を同じ 1 回の撮影で比べる。alc-app の影の照合が使う)
+    IdentifyKeepAll,
     /// `VEIN VERIFY <id>`: 1:1 照合 (VERIFY <id>)。免許証で本人が決まった後に使う
     Verify(u32),
     /// `VEIN SYNC WRITE …`: サーバーの記録をモジュールの ID へ書く
@@ -954,6 +1032,85 @@ pub fn test_sysinfo(port: &mut dyn Port, t: &Timeouts) -> Result<[u8; DATA_LEN],
         return Err(VeinError::Unsupported);
     }
     Ok(p.data)
+}
+
+/// 試験: 接続してモジュールの UART の速度を番号 `idx` (0〜4、[`BAUD_RATES`]) で書く ([`CMD_SET_BAUDRATE`])。
+/// 応答は今の速度で返る。端末の側の速度を切り替えるのは呼び出し側
+pub fn test_baud(port: &mut dyn Port, t: &Timeouts, idx: u8) -> Result<(), VeinError> {
+    connect(port, t)?;
+    setting_ok(&exchange(port, t, CMD_SET_BAUDRATE, &[idx])?)
+}
+
+/// `VEIN TEST BAUD` の成功の行 (端末の側も切り替えて接続し直せた)
+pub fn test_baud_line(bps: u32) -> String {
+    format!("VEIN TEST BAUD OK BAUD={bps}")
+}
+
+/// 速い方の速度の番号 ([`BAUD_RATES`] の 115200)。8 KB の記録の読み出しが 57600 の 2.3 秒から 1.5 秒になる
+/// (`VEIN IDENTIFY KEEP` の通しで 4.9 → 3.8 秒、2026-11-04 実機)
+pub const BAUD_FAST_INDEX: u8 = 4;
+/// 速い方の速度 (bps)。端末の UART はこの速度で開く
+pub const BAUD_FAST: u32 = BAUD_RATES[BAUD_FAST_INDEX as usize];
+/// 速度を書いてから端末の側を切り替えるまでの間 (応答を出し切ったモジュールが切り替わるのを待つ)
+pub const BAUD_SETTLE_MS: u32 = 50;
+
+/// 今の速度 `bps` で接続を試し、答えなければほかの速度 (速い方から) を試す。話せた速度を返す。
+/// どれでも答えなければ `bps` に戻して `None`。
+/// モジュールは速度の設定を電源を切っても覚えている (2026-11-04 実機) ので、どの速度にいるかは分からない
+pub fn find_baud(port: &mut dyn Port, t: &Timeouts, bps: u32) -> Option<u32> {
+    if connect(port, t).is_ok() {
+        return Some(bps);
+    }
+    for &other in BAUD_RATES.iter().rev().filter(|b| **b != bps) {
+        port.set_baud(other);
+        if connect(port, t).is_ok() {
+            return Some(other);
+        }
+    }
+    port.set_baud(bps);
+    None
+}
+
+/// 今 `bps` で話しているモジュールの速度を番号 `idx` に書き、端末の側も切り替えて接続し直す。新しい速度を返す。
+/// 新しい速度で答えなければ端末の側を `bps` に戻して、その失敗を返す (呼び出し側が [`find_baud`] で探し直す)
+pub fn switch_baud(port: &mut dyn Port, t: &Timeouts, idx: u8, bps: u32) -> Result<u32, VeinError> {
+    let new = BAUD_RATES[usize::from(idx)];
+    test_baud(port, t, idx)?;
+    port.pause(BAUD_SETTLE_MS);
+    port.set_baud(new);
+    if let Err(e) = connect(port, t) {
+        port.set_baud(bps);
+        return Err(e);
+    }
+    Ok(new)
+}
+
+/// 起動時の速度合わせ ([`bring_up_baud`]) の結果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaudUp {
+    /// もう速い方 ([`BAUD_FAST`]) だった
+    Fast,
+    /// この速度 (bps) から速い方へ切り替えた
+    Switched(u32),
+    /// 切り替えられず、この速度 (bps) のまま
+    Kept(u32, VeinError),
+    /// どの速度でも答えない (モジュールが無い・電源が無い)
+    NoModule,
+}
+
+/// 起動時に 1 回: モジュールの速度を探し、速い方でなければ速い方へ切り替える。端末の側の今の速度と結果を返す。
+/// 端末の UART は [`BAUD_FAST`] で開いておく (切り替え済みの機体は 1 回目の接続で済む)
+pub fn bring_up_baud(port: &mut dyn Port, t: &Timeouts) -> (u32, BaudUp) {
+    let Some(now) = find_baud(port, t, BAUD_FAST) else {
+        return (BAUD_FAST, BaudUp::NoModule);
+    };
+    if now == BAUD_FAST {
+        return (now, BaudUp::Fast);
+    }
+    match switch_baud(port, t, BAUD_FAST_INDEX, now) {
+        Ok(new) => (new, BaudUp::Switched(now)),
+        Err(e) => (find_baud(port, t, now).unwrap_or(now), BaudUp::Kept(now, e)),
+    }
 }
 
 /// 試験: 接続して撮影し、生画像を読む ([`CMD_READ_IMAGE`] → READ_DATA 種別 `0x24`)。
@@ -1260,7 +1417,7 @@ fn capture_then_identify(
     on_prompt: &mut dyn FnMut(Prompt),
 ) -> Result<(Vec<u8>, Option<u32>), VeinError> {
     enroll_id(port, t, SCRATCH_ID, 1, on_prompt)?;
-    let record = read_enroll(port, t, SCRATCH_ID);
+    let record = read_fresh_record(port, t, SCRATCH_ID);
     let _ = exchange(port, t, CMD_CLEAR_ENROLL, &SCRATCH_ID.to_le_bytes());
     let record = record?;
     let hit = verify(port, t, 0, on_prompt)?;
@@ -1572,9 +1729,10 @@ pub fn run(
     let lines = match cmd {
         Command::Enroll(id, templates) => enroll(port, t, id, templates, on_prompt).map(|rec| record_lines(id, &rec)),
         // 当たったときだけ撮った記録 (`VEIN RECORD 1 …`) を出し、続けて IDENTIFY と同じ結果の行
-        Command::IdentifyKeep => capture_identify(port, t, on_prompt).map(|(record, hit)| {
+        Command::IdentifyKeep | Command::IdentifyKeepAll => capture_identify(port, t, on_prompt).map(|(record, hit)| {
             let log = read_match_log(port, t);
-            let mut lines = if hit.is_some() { record_lines(SCRATCH_ID, &record) } else { Vec::new() };
+            let all = cmd == Command::IdentifyKeepAll;
+            let mut lines = if hit.is_some() || all { record_lines(SCRATCH_ID, &record) } else { Vec::new() };
             lines.extend(match_lines(hit, log.as_deref(), identify_line));
             lines
         }),
@@ -1844,6 +2002,8 @@ mod tests {
         send_ok: bool,
         discards: usize,
         pauses: Vec<u32>,
+        /// [`Port::set_baud`] で切り替えた速度の並び
+        bauds: Vec<u32>,
     }
 
     impl FakePort {
@@ -1856,6 +2016,7 @@ mod tests {
                 send_ok: true,
                 discards: 0,
                 pauses: Vec::new(),
+                bauds: Vec::new(),
             }
         }
     }
@@ -1884,6 +2045,9 @@ mod tests {
         }
         fn pause(&mut self, ms: u32) {
             self.pauses.push(ms);
+        }
+        fn set_baud(&mut self, bps: u32) {
+            self.bauds.push(bps);
         }
     }
 
@@ -3608,6 +3772,10 @@ mod tests {
             vec!["VEIN RECORD 1 0 DEEDDEED", "VEIN RECORD 1 END 4", "VEIN IDENTIFIED 15"]
         );
         assert_eq!(run_t(Command::IdentifyKeep, keep_script(&data, verified(None))), vec!["VEIN NOMATCH"]);
+        assert_eq!(
+            run_t(Command::IdentifyKeepAll, keep_script(&data, verified(None))),
+            vec!["VEIN RECORD 1 0 DEEDDEED", "VEIN RECORD 1 END 4", "VEIN NOMATCH"]
+        );
         assert_eq!(run_t(Command::IdentifyKeep, vec![connected(), Some(reply(CMD_GET_SYSTEM_INFO, &[XG_ERR_FAIL, XG_ERR_NO_SUPPORT]))]), vec!["ERR VEIN UNSUPPORTED"]);
     }
 
@@ -3740,4 +3908,235 @@ mod tests {
             command(CMD_ENROLL, &[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 2, 0]).to_vec()
         );
     }
+
+    fn baud_ok() -> Option<Vec<u8>> {
+        Some(reply(CMD_SET_BAUDRATE, &[XG_ERR_SUCCESS]))
+    }
+
+    #[test]
+    fn find_baud_keeps_the_current_speed_when_it_answers() {
+        let mut port = FakePort::new(vec![connected()]);
+        assert_eq!(find_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST), Some(BAUD_FAST));
+        assert!(port.bauds.is_empty());
+    }
+
+    #[test]
+    fn find_baud_tries_the_other_speeds_fastest_first() {
+        // 115200 が黙れば 57600、57600 も黙れば 38400 (残りを速い方から試す)
+        let mut port = FakePort::new(vec![None, connected()]);
+        assert_eq!(find_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST), Some(57_600));
+        assert_eq!(port.bauds, vec![57_600]);
+        let mut port = FakePort::new(vec![None, None, connected()]);
+        assert_eq!(find_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST), Some(38_400));
+        assert_eq!(port.bauds, vec![57_600, 38_400]);
+    }
+
+    #[test]
+    fn find_baud_goes_back_to_the_current_speed_when_nothing_answers() {
+        let mut port = FakePort::new(vec![]);
+        assert_eq!(find_baud(&mut port, &Timeouts::DEFAULT, 57_600), None);
+        assert_eq!(port.bauds, vec![115_200, 38_400, 19_200, 9_600, 57_600]);
+    }
+
+    #[test]
+    fn switch_baud_writes_the_index_then_switches_and_reconnects() {
+        let mut port = FakePort::new(vec![connected(), baud_ok(), connected()]);
+        assert_eq!(switch_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST_INDEX, 57_600), Ok(BAUD_FAST));
+        assert_eq!(port.sent[1], command(CMD_SET_BAUDRATE, &[4]).to_vec());
+        assert_eq!(port.pauses, vec![BAUD_SETTLE_MS]);
+        assert_eq!(port.bauds, vec![BAUD_FAST]);
+    }
+
+    #[test]
+    fn switch_baud_does_not_switch_when_the_module_refuses() {
+        let mut port = FakePort::new(vec![connected(), Some(reply(CMD_SET_BAUDRATE, &[XG_ERR_FAIL, 0x10]))]);
+        assert_eq!(
+            switch_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST_INDEX, 57_600),
+            Err(VeinError::Unsupported)
+        );
+        assert!(port.bauds.is_empty());
+        let mut port = FakePort::new(vec![connected(), Some(reply(CMD_SET_BAUDRATE, &[XG_ERR_FAIL, 0x02]))]);
+        assert_eq!(
+            switch_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST_INDEX, 57_600),
+            Err(VeinError::Rc(0x02))
+        );
+        let mut port = FakePort::new(vec![]);
+        assert_eq!(
+            switch_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST_INDEX, 57_600),
+            Err(VeinError::NoModule)
+        );
+    }
+
+    #[test]
+    fn switch_baud_goes_back_when_the_new_speed_is_silent() {
+        let mut port = FakePort::new(vec![connected(), baud_ok(), None]);
+        assert_eq!(
+            switch_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST_INDEX, 57_600),
+            Err(VeinError::NoModule)
+        );
+        assert_eq!(port.bauds, vec![BAUD_FAST, 57_600]);
+    }
+
+    #[test]
+    fn bring_up_baud_leaves_a_fast_module_alone() {
+        let mut port = FakePort::new(vec![connected()]);
+        assert_eq!(bring_up_baud(&mut port, &Timeouts::DEFAULT), (BAUD_FAST, BaudUp::Fast));
+        assert_eq!(port.sent.len(), 1);
+    }
+
+    #[test]
+    fn bring_up_baud_switches_a_factory_module_to_fast() {
+        // 115200 は黙る → 57600 で答える → 速度を書く → 115200 で答える
+        let mut port = FakePort::new(vec![None, connected(), connected(), baud_ok(), connected()]);
+        assert_eq!(bring_up_baud(&mut port, &Timeouts::DEFAULT), (BAUD_FAST, BaudUp::Switched(57_600)));
+        assert_eq!(port.bauds, vec![57_600, BAUD_FAST]);
+    }
+
+    #[test]
+    fn bring_up_baud_keeps_the_found_speed_when_switching_fails() {
+        // 57600 で見つかるが、115200 に替えると黙る → 57600 に戻して探し直す
+        let mut port = FakePort::new(vec![None, connected(), connected(), baud_ok(), None, connected()]);
+        assert_eq!(
+            bring_up_baud(&mut port, &Timeouts::DEFAULT),
+            (57_600, BaudUp::Kept(57_600, VeinError::NoModule))
+        );
+        // 探し直しでも答えなければ見つけた速度のまま
+        let mut port = FakePort::new(vec![None, connected(), connected(), baud_ok(), None]);
+        assert_eq!(
+            bring_up_baud(&mut port, &Timeouts::DEFAULT),
+            (57_600, BaudUp::Kept(57_600, VeinError::NoModule))
+        );
+    }
+
+    #[test]
+    fn bring_up_baud_reports_no_module() {
+        let mut port = FakePort::new(vec![]);
+        assert_eq!(bring_up_baud(&mut port, &Timeouts::DEFAULT), (BAUD_FAST, BaudUp::NoModule));
+    }
+
+    #[test]
+    fn set_baud_is_a_no_op_by_default() {
+        // 速度を持たない口 (既定の実装) でも探せる
+        let mut port = FailAt(FakePort::new(vec![None, connected()]), 0);
+        assert_eq!(find_baud(&mut port, &Timeouts::DEFAULT, BAUD_FAST), Some(57_600));
+        assert!(port.0.bauds.is_empty());
+    }
+
+    #[test]
+    fn test_baud_line_names_the_speed() {
+        assert_eq!(test_baud_line(115_200), "VEIN TEST BAUD OK BAUD=115200");
+        assert_eq!(BAUD_FAST, 115_200);
+    }
+
+    /// 1 本だけの記録 (実機と同じ mode 1、グループ `group`)
+    fn fresh_template(seed: u8, group: u8) -> Vec<u8> {
+        let mut plane = [0u8; vein_match::PLANE_LEN];
+        for (i, b) in plane.iter_mut().enumerate() {
+            *b = (i as u32 * 31 + u32::from(seed) * 7).is_multiple_of(3) as u8;
+        }
+        let rec = vein_match_search::make_record(&[plane], 7, group).unwrap();
+        vein_match_search::build_template(&rec, 7, 1, &[]).unwrap()
+    }
+
+    /// `t` を [`chunks`] の塊に分けた READ_DATA の応答の並び
+    fn data_chunks(t: &[u8]) -> Vec<Option<Vec<u8>>> {
+        chunks(t.len()).map(|(off, len)| Some(chunk(&t[off..off + len]))).collect()
+    }
+
+    #[test]
+    fn complete_fresh_record_rebuilds_the_first_entry_from_the_prefix() {
+        for group in [0, 5] {
+            let t = fresh_template(3, group);
+            assert!(t.len() > FRESH_PREFIX_LEN);
+            let rebuilt = complete_fresh_record(&t[..FRESH_PREFIX_LEN]).unwrap();
+            assert_eq!(rebuilt.len(), t.len());
+            let (_, a) = vein_match_search::parse_template(&t).unwrap();
+            let (hdr, b) = vein_match_search::parse_template(&rebuilt).unwrap();
+            let used = 0x40 + vein_match_search::ENTRY;
+            assert_eq!(a[..used], b[..used]);
+            assert_eq!((hdr.mode, hdr.count, hdr.user, hdr.group), (1, 1, 7, group));
+            assert_eq!(
+                vein_match_search::template_to_charas(&rebuilt).unwrap(),
+                vein_match_search::template_to_charas(&t).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn complete_fresh_record_takes_the_old_aes_header_too() {
+        // 旧見出し 0xaaee (8 バイト): 0xaeea の見出し (0xc) の後ろ 4 バイトを落とした形
+        let t = fresh_template(4, 0);
+        let mut old = t[..0x20].to_vec();
+        old.extend_from_slice(&[0xee, 0xaa]);
+        old.extend_from_slice(&t[0x22..0x28]);
+        old.extend_from_slice(&t[0x2c..FRESH_PREFIX_LEN]);
+        let rebuilt = complete_fresh_record(&old).unwrap();
+        assert_eq!(
+            vein_match_search::template_to_charas(&rebuilt).unwrap(),
+            vein_match_search::template_to_charas(&t).unwrap()
+        );
+    }
+
+    #[test]
+    fn complete_fresh_record_rejects_other_shapes() {
+        let t = fresh_template(5, 0);
+        let p = &t[..FRESH_PREFIX_LEN];
+        // 短い / 見出しが違う / mode が 1 でない / AES の見出しが違う / AES の見出しより短い / 1 本目まで届かない
+        assert_eq!(complete_fresh_record(&p[..0x1f]), None);
+        let mut bad = p.to_vec();
+        bad[0] ^= 1;
+        assert_eq!(complete_fresh_record(&bad), None);
+        let mut bad = p.to_vec();
+        bad[6] = 3;
+        assert_eq!(complete_fresh_record(&bad), None);
+        let mut bad = p.to_vec();
+        bad[0x20] = 0;
+        assert_eq!(complete_fresh_record(&bad), None);
+        assert_eq!(complete_fresh_record(&p[..0x22]), None);
+        assert_eq!(complete_fresh_record(&p[..0x20 + 0xc + 0x40]), None);
+        // 記録の見出しが違う (magic / 版 / 件数 0)
+        for (at, v) in [(0usize, 0u8), (3, 1), (0xd, 0)] {
+            let mut rec = vein_match_search::make_record(&[[0u8; vein_match::PLANE_LEN]], 0, 0).unwrap();
+            rec[at] = v;
+            let t = vein_match_search::build_template(&rec, 0, 1, &[]).unwrap();
+            assert_eq!(complete_fresh_record(&t[..FRESH_PREFIX_LEN]), None, "{at}");
+        }
+    }
+
+    #[test]
+    fn read_fresh_record_reads_only_the_prefix() {
+        let t = fresh_template(6, 0);
+        let mut script = vec![size(t.len())];
+        script.extend(data_chunks(&t[..FRESH_PREFIX_LEN]));
+        let mut port = FakePort::new(script);
+        let got = read_fresh_record(&mut port, &Timeouts::DEFAULT, SCRATCH_ID).unwrap();
+        assert_eq!(complete_fresh_record(&t[..FRESH_PREFIX_LEN]), Some(got));
+        // READ_ENROLL 1 回 + 先頭の塊だけ (8 KB の 16 塊でなく 3 塊)
+        assert_eq!(port.sent.len(), 1 + chunks(FRESH_PREFIX_LEN).count());
+        assert_eq!(chunks(FRESH_PREFIX_LEN).count(), 3);
+    }
+
+    #[test]
+    fn read_fresh_record_falls_back_to_the_whole_record() {
+        // 組み直せない形 (見本の登録データ) なら、先頭を読んだ後に全部を読み直す
+        let data = sample_chara(2000);
+        let mut script = vec![size(data.len())];
+        script.extend(data_chunks(&data[..FRESH_PREFIX_LEN]));
+        script.extend(data_chunks(&data));
+        let mut port = FakePort::new(script);
+        assert_eq!(read_fresh_record(&mut port, &Timeouts::DEFAULT, SCRATCH_ID), Ok(data));
+    }
+
+    #[test]
+    fn read_fresh_record_errors() {
+        let t = |script| read_fresh_record(&mut FakePort::new(script), &Timeouts::DEFAULT, SCRATCH_ID);
+        assert_eq!(t(vec![Some(reply(CMD_READ_ENROLL, &[XG_ERR_FAIL, 0x07]))]), Err(VeinError::Rc(0x07)));
+        assert_eq!(t(vec![size(0)]), Err(VeinError::ReadFail));
+        assert_eq!(t(vec![size(CHARA_MAX + 1)]), Err(VeinError::ReadFail));
+        assert_eq!(t(vec![]), Err(VeinError::Timeout));
+        // 先頭の読み出しに失敗
+        assert_eq!(t(vec![size(3000)]), Err(VeinError::ReadFail));
+    }
 }
+
+
