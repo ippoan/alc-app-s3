@@ -1620,6 +1620,31 @@ pub fn match_log_line(text: &str) -> Option<String> {
     Some(format!("VEIN MATCHLOG {body}"))
 }
 
+/// `VEIN IDENTIFY KEEP` が始まった印 (重複登録の検査を切った行。元から切れていれば作業用 ID を撮り始めた行)
+const KEEP_BLOCK_STARTS: [&str; 2] = ["Set DuCheck:0", "UserId 1,"];
+/// [`capture_log_line`] に残す行 (撮影 1 枚ごとの明るさ・赤外・指の検知・特徴量の作成)
+const CAPTURE_LOG_KEYS: [&str; 5] = ["Gray", "Ir", "CHECK FINGER", "lineW", "XG_Create"];
+
+/// `VEIN CAPLOG <撮影の行を ` | ` でつないだもの>`: `VEIN IDENTIFY KEEP` の 2 回の撮影 (作業用 ID への 1 本と照合) の
+/// 明るさ (`Gray`)・赤外 (`Ir`) などの行。KEEP が始まった印 ([`KEEP_BLOCK_STARTS`]) より後だけを見る
+/// ([`match_log_line`] の塊は照合の特徴量を作った後からなので、撮影の行が入らない)。
+/// 外れたのが撮影の暗さか照合かを、当たった回と比べて読むため。印も撮影の行も無ければ `None`
+pub fn capture_log_line(text: &str) -> Option<String> {
+    let all: Vec<&str> = text.split(['\n', '\r', '\0']).collect();
+    let start = KEEP_BLOCK_STARTS.iter().find_map(|m| all.iter().rposition(|l| l.contains(m)))?;
+    let body: String = all[start + 1..]
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| CAPTURE_LOG_KEYS.iter().any(|k| l.contains(k)))
+        .collect::<Vec<_>>()
+        .join(" | ")
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(MATCH_LOG_LINE_MAX)
+        .collect();
+    (!body.is_empty()).then(|| format!("VEIN CAPLOG {body}"))
+}
+
 /// 動作記録 (GET_DEBUG → READ_DATA 種別 0x26) を読む。接続済みであること
 fn read_debug_log(port: &mut dyn Port, t: &Timeouts) -> Result<Vec<u8>, VeinError> {
     let p = exchange(port, t, CMD_GET_DEBUG, &[])?;
@@ -1732,7 +1757,11 @@ pub fn run(
         Command::IdentifyKeep | Command::IdentifyKeepAll => capture_identify(port, t, on_prompt).map(|(record, hit)| {
             let log = read_match_log(port, t);
             let all = cmd == Command::IdentifyKeepAll;
-            let mut lines = if hit.is_some() || all { record_lines(SCRATCH_ID, &record) } else { Vec::new() };
+            // 撮影の明るさの行は当たっても外れても出す (当たった回と比べるため)
+            let mut lines: Vec<String> = log.as_deref().and_then(capture_log_line).into_iter().collect();
+            if hit.is_some() || all {
+                lines.extend(record_lines(SCRATCH_ID, &record));
+            }
             lines.extend(match_lines(hit, log.as_deref(), identify_line));
             lines
         }),
@@ -3762,6 +3791,43 @@ mod tests {
         let mut port = FakePort::new(vec![connected(), sysinfo(1), Some(reply(CMD_SET_DUP_CHECK, &[XG_ERR_FAIL, 0x05]))]);
         assert_eq!(keep(&mut port), Err(VeinError::Rc(0x05)));
         assert!(port.sent.iter().all(|p| p[3] != CMD_ENROLL));
+    }
+
+    /// 実機 (2026-11-05、開発用の Vein Station) の KEEP の外れの動作記録を縮めたもの: 前の回の撮影 → 重複を切る →
+    /// 作業用 ID に 1 本撮る → 照合 (点数の段階まで進まない) → 重複を戻す
+    const LOG_KEEP_MISS: &str = "[0]-Ir:29,40 Gray:118\nSet DuCheck:0\nUserId 1, Times 1, ReTryTimes 2\n1-CHECK FINGER, gray = 25, 1\n\
+        2-IrBright:26, 40\n[0]-Ir:26,40 Gray:97\nXG_Create:0,886,127\nPS_GenChar OK:171\nWriteEnroll:0,1,0\nPS_GenChar OK\n\
+        &&&lineW:9\n&&&lineW:10\nIDENTT1->:0, 1, 0, 0\nIdent3:265\nPS_Search FAIL\nUSER:0, th[0, 0, 0], U0, R0, MS:265\nSet DuCheck:1\n";
+
+    #[test]
+    fn capture_log_line_keeps_the_capture_lines_of_the_last_keep() {
+        assert_eq!(
+            capture_log_line(LOG_KEEP_MISS).unwrap(),
+            "VEIN CAPLOG 1-CHECK FINGER, gray = 25, 1 | 2-IrBright:26, 40 | [0]-Ir:26,40 Gray:97 | XG_Create:0,886,127 | \
+             &&&lineW:9 | &&&lineW:10"
+        );
+        // 重複を切らなかった回は作業用 ID を撮り始めた行から
+        let off = LOG_KEEP_MISS.replace("Set DuCheck:0\n", "");
+        assert_eq!(capture_log_line(&off), capture_log_line(LOG_KEEP_MISS));
+        // 印も撮影の行も無ければ出さない
+        assert_eq!(capture_log_line("[0]-Ir:29,40 Gray:118\n"), None);
+        assert_eq!(capture_log_line("Set DuCheck:0\nPS_Search FAIL\n"), None);
+        // 表示できない文字は落とし、長さを切る
+        let long = format!("Set DuCheck:0\n\u{1}Gray:{}\n", "9".repeat(1000));
+        assert_eq!(capture_log_line(&long).unwrap().len(), "VEIN CAPLOG ".len() + MATCH_LOG_LINE_MAX);
+    }
+
+    #[test]
+    fn identify_keep_puts_the_capture_line_first_on_a_hit_and_a_miss() {
+        let data = sample_chara(4);
+        let lines = run_t(Command::IdentifyKeep, with_debug(keep_script(&data, verified(None)), LOG_KEEP_MISS));
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("VEIN CAPLOG 1-CHECK FINGER"));
+        assert!(lines[1].starts_with("VEIN MATCHLOG &&&lineW:9"));
+        assert_eq!(lines[2], "VEIN NOMATCH SCORE=0");
+        let lines = run_t(Command::IdentifyKeep, with_debug(keep_script(&data, verified(Some(15))), LOG_KEEP_MISS));
+        assert!(lines[0].starts_with("VEIN CAPLOG "));
+        assert_eq!(lines[1], "VEIN RECORD 1 0 DEEDDEED");
     }
 
     #[test]
