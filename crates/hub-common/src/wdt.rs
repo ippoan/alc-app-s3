@@ -67,6 +67,11 @@ pub fn pause_ui() {
     }
 }
 
+/// OTA 等で監視を一時解除している間か (`OtaWdtPause` の生存中)。別タスクから読んでよい
+pub fn ui_paused() -> bool {
+    !gate().is_watching()
+}
+
 /// `pause_ui()` で解除した監視を戻す。対応する pause と同数呼んだ時だけ実再登録する。
 pub fn resume_ui() {
     let transitioned = gate().resume();

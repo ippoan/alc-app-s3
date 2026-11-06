@@ -24,6 +24,7 @@ pub mod improv;
 pub mod layout;
 pub mod machine_token;
 pub mod nfc_login;
+pub mod nfc_stall;
 pub mod nfc_sticky;
 pub mod nfc_tap;
 pub mod nfca_uid;
