@@ -1771,7 +1771,14 @@ pub fn run(
         }),
         Command::Verify(id) => verify_id(port, t, id, on_prompt).map(|hit| {
             let log = read_match_log(port, t);
-            match_lines(hit, log.as_deref(), |hit, score| verify_line(id, hit, score))
+            // モジュールの VERIFY <id> は指定外の ID に当たっても成功を返す (同じ指を 98・99 に入れて
+            // VERIFY 99 → 98、2026-11-06 実機。引数を仕様の 10 バイトにしても同じ)。指定と違えば不一致
+            let other = hit.filter(|&h| h != id);
+            let mut lines = match_lines(hit.filter(|&h| h == id), log.as_deref(), |hit, score| verify_line(id, hit, score));
+            if let (Some(o), Some(last)) = (other, lines.last_mut()) {
+                last.push_str(&format!(" OTHER={o}"));
+            }
+            lines
         }),
         Command::SyncWrite(w) => sync_write(slot, port, t, w).map(|line| vec![line]),
         Command::SyncClear(id) => clear(port, t, id).map(|()| vec![format!("VEIN SYNC CLEARED {id}")]),
@@ -3865,6 +3872,11 @@ mod tests {
             vec!["VEIN VERIFIED 15"]
         );
         assert_eq!(run_t(Command::Verify(15), vec![connected(), finger(Some(1)), verified(None)]), vec!["VEIN NOMATCH"]);
+        // 指定外の ID に当たった成功は不一致にし、当たった ID を OTHER= で残す
+        assert_eq!(
+            run_t(Command::Verify(15), vec![connected(), finger(Some(1)), verified(Some(16))]),
+            vec!["VEIN NOMATCH OTHER=16"]
+        );
         let mut info = vec![XG_ERR_SUCCESS, 3, 0, 0, 0, 0, 0, 0, 0, 100, 0, 0, 0];
         info.resize(DATA_LEN, 0);
         assert_eq!(
