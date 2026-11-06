@@ -93,6 +93,10 @@ fn init_with_retry(i2c_port: i32, sda_num: i32, scl_num: i32, status: &SharedSta
             alc_hub_common::evtlog::emit(&format!("EVT NFC_INIT_NG rc={rc}"));
             push_event(status, &msg);
             last_rc = rc;
+        } else {
+            // 2 回目以降もホストには毎回出す (リングには載せない)。ホストがつながる前の 1 回目を
+            // 取りこぼしても、キオスクの画面が「NFC 未検出」と出せるように (Refs #352)
+            alc_hub_common::hostout::line(&format!("EVT NFC_INIT_NG rc={rc}"));
         }
         FreeRtos::delay_ms(INIT_RETRY.as_millis() as u32);
     }
