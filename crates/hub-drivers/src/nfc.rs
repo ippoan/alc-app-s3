@@ -26,6 +26,7 @@
 //! 同じ形式で表示される) と `EVT NFC_LICENSE` のホスト出力はボード非依存なので
 //! 本モジュールに残す。
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
@@ -34,6 +35,7 @@ use esp_idf_svc::hal::gpio::{AnyIOPin, Pin};
 
 use alc_hub_common::status::{now_ms, SharedStatus};
 use alc_hub_core::desfire;
+use alc_hub_core::nfc_stall;
 use alc_hub_core::nfc_sticky::{self, Sticky};
 use alc_hub_core::nfc_tap::{TapGate, TapOutcome, DEFAULT_COMMIT_WINDOW_MS};
 
@@ -314,6 +316,50 @@ fn level_with(gpio: i32, pullup: bool) -> i32 {
     }
 }
 
+/// 読み取りループが最後に周回した時刻 (起動からの**秒**、0 = まだ待受に入っていない)。
+/// [`start_stall_watch`] が読む。xtensa に 64 bit の atomic が無いので秒の u32 で持つ (閾値 30 秒には足りる)
+static LAST_LOOP_S: AtomicU32 = AtomicU32::new(0);
+
+/// 起動からの秒 (0 は「未周回」と区別するため 1 から)
+fn now_s() -> u32 {
+    ((now_ms() / 1000) as u32).max(1)
+}
+
+/// 読み取りループが止まったら再起動する見張りを立てる (Refs #352)。
+///
+/// 判定は [`nfc_stall::stalled_for`]。止まったら `EVT NFC_STALL` をリングに残して `esp_restart`
+/// する (リングはソフトリセットを越えて残るので、後から `LOG DUMP` / get_device_log で読める)。
+/// 読み取りが同期の FFI の中で止まるとそのスレッドからは戻れないので、外のスレッドで見る。
+///
+/// OTA の書き込み中 (`OtaWdtPause` の間) は CPU を専有して NFC が回らないので見ない —
+/// 明けた時点を周回したことにして、明けた直後に誤って再起動しない。
+/// [`start`] の後に 1 回呼ぶ。止まったときに再起動してよい機だけが呼ぶ
+pub fn start_stall_watch() -> Result<()> {
+    crate::task::name_next_psram(c"nfc_watch", 4 * 1024);
+    std::thread::Builder::new()
+        .name("nfc_watch".into())
+        .stack_size(4 * 1024)
+        .spawn(|| loop {
+            FreeRtos::delay_ms(1000);
+            let last = LAST_LOOP_S.load(Ordering::Relaxed);
+            if alc_hub_common::wdt::ui_paused() {
+                if last != 0 {
+                    LAST_LOOP_S.store(now_s(), Ordering::Relaxed);
+                }
+                continue;
+            }
+            let ms = |s: u32| u64::from(s) * 1000;
+            if let Some(gap) = nfc_stall::stalled_for(ms(now_s()), ms(last)) {
+                log::error!("nfc: 読み取りループが {gap} ms 進んでいない — 再起動する");
+                alc_hub_common::evtlog::emit(&format!("EVT NFC_STALL ms={gap}"));
+                // 行がシリアルとリングに出切るのを待つ
+                FreeRtos::delay_ms(300);
+                unsafe { esp_idf_svc::sys::esp_restart() };
+            }
+        })?;
+    Ok(())
+}
+
 fn run(
     i2c_port: i32,
     sda_num: i32,
@@ -408,8 +454,17 @@ fn run(
     // 押し流すため (tuple の中身は周末の `inst` を参照)
     let mut last_inst: Option<(i32, bool, bool, bool)> = None;
 
+    let mut last_alive_ms: u64 = 0;
     loop {
         tick = tick.wrapping_add(1);
+        // 見張り (`start_stall_watch`) とホストの画面に、ループが回っていることを知らせる
+        LAST_LOOP_S.store(now_s(), Ordering::Relaxed);
+        let loop_ms = now_ms().max(1);
+        if nfc_stall::alive_due(loop_ms, last_alive_ms) {
+            // 周期の行なのでリングには載せない (evtlog の doc)。画面は途絶えたら「NFC 応答なし」にする
+            alc_hub_common::hostout::line(&format!("EVT NFC_ALIVE tick={tick}"));
+            last_alive_ms = loop_ms;
+        }
 
         // --- 保留の確定 (issue #143) ---
         // **存在検知ゲート (下の `if !triggered { … continue; }`) より前に置くこと。**

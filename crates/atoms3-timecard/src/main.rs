@@ -386,6 +386,9 @@ fn main() -> Result<()> {
         Arc::clone(&status),
         move |e: &NfcEvent| on_card(e, &ws_meas_tx, speaker_tx.as_ref()),
     )?;
+    // 読み取りが止まったら再起動する (止まったままだと画面も音も無い機では気付けない、Refs #352)
+    #[cfg(any(not(feature = "porta-taken"), feature = "nfc-j6"))]
+    nfc::start_stall_watch()?;
 
     // BLE (血圧計 Omron HEM-6231T と体温計) — **`OMRON BP ON` のとき、または vein 版**。
     //

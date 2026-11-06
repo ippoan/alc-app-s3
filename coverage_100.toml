@@ -79,6 +79,10 @@ path = "crates/hub-core/src/nfc_login.rs"
 type = "unit"
 
 [[file]]
+path = "crates/hub-core/src/nfc_stall.rs"
+type = "unit"
+
+[[file]]
 path = "crates/hub-core/src/nfc_sticky.rs"
 type = "unit"
 
