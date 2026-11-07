@@ -120,6 +120,9 @@ CoreS3 の `STATUS LAN=…` も同様 (行頭は互換のため変えない)。
 **警告デバイスを兼ねる**。`HB OK` / `HB NG <reason>` / `HB OFF` に CoreS3 と同じく答え
 (初回の `HB OK` で武装し、途切れたら鳴る。`HB OFF` は `OK HB OFF`、他は返信しない)、
 鳴動の状態は `STATUS` 行末の `ALARM=…` (CoreS3 と同じ欄) で渡す。`EVT ALARM` の行は出さない。
+ただし着信 (`call=1`) で鳴っているのを本体のボタンで止めたときだけ `EVT CALL_BUTTON` を 1 行出す
+(ブラウザはこれを IT点呼 の着信に出る合図にする。VoiceS3R の `EVT ALARM` の alarming/call → muted/call と同じ瞬間。
+`EVT ALARM` で始まる名前にしないのは、その行で機種を見分けるため)。
 heartbeat を受けない機体 (キオスクの Vein Station) は武装しないので鳴らない
 
 ## 4. 共通コマンド (どの機種が何に答えるか)

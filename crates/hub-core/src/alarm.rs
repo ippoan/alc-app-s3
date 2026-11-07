@@ -89,6 +89,23 @@ pub const SILENCE_TICK_MS: u64 = 5_000;
 /// `cause=ng:` のように空で出すと行の文法 (`ng:<reason>`) が崩れるため
 pub const DEFAULT_NG_REASON: &str = "unspecified";
 
+/// 着信で鳴っていたのを本体のボタンで止めた合図の行 (Vein Base だけが出す)。
+///
+/// Vein Base は `EVT ALARM` を出さない (ブラウザがその行で機種を見分けるため。
+/// `docs/console-protocol.md` §3)。そのままだと、ブラウザは「着信中にボタンを押した」
+/// (= IT点呼 の着信に出る) を知れない。VoiceS3R ではブラウザが `EVT ALARM` の
+/// alarming/call → muted/call の遷移で数えているので、同じ瞬間にこの 1 行を出す
+/// ([`is_call_answer`])。**名前を `EVT ALARM` で始めない** (同じ理由)
+pub const CALL_BUTTON_LINE: &str = "EVT CALL_BUTTON";
+
+/// [`AlarmMonitor::on_button`] の結果が「着信で鳴っていたのを黙らせた」か。
+/// 判定は VoiceS3R の行をブラウザが数える条件 (muted/call への遷移) と同じ
+pub fn is_call_answer(actions: &[Action]) -> bool {
+    actions
+        .iter()
+        .any(|a| matches!(a, Action::Emit(line) if line == "EVT ALARM state=muted cause=call"))
+}
+
 /// firmware 側が実行する副作用
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -1081,5 +1098,25 @@ mod tests {
             vec![Action::PlayResolved, emit("idle", "none")]
         );
         assert_eq!(m.status_field(12_000), "ALARM=idle/none/0/20000");
+    }
+
+    #[test]
+    fn call_answer_only_when_button_mutes_a_call() {
+        // 着信 (call=1) で鳴っているところをボタンで黙らせた → 合図
+        let mut m = AlarmMonitor::with_boot_grace(None);
+        m.on_heartbeat(0, true, None, true);
+        let _ = m.tick(10);
+        assert!(is_call_answer(&m.on_button(20)));
+        // 黙らせた後の押下 (鳴動へ戻す) は合図ではない
+        assert!(!is_call_answer(&m.on_button(30)));
+        // 着信でない鳴動 (沈黙) を黙らせても合図ではない
+        let mut s = AlarmMonitor::with_boot_grace(None);
+        s.on_heartbeat(0, true, None, false);
+        let _ = s.tick(SILENCE_MS + 100);
+        assert!(!is_call_answer(&s.on_button(SILENCE_MS + 200)));
+        // 鳴っていないときの押下は何も起こさない
+        let mut idle = AlarmMonitor::with_boot_grace(None);
+        assert!(!is_call_answer(&idle.on_button(0)));
+        assert!(!CALL_BUTTON_LINE.starts_with("EVT ALARM"));
     }
 }
