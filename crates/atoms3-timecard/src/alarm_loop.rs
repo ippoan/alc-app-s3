@@ -8,7 +8,7 @@
 use std::sync::{mpsc::Sender, Arc, Mutex};
 
 use alc_hub_common::status::now_ms;
-use alc_hub_core::alarm::{AlarmMonitor, SharedMonitor, SILENCE_MS};
+use alc_hub_core::alarm::{self as alarm_core, AlarmMonitor, SharedMonitor, SILENCE_MS};
 use alc_hub_drivers::{alarm, speaker::Sound};
 use anyhow::Result;
 use esp_idf_svc::hal::{
@@ -80,7 +80,14 @@ pub fn start(
                 match monitor.lock() {
                     Ok(mut m) => {
                         if button_edge {
-                            actions.extend(m.on_button(now));
+                            let pressed = m.on_button(now);
+                            // 着信で鳴っていたのを止めた = IT点呼 の着信に出る合図をブラウザへ
+                            // (Vein Base は `EVT ALARM` を出さないので、この 1 行だけ。シリアルだけで
+                            // リングには残さない — 人を特定する値は無いが、合図はその場限りのため)
+                            if alarm_core::is_call_answer(&pressed) {
+                                println!("{}", alarm_core::CALL_BUTTON_LINE);
+                            }
+                            actions.extend(pressed);
                         }
                         actions.extend(m.tick(now));
                     }
