@@ -1457,11 +1457,18 @@ pub enum MatchVia {
 /// 動作記録から読んだ、直近の照合の点数
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MatchScore {
-    /// `<id>->A:<id>, <n>,<点数>` の点数
+    /// `<id>->A:<id>, <n>,<点数>` の点数 (規則 A・C。E など点数の位置が分からない形は 0)
     pub score: u32,
     /// `USER:<id>, th[s0, s1, s2]` の 3 つ。**どれが合否かは未確定** (`TH=` には真ん中を出す)。静脈が不一致なら 0, 0, 0
     pub th: [u32; 3],
     pub via: MatchVia,
+    /// 当たった ID の静脈の行の規則 (`->A:` / `->C:` / `->E:` の文字)。静脈の行が無ければ `None`
+    pub rule: Option<char>,
+    /// `PS_Search OK:FV=<id>(..),FP=<id>` の 2 つ (静脈の層・指紋互換の層がそれぞれ当てた ID、0 = 当てていない)。
+    /// 行が無い (`PS_Search FAIL`) なら `None`。**2 つが違えば取り違えの手がかり** (2026-11-10 実機: 静脈は 10、指紋互換は 12 で 12 を返した)
+    pub layers: Option<(u32, u32)>,
+    /// 静脈の層が当たった ID と違う ID を当てたとき、その ID の静脈の点数 (読めなければ `None`)
+    pub fv_score: Option<u32>,
 }
 
 impl MatchScore {
@@ -1473,7 +1480,17 @@ impl MatchScore {
             MatchVia::Fp => "FP",
         };
         let [a, b, c] = self.th;
-        format!(" SCORE={} TH={b} VIA={via} THS={a},{b},{c}", self.score)
+        let mut s = format!(" SCORE={} TH={b} VIA={via} THS={a},{b},{c}", self.score);
+        if let Some(r) = self.rule {
+            s.push_str(&format!(" RULE={r}"));
+        }
+        if let Some((fv, fp)) = self.layers {
+            s.push_str(&format!(" FV={fv} FP={fp}"));
+        }
+        if let Some(n) = self.fv_score {
+            s.push_str(&format!(" FVSCORE={n}"));
+        }
+        s
     }
 }
 
@@ -1493,14 +1510,38 @@ fn field_after(line: &str, key: &str) -> Option<u32> {
     leading_u32(&line[line.find(key)? + key.len()..])
 }
 
-/// `->A:` の行 → 点数。ID の後ろの 5 つ目 (`<n>,<t0>,<t1>,<t2>,<点数>`)。1:1 は
+/// 静脈の行 `->X:<id>, …` の規則の文字 `X` (英大文字 1 字) と、`:` より後ろ。無ければ `None`。
+/// 実機の規則は A (`<n>,<t0>,<t1>,<t2>,<点数>[,<1>]`)・C (A と同じ並び)・E (`[t0.t1.t2], <n>, <n>`) を見た (2026-11-10)
+fn rule_line(line: &str) -> Option<(char, &str)> {
+    let at = line.find("->")?;
+    let rest = &line[at + 2..];
+    let mut chars = rest.chars();
+    let rule = chars.next().filter(|c| c.is_ascii_uppercase())?;
+    (chars.next() == Some(':')).then_some((rule, &rest[2..]))
+}
+
+/// 静脈の行のうち ID が `id` のものの規則の文字
+fn rule_of(line: &str, id: u32) -> Option<char> {
+    let (rule, rest) = rule_line(line)?;
+    (leading_u32(rest) == Some(id)).then_some(rule)
+}
+
+/// 静脈の行 → 点数。ID の後ろの 5 つ目 (`<n>,<t0>,<t1>,<t2>,<点数>`)。1:1 は
 /// `1:1->A:<id>, <n>,<t0>,<t1>,<t2>,<点数>`、1:N は `1:N->A:<id>, <n>,<t0>,<t1>,<t2>,<点数>,<1>` と
-/// 点数の後ろにもう 1 つ付くので、最後のフィールドではなく位置で取る (実機 2026-10-31)
+/// 点数の後ろにもう 1 つ付くので、最後のフィールドではなく位置で取る (実機 2026-10-31)。規則 C も同じ並び。
+/// E は並びが違い点数の位置が分からないので読まない (`None`)
 fn score_of(line: &str, id: u32) -> Option<u32> {
-    let rest = &line[line.find("->A:")? + 4..];
+    let (rule, rest) = rule_line(line)?;
+    matches!(rule, 'A' | 'C').then_some(())?;
     let mut fields = rest.split(',');
     (leading_u32(fields.next()?) == Some(id)).then_some(())?;
     parse_u32(fields.nth(4)?)
+}
+
+/// `PS_Search OK:FV=<id>(..),FP=<id>` → (静脈の層の ID, 指紋互換の層の ID)。`-1` など数字でないものは 0
+fn layers_of(line: &str) -> Option<(u32, u32)> {
+    line.contains("PS_Search OK:").then_some(())?;
+    Some((field_after(line, "FV=").unwrap_or(0), field_after(line, "FP=").unwrap_or(0)))
 }
 
 /// `USER:<id>, th[s0, s1, s2]` → 3 つ
@@ -1542,12 +1583,20 @@ pub fn parse_match_log(text: &str, id: u32) -> Option<MatchScore> {
     let block = last_match_block(text)?;
     let score = block.iter().rev().find_map(|l| score_of(l, id)).unwrap_or(0);
     let th = block.iter().rev().find_map(|l| th_of(l, id))?;
+    let rule = block.iter().rev().find_map(|l| rule_of(l, id));
+    // 指紋互換の層が外れた (`PS_Search FAIL`) のに当たったなら静脈で通った (点数が読めない規則 E の回、2026-11-10 実機)
+    let fp_failed = block.iter().any(|l| l.contains("PS_Search FAIL"));
     let via = block
         .iter()
         .rev()
         .find_map(|l| via_of(l, id))
-        .unwrap_or(if score >= th[1] { MatchVia::Fv } else { MatchVia::Fp });
-    Some(MatchScore { score, th, via })
+        .unwrap_or(if fp_failed || score >= th[1] { MatchVia::Fv } else { MatchVia::Fp });
+    let layers = block.iter().rev().find_map(|l| layers_of(l));
+    let fv_score = layers
+        .map(|(fv, _)| fv)
+        .filter(|&fv| fv != 0 && fv != id)
+        .and_then(|fv| block.iter().rev().find_map(|l| score_of(l, fv)));
+    Some(MatchScore { score, th, via, rule, layers, fv_score })
 }
 
 /// 不一致だった照合の塊で、静脈の点数が付いた候補のうち最も高いもの (`->A:` の行。どの ID でも)
@@ -1577,7 +1626,8 @@ impl MissScore {
 
 /// `->A:<id>, <n>,<t0>,<t1>,<t2>,<点数>` → 候補 1 つ (読めない行は `None`)
 fn candidate_of(line: &str) -> Option<MissBest> {
-    let rest = &line[line.find("->A:")? + 4..];
+    let (rule, rest) = rule_line(line)?;
+    matches!(rule, 'A' | 'C').then_some(())?;
     let mut fields = rest.split(',');
     let id = leading_u32(fields.next()?)?;
     fields.next()?;
@@ -3406,34 +3456,75 @@ mod tests {
     const LOG_FV: &str = BLOCK_FV;
     const LOG_FP: &str = BLOCK_FP;
 
+    /// 点数・閾値・経路だけを比べる (規則と層の ID は別の試験で見る)
+    fn triple(m: MatchScore) -> (u32, [u32; 3], MatchVia) {
+        (m.score, m.th, m.via)
+    }
+
+    #[test]
+    fn parse_match_log_reads_rules_c_and_e_and_both_layers() {
+        // 2026-11-10 実機の塊 (規則 C)。点数は A と同じ位置
+        let c = "PS_GenChar OK:1\n1:N->C:11, 6,58,69,75, 62\nIdent3:1287\n2-NO:0\nPS_Search OK:FV=11(11),FP=11\n\
+                 USER:11, th[58, 74, 77], U11, R6, MS:1338\n";
+        let m = parse_match_log(c, 11).unwrap();
+        assert_eq!(triple(m), (62, [58, 74, 77], MatchVia::Fv));
+        assert_eq!((m.rule, m.layers, m.fv_score), (Some('C'), Some((11, 11)), None));
+        assert_eq!(m.suffix(), " SCORE=62 TH=74 VIA=FV THS=58,74,77 RULE=C FV=11 FP=11");
+        // 規則 E: 点数の位置は分からないが静脈で当たった (指紋互換は FAIL)。前は VIA=FP と誤って出していた
+        let e = "PS_GenChar OK:1\n###1:USER:10, 132, 61, 56, 78, 15, 8\n1:N->E:10, [64.56.80], 124, 15\nIdent3:1638\n\
+                 1-NO:2\nPS_Search FAIL\nUSER:10, th[64, 56, 80], U10, R1, MS:1688\n";
+        let m = parse_match_log(e, 10).unwrap();
+        assert_eq!(triple(m), (0, [64, 56, 80], MatchVia::Fv));
+        assert_eq!((m.rule, m.layers), (Some('E'), None));
+        assert_eq!(m.suffix(), " SCORE=0 TH=56 VIA=FV THS=64,56,80 RULE=E");
+        // 静脈の層は 10 (77 点)、指紋互換の層は 12 で、モジュールは 12 を返した (取り違えの手がかり)
+        let split = "PS_GenChar OK:1\n1:N->A:10, 5,60,62,80,77,1\nIdent3:759\n1-NO:1\nPS_Search OK:FV=10(10),FP=12\n\
+                     USER:12, th[60, 62, 80], U10, R5, MS:809\n";
+        let m = parse_match_log(split, 12).unwrap();
+        assert_eq!(triple(m), (0, [60, 62, 80], MatchVia::Fp));
+        assert_eq!((m.rule, m.layers, m.fv_score), (None, Some((10, 12)), Some(77)));
+        assert_eq!(m.suffix(), " SCORE=0 TH=62 VIA=FP THS=60,62,80 FV=10 FP=12 FVSCORE=77");
+        // 指紋互換だけ (`IDENTT1->:` は静脈の行ではない)
+        let fp = "PS_GenChar OK:1\nIDENTT1->:0, 1, 0, 0\nIdent3:727\nPS_Search OK:FV=0(0),FP=10\n\
+                  USER:10, th[0, 0, 0], U0, R0, MS:727\n";
+        let m = parse_match_log(fp, 10).unwrap();
+        assert_eq!(triple(m), (0, [0, 0, 0], MatchVia::Fp));
+        assert_eq!((m.rule, m.layers, m.fv_score), (None, Some((0, 10)), None));
+        // 不一致の点数も規則 C を拾い、E は飛ばす
+        assert_eq!(
+            parse_miss_log("PS_GenChar OK\n1:N->C:11, 6,58,69,75, 62\n1:N->E:10, [64.56.80], 124, 15\nPS_Search FAIL\n"),
+            Some(MissScore { best: Some(MissBest { id: 11, score: 62, th: [58, 69, 75] }) })
+        );
+    }
+
     #[test]
     fn parse_match_log_reads_only_the_last_match_block() {
-        assert_eq!(parse_match_log(BLOCK_FV, 15).unwrap(), MatchScore { score: 68, th: [57, 67, 78], via: MatchVia::Fv });
+        assert_eq!(triple(parse_match_log(BLOCK_FV, 15).unwrap()), (68, [57, 67, 78], MatchVia::Fv));
         // 静脈は不一致 (点数 0)、指紋互換で通った。NUL の埋めがあっても読める
-        assert_eq!(parse_match_log(BLOCK_FP, 15).unwrap(), MatchScore { score: 0, th: [0, 0, 0], via: MatchVia::Fp });
+        assert_eq!(triple(parse_match_log(BLOCK_FP, 15).unwrap()), (0, [0, 0, 0], MatchVia::Fp));
         // ★ 前の回の `->A:` を拾わない (最後の塊に無ければ 0)
         let log = format!("{BLOCK_FV}{BLOCK_FP}");
-        assert_eq!(parse_match_log(&log, 15).unwrap(), MatchScore { score: 0, th: [0, 0, 0], via: MatchVia::Fp });
+        assert_eq!(triple(parse_match_log(&log, 15).unwrap()), (0, [0, 0, 0], MatchVia::Fp));
         let log = format!("{BLOCK_FP}{BLOCK_FV}");
         assert_eq!(parse_match_log(&log, 15).unwrap().score, 68);
         // 1:N は点数の後ろにもう 1 つ付く (実機の塊)。最後のフィールドではなく位置で取る
         let log = "PS_GenChar OK:175\n1:N->A:15, 3,60,71,78,68,1\nPS_Search OK:FV=15(15),FP=15\n\
                    USER:15, th[60, 71, 78], U15, R3, MS:399\n";
-        assert_eq!(parse_match_log(log, 15).unwrap(), MatchScore { score: 68, th: [60, 71, 78], via: MatchVia::Fv });
+        assert_eq!(triple(parse_match_log(log, 15).unwrap()), (68, [60, 71, 78], MatchVia::Fv));
         // 1:N で静脈は外れ、指紋互換で通った塊 (`###1:USER` / `GUESS USER` の行が付く)
         let log = "PS_GenChar OK:175\n###1:USER:15, 97, 57, 55, 72, 3, 0\nGUESS USER:15\n\
                    PS_Search OK:FV=0(15),FP=15\nUSER:15, th[0, 0, 0], U0, R0, MS:906\n";
-        assert_eq!(parse_match_log(log, 15).unwrap(), MatchScore { score: 0, th: [0, 0, 0], via: MatchVia::Fp });
+        assert_eq!(triple(parse_match_log(log, 15).unwrap()), (0, [0, 0, 0], MatchVia::Fp));
         // 1:N (別の ID の行が混じる) は当たった ID の行だけを見る
         let log = "PS_GenChar OK:1\n1:N->A:20, 7,1,2,3,99,1\nUSER:20, th[1, 2, 3]\n\
                    1:N->A:15, 7,50,60,70,58,1\nUSER:15, th[50, 60, 70]\nPS_Search OK:FV=15(15),FP=0\n";
-        assert_eq!(parse_match_log(log, 15).unwrap(), MatchScore { score: 58, th: [50, 60, 70], via: MatchVia::Fv });
+        assert_eq!(triple(parse_match_log(log, 15).unwrap()), (58, [50, 60, 70], MatchVia::Fv));
         // PS_Search の行が無い / 別の ID だけなら、点数と真ん中の閾値で決める
         assert_eq!(parse_match_log("PS_GenChar OK\n1:1->A:7, 7,1,50,9,50\nUSER:7, th[1, 50, 9]\n", 7).unwrap().via, MatchVia::Fv);
         assert_eq!(parse_match_log("PS_GenChar OK\n1:1->A:7, 7,1,50,9,49\nUSER:7, th[1, 50, 9]\n", 7).unwrap().via, MatchVia::Fp);
         assert_eq!(parse_match_log("PS_GenChar OK\n1:1->A:7, 7,1,50,9,60\nUSER:7, th[1, 50, 9]\nPS_Search OK:FV=8,FP=-1\n", 7).unwrap().via, MatchVia::Fv);
         // 応答の付け足し (TH は真ん中)
-        assert_eq!(parse_match_log(BLOCK_FV, 15).unwrap().suffix(), " SCORE=68 TH=67 VIA=FV THS=57,67,78");
+        assert_eq!(parse_match_log(BLOCK_FV, 15).unwrap().suffix(), " SCORE=68 TH=67 VIA=FV THS=57,67,78 RULE=A FV=15 FP=15");
     }
 
     #[test]
@@ -3475,12 +3566,12 @@ mod tests {
         let script = with_debug(vec![connected(), finger(Some(1)), verified(Some(15))], LOG_FV);
         assert_eq!(
             run_t(Command::Identify, script),
-            vec!["VEIN IDENTIFIED 15 SCORE=68 TH=67 VIA=FV THS=57,67,78"]
+            vec!["VEIN IDENTIFIED 15 SCORE=68 TH=67 VIA=FV THS=57,67,78 RULE=A FV=15 FP=15"]
         );
         let script = with_debug(vec![connected(), finger(Some(1)), verified(Some(15))], LOG_FP);
         assert_eq!(
             run_t(Command::Verify(15), script).last().unwrap(),
-            "VEIN VERIFIED 15 SCORE=0 TH=0 VIA=FP THS=0,0,0"
+            "VEIN VERIFIED 15 SCORE=0 TH=0 VIA=FP THS=0,0,0 FV=0 FP=15"
         );
         // 4096 バイトまで複数の塊で読む
         let mut big = " ".repeat(DEBUG_LOG_MAX - LOG_FV.len());
@@ -3488,7 +3579,7 @@ mod tests {
         let script = with_debug(vec![connected(), finger(Some(1)), verified(Some(15))], &big);
         assert_eq!(
             run_t(Command::Identify, script),
-            vec!["VEIN IDENTIFIED 15 SCORE=68 TH=67 VIA=FV THS=57,67,78"]
+            vec!["VEIN IDENTIFIED 15 SCORE=68 TH=67 VIA=FV THS=57,67,78 RULE=A FV=15 FP=15"]
         );
         // 要求は GET_DEBUG (データ無し) → READ_DATA 種別 0x26
         let mut port = FakePort::new(with_debug(vec![connected(), finger(Some(1)), verified(Some(15))], LOG_FV));
@@ -3585,7 +3676,7 @@ mod tests {
         let lines = run_t(Command::Verify(15), with_debug(hit(), LOG_FP));
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("VEIN MATCHLOG Match.User:15, 0 | PS_Search OK:FV=0(0),FP=15"));
-        assert_eq!(lines[1], "VEIN VERIFIED 15 SCORE=0 TH=0 VIA=FP THS=0,0,0");
+        assert_eq!(lines[1], "VEIN VERIFIED 15 SCORE=0 TH=0 VIA=FP THS=0,0,0 FV=0 FP=15");
         assert_eq!(run_t(Command::Identify, with_debug(hit(), LOG_FV)).len(), 1);
         // 静脈で当たったが点数の行が読めない塊 (実機 2026-11-02、Vein Base の 1:N) は塊も出す
         let unread = "PS_GenChar OK:1\nIDENTT1->:10, 1, 72, 0\nPS_Search OK:FV=10(10),FP=10\nUSER:10, th[67, 61, 76], U10, R1, MS:200\n";
@@ -3593,7 +3684,7 @@ mod tests {
             run_t(Command::Identify, with_debug(hit(), &unread.replace("10", "15"))),
             vec![
                 "VEIN MATCHLOG IDENTT1->:15, 1, 72, 0 | PS_Search OK:FV=15(15),FP=15 | USER:15, th[67, 61, 76], U15, R1, MS:200",
-                "VEIN IDENTIFIED 15 SCORE=0 TH=61 VIA=FV THS=67,61,76",
+                "VEIN IDENTIFIED 15 SCORE=0 TH=61 VIA=FV THS=67,61,76 FV=15 FP=15",
             ]
         );
         // 記録が読めなければ今までの行のまま (塊も出さない)
