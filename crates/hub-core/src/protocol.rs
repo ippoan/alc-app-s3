@@ -742,7 +742,10 @@ pub fn parse_line(line: &str, default_qr_timeout_ms: u64) -> Result<Option<HostC
                 (Some("KEEP"), Some(a)) if a.eq_ignore_ascii_case("ALL") && it.next().is_none() => {
                     HostCommand::Vein(crate::vein::Command::IdentifyKeepAll)
                 }
-                _ => return Err("ERR VEIN: IDENTIFY は引数なしか KEEP [ALL] です".into()),
+                (Some("KEEP"), Some(a)) if a.eq_ignore_ascii_case("LATE") && it.next().is_none() => {
+                    HostCommand::Vein(crate::vein::Command::IdentifyKeepLate)
+                }
+                _ => return Err("ERR VEIN: IDENTIFY は引数なしか KEEP [ALL|LATE] です".into()),
             },
             Some("VERIFY") => match (it.next().and_then(crate::vein::parse_module_id), it.next()) {
                 (Some(id), None) => HostCommand::Vein(crate::vein::Command::Verify(id)),
@@ -1871,12 +1874,15 @@ mod tests {
         ] {
             assert_eq!(parse_line(bad, T), Err(BAD_ENROLL.into()), "{bad}");
         }
-        assert_eq!(parse_line("VEIN IDENTIFY 2", T), Err("ERR VEIN: IDENTIFY は引数なしか KEEP [ALL] です".into()));
+        assert_eq!(parse_line("VEIN IDENTIFY 2", T), Err("ERR VEIN: IDENTIFY は引数なしか KEEP [ALL|LATE] です".into()));
         assert_eq!(parse_line("VEIN IDENTIFY KEEP", T), ok(Command::IdentifyKeep));
         assert_eq!(parse_line("vein identify keep", T), ok(Command::IdentifyKeep));
         assert_eq!(parse_line("VEIN IDENTIFY KEEP all", T), ok(Command::IdentifyKeepAll));
         assert!(parse_line("VEIN IDENTIFY KEEP ALL 1", T).is_err());
-        assert_eq!(parse_line("VEIN IDENTIFY KEEP 1", T), Err("ERR VEIN: IDENTIFY は引数なしか KEEP [ALL] です".into()));
+        assert_eq!(parse_line("VEIN IDENTIFY KEEP LATE", T), ok(Command::IdentifyKeepLate));
+        assert_eq!(parse_line("vein identify keep late", T), ok(Command::IdentifyKeepLate));
+        assert!(parse_line("VEIN IDENTIFY KEEP LATE 1", T).is_err());
+        assert_eq!(parse_line("VEIN IDENTIFY KEEP 1", T), Err("ERR VEIN: IDENTIFY は引数なしか KEEP [ALL|LATE] です".into()));
         const BAD_SYNC: &str = "ERR VEIN: SYNC は WRITE <id> <offset> <hex> / WRITE <id> END / CLEAR <id> / INFO です (ID は 10〜100、hex は 192 バイトまで)";
         for bad in [
             "VEIN SYNC",
