@@ -350,9 +350,10 @@ pub fn start(
                     let touches = !matches!(cmd, proto::Command::SyncWrite(proto::WriteCommand::Chunk { .. }));
                     // 行は 1 行ずつ 1 回の write で出す (VEIN RECORD は 1 行 2 千文字を超える)。
                     // 受けたデータ・読んだ記録はここから先ログに出さない
-                    for line in proto::run(cmd, &mut assembling, &mut port, &Timeouts::DEFAULT, &mut on_prompt) {
-                        emit_whole_line(&line);
-                    }
+                    // KEEP LATE は結果の行を後ろの撮影より先に出す (run_each が出せた順に渡す)
+                    proto::run_each(cmd, &mut assembling, &mut port, &Timeouts::DEFAULT, &mut on_prompt, &mut |line| {
+                        emit_whole_line(&line)
+                    });
                     if touches {
                         watch.after_capture();
                     }

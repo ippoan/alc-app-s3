@@ -851,6 +851,9 @@ pub enum Command {
     /// `VEIN IDENTIFY KEEP ALL`: [`Command::IdentifyKeep`] と同じだが、外れても撮った記録を返す
     /// (モジュールの判定とホストの照合を同じ 1 回の撮影で比べる。alc-app の影の照合が使う)
     IdentifyKeepAll,
+    /// `VEIN IDENTIFY KEEP LATE`: 照合を先に済ませて結果の行を出し、当たった回だけその後で作業用 ID に 1 本撮って
+    /// 記録を返す ([`identify_keep_late`])。利用者が待つ区間を素の IDENTIFY と同じにする
+    IdentifyKeepLate,
     /// `VEIN VERIFY <id>`: 1:1 照合 (VERIFY <id>)。免許証で本人が決まった後に使う
     Verify(u32),
     /// `VEIN SYNC WRITE …`: サーバーの記録をモジュールの ID へ書く
@@ -1424,6 +1427,94 @@ fn capture_then_identify(
     Ok((record, hit))
 }
 
+/// [`identify_keep_late`] の後ろの撮影で、指を待つ上限 (ミリ秒)。照合の直後で指は乗っているはずなので短く —
+/// 離れていたら撮らずに諦め、次の人の照合を待たせない
+pub const KEEP_LATE_FINGER_MS: u32 = 2_000;
+
+/// 本番の「照合を先、撮影を後ろ」(`VEIN IDENTIFY KEEP LATE`)。[`capture_identify`] の逆順で、利用者が待つ区間を
+/// 素の [`identify`] と同じにする (KEEP は撮影 → 照合の順なので、撮影ぶん約 2 秒が結果の前に乗っていた。2026-11-11 実測)。
+///
+/// 接続 → 指が置ききるのを待つ → 重複登録の検査を読み、入っていれば切る → 1:N 照合 (VERIFY 0) → 動作記録を読む →
+/// **結果の行をここで `emit` する** → (当たった回だけ) 指がまだ乗っていれば作業用 ID に 1 本撮る → 「離して」 →
+/// 先頭を読む → 作業用 ID を消す → 重複登録の検査を戻す → `VEIN RECORD 1 …` と `VEIN KEEP DONE` /
+/// `VEIN KEEP SKIP <理由>`。
+///
+/// - 行は出せた順に `emit` へ渡す。結果が `VEIN IDENTIFIED` なら、その後に必ず `KEEP DONE` か `KEEP SKIP` が 1 行続く。
+///   `VEIN NOMATCH` と `ERR VEIN` の後には何も続かない (外れた回は撮らない)
+/// - 照合の前に `VEIN CAPLOG` (照合の撮影の明るさ) を出す (動作記録に照合の撮影の行が読めたときだけ)
+/// - 照合の途中の「離して」は渡さない。当たったら後ろの撮影の後に 1 回だけ渡す (撮る前に指が離れないように)
+/// - 後ろの撮影の途中経過 (置いて・撮り直し) は鳴らさない。指を待つのは [`KEEP_LATE_FINGER_MS`] まで
+/// - **実機で未確認**: 照合の直後に、乗ったままの指を ENROLL が撮るか (今の KEEP は撮影 → 照合の向きでしか確かめていない)。
+///   撮れなければ `KEEP SKIP` が続くだけで、結果の行には影響しない
+pub fn identify_keep_late(port: &mut dyn Port, t: &Timeouts, on_prompt: &mut dyn FnMut(Prompt), emit: &mut dyn FnMut(String)) {
+    let mut dup = 0u8;
+    let head = (|| {
+        connect(port, t)?;
+        settle_finger(port, t);
+        let info = exchange(port, t, CMD_GET_SYSTEM_INFO, &[])?;
+        setting_ok(&info)?;
+        dup = info.data[SYSINFO_DUP_CHECK_AT];
+        if dup != 0 {
+            setting_ok(&exchange(port, t, CMD_SET_DUP_CHECK, &[0])?)?;
+        }
+        verify(port, t, 0, &mut |p| {
+            if p != Prompt::Release {
+                on_prompt(p)
+            }
+        })
+    })();
+    let restore_dup = |port: &mut dyn Port| {
+        if dup != 0 {
+            let _ = exchange(port, t, CMD_SET_DUP_CHECK, &[dup]);
+        }
+    };
+    let hit = match head {
+        Ok(hit) => hit,
+        Err(e) => {
+            restore_dup(port);
+            emit(err_line(e));
+            return;
+        }
+    };
+    let log = read_match_log(port, t);
+    if let Some(line) = log.as_deref().and_then(verify_capture_log_line) {
+        emit(line);
+    }
+    for line in match_lines(hit, log.as_deref(), identify_line) {
+        emit(line);
+    }
+    if hit.is_none() {
+        restore_dup(port);
+        return;
+    }
+    let late = keep_late_capture(port, t);
+    on_prompt(Prompt::Release);
+    restore_dup(port);
+    match late {
+        Ok(record) => {
+            for line in record_lines(SCRATCH_ID, &record) {
+                emit(line);
+            }
+            emit("VEIN KEEP DONE".into());
+        }
+        Err(reason) => emit(format!("VEIN KEEP SKIP {reason}")),
+    }
+}
+
+/// [`identify_keep_late`] の後ろの撮影: 指が乗っているのを見てから作業用 ID に 1 本撮り、先頭を読んで作業用 ID を消す。
+/// 撮らなかった・撮れなかった理由 (`NO_FINGER` / `ERR VEIN` と同じ理由) を返す
+fn keep_late_capture(port: &mut dyn Port, t: &Timeouts) -> Result<Vec<u8>, String> {
+    match finger_state(port, t) {
+        FingerReply::Absent => return Err(VeinError::NoFinger.reason()),
+        FingerReply::Failed(e) => return Err(e.reason()),
+        FingerReply::Present | FingerReply::Unsupported => {}
+    }
+    let quick = Timeouts { finger_ms: KEEP_LATE_FINGER_MS, ..*t };
+    let got = enroll_id(port, &quick, SCRATCH_ID, 1, &mut |_| {}).and_then(|()| read_fresh_record(port, t, SCRATCH_ID));
+    let _ = exchange(port, t, CMD_CLEAR_ENROLL, &SCRATCH_ID.to_le_bytes());
+    got.map_err(|e| e.reason())
+}
+
 /// 本番の 1:1 照合 (`VEIN VERIFY <id>`): [`identify`] と同じ手順で VERIFY <id>
 pub fn verify_id(
     port: &mut dyn Port,
@@ -1682,7 +1773,25 @@ const CAPTURE_LOG_KEYS: [&str; 5] = ["Gray", "Ir", "CHECK FINGER", "lineW", "XG_
 pub fn capture_log_line(text: &str) -> Option<String> {
     let all: Vec<&str> = text.split(['\n', '\r', '\0']).collect();
     let start = KEEP_BLOCK_STARTS.iter().find_map(|m| all.iter().rposition(|l| l.contains(m)))?;
-    let body: String = all[start + 1..]
+    caplog_of(&all[start + 1..])
+}
+
+/// [`identify_keep_late`] の照合の撮影の前の区切り (接続・重複登録の検査を切った行・前の照合の終わりの行)
+const VERIFY_CAPTURE_STARTS: [&str; 4] = ["CONNECT[", "Set DuCheck", "USER:", "MS:"];
+
+/// `VEIN CAPLOG …` の照合版: 最後の照合の塊 ([`MATCH_BLOCK_START`]) の直前にある、その照合の撮影の行。
+/// 撮影の行の始まりは、その前の区切り ([`VERIFY_CAPTURE_STARTS`]) の次の行から。区切りが無ければ `None`
+/// (前の回の行を混ぜないため)
+pub fn verify_capture_log_line(text: &str) -> Option<String> {
+    let all: Vec<&str> = text.split(['\n', '\r', '\0']).collect();
+    let end = all.iter().rposition(|l| l.contains(MATCH_BLOCK_START))?;
+    let start = all[..end].iter().rposition(|l| VERIFY_CAPTURE_STARTS.iter().any(|m| l.contains(m)))?;
+    caplog_of(&all[start + 1..end])
+}
+
+/// 撮影の行 ([`CAPTURE_LOG_KEYS`]) だけを ` | ` でつないだ `VEIN CAPLOG …`。1 行も無ければ `None`
+fn caplog_of(lines: &[&str]) -> Option<String> {
+    let body: String = lines
         .iter()
         .map(|l| l.trim())
         .filter(|l| CAPTURE_LOG_KEYS.iter().any(|k| l.contains(k)))
@@ -1815,6 +1924,11 @@ pub fn run(
             lines.extend(match_lines(hit, log.as_deref(), identify_line));
             lines
         }),
+        Command::IdentifyKeepLate => {
+            let mut lines = Vec::new();
+            identify_keep_late(port, t, on_prompt, &mut |l| lines.push(l));
+            Ok(lines)
+        }
         Command::Identify => identify(port, t, on_prompt).map(|hit| {
             let log = read_match_log(port, t);
             match_lines(hit, log.as_deref(), identify_line)
@@ -1840,6 +1954,25 @@ pub fn run(
         .map(|level| vec![security_line(level)]),
     };
     lines.unwrap_or_else(|e| vec![err_line(e)])
+}
+
+/// [`run`] と同じだが、行を出せた順に `emit` へ渡す。`VEIN IDENTIFY KEEP LATE` は結果の行を後ろの撮影より先に
+/// 出す ([`identify_keep_late`])。ほかの口は [`run`] の行をまとめて渡す
+pub fn run_each(
+    cmd: Command,
+    slot: &mut Option<TemplateAssembler>,
+    port: &mut dyn Port,
+    t: &Timeouts,
+    on_prompt: &mut dyn FnMut(Prompt),
+    emit: &mut dyn FnMut(String),
+) {
+    if cmd == Command::IdentifyKeepLate {
+        identify_keep_late(port, t, on_prompt, emit);
+        return;
+    }
+    for line in run(cmd, slot, port, t, on_prompt) {
+        emit(line);
+    }
 }
 
 /// `VEIN TEST VERIFY <id> RC=<1 バイト目> DATA=<残り>` (大文字 16 進)。
@@ -3913,6 +4046,128 @@ mod tests {
         // 表示できない文字は落とし、長さを切る
         let long = format!("Set DuCheck:0\n\u{1}Gray:{}\n", "9".repeat(1000));
         assert_eq!(capture_log_line(&long).unwrap().len(), "VEIN CAPLOG ".len() + MATCH_LOG_LINE_MAX);
+    }
+
+    /// `VEIN IDENTIFY KEEP LATE` を回し、出した行・途中経過・送った命令の種類を返す
+    fn late(script: Vec<Option<Vec<u8>>>) -> (Vec<String>, Vec<Prompt>, Vec<u8>) {
+        let mut port = FakePort::new(script);
+        let (mut lines, mut prompts) = (Vec::new(), Vec::new());
+        identify_keep_late(&mut port, &Timeouts::DEFAULT, &mut |p| prompts.push(p), &mut |l| lines.push(l));
+        (lines, prompts, port.sent.iter().map(|p| p[3]).collect())
+    }
+
+    /// 照合まで (接続 → 指を待つ → 設定を読む → 重複を切る → 照合) の台本
+    fn late_head(dup: u8, verify: Option<Vec<u8>>) -> Vec<Option<Vec<u8>>> {
+        let mut v = vec![connected(), finger(Some(1)), sysinfo(dup)];
+        if dup != 0 {
+            v.push(set_dup_ok());
+        }
+        v.push(verify);
+        v
+    }
+
+    #[test]
+    fn identify_keep_late_emits_the_result_before_capturing_the_record() {
+        let data = sample_chara(4);
+        let mut script = with_debug(late_head(1, verified(Some(15))), LOG_FV);
+        script.extend([finger(Some(1)), cleared(), enrolled(), size(4), Some(chunk(&data)), cleared_ok(), set_dup_ok()]);
+        let (lines, prompts, cmds) = late(script);
+        assert_eq!(
+            lines,
+            vec![
+                "VEIN CAPLOG 0-Gray:127 | [0]-Ir:29,40 Gray:105 | XG_Create:0,842,125",
+                "VEIN IDENTIFIED 15 SCORE=68 TH=67 VIA=FV THS=57,67,78 RULE=A FV=15 FP=15",
+                "VEIN RECORD 1 0 DEEDDEED",
+                "VEIN RECORD 1 END 4",
+                "VEIN KEEP DONE",
+            ]
+        );
+        // 照合の「離して」と撮影の途中経過は渡さず、撮った後に 1 回だけ
+        assert_eq!(prompts, vec![Prompt::Place, Prompt::Release]);
+        // 照合 → 動作記録 → 指を見る → 作業用 ID に撮る → 読む → 消す → 重複を戻す
+        let at = cmds.iter().position(|&c| c == CMD_VERIFY).unwrap();
+        assert_eq!(
+            cmds[at..].iter().copied().filter(|&c| c != CMD_READ_DATA).collect::<Vec<_>>(),
+            vec![CMD_VERIFY, CMD_GET_DEBUG, CMD_FINGER_STATE, CMD_CLEAR_ENROLL, CMD_ENROLL, CMD_READ_ENROLL, CMD_CLEAR_ENROLL, CMD_SET_DUP_CHECK]
+        );
+        assert_eq!(cmds[..at], [CMD_CONNECTION, CMD_FINGER_STATE, CMD_GET_SYSTEM_INFO, CMD_SET_DUP_CHECK]);
+    }
+
+    #[test]
+    fn identify_keep_late_miss_does_not_capture_and_restores_the_dup_check() {
+        let mut script = late_head(1, verified(None));
+        script.extend([None, set_dup_ok()]);
+        let (lines, prompts, cmds) = late(script);
+        assert_eq!(lines, vec!["VEIN NOMATCH"]);
+        assert!(!prompts.contains(&Prompt::Release));
+        assert_eq!(cmds.last(), Some(&CMD_SET_DUP_CHECK));
+        assert!(!cmds.contains(&CMD_ENROLL));
+    }
+
+    #[test]
+    fn identify_keep_late_errors_end_with_the_err_line_and_restore_the_dup_check() {
+        assert_eq!(late(vec![None]).0, vec!["ERR VEIN NO_MODULE"]);
+        let mut script = late_head(1, None);
+        script.push(set_dup_ok());
+        let (lines, _, cmds) = late(script);
+        assert_eq!(lines, vec!["ERR VEIN TIMEOUT"]);
+        assert_eq!(&cmds[cmds.len() - 2..], &[CMD_VERIFY, CMD_SET_DUP_CHECK]);
+        // 重複が元から切れていれば戻さない
+        let (lines, _, cmds) = late(late_head(0, None));
+        assert_eq!(lines, vec!["ERR VEIN TIMEOUT"]);
+        assert!(!cmds.contains(&CMD_SET_DUP_CHECK));
+    }
+
+    #[test]
+    fn identify_keep_late_skips_the_capture_when_the_finger_is_gone_or_the_capture_fails() {
+        // 指が離れていた: 撮らずに SKIP (「離して」は鳴らす)
+        let mut script = late_head(0, verified(Some(15)));
+        script.extend([None, finger(Some(0))]);
+        let (lines, prompts, cmds) = late(script);
+        assert_eq!(lines, vec!["VEIN IDENTIFIED 15", "VEIN KEEP SKIP NO_FINGER"]);
+        assert_eq!(prompts.last(), Some(&Prompt::Release));
+        assert!(!cmds.contains(&CMD_ENROLL));
+        // 指の問い合わせが返らない
+        let mut script = late_head(0, verified(Some(15)));
+        script.extend([None, None]);
+        assert_eq!(late(script).0[1], format!("VEIN KEEP SKIP {}", VeinError::Timeout.reason()));
+        // 指の問い合わせが非対応なら撮ってみる。撮影が失敗したら作業用 ID を消して SKIP
+        let mut script = late_head(0, verified(Some(15)));
+        script.extend([None, Some(reply(CMD_FINGER_STATE, &[XG_ERR_FAIL, XG_ERR_NO_SUPPORT])), cleared(), None, cleared_ok()]);
+        let (lines, _, cmds) = late(script);
+        assert_eq!(lines[1], "VEIN KEEP SKIP TIMEOUT");
+        assert_eq!(&cmds[cmds.len() - 2..], &[CMD_ENROLL, CMD_CLEAR_ENROLL]);
+    }
+
+    #[test]
+    fn run_and_run_each_handle_identify_keep_late() {
+        let mut script = late_head(0, verified(None));
+        script.push(None);
+        assert_eq!(run_t(Command::IdentifyKeepLate, script.clone()), vec!["VEIN NOMATCH"]);
+        let mut lines = Vec::new();
+        let mut quiet = |_: Prompt| {};
+        let mut port = FakePort::new(script);
+        run_each(Command::IdentifyKeepLate, &mut None, &mut port, &Timeouts::DEFAULT, &mut quiet, &mut |l| lines.push(l));
+        assert_eq!(lines, vec!["VEIN NOMATCH"]);
+        // ほかの口は run の行をそのまま
+        let mut lines = Vec::new();
+        run_each(Command::SyncInfo, &mut None, &mut FakePort::new(vec![None]), &Timeouts::DEFAULT, &mut quiet, &mut |l| lines.push(l));
+        assert_eq!(lines, vec!["ERR VEIN NO_MODULE"]);
+    }
+
+    #[test]
+    fn verify_capture_log_line_takes_the_capture_lines_before_the_last_match() {
+        assert_eq!(
+            verify_capture_log_line(BLOCK_FV).unwrap(),
+            "VEIN CAPLOG 0-Gray:127 | [0]-Ir:29,40 Gray:105 | XG_Create:0,842,125"
+        );
+        // 前の照合の終わりから・重複を切った行から
+        let two = format!("{BLOCK_FV}Set DuCheck:0\n0-Gray:61\nPS_GenChar OK\nPS_Search FAIL\n");
+        assert_eq!(verify_capture_log_line(&two).unwrap(), "VEIN CAPLOG 0-Gray:61");
+        // 照合の塊が無い・区切りが無い・撮影の行が無い
+        assert_eq!(verify_capture_log_line("0-Gray:1\n"), None);
+        assert_eq!(verify_capture_log_line("0-Gray:1\nPS_GenChar OK\n"), None);
+        assert_eq!(verify_capture_log_line("MS:1\nbH=1\nPS_GenChar OK\n"), None);
     }
 
     #[test]
