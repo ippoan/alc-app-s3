@@ -1757,6 +1757,25 @@ mod tests {
     }
 
     #[test]
+    fn unsynced_without_boot_id_or_outside_window_is_handled() {
+        let store = TestStore::new(10);
+        let mut q = open_queue(&store, 1);
+        // 稼働時間はあるが boot_id が無い → 未同期リストに載らない
+        q.push_record("alcohol", SYNCED, PAYLOAD, None, Some(1_000), None)
+            .unwrap();
+        q.push_record("alcohol", 5_000, PAYLOAD, None, Some(5_000), None)
+            .unwrap();
+        assert!(!q.has_correctable(7));
+        // 窓 (seq=1) の外にある補正対象は store だけ書き戻す
+        q.push_record("alcohol", 6_000, PAYLOAD, None, Some(6_000), Some(7))
+            .unwrap();
+        assert_eq!(q.fix_unsynced_times(SYNCED + 100_000, 66_000, 7), 1);
+        assert_eq!(q.entries().next().unwrap().recorded_at_ms, SYNCED);
+        assert!(store.lines()[2].contains(&format!("\"recorded_at_ms\":{}", SYNCED + 40_000)));
+        assert!(!q.has_correctable(7));
+    }
+
+    #[test]
     fn has_correctable_and_wait_for_clock() {
         let store = TestStore::new(10);
         let mut q = open_queue(&store, 2);
