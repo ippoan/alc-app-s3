@@ -62,8 +62,7 @@ jobs:
           private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
           repositories: vein-match
 
-      # rustc 1.100 は if-let の暗黙 else を行として数え uplink.rs 845/898 が割れる。テストを足したら外す
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
 
