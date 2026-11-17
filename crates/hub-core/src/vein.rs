@@ -1435,14 +1435,16 @@ pub const KEEP_LATE_FINGER_MS: u32 = 2_000;
 /// 素の [`identify`] と同じにする (KEEP は撮影 → 照合の順なので、撮影ぶん約 2 秒が結果の前に乗っていた。2026-11-11 実測)。
 ///
 /// 接続 → 指が置ききるのを待つ → 重複登録の検査を読み、入っていれば切る → 1:N 照合 (VERIFY 0) → 動作記録を読む →
-/// **結果の行をここで `emit` する** → (当たった回だけ) 指がまだ乗っていれば作業用 ID に 1 本撮る → 「離して」 →
-/// 先頭を読む → 作業用 ID を消す → 重複登録の検査を戻す → `VEIN RECORD 1 …` と `VEIN KEEP DONE` /
+/// **結果の行をここで `emit` する** → (当たった回だけ) 指がまだ乗っていれば作業用 ID に 1 本撮る → 撮れた合図で
+/// 「離して」 → 先頭を読む → 作業用 ID を消す → 重複登録の検査を戻す → `VEIN RECORD 1 …` と `VEIN KEEP DONE` /
 /// `VEIN KEEP SKIP <理由>`。
 ///
 /// - 行は出せた順に `emit` へ渡す。結果が `VEIN IDENTIFIED` なら、その後に必ず `KEEP DONE` か `KEEP SKIP` が 1 行続く。
 ///   `VEIN NOMATCH` と `ERR VEIN` の後には何も続かない (外れた回は撮らない)
 /// - 照合の前に `VEIN CAPLOG` (照合の撮影の明るさ) を出す (動作記録に照合の撮影の行が読めたときだけ)
-/// - 照合の途中の「離して」は渡さない。当たったら後ろの撮影の後に 1 回だけ渡す (撮る前に指が離れないように)
+/// - 照合の途中の「離して」は渡さない。当たったら後ろの撮影でモジュールが撮れた合図を返した時点で 1 回だけ渡す
+///   (撮る前に指が離れないように。読み出し・消去・重複の戻しはその後ろなので利用者を待たせない)。撮れずに終わった回
+///   (指が無い・撮影の失敗) は撮影を諦めた後に 1 回渡す。撮れた合図の後に失敗した回は鳴らし直さない
 /// - 後ろの撮影の途中経過 (置いて・撮り直し) は鳴らさない。指を待つのは [`KEEP_LATE_FINGER_MS`] まで
 /// - **実機で未確認**: 照合の直後に、乗ったままの指を ENROLL が撮るか (今の KEEP は撮影 → 照合の向きでしか確かめていない)。
 ///   撮れなければ `KEEP SKIP` が続くだけで、結果の行には影響しない
@@ -1487,8 +1489,10 @@ pub fn identify_keep_late(port: &mut dyn Port, t: &Timeouts, on_prompt: &mut dyn
         restore_dup(port);
         return;
     }
-    let late = keep_late_capture(port, t);
-    on_prompt(Prompt::Release);
+    let (late, released) = keep_late_capture(port, t, on_prompt);
+    if !released {
+        on_prompt(Prompt::Release);
+    }
     restore_dup(port);
     match late {
         Ok(record) => {
@@ -1502,17 +1506,31 @@ pub fn identify_keep_late(port: &mut dyn Port, t: &Timeouts, on_prompt: &mut dyn
 }
 
 /// [`identify_keep_late`] の後ろの撮影: 指が乗っているのを見てから作業用 ID に 1 本撮り、先頭を読んで作業用 ID を消す。
-/// 撮らなかった・撮れなかった理由 (`NO_FINGER` / `ERR VEIN` と同じ理由) を返す
-fn keep_late_capture(port: &mut dyn Port, t: &Timeouts) -> Result<Vec<u8>, String> {
+/// 撮らなかった・撮れなかった理由 (`NO_FINGER` / `ERR VEIN` と同じ理由) を返す。
+///
+/// モジュールが撮れた合図 (「離して」) を返したら、その場で `on_prompt` へ 1 回だけ渡す (読み出し・消去を待たせない)。
+/// 渡したかどうかを併せて返す (渡していなければ呼び出し側が鳴らす)
+fn keep_late_capture(
+    port: &mut dyn Port,
+    t: &Timeouts,
+    on_prompt: &mut dyn FnMut(Prompt),
+) -> (Result<Vec<u8>, String>, bool) {
     match finger_state(port, t) {
-        FingerReply::Absent => return Err(VeinError::NoFinger.reason()),
-        FingerReply::Failed(e) => return Err(e.reason()),
+        FingerReply::Absent => return (Err(VeinError::NoFinger.reason()), false),
+        FingerReply::Failed(e) => return (Err(e.reason()), false),
         FingerReply::Present | FingerReply::Unsupported => {}
     }
     let quick = Timeouts { finger_ms: KEEP_LATE_FINGER_MS, ..*t };
-    let got = enroll_id(port, &quick, SCRATCH_ID, 1, &mut |_| {}).and_then(|()| read_fresh_record(port, t, SCRATCH_ID));
+    let mut released = false;
+    let got = enroll_id(port, &quick, SCRATCH_ID, 1, &mut |p| {
+        if p == Prompt::Release && !released {
+            released = true;
+            on_prompt(Prompt::Release);
+        }
+    })
+    .and_then(|()| read_fresh_record(port, t, SCRATCH_ID));
     let _ = exchange(port, t, CMD_CLEAR_ENROLL, &SCRATCH_ID.to_le_bytes());
-    got.map_err(|e| e.reason())
+    (got.map_err(|e| e.reason()), released)
 }
 
 /// 本番の 1:1 照合 (`VEIN VERIFY <id>`): [`identify`] と同じ手順で VERIFY <id>
@@ -2197,7 +2215,9 @@ pub fn say_ok_line(v: VeinVoice) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::VecDeque;
+    use std::rc::Rc;
 
     /// 仕様書 §1.2.2 の例 (接続): 送信
     const SPEC_CONNECT_SEND: [u8; 24] = [
@@ -2223,6 +2243,8 @@ mod tests {
         pauses: Vec<u32>,
         /// [`Port::set_baud`] で切り替えた速度の並び
         bauds: Vec<u32>,
+        /// 送信の回数。port を借りている間 (途中経過の受け取り中) にも外から読めるよう共有する
+        sends: Rc<Cell<usize>>,
     }
 
     impl FakePort {
@@ -2236,6 +2258,7 @@ mod tests {
                 discards: 0,
                 pauses: Vec::new(),
                 bauds: Vec::new(),
+                sends: Rc::default(),
             }
         }
     }
@@ -2243,6 +2266,7 @@ mod tests {
     impl Port for FakePort {
         fn send(&mut self, bytes: &[u8]) -> bool {
             self.sent.push(bytes.to_vec());
+            self.sends.set(self.sent.len());
             if !self.send_ok {
                 return false;
             }
@@ -4082,7 +4106,7 @@ mod tests {
                 "VEIN KEEP DONE",
             ]
         );
-        // 照合の「離して」と撮影の途中経過は渡さず、撮った後に 1 回だけ
+        // 照合の「離して」と撮影の途中経過は渡さず、撮れた合図で 1 回だけ
         assert_eq!(prompts, vec![Prompt::Place, Prompt::Release]);
         // 照合 → 動作記録 → 指を見る → 作業用 ID に撮る → 読む → 消す → 重複を戻す
         let at = cmds.iter().position(|&c| c == CMD_VERIFY).unwrap();
@@ -4137,6 +4161,47 @@ mod tests {
         let (lines, _, cmds) = late(script);
         assert_eq!(lines[1], "VEIN KEEP SKIP TIMEOUT");
         assert_eq!(&cmds[cmds.len() - 2..], &[CMD_ENROLL, CMD_CLEAR_ENROLL]);
+    }
+
+    #[test]
+    fn identify_keep_late_releases_before_reading_the_record() {
+        let data = sample_chara(4);
+        let mut script = late_head(0, verified(Some(15)));
+        script.extend([None, finger(Some(1)), cleared(), enrolled(), size(4), Some(chunk(&data)), cleared_ok()]);
+        let mut port = FakePort::new(script);
+        let sends = port.sends.clone();
+        let (mut lines, mut at_release) = (Vec::new(), Vec::new());
+        identify_keep_late(
+            &mut port,
+            &Timeouts::DEFAULT,
+            &mut |p| {
+                if p == Prompt::Release {
+                    at_release.push(sends.get())
+                }
+            },
+            &mut |l| lines.push(l),
+        );
+        assert_eq!(lines.last().map(String::as_str), Some("VEIN KEEP DONE"));
+        // 「離して」は ENROLL の途中 (最後に送ったのが ENROLL) の 1 回だけで、READ_ENROLL はその後ろ
+        assert_eq!(at_release.len(), 1);
+        let cmds: Vec<u8> = port.sent.iter().map(|p| p[3]).collect();
+        assert_eq!(cmds[at_release[0] - 1], CMD_ENROLL);
+        let read = cmds.iter().position(|&c| c == CMD_READ_ENROLL).unwrap();
+        assert!(read >= at_release[0]);
+    }
+
+    #[test]
+    fn identify_keep_late_does_not_release_twice_when_the_capture_fails_after_release() {
+        let mut failed = reply(CMD_ENROLL, &[XG_INPUT_FINGER]);
+        failed.extend(reply(CMD_ENROLL, &[XG_RELEASE_FINGER]));
+        failed.extend(reply(CMD_ENROLL, &[XG_ERR_FAIL, XG_ERR_VERIFY]));
+        let mut script = late_head(1, verified(Some(15)));
+        script.extend([None, finger(Some(1)), cleared(), Some(failed), cleared_ok(), set_dup_ok()]);
+        let (lines, prompts, cmds) = late(script);
+        assert_eq!(lines.last().unwrap(), &format!("VEIN KEEP SKIP {}", VeinError::Rc(XG_ERR_VERIFY).reason()));
+        assert_eq!(prompts.iter().filter(|&&p| p == Prompt::Release).count(), 1);
+        assert!(!cmds.contains(&CMD_READ_ENROLL));
+        assert_eq!(&cmds[cmds.len() - 2..], &[CMD_CLEAR_ENROLL, CMD_SET_DUP_CHECK]);
     }
 
     #[test]
