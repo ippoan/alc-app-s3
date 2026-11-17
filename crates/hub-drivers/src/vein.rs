@@ -267,7 +267,11 @@ pub fn start(
                     // 登録の置き直しは「もう一度置いてください」。
                     // どれもモジュールの途中経過 (置き直しは指が離れたこと) でしか分からないので端末が鳴らす
                     let sound = match p {
-                        proto::Prompt::Release => Some(Sound::VeinRelease),
+                        proto::Prompt::Release => {
+                            // 「離して」を鳴らした時刻をログに残す (照合の結果からピまでの秒数を実測するため。生体データなし)
+                            alc_hub_common::evtlog::emit("EVT VEIN RELEASE");
+                            Some(Sound::VeinRelease)
+                        }
                         proto::Prompt::Retry(code) => {
                             // 画面が「もう一度置いてください」を出し、次の指を待つ時間を延ばすのに使う。
                             // 音だけだと、撮り直しの指待ち (最長 15 秒) の間に画面が何も言えない。
