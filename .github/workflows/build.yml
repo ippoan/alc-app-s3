@@ -1011,9 +1011,25 @@ jobs:
             echo " ($target)"
           done
 
+  # FP001S 顔・手のひら静脈端末 (RP2354A、ippoan/vein-base の pcb/fp001s_test_board t3)。ESP のワークスペースとは
+  # 別ビルド (stable + thumbv8m、crates/fp001s-rp2354 が自前の [workspace] を持つ)。PR でも push でもコンパイルを担保する
+  fp001s-rp2354:
+    name: "Build (fp001s-rp2354)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust stable + thumbv8m
+        run: rustup toolchain install stable --profile minimal --target thumbv8m.main-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/fp001s-rp2354
+      - name: cargo build
+        working-directory: crates/fp001s-rp2354
+        run: cargo build --release --locked
+
   auto-merge:
     name: Auto Merge
-    needs: [coverage, check]
+    needs: [coverage, check, fp001s-rp2354]
     if: github.event_name == 'pull_request'
     uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
     with:

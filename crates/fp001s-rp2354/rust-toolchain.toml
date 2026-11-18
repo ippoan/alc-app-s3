@@ -1,0 +1,4 @@
+# RP2354A (Cortex-M33): the stable toolchain, not the repo root's `esp` one
+[toolchain]
+channel = "stable"
+targets = ["thumbv8m.main-none-eabihf"]

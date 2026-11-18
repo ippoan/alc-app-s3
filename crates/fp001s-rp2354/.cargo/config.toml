@@ -1,0 +1,9 @@
+# This crate is built on its own (it is not a member of the ESP workspace at the repo root):
+#   cd crates/fp001s-rp2354 && cargo build --release
+# The repo root's .cargo/config.toml targets xtensa; this one overrides it for this directory.
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+# BOOTSEL (hold the button / short TP1-TP2 at power-up), then:  picotool load -u -v -x -t elf <elf>
+runner = "picotool load -u -v -x -t elf"

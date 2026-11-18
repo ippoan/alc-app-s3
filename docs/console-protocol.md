@@ -67,6 +67,7 @@ DEVICE <kind> VER=<version> [BOARD=<board>] FLAVOR=<flavor>
 | `timecard` | NFC タイムカード端末 |
 | `alarm` | 警告デバイス (Atom VoiceS3R) |
 | `bp-station` | 血圧計用 PC の測定台 (`atoms3-nfc` の VoiceS3R build) |
+| `fp001s` | FP001S 顔・手のひら静脈端末 (RP2354A、`crates/fp001s-rp2354`。ESP ではない。USB は CDC 2 本: コンソールと FP001S の UART そのまま) |
 
 `BOARD=` は板種 (`cores3` / `cores3se`) が複数ある機種だけが足す。今のところ
 CoreS3 だけ (`crates/hub-core/src/board.rs`)。板種は起動後に変わらないので、
@@ -89,6 +90,7 @@ CoreS3 だけ (`crates/hub-core/src/board.rs`)。板種は起動後に変わら�
 | `timecard-vein-gps` | 同 `vein-gps` feature (`vein` の PORT.A を Unit GPS にし、Unit NFC を中継基板の J6 (SDA=G38 / SCL=G39) へ移した版。NMEA を受けると `EVT GPS FIX …` / `EVT GPS NOFIX …` を出す) |
 | `alarm` | 警告デバイス |
 | `bp-station` | 測定台 |
+| `fp001s` | FP001S 端末 (`crates/fp001s-rp2354`) |
 
 `cores3-dev` は `lan` と `mem-hud` の両方を持つビルドだけが名乗る (`mem-hud` で `lan` 無しは
 `cores3-wifi`)。**この語が入る前の開発用ビルドが入っている機体は、新しい版を入れるまで
