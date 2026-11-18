@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "executor-interrupt"] }
-embassy-rp = { version = "0.10", features = ["unstable-pac", "time-driver", "critical-section-impl", "rp235xa", "binary-info"] }
+embassy-rp = { version = "0.10", features = ["unstable-pac", "time-driver", "critical-section-impl", "rp235xa", "binary-info", "imagedef-none"] }
 embassy-usb = "0.6"
 embassy-time = "0.5"
 embassy-futures = "0.1"

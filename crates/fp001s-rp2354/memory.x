@@ -4,7 +4,7 @@ MEMORY {
      *
      * 2 MiB is a safe default here, although a Pico 2 has 4 MiB.
      */
-    FLASH : ORIGIN = 0x10000000, LENGTH = 2044K  /* the last 4 KiB (0x101FF000) keeps the device key, src/key.rs */
+    FLASH : ORIGIN = 0x10000000, LENGTH = 1016K  /* one A/B partition (src/ota.rs, partition_table.json); runs from either */
     /*
      * RAM consists of 8 banks, SRAM0-SRAM7, with a striped mapping.
      * This is usually good for performance, as it distributes load on

@@ -8,7 +8,8 @@
 use embassy_rp::flash::{Blocking, Flash, ERASE_SIZE};
 use embassy_rp::peripherals::FLASH;
 
-/// RP2354A: 2 MiB inside; the Pico 2 (4 MiB) uses the same offset (memory.x stops the program short of it).
+/// RP2354A: 2 MiB inside; the Pico 2 (4 MiB) uses the same offset. The sector is outside the A / B partitions
+/// (src/ota.rs, partition_table.json), so a serial OTA never touches it.
 pub const FLASH_SIZE: usize = 2 * 1024 * 1024;
 pub const KEY_OFFSET: u32 = (FLASH_SIZE - ERASE_SIZE) as u32;
 const MAGIC: [u8; 4] = *b"FPK1";

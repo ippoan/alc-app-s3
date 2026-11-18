@@ -2,7 +2,7 @@
 //!
 //! The words and the reply formats are docs/console-protocol.md's (the 正本), the same as the other kinds:
 //! `PING` -> `PONG`, `DEVICE` -> `DEVICE fp001s VER=<v> FLAVOR=fp001s`, `AUTH KEYGEN [FORCE]` / `AUTH PUBKEY` /
-//! `AUTH SIGN <nonce>` as alc-hub-core's `alarm_key` (ed25519, base64url without padding, the nonce is 32 lowercase
+//! `AUTH SIGN <nonce>` as alc-hub-core's `alarm_key`, `OTA CONFIRM` / `OTA SERIAL <size> <flavor>` as §6 (ed25519, base64url without padding, the nonce is 32 lowercase
 //! hex characters and is signed as is). Anything else: `ERR UNSUPPORTED (fp001s)`.
 //!
 //! ★ `alarm_key` is std (alc-hub-core); this is a no_std copy of the few functions this kind needs. Keep the two
@@ -25,6 +25,10 @@ pub enum Cmd<'a> {
     Keygen { force: bool },
     Pubkey,
     Sign(&'a str),
+    /// `OTA CONFIRM` (§6 0. / 7.)
+    OtaConfirm,
+    /// `OTA SERIAL <size> <flavor>` (§6 1.); None for a size that is not a number
+    OtaSerial(Option<u32>, &'a str),
     Unknown,
 }
 
@@ -37,6 +41,8 @@ pub fn parse(line: &str) -> Cmd<'_> {
         (Some("AUTH"), Some("KEYGEN"), Some("FORCE"), None) => Cmd::Keygen { force: true },
         (Some("AUTH"), Some("PUBKEY"), None, _) => Cmd::Pubkey,
         (Some("AUTH"), Some("SIGN"), Some(n), None) => Cmd::Sign(n),
+        (Some("OTA"), Some("CONFIRM"), None, _) => Cmd::OtaConfirm,
+        (Some("OTA"), Some("SERIAL"), Some(size), Some(flavor)) if w.next().is_none() => Cmd::OtaSerial(size.parse().ok(), flavor),
         _ => Cmd::Unknown,
     }
 }
@@ -85,6 +91,12 @@ pub fn sig_line(seed: &[u8; 32], nonce: &str) -> Option<Line> {
     let _ = l.push(' ');
     b64url(&mut l, &key.sign(nonce.as_bytes()).to_bytes());
     Some(l)
+}
+
+pub fn fmt(args: core::fmt::Arguments<'_>) -> Line {
+    let mut l = Line::new();
+    let _ = l.write_fmt(args);
+    l
 }
 
 pub fn line(s: &str) -> Line {
