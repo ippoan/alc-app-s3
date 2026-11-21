@@ -5,5 +5,5 @@
 target = "thumbv8m.main-none-eabihf"
 
 [target.thumbv8m.main-none-eabihf]
-# BOOTSEL (hold the button / short TP1-TP2 at power-up), then:  picotool load -u -v -x -t elf <elf>
-runner = "picotool load -u -v -x -t elf"
+# BOOTSEL (hold the button / short TP1-TP2 at power-up), then: ./run.sh <elf> (the bought form, bought.py)
+runner = "./run.sh"

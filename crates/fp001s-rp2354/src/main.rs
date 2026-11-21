@@ -139,6 +139,9 @@ impl Console {
             return Ok(());
         }
         self.told = true;
+        // the host's tty may still be cooked (Linux echoes until it goes raw) and pyserial flushes input on open:
+        // a line sent at the very connection is echoed back as a command and lost to the reader
+        Timer::after_millis(200).await;
         let slot = ota::label(self.boot.partition);
         if PENDING.load(Ordering::Relaxed) {
             let l = proto::fmt(format_args!("EVT OTA_SERIAL_PENDING slot={slot} timeout_ms={}", ota::CONFIRM_TIMEOUT_MS));
@@ -238,7 +241,7 @@ impl Console {
         }
         self.reply("OTA OK").await?;
         Timer::after_millis(100).await; // let the reply out
-        ota::reboot_into(target, 500)
+        ota::reboot_into(self.boot.partition, target, 500)
     }
 }
 

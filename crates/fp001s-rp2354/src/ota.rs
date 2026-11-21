@@ -11,7 +11,10 @@
 //! The image is "try before you buy" (TBYB, its IMAGE_DEF in main.rs): after `OTA OK` the board reboots into the
 //! new partition on trial. `OTA CONFIRM` buys it (`explicit_buy`); without one in 10 minutes the app stops feeding
 //! the watchdog, the ROM drops the unbought image and boots the other partition again, which then reports
-//! `EVT OTA_ROLLED_BACK reason=serial_unconfirmed`. An image that dies before it can feed the watchdog falls back
+//! `EVT OTA_ROLLED_BACK reason=serial_unconfirmed`. The ROM leaves no sign of a fallback (its OTHER_ERASED flag is
+//! the version-downgrade erase on a buy, not this), so before the trial reboot we note the partition we leave in the
+//! watchdog's scratch 0/1 (the ROM keeps 4-7 for itself; a watchdog reset keeps them, a power cut does not — a trial
+//! cut off by unplugging falls back silently). An image that dies before it can feed the watchdog falls back
 //! the same way (the ROM arms the watchdog for a TBYB boot), unlike the ESP kinds (console-protocol.md 既知の限界).
 
 use embassy_rp::rom_data;
@@ -27,7 +30,8 @@ pub const CONFIRM_TIMEOUT_MS: u64 = 600_000;
 
 const SYS_INFO_BOOT_INFO: u32 = 0x0040;
 const TBYB_BUY_PENDING: u32 = 0x01;
-const TBYB_OTHER_ERASED: u32 = 0x02;
+/// watchdog scratch 0 while a trial is out: "TRIA"; scratch 1: the partition left for it
+const TRIAL_MAGIC: u32 = 0x5452_4941;
 const REBOOT_TYPE_FLASH_UPDATE: u32 = 0x0004;
 const REBOOT_NO_RETURN: u32 = 0x0100;
 
@@ -47,12 +51,15 @@ pub fn boot_info() -> BootInfo {
         return BootInfo { partition: -1, buy_pending: false, rolled_back: false };
     }
     let w = buf[1]; // diagnostic partition | boot type << 8 | partition << 16 | tbyb_and_update_info << 24
-    let tbyb = w >> 24;
-    BootInfo {
-        partition: ((w >> 16) & 0xFF) as u8 as i8,
-        buy_pending: tbyb & TBYB_BUY_PENDING != 0,
-        rolled_back: tbyb & TBYB_OTHER_ERASED != 0,
+    let partition = ((w >> 16) & 0xFF) as u8 as i8;
+    let buy_pending = (w >> 24) & TBYB_BUY_PENDING != 0;
+    let wd = embassy_rp::pac::WATCHDOG;
+    let rolled_back =
+        !buy_pending && wd.scratch0().read() == TRIAL_MAGIC && wd.scratch1().read() == partition as u8 as u32;
+    if !buy_pending {
+        wd.scratch0().write_value(0); // the trial is over either way: bought (we are it) or fallen back (we are this)
     }
+    BootInfo { partition, buy_pending, rolled_back }
 }
 
 /// The partition an update goes to: the one we are not running from. None without a partition table (an image
@@ -81,11 +88,18 @@ pub fn label(partition: i8) -> &'static str {
 
 /// Buy the running trial image (the ROM rewrites its first sector; `work` is its 4 KiB work area).
 pub fn buy(work: &mut [u8; CHUNK]) -> bool {
-    unsafe { rom_data::explicit_buy(work.as_mut_ptr(), CHUNK as u32) == 0 }
+    let ok = unsafe { rom_data::explicit_buy(work.as_mut_ptr(), CHUNK as u32) == 0 };
+    if ok {
+        embassy_rp::pac::WATCHDOG.scratch0().write_value(0);
+    }
+    ok
 }
 
-/// Reboot into the freshly written partition (on trial), after `delay_ms`.
-pub fn reboot_into(partition_start: u32, delay_ms: u32) -> ! {
+/// Reboot into the freshly written partition (on trial), after `delay_ms`; `from` is the partition we run from.
+pub fn reboot_into(from: i8, partition_start: u32, delay_ms: u32) -> ! {
+    let wd = embassy_rp::pac::WATCHDOG;
+    wd.scratch1().write_value(from as u8 as u32);
+    wd.scratch0().write_value(TRIAL_MAGIC);
     rom_data::reboot(REBOOT_TYPE_FLASH_UPDATE | REBOOT_NO_RETURN, delay_ms, XIP_BASE + partition_start, 0);
     loop {
         cortex_m::asm::wfi();

@@ -7,6 +7,12 @@
 
 use embassy_rp::flash::{Blocking, Flash, ERASE_SIZE};
 use embassy_rp::peripherals::FLASH;
+use embassy_rp::rom_data;
+
+/// `flash_op` flags (bootrom_constants.h): read, secure, storage (physical) addresses.
+/// Storage addresses are still written XIP_BASE + offset (the ROM subtracts it, varm_flash_permissions.h).
+const CFLASH_READ_SECURE_STORAGE: u32 = (2 << 16) | (1 << 8);
+const XIP_BASE: u32 = 0x1000_0000;
 
 /// RP2354A: 2 MiB inside; the Pico 2 (4 MiB) uses the same offset. The sector is outside the A / B partitions
 /// (src/ota.rs, partition_table.json), so a serial OTA never touches it.
@@ -16,9 +22,14 @@ const MAGIC: [u8; 4] = *b"FPK1";
 
 pub type KeyFlash = Flash<'static, FLASH, Blocking, FLASH_SIZE>;
 
-pub fn load(flash: &mut KeyFlash) -> Option<[u8; 32]> {
+/// Read through the ROM by physical address, not the XIP window: booted from a partition, the ROM maps only that
+/// partition at 0x1000_0000 (QMI ATRANS), so an XIP read of the last sector is out of the window and bus-faults.
+pub fn load(_flash: &mut KeyFlash) -> Option<[u8; 32]> {
     let mut buf = [0u8; 36];
-    flash.blocking_read(KEY_OFFSET, &mut buf).ok()?;
+    let rc = unsafe { rom_data::flash_op(CFLASH_READ_SECURE_STORAGE, XIP_BASE + KEY_OFFSET, buf.len() as u32, buf.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
     if buf[..4] != MAGIC {
         return None;
     }
