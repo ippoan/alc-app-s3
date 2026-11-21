@@ -4,10 +4,11 @@ FP001S(Grow の顔・手のひら静脈モジュール)端末のファーム。R
 
 - USB は CDC 2 本(composite): **1 本目 = コンソール**(`docs/console-protocol.md`。`PING` / `DEVICE` / `AUTH KEYGEN [FORCE]` / `AUTH PUBKEY` / `AUTH SIGN <nonce>` / `OTA SERIAL <size> fp001s` / `OTA CONFIRM`)、**2 本目 = FP001S の UART そのまま**(115200 8N1、`EF AA` のフレームを両方向に素通し)。
 - UART0: GP0 TX → FP001S の RXD(黄)、GP1 RX ← TXD(黒)。
-- 鍵は VoiceS3R(`alarm`)と同じ: `AUTH KEYGEN` で機体が ed25519 の鍵対を作り、seed はフラッシュの最後の 4 KiB に置く(外へは出さない)。応答の形は `alc_hub_core::alarm_key` と 1 文字も違わない(no_std の写し、`src/proto.rs`)。Secure Boot と OTP は使わない(取り消せない操作は無い)。
+- 鍵は VoiceS3R(`alarm`)と同じ: `AUTH KEYGEN` で機体が ed25519 の鍵対を作り、seed はフラッシュの最後の 4 KiB に置く(外へは出さない)。応答の形は `alc_hub_core::alarm_key` と 1 文字も違わない(no_std 版は `crates/alarm-key-nostd`、t4 の鍵 `crates/fp001s-key-ch32` と共有)。Secure Boot と OTP は使わない(取り消せない操作は無い)。
 - シリアル OTA は §6 と同じ行(`OTA READY 4096 RX=4096` → 4096 B ずつ `OTA ACK <累計>` → `OTA OK`)。書き先は動いていない方の区画(A / B、`partition_table.json`)。イメージは「試してから確定」(TBYB): 再起動後に `OTA CONFIRM` が来れば ROM の `explicit_buy` で確定、10 分来なければウォッチドッグを止めて ROM に前の区画へ戻させ、戻った側が `EVT OTA_ROLLED_BACK slot=<A|B> reason=serial_unconfirmed` を出す。起動直後に落ちるイメージも同じく戻る(ESP の機種の「既知の限界」は無い)。送るのは ELF のフラットなバイナリ(`llvm-objcopy -O binary`)。
 - 「戻った」ことは ROM が教えてくれない(`tbyb_and_update_info` の OTHER_ERASED は確定時の版下げ消去の印で別物)。なので、試しの再起動の前に、離れる区画をウォッチドッグの scratch 0/1 に書いておく。ウォッチドッグのリセットでは残り、電源を切ると消える(試し中に抜くと、黙って前の区画に戻る)。
 - 2026-11-21 に Pico 2 で確かめた: 区画表、A への書き込み、`PING` / `DEVICE` / `AUTH`(署名は ed25519 で検証)、電源を入れ直しても鍵が残ること、シリアル OTA の A⇄B と `OTA CONFIRM`。
+- その後 ed25519 の実装を ed25519-dalek から salty に替えた(`crates/alarm-key-nostd`、t4 の CH32V203 の 32〜64 KiB の flash に収めるため)。RFC 8032 の署名は決定的なので、同じ鍵・nonce の行は前と 1 バイトも違わない(hub-core と突き合わせるホストテスト)。Pico 2 での再確認はまだ。
 
 ## 工場での書き込み(1 回だけ)
 

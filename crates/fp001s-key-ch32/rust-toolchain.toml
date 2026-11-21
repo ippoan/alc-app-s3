@@ -1,0 +1,4 @@
+# CH32V203 (QingKe V4B, RV32IMAC): the stable toolchain, not the repo root's `esp` one
+[toolchain]
+channel = "stable"
+targets = ["riscv32imac-unknown-none-elf"]

@@ -1,0 +1,10 @@
+# This crate is built on its own (it is not a member of the ESP workspace at the repo root):
+#   cd crates/fp001s-key-ch32 && cargo build --release
+# The repo root's .cargo/config.toml targets xtensa; this one overrides it for this directory.
+[build]
+target = "riscv32imac-unknown-none-elf"
+
+[target.riscv32imac-unknown-none-elf]
+# SWD (the board's SWDIO / SWCLK test points) with a WCH-LinkE: wlink flash <elf> (README.md)
+runner = "wlink flash"
+rustflags = ["-C", "link-arg=-Tlink.x"]

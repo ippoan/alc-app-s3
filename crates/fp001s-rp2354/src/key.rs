@@ -3,7 +3,7 @@
 //! 2026-11-18): nothing here is irreversible. A reflash that wipes the sector loses the key; `AUTH KEYGEN` makes a
 //! new one and the host registers its `AUTH PUBKEY` again.
 //!
-//! Sector layout: MAGIC (4) | seed (32) | the rest 0xFF. Anything else reads as "no key".
+//! Sector layout: MAGIC (4) | seed (32) | the rest 0xFF (alarm_key_nostd::record). Anything else reads as "no key".
 
 use embassy_rp::flash::{Blocking, Flash, ERASE_SIZE};
 use embassy_rp::peripherals::FLASH;
@@ -18,30 +18,23 @@ const XIP_BASE: u32 = 0x1000_0000;
 /// (src/ota.rs, partition_table.json), so a serial OTA never touches it.
 pub const FLASH_SIZE: usize = 2 * 1024 * 1024;
 pub const KEY_OFFSET: u32 = (FLASH_SIZE - ERASE_SIZE) as u32;
-const MAGIC: [u8; 4] = *b"FPK1";
 
 pub type KeyFlash = Flash<'static, FLASH, Blocking, FLASH_SIZE>;
 
 /// Read through the ROM by physical address, not the XIP window: booted from a partition, the ROM maps only that
 /// partition at 0x1000_0000 (QMI ATRANS), so an XIP read of the last sector is out of the window and bus-faults.
 pub fn load(_flash: &mut KeyFlash) -> Option<[u8; 32]> {
-    let mut buf = [0u8; 36];
+    let mut buf = [0u8; alarm_key_nostd::RECORD_LEN];
     let rc = unsafe { rom_data::flash_op(CFLASH_READ_SECURE_STORAGE, XIP_BASE + KEY_OFFSET, buf.len() as u32, buf.as_mut_ptr()) };
     if rc != 0 {
         return None;
     }
-    if buf[..4] != MAGIC {
-        return None;
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&buf[4..]);
-    Some(seed)
+    alarm_key_nostd::parse_record(&buf)
 }
 
 pub fn store(flash: &mut KeyFlash, seed: &[u8; 32]) -> bool {
     let mut buf = [0xFFu8; 256]; // one flash page
-    buf[..4].copy_from_slice(&MAGIC);
-    buf[4..36].copy_from_slice(seed);
+    buf[..alarm_key_nostd::RECORD_LEN].copy_from_slice(&alarm_key_nostd::record(seed));
     flash.blocking_erase(KEY_OFFSET, KEY_OFFSET + ERASE_SIZE as u32).is_ok()
         && flash.blocking_write(KEY_OFFSET, &buf).is_ok()
         && load(flash).as_ref() == Some(seed)

@@ -1,0 +1,3 @@
+# Host tests: the stable toolchain, not the repo root's `esp` one
+[toolchain]
+channel = "stable"

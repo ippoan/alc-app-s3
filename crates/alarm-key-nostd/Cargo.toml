@@ -1,0 +1,28 @@
+[package]
+name = "alarm-key-nostd"
+version = "0.1.0"
+edition = "2021"
+description = "alc-hub-core の alarm_key (AUTH の応答行) の no_std 版。ESP 以外の機種 (fp001s-rp2354 / fp001s-key-ch32) が共有する"
+publish = false
+
+# Not a member of the ESP workspace at the repo root (no esp toolchain here): its own workspace, host tests only.
+#   cd crates/alarm-key-nostd && cargo test --all-features --target x86_64-unknown-linux-gnu
+[workspace]
+
+[features]
+# The seed's entropy source checks (SP 800-90B health tests) + SHA-256 conditioning, for a board without a TRNG
+entropy = ["dep:sha2"]
+
+[dependencies]
+# ed25519 for microcontrollers (tweetnacl's field off Cortex-M4). RFC 8032 signatures are deterministic, so the bytes
+# are alc-hub-core's ed25519-dalek's (tests/same_as_hub_core.rs). Not ed25519-dalek / ed25519-compact: on the CH32V203
+# (riscv32imac, opt-level z) the key's firmware is 58 / 66 KiB with them, 41 KiB with salty.
+# slow-motion: tweetnacl's field on every target. Without it salty picks its Cortex-M4 assembly on thumbv8m.main
+# (fp001s-rp2354), a path the host tests never run
+salty = { version = "0.3", default-features = false, features = ["slow-motion"] }
+heapless = "0.9"
+sha2 = { version = "0.10", default-features = false, optional = true }
+
+[dev-dependencies]
+# the 正本: the lines must be the same, character for character (tests/same_as_hub_core.rs)
+alc-hub-core = { path = "../hub-core" }

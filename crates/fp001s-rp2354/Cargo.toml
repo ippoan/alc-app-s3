@@ -22,8 +22,8 @@ panic-halt = "1"
 static_cell = "2"
 portable-atomic = { version = "1.5", features = ["critical-section"] }
 heapless = "0.9"
-# the same as alc-hub-core (alarm_key): no alloc here
-ed25519-dalek = { version = "2", default-features = false }
+# AUTH's lines (alc-hub-core's alarm_key, no_std; shared with fp001s-key-ch32)
+alarm-key-nostd = { path = "../alarm-key-nostd" }
 
 [profile.release]
 debug = 2

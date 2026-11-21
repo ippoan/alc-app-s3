@@ -1027,9 +1027,48 @@ jobs:
         working-directory: crates/fp001s-rp2354
         run: cargo build --release --locked
 
+  # FP001S 端末 t4 の鍵専用 CH32V203 (ippoan/vein-base の pcb/fp001s_test_board)。fp001s-rp2354 と同じく ESP の
+  # ワークスペースとは別ビルド (stable + riscv32imac、crates/fp001s-key-ch32 が自前の [workspace] を持つ)
+  fp001s-key-ch32:
+    name: "Build (fp001s-key-ch32)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust stable + riscv32imac
+        run: rustup toolchain install stable --profile minimal --target riscv32imac-unknown-none-elf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/fp001s-key-ch32
+      - name: cargo build
+        working-directory: crates/fp001s-key-ch32
+        run: cargo build --release --locked
+
+  # AUTH の応答行の no_std 版 (fp001s-rp2354 / fp001s-key-ch32 が共有)。hub-core の alarm_key と行が 1 文字も
+  # 違わないことをホストで確かめる。dev-dependency の hub-core が vein-match (private) を引くので coverage と同じ認証
+  alarm-key-nostd:
+    name: "Test (alarm-key-nostd)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ippoan/ci-workflows/.github/actions/private-git-auth@main
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          repositories: vein-match
+      - name: Rust stable
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/alarm-key-nostd
+      # --locked にしない: この Cargo.lock は dev-dependency の hub-core の依存も固定していて、hub-core (ESP の
+      # ワークスペース) に依存を足すたびに古くなる。firmware 側 (fp001s-*) の build は --locked のまま
+      - name: cargo test
+        working-directory: crates/alarm-key-nostd
+        run: cargo test --all-features --target x86_64-unknown-linux-gnu
+
   auto-merge:
     name: Auto Merge
-    needs: [coverage, check, fp001s-rp2354]
+    needs: [coverage, check, fp001s-rp2354, fp001s-key-ch32, alarm-key-nostd]
     if: github.event_name == 'pull_request'
     uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
     with:

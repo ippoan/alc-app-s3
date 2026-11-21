@@ -68,6 +68,7 @@ DEVICE <kind> VER=<version> [BOARD=<board>] FLAVOR=<flavor>
 | `alarm` | 警告デバイス (Atom VoiceS3R) |
 | `bp-station` | 血圧計用 PC の測定台 (`atoms3-nfc` の VoiceS3R build) |
 | `fp001s` | FP001S 顔・手のひら静脈端末 (RP2354A、`crates/fp001s-rp2354`。ESP ではない。USB は CDC 2 本: コンソールと FP001S の UART そのまま) |
+| `fp001s-key` | FP001S 端末 t4 の鍵専用 CH32V203 (`crates/fp001s-key-ch32`。ESP ではない。USB CDC 1 本で `PING` / `DEVICE` / `AUTH` だけ、FLAVOR も `fp001s-key`。FP001S の UART は CH340C で PC へ直結) |
 
 `BOARD=` は板種 (`cores3` / `cores3se`) が複数ある機種だけが足す。今のところ
 CoreS3 だけ (`crates/hub-core/src/board.rs`)。板種は起動後に変わらないので、

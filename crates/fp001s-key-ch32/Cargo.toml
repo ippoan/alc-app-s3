@@ -1,0 +1,36 @@
+[package]
+name = "alc-fp001s-key-ch32"
+version = "0.1.0"
+edition = "2021"
+description = "FP001S 端末 t4 (ippoan/vein-base の pcb/fp001s_test_board) の鍵専用 CH32V203: USB CDC のコンソールで AUTH だけに答える"
+publish = false
+
+# Not a member of the ESP workspace at the repo root (different target and toolchain): its own workspace.
+[workspace]
+
+[dependencies]
+# ch32-hal is not on crates.io (0.0.0 is a placeholder): pinned to a commit. Its USBD driver needs embassy-usb-driver
+# from embassy's git (the endpoint allocation API), so embassy-usb comes from the same rev.
+ch32-hal = { git = "https://github.com/ch32-rs/ch32-hal", rev = "f2be1bca8d8e0dc3892668afa7b558c6f2c1a19d", default-features = false, features = [
+    # 64 KiB flash / 20 KiB SRAM with the USBD on PA11 / PA12 (F8U6; G8R6 / K8T6 are the same firmware). Not the
+    # F6P6 (32 KiB): ed25519 + USB CDC is ~41 KiB (README.md). Not the F8P6: its USB is the USBFS on PB6 / PB7.
+    # Another part also means memory.x and src/key.rs's FLASH_SIZE
+    "ch32v203f8u6",
+    "rt",
+] }
+embassy-executor = { version = "0.10", features = ["platform-spin", "executor-thread"] }
+embassy-usb = { git = "https://github.com/embassy-rs/embassy", rev = "e867f1210417a95be666d965a3567b3b2bed3bb9", default-features = false, features = ["device", "class-cdc-acm"] }
+embassy-futures = "0.1.2"
+qingke-rt = "0.8"
+qingke = "0.8"
+panic-halt = "1"
+heapless = "0.9"
+alarm-key-nostd = { path = "../alarm-key-nostd", features = ["entropy"] }
+# ed25519 hashes with SHA-512: the compact software backend saves ~12 KiB of the 32 KiB flash
+sha2 = { version = "0.10", default-features = false, features = ["force-soft-compact"] }
+
+[profile.release]
+debug = 2
+lto = true
+opt-level = "z"
+codegen-units = 1
