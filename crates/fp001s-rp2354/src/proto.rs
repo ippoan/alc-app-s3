@@ -29,6 +29,8 @@ pub enum Cmd<'a> {
     OtaConfirm,
     /// `OTA SERIAL <size> <flavor>` (§6 1.); None for a size that is not a number
     OtaSerial(Option<u32>, &'a str),
+    /// `IR`: the module's infrared proximity sensor (FP008 manual ch. 7), the latest heartbeat
+    Ir,
     Unknown,
 }
 
@@ -42,6 +44,7 @@ pub fn parse(line: &str) -> Cmd<'_> {
         (Some("AUTH"), Some("PUBKEY"), None, _) => Cmd::Pubkey,
         (Some("AUTH"), Some("SIGN"), Some(n), None) => Cmd::Sign(n),
         (Some("OTA"), Some("CONFIRM"), None, _) => Cmd::OtaConfirm,
+        (Some("IR"), None, ..) => Cmd::Ir,
         (Some("OTA"), Some("SERIAL"), Some(size), Some(flavor)) if w.next().is_none() => Cmd::OtaSerial(size.parse().ok(), flavor),
         _ => Cmd::Unknown,
     }
@@ -91,6 +94,24 @@ pub fn sig_line(seed: &[u8; 32], nonce: &str) -> Option<Line> {
     let _ = l.push(' ');
     b64url(&mut l, &key.sign(nonce.as_bytes()).to_bytes());
     Some(l)
+}
+
+/// One heartbeat of the infrared sensor's own serial port (FP008 manual ch. 7, 9600 8N1): infrared value (2) +
+/// trigger threshold (2) + emission current setting (1), 5 bytes with no header; one every ~0.5 s (0.128 s while
+/// something is sensed). The manual doesn't say the byte order: big-endian is taken, and RAW= carries the bytes.
+pub const IR_LEN: usize = 5;
+
+/// `IR VALUE=<n> THRESHOLD=<n> CURRENT=<n> AGE_MS=<ms> IRQ=<0|1> RAW=<10 hex>`, or `IR NONE IRQ=<0|1>` before the
+/// first heartbeat. IRQ is the module's pin 5 (High while the sensor is on: value >= threshold).
+pub fn ir_line(hb: Option<([u8; IR_LEN], u64)>, irq: bool) -> Line {
+    let irq = u8::from(irq);
+    let Some((b, age_ms)) = hb else { return fmt(format_args!("IR NONE IRQ={irq}")) };
+    let value = u16::from_be_bytes([b[0], b[1]]);
+    let threshold = u16::from_be_bytes([b[2], b[3]]);
+    fmt(format_args!(
+        "IR VALUE={value} THRESHOLD={threshold} CURRENT={} AGE_MS={age_ms} IRQ={irq} RAW={:02X}{:02X}{:02X}{:02X}{:02X}",
+        b[4], b[0], b[1], b[2], b[3], b[4]
+    ))
 }
 
 pub fn fmt(args: core::fmt::Arguments<'_>) -> Line {

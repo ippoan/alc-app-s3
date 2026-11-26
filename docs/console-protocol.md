@@ -67,7 +67,7 @@ DEVICE <kind> VER=<version> [BOARD=<board>] FLAVOR=<flavor>
 | `timecard` | NFC タイムカード端末 |
 | `alarm` | 警告デバイス (Atom VoiceS3R) |
 | `bp-station` | 血圧計用 PC の測定台 (`atoms3-nfc` の VoiceS3R build) |
-| `fp001s` | FP001S 顔・手のひら静脈端末 (RP2354A、`crates/fp001s-rp2354`。ESP ではない。USB は CDC 2 本: コンソールと FP001S の UART そのまま) |
+| `fp001s` | FP001S 顔・手のひら静脈端末 (RP2354A、`crates/fp001s-rp2354`。ESP ではない。USB は CDC 2 本: コンソールと FP001S の UART そのまま)。FP008 でも同じファーム。コンソールの `IR` で FP008 の赤外線近接センサーの最新の値を返す: `IR VALUE=<n> THRESHOLD=<n> CURRENT=<n> AGE_MS=<ms> IRQ=<0\|1> RAW=<10 桁の 16 進>`、心拍がまだ無ければ `IR NONE IRQ=<0\|1>` (センサーの別ポートは 9600 の 5 バイト、バイト順はマニュアルに無く big-endian とみた。IRQ はモジュールの 5 番) |
 
 `BOARD=` は板種 (`cores3` / `cores3se`) が複数ある機種だけが足す。今のところ
 CoreS3 だけ (`crates/hub-core/src/board.rs`)。板種は起動後に変わらないので、

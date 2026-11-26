@@ -5,6 +5,8 @@
 //!   - interface 0 = the console (docs/console-protocol.md: `PING`, `DEVICE`, `AUTH KEYGEN|PUBKEY|SIGN`,
 //!     `OTA SERIAL|CONFIRM` (src/ota.rs))
 //!   - interface 1 = the FP001S's UART as is (115200 8N1, the module's EF AA frames both ways, not parsed here)
+//! FP008 only: its infrared proximity sensor's own serial port (manual ch. 7, the 4 pads by the 8-pin connector, 9600
+//! 8N1, TX only is wired) on UART1 RX = GP5, and its IRQ (connector pin 5) on GP2; the console's `IR` reads both.
 //! The module's camera (UVC) is the other port of the board's hub, not this chip's.
 //!
 //! The device key (src/key.rs) is the VoiceS3R's way: made on the board, kept in flash, never sent out; no Secure
@@ -20,10 +22,11 @@ use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_rp::bind_interrupts;
 use embassy_rp::flash::Flash;
-use embassy_rp::peripherals::{TRNG, UART0, USB};
+use embassy_rp::gpio::{Input, Pull};
+use embassy_rp::peripherals::{TRNG, UART0, UART1, USB};
 use embassy_rp::watchdog::Watchdog;
 use embassy_time::{with_timeout, Duration, Instant, Timer};
-use portable_atomic::{AtomicBool, Ordering};
+use portable_atomic::{AtomicBool, AtomicU64, Ordering};
 use embassy_rp::trng::Trng;
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, BufferedUartRx, BufferedUartTx, Config as UartConfig};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbIrq};
@@ -57,10 +60,55 @@ static PENDING: AtomicBool = AtomicBool::new(false);
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbIrq<USB>;
     UART0_IRQ => BufferedInterruptHandler<UART0>;
+    UART1_IRQ => BufferedInterruptHandler<UART1>;
     TRNG_IRQ => embassy_rp::trng::InterruptHandler<TRNG>;
 });
 
 type UsbDrv = Driver<'static, USB>;
+
+/// the infrared sensor's latest heartbeat: bit 63 = valid, bits 0..40 = its 5 bytes (big-endian); and when, in ticks
+static IR_HB: AtomicU64 = AtomicU64::new(0);
+static IR_AT: AtomicU64 = AtomicU64::new(0);
+
+/// UART1 RX (9600): the heartbeat has no header, so a packet is the bytes between two silences (one is >= 128 ms
+/// apart, a byte is ~1 ms); anything that isn't 5 bytes long is dropped
+#[embassy_executor::task]
+async fn ir_task(mut rx: BufferedUartRx) -> ! {
+    let mut pkt = [0u8; proto::IR_LEN];
+    let mut n = 0usize;
+    let mut buf = [0u8; 16];
+    loop {
+        match with_timeout(Duration::from_millis(20), rx.read(&mut buf)).await {
+            Ok(Ok(k)) => {
+                for &b in &buf[..k] {
+                    if n < pkt.len() {
+                        pkt[n] = b;
+                    }
+                    n = n.saturating_add(1);
+                }
+            }
+            Ok(Err(_)) => n = pkt.len() + 1, // a framing / break error: drop this packet
+            Err(_) => {
+                if n == proto::IR_LEN {
+                    let v = (1u64 << 63) | pkt.iter().fold(0u64, |a, &b| (a << 8) | u64::from(b));
+                    IR_AT.store(Instant::now().as_ticks(), Ordering::Relaxed);
+                    IR_HB.store(v, Ordering::Relaxed);
+                }
+                n = 0;
+            }
+        }
+    }
+}
+
+fn ir_latest() -> Option<([u8; proto::IR_LEN], u64)> {
+    let v = IR_HB.load(Ordering::Relaxed);
+    if v >> 63 == 0 {
+        return None;
+    }
+    let b = v.to_be_bytes();
+    let age = Instant::now().as_ticks().saturating_sub(IR_AT.load(Ordering::Relaxed));
+    Some(([b[3], b[4], b[5], b[6], b[7]], Duration::from_ticks(age).as_millis()))
+}
 
 #[embassy_executor::task]
 async fn usb_task(mut usb: UsbDevice<'static, UsbDrv>) -> ! {
@@ -124,6 +172,7 @@ struct Console {
     seed: Option<[u8; 32]>,
     boot: ota::BootInfo,
     told: bool,
+    irq: Input<'static>,
 }
 
 type UsbErr = embassy_usb::driver::EndpointError;
@@ -190,6 +239,7 @@ impl Console {
                 proto::fmt(format_args!("OTA CONFIRMED RX={}", ota::CHUNK))
             }
             proto::Cmd::OtaSerial(size, flavor) => return self.ota_serial(size, flavor).await,
+            proto::Cmd::Ir => proto::ir_line(ir_latest(), self.irq.is_high()),
             proto::Cmd::Unknown => proto::line("ERR UNSUPPORTED (fp001s)"),
         };
         self.reply(&reply).await
@@ -331,15 +381,23 @@ async fn main(spawner: Spawner) {
     let (uart_tx, uart_rx) = uart.split();
     let (usb_tx, usb_rx) = bridge.split();
 
+    static IR_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+    let mut ic = UartConfig::default();
+    ic.baudrate = 9_600;
+    let ir_rx = BufferedUartRx::new(p.UART1, Irqs, p.PIN_5, IR_BUF.init([0; 64]), ic);
+    // no pull: the RP2350's E9 (a pull-down latches the pin high); the FP008 drives it both ways
+    let irq = Input::new(p.PIN_2, Pull::None);
+
     let flash = Flash::new_blocking(p.FLASH);
     let trng = Trng::new(p.TRNG, Irqs, embassy_rp::trng::Config::default());
 
     spawner.spawn(usb_task(usb).unwrap());
     spawner.spawn(bridge_task(usb_tx, usb_rx, uart_tx, uart_rx).unwrap());
+    spawner.spawn(ir_task(ir_rx).unwrap());
     let boot = ota::boot_info();
     PENDING.store(boot.buy_pending, Ordering::Relaxed);
     let mut flash = flash;
     let seed = key::load(&mut flash);
     spawner.spawn(watchdog_task(Watchdog::new(p.WATCHDOG)).unwrap());
-    spawner.spawn(console_task(Console { class: console, flash, trng, seed, boot, told: false }).unwrap());
+    spawner.spawn(console_task(Console { class: console, flash, trng, seed, boot, told: false, irq }).unwrap());
 }

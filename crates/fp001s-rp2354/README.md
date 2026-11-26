@@ -4,6 +4,7 @@ FP001S(Grow の顔・手のひら静脈モジュール)端末のファーム。R
 
 - USB は CDC 2 本(composite): **1 本目 = コンソール**(`docs/console-protocol.md`。`PING` / `DEVICE` / `AUTH KEYGEN [FORCE]` / `AUTH PUBKEY` / `AUTH SIGN <nonce>` / `OTA SERIAL <size> fp001s` / `OTA CONFIRM`)、**2 本目 = FP001S の UART そのまま**(115200 8N1、`EF AA` のフレームを両方向に素通し)。
 - UART0: GP0 TX → FP001S の RXD(黄)、GP1 RX ← TXD(黒)。
+- FP008(命令は同じ EF AA)も同じファームで動く(2026-11-26 に Pico 2 で顔・手のひらの登録と照合を確認)。FP008 の赤外線近接センサー(マニュアル 7 章、8 ピンのコネクタ脇の 4 パッド 1 VCC 3.3V / 2 TX / 3 RX / 4 GND、9600 8N1)の TX を **GP5(UART1 RX)**へ、モジュールの IRQ(コネクタ 5 番)を **GP2** へ。コンソールの `IR` が最新の心拍(赤外線の値・しきい値・電流)と IRQ を返す(`docs/console-protocol.md` §2 の表)。パッドの VCC はつながない(センサーはコネクタ 6 番から給電)。本番の基板(vein-base の `pcb/fp008_board` f12)は GP2 だけで、パッドは引いていない。
 - 鍵は VoiceS3R(`alarm`)と同じ: `AUTH KEYGEN` で機体が ed25519 の鍵対を作り、seed はフラッシュの最後の 4 KiB に置く(外へは出さない)。応答の形は `alc_hub_core::alarm_key` と 1 文字も違わない(no_std の写し、`src/proto.rs`)。Secure Boot と OTP は使わない(取り消せない操作は無い)。
 - シリアル OTA は §6 と同じ行(`OTA READY 4096 RX=4096` → 4096 B ずつ `OTA ACK <累計>` → `OTA OK`)。書き先は動いていない方の区画(A / B、`partition_table.json`)。イメージは「試してから確定」(TBYB): 再起動後に `OTA CONFIRM` が来れば ROM の `explicit_buy` で確定、10 分来なければウォッチドッグを止めて ROM に前の区画へ戻させ、戻った側が `EVT OTA_ROLLED_BACK slot=<A|B> reason=serial_unconfirmed` を出す。起動直後に落ちるイメージも同じく戻る(ESP の機種の「既知の限界」は無い)。送るのは ELF のフラットなバイナリ(`llvm-objcopy -O binary`)。
 - 「戻った」ことは ROM が教えてくれない(`tbyb_and_update_info` の OTHER_ERASED は確定時の版下げ消去の印で別物)。なので、試しの再起動の前に、離れる区画をウォッチドッグの scratch 0/1 に書いておく。ウォッチドッグのリセットでは残り、電源を切ると消える(試し中に抜くと、黙って前の区画に戻る)。
