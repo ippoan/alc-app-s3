@@ -10,6 +10,18 @@ FP001S(Grow の顔・手のひら静脈モジュール)端末のファーム。R
 - 「戻った」ことは ROM が教えてくれない(`tbyb_and_update_info` の OTHER_ERASED は確定時の版下げ消去の印で別物)。なので、試しの再起動の前に、離れる区画をウォッチドッグの scratch 0/1 に書いておく。ウォッチドッグのリセットでは残り、電源を切ると消える(試し中に抜くと、黙って前の区画に戻る)。
 - 2026-11-21 に Pico 2 で確かめた: 区画表、A への書き込み、`PING` / `DEVICE` / `AUTH`(署名は ed25519 で検証)、電源を入れ直しても鍵が残ること、シリアル OTA の A⇄B と `OTA CONFIRM`。
 
+## Pico 2 での配線
+
+基板(RP2354A)と同じピン割り当て(UART0 = GP0 TX / GP1 RX、IRQ = GP2、FP008 の赤外線センサーの設定パッドを試すときだけ UART1 RX = GP5)。図は `docs/mkwiring.py <出力先>` で作り直せる。
+
+### FP008
+
+![FP008 と Pico 2 の配線](docs/wiring-fp008.svg)
+
+### FP001S
+
+![FP001S と Pico 2 の配線](docs/wiring-fp001s.svg)
+
 ## 工場での書き込み(1 回だけ)
 
 1. BOOTSEL で起動(Pico 2 はボタンを押しながら USB、t3 は TP1 と TP2 をショートして電源)
