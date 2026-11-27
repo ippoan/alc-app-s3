@@ -27,7 +27,7 @@ def pico(x, y, used):
             pos[n] = (px, ly)
     return '\n'.join(s)
 
-def diagram(title, sub, conn_name, rows, notes, used, fname):
+def diagram(title, sub, conn_name, rows, notes, used, fname, board=None):
     # rows: (fp_pin, fp_label, color, pico_pin or text, pico_label, dashed)
     W = 980; top = 110; rh = 44
     H = max(top + len(rows) * rh + 40 + len(notes) * 22 + 20, 470)
@@ -35,7 +35,7 @@ def diagram(title, sub, conn_name, rows, notes, used, fname):
          f'<rect width="{W}" height="{H}" fill="#fff"/>',
          f'<text x="24" y="40" font-size="24" font-weight="bold">{title}</text>',
          f'<text x="24" y="68" font-size="14" fill="#444">{sub}</text>',
-         pico(24, top, used)]
+         pico(24, top, used) if board is None else board(24, top)]
     xa, xb = 230, 620
     s.append(f'<text x="{xa}" y="{top-14}" font-size="14" font-weight="bold">{conn_name}</text>')
     s.append(f'<text x="{xb+20}" y="{top-14}" font-size="14" font-weight="bold">つなぐ先</text>')
@@ -81,3 +81,22 @@ diagram('FP001S ⇔ Pico 2', '色は FP001S の付属ケーブル(コネクタ�
      '・GND は FP001S・AMS1117・Pico 2 を全部共通に(忘れると UART が 0V)',
      '・人感センサー(IRQ)は FP001S には無い'],
  {1,2,38}, f'{out}/wiring-fp001s.svg')
+
+def pl2303(x, y):
+    return '\n'.join([f'<rect x="{x}" y="{y}" width="150" height="150" rx="8" fill="#37474f"/>',
+                      f'<text x="{x+75}" y="{y+60}" font-size="16" fill="#fff" text-anchor="middle" font-weight="bold">PL2303</text>',
+                      f'<text x="{x+75}" y="{y+82}" font-size="11" fill="#cfd8dc" text-anchor="middle">USB-TTL 3.3V</text>',
+                      f'<text x="{x+75}" y="{y+100}" font-size="11" fill="#cfd8dc" text-anchor="middle">→ PC(/dev/ttyUSB0)</text>'])
+
+diagram('FP008 と FP001S を同時に', 'FP008 は上の図のとおり Pico 2 へ。FP001S の UART は PL2303 の USB-TTL ケーブル(3.3V)で PC へ直接(ファームは変えない)。',
+        'FP001S(6 ピン)', [
+    (1, '赤 3.3V', '#d32f2f', 'AMS1117-3.3 の出力(PL2303 の赤 VCC はつながない)', '', False),
+    (2, '黒 TXD(出力)', '#222', 'PL2303 の RXD(白のことが多い)', '', False),
+    (3, '黄 RXD(入力)', '#fbc02d', 'PL2303 の TXD(緑のことが多い)', '', False),
+    (4, '緑 GND', '#43a047', 'PL2303 の GND(黒)と AMS1117 の GND', '', False),
+    (5, '青 D−', '#1e88e5', 'USB-C 変換基板の D−(カメラ)', '', True),
+    (6, '白 D+', '#9e9e9e', 'USB-C 変換基板の D+(カメラ)', '', True),
+ ], ['・PL2303 の線の色は製品のラベルで確かめる。115200 8N1',
+     '・FP001S は 400 mA 食うので PL2303 からは給電しない',
+     '・Pico 2 側(FP008)はそのまま: /dev/ttyACM1 が FP008、/dev/ttyUSB0 が FP001S'],
+ set(), f'{out}/wiring-dual.svg', board=pl2303)
