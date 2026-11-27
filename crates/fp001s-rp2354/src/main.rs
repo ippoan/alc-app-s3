@@ -7,6 +7,9 @@
 //!   - interface 1 = the FP001S's UART as is (115200 8N1, the module's EF AA frames both ways, not parsed here)
 //! FP008 only: its infrared proximity sensor's own serial port (manual ch. 7, the 4 pads by the 8-pin connector, 9600
 //! 8N1, TX only is wired) on UART1 RX = GP5, and its IRQ (connector pin 5) on GP2; the console's `IR` reads both.
+//! Presence: GP2 has a pull-up; once it has been seen low the module is an FP008 (`DEVICE ... BOARD=fp008`; the
+//! FP001S has no IRQ line and the pin stays high). On an FP008 a rising edge starts a MID_VERIFY by itself (when
+//! neither the host nor an earlier one is in flight) and its result comes out on the console as `EVT VERIFY ...`.
 //! The module's camera (UVC) is the other port of the board's hub, not this chip's.
 //!
 //! The device key (src/key.rs) is the VoiceS3R's way: made on the board, kept in flash, never sent out; no Secure
@@ -19,7 +22,10 @@ mod ota;
 mod proto;
 
 use embassy_executor::Spawner;
-use embassy_futures::join::join;
+use embassy_futures::select::{select, Either};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
+use embassy_sync::mutex::Mutex;
 use embassy_rp::bind_interrupts;
 use embassy_rp::flash::Flash;
 use embassy_rp::gpio::{Input, Pull};
@@ -56,6 +62,27 @@ pub static IMAGE_DEF: embassy_rp::block::ImageDef = embassy_rp::block::ImageDef:
 
 /// this boot is a trial (src/ota.rs) not yet bought
 static PENDING: AtomicBool = AtomicBool::new(false);
+
+/// GP2 (the FP008's IRQ): its level, and whether it has ever been low (= an FP008 is on the line)
+static IRQ_HIGH: AtomicBool = AtomicBool::new(true);
+static SEEN_LOW: AtomicBool = AtomicBool::new(false);
+/// when the host last wrote to the module, and when this firmware's own MID_VERIFY went out (ticks; 0 = none in
+/// flight: its REPLY or AUTO_TIMEOUT_MS clears it)
+static HOST_AT: AtomicU64 = AtomicU64::new(0);
+static AUTO_AT: AtomicU64 = AtomicU64::new(0);
+/// the module's timeout for a presence-started verify, and how long a host command keeps those off
+const AUTO_VERIFY_S: u8 = 10;
+const AUTO_TIMEOUT_MS: u64 = (AUTO_VERIFY_S as u64 + 3) * 1000;
+const HOST_QUIET_MS: u64 = 20_000;
+
+/// lines for the console from the other tasks (`EVT ...`); dropped when full
+static EVT: Channel<CriticalSectionRawMutex, proto::Line, 4> = Channel::new();
+
+type UartTx = Mutex<CriticalSectionRawMutex, BufferedUartTx>;
+
+fn ms_since(ticks: u64) -> u64 {
+    Duration::from_ticks(Instant::now().as_ticks().saturating_sub(ticks)).as_millis()
+}
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbIrq<USB>;
@@ -115,38 +142,81 @@ async fn usb_task(mut usb: UsbDevice<'static, UsbDrv>) -> ! {
     usb.run().await
 }
 
-/// interface 1 <-> UART0, byte for byte
+/// host (interface 1) -> UART0, byte for byte
 #[embassy_executor::task]
-async fn bridge_task(
-    mut usb_tx: Sender<'static, UsbDrv>,
-    mut usb_rx: Receiver<'static, UsbDrv>,
-    mut uart_tx: BufferedUartTx,
-    mut uart_rx: BufferedUartRx,
-) -> ! {
+async fn host_to_module(mut usb_rx: Receiver<'static, UsbDrv>, tx: &'static UartTx) -> ! {
+    let mut buf = [0u8; 64];
     loop {
         usb_rx.wait_connection().await;
-        let to_module = async {
-            let mut buf = [0u8; 64];
-            while let Ok(n) = usb_rx.read_packet(&mut buf).await {
-                if uart_tx.write_all(&buf[..n]).await.is_err() {
-                    break;
-                }
+        while let Ok(n) = usb_rx.read_packet(&mut buf).await {
+            HOST_AT.store(Instant::now().as_ticks(), Ordering::Relaxed);
+            if tx.lock().await.write_all(&buf[..n]).await.is_err() {
+                break;
             }
-        };
-        let from_module = async {
-            let mut buf = [0u8; 64];
-            loop {
-                match uart_rx.read(&mut buf).await {
-                    Ok(n) if n > 0 => {
-                        if usb_tx.write_packet(&buf[..n]).await.is_err() {
-                            break;
-                        }
+        }
+    }
+}
+
+/// UART0 -> host (interface 1) byte for byte, always read (a presence-started verify's REPLY is picked out here
+/// even with no host); a host that doesn't read loses the bytes after 50 ms instead of stalling this
+#[embassy_executor::task]
+async fn module_to_host(mut usb_tx: Sender<'static, UsbDrv>, mut uart_rx: BufferedUartRx) -> ! {
+    let mut buf = [0u8; 64];
+    let mut fp = proto::FrameParser::new();
+    loop {
+        let Ok(n) = uart_rx.read(&mut buf).await else { continue };
+        for &b in &buf[..n] {
+            if let Some((mid, len)) = fp.push(b) {
+                if AUTO_AT.load(Ordering::Relaxed) != 0 {
+                    if let Some(l) = proto::verify_evt(mid, &fp.buf[..len]) {
+                        AUTO_AT.store(0, Ordering::Relaxed);
+                        let _ = EVT.try_send(l);
                     }
-                    _ => {}
                 }
             }
-        };
-        join(to_module, from_module).await;
+        }
+        if n > 0 {
+            let _ = with_timeout(Duration::from_millis(50), usb_tx.write_packet(&buf[..n])).await;
+        }
+    }
+}
+
+/// GP2: `EVT PRESENCE 1|0` on each change, and on an FP008's rising edge a MID_VERIFY of this firmware's own
+#[embassy_executor::task]
+async fn presence_task(mut irq: Input<'static>, tx: &'static UartTx) -> ! {
+    loop {
+        let high = irq.is_high();
+        IRQ_HIGH.store(high, Ordering::Relaxed);
+        if !high {
+            SEEN_LOW.store(true, Ordering::Relaxed);
+        }
+        let at = AUTO_AT.load(Ordering::Relaxed);
+        if at != 0 && ms_since(at) > AUTO_TIMEOUT_MS {
+            AUTO_AT.store(0, Ordering::Relaxed); // no REPLY: give up on it
+        }
+        if with_timeout(Duration::from_secs(1), irq.wait_for_any_edge()).await.is_err() {
+            continue;
+        }
+        Timer::after_millis(20).await; // settle
+        let now_high = irq.is_high();
+        if now_high == high {
+            continue;
+        }
+        IRQ_HIGH.store(now_high, Ordering::Relaxed);
+        if !now_high {
+            SEEN_LOW.store(true, Ordering::Relaxed);
+        }
+        let _ = EVT.try_send(proto::fmt(format_args!("EVT PRESENCE {}", u8::from(now_high))));
+        let host = HOST_AT.load(Ordering::Relaxed);
+        let host_quiet = host == 0 || ms_since(host) > HOST_QUIET_MS;
+        if now_high && SEEN_LOW.load(Ordering::Relaxed) && host_quiet && AUTO_AT.load(Ordering::Relaxed) == 0 {
+            AUTO_AT.store(Instant::now().as_ticks().max(1), Ordering::Relaxed);
+            if tx.lock().await.write_all(&proto::verify_frame(AUTO_VERIFY_S)).await.is_err() {
+                AUTO_AT.store(0, Ordering::Relaxed);
+            } else {
+                let _ = EVT.try_send(proto::fmt(format_args!("EVT VERIFY START TIMEOUT_S={AUTO_VERIFY_S}")));
+            }
+        }
     }
 }
 
@@ -172,7 +242,6 @@ struct Console {
     seed: Option<[u8; 32]>,
     boot: ota::BootInfo,
     told: bool,
-    irq: Input<'static>,
 }
 
 type UsbErr = embassy_usb::driver::EndpointError;
@@ -206,7 +275,7 @@ impl Console {
     async fn command(&mut self, line: &str) -> Result<(), UsbErr> {
         let reply = match proto::parse(line) {
             proto::Cmd::Ping => proto::line("PONG"),
-            proto::Cmd::Device => proto::device_line(VERSION),
+            proto::Cmd::Device => proto::device_line(VERSION, SEEN_LOW.load(Ordering::Relaxed)),
             proto::Cmd::Keygen { force } => {
                 if self.seed.is_some() && !force {
                     proto::line("ERR AUTH: key exists")
@@ -239,7 +308,7 @@ impl Console {
                 proto::fmt(format_args!("OTA CONFIRMED RX={}", ota::CHUNK))
             }
             proto::Cmd::OtaSerial(size, flavor) => return self.ota_serial(size, flavor).await,
-            proto::Cmd::Ir => proto::ir_line(ir_latest(), self.irq.is_high()),
+            proto::Cmd::Ir => proto::ir_line(ir_latest(), IRQ_HIGH.load(Ordering::Relaxed)),
             proto::Cmd::Unknown => proto::line("ERR UNSUPPORTED (fp001s)"),
         };
         self.reply(&reply).await
@@ -303,9 +372,19 @@ async fn console_task(mut con: Console) -> ! {
         if con.tell_boot().await.is_err() {
             continue;
         }
+        while EVT.try_receive().is_ok() {} // events from before this connection are stale
         let mut buf = [0u8; 64];
         'conn: loop {
-            let Ok(n) = con.class.read_packet(&mut buf).await else { break 'conn };
+            let n = match select(con.class.read_packet(&mut buf), EVT.receive()).await {
+                Either::First(Ok(n)) => n,
+                Either::First(Err(_)) => break 'conn,
+                Either::Second(l) => {
+                    if con.reply(&l).await.is_err() {
+                        break 'conn;
+                    }
+                    continue;
+                }
+            };
             for &b in &buf[..n] {
                 if b == b'\r' || b == b'\n' {
                     if line.is_empty() {
@@ -379,25 +458,30 @@ async fn main(spawner: Spawner) {
     uc.baudrate = 115_200;
     let uart = BufferedUart::new(p.UART0, p.PIN_0, p.PIN_1, Irqs, TX_BUF.init([0; 256]), RX_BUF.init([0; 1024]), uc);
     let (uart_tx, uart_rx) = uart.split();
+    static UART_TX: StaticCell<UartTx> = StaticCell::new();
+    let uart_tx: &'static UartTx = UART_TX.init(Mutex::new(uart_tx));
     let (usb_tx, usb_rx) = bridge.split();
 
     static IR_BUF: StaticCell<[u8; 64]> = StaticCell::new();
     let mut ic = UartConfig::default();
     ic.baudrate = 9_600;
     let ir_rx = BufferedUartRx::new(p.UART1, Irqs, p.PIN_5, IR_BUF.init([0; 64]), ic);
-    // no pull: the RP2350's E9 (a pull-down latches the pin high); the FP008 drives it both ways
-    let irq = Input::new(p.PIN_2, Pull::None);
+    // pull-up (not down: the RP2350's E9 latches a pulled-down pin high): the FP008 drives it both ways, and with no
+    // line (the FP001S) it stays high, which is how the two are told apart
+    let irq = Input::new(p.PIN_2, Pull::Up);
 
     let flash = Flash::new_blocking(p.FLASH);
     let trng = Trng::new(p.TRNG, Irqs, embassy_rp::trng::Config::default());
 
     spawner.spawn(usb_task(usb).unwrap());
-    spawner.spawn(bridge_task(usb_tx, usb_rx, uart_tx, uart_rx).unwrap());
+    spawner.spawn(host_to_module(usb_rx, uart_tx).unwrap());
+    spawner.spawn(module_to_host(usb_tx, uart_rx).unwrap());
+    spawner.spawn(presence_task(irq, uart_tx).unwrap());
     spawner.spawn(ir_task(ir_rx).unwrap());
     let boot = ota::boot_info();
     PENDING.store(boot.buy_pending, Ordering::Relaxed);
     let mut flash = flash;
     let seed = key::load(&mut flash);
     spawner.spawn(watchdog_task(Watchdog::new(p.WATCHDOG)).unwrap());
-    spawner.spawn(console_task(Console { class: console, flash, trng, seed, boot, told: false, irq }).unwrap());
+    spawner.spawn(console_task(Console { class: console, flash, trng, seed, boot, told: false }).unwrap());
 }
