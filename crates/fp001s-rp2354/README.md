@@ -22,6 +22,12 @@ FP001S(Grow の顔・手のひら静脈モジュール)端末のファーム。R
 
 ![FP001S と Pico 2 の配線](docs/wiring-fp001s.svg)
 
+### 2 台同時(FP001S は PL2303 の USB-TTL で)
+
+ファームの UART はモジュール 1 台ぶん。2 台を同時に試すときは FP008 を Pico 2 に、FP001S を PL2303 の USB-TTL ケーブル(3.3V)で PC に直接つなぐ。
+
+![FP008 と FP001S を同時に](docs/wiring-dual.svg)
+
 ## 工場での書き込み(1 回だけ)
 
 1. BOOTSEL で起動(Pico 2 はボタンを押しながら USB、t3 は TP1 と TP2 をショートして電源)
