@@ -1,7 +1,7 @@
 //! The console's pure part: line parsing and the reply lines, no hardware (alloc-free).
 //!
 //! The words and the reply formats are docs/console-protocol.md's (the 正本), the same as the other kinds:
-//! `PING` -> `PONG`, `DEVICE` -> `DEVICE fp001s VER=<v> FLAVOR=fp001s`, `AUTH KEYGEN [FORCE]` / `AUTH PUBKEY` /
+//! `PING` -> `PONG`, `DEVICE` -> `DEVICE fp001s VER=<v> BOARD=<fp008|fp001s> FLAVOR=fp001s`, `AUTH KEYGEN [FORCE]` / `AUTH PUBKEY` /
 //! `AUTH SIGN <nonce>` as alc-hub-core's `alarm_key`, `OTA CONFIRM` / `OTA SERIAL <size> <flavor>` as §6 (ed25519, base64url without padding, the nonce is 32 lowercase
 //! hex characters and is signed as is). Anything else: `ERR UNSUPPORTED (fp001s)`.
 //!
@@ -68,10 +68,89 @@ fn b64url(out: &mut Line, data: &[u8]) {
     }
 }
 
-pub fn device_line(ver: &str) -> Line {
+/// `DEVICE fp001s VER=<v> BOARD=<fp008|fp001s> FLAVOR=fp001s`: BOARD is the module, told by the presence line
+/// (`fp008` once the IRQ pin has been seen low; the FP001S has no such line and the pin's pull-up keeps it high)
+pub fn device_line(ver: &str, fp008: bool) -> Line {
+    let board = if fp008 { "fp008" } else { "fp001s" };
     let mut l = Line::new();
-    let _ = write!(l, "DEVICE {KIND} VER={ver} FLAVOR={FLAVOR}");
+    let _ = write!(l, "DEVICE {KIND} VER={ver} BOARD={board} FLAVOR={FLAVOR}");
     l
+}
+
+/// The module's frame: `EF AA <mid> <len:2 BE> <data> <xor of mid..data>`
+pub const MID_REPLY: u8 = 0x00;
+pub const MID_VERIFY: u8 = 0x12;
+
+/// MID_VERIFY [pd_rightaway = 0, timeout s], ready to write to the module's UART
+pub fn verify_frame(timeout_s: u8) -> [u8; 8] {
+    let body = [MID_VERIFY, 0x00, 0x02, 0x00, timeout_s];
+    let p = body.iter().fold(0u8, |a, &b| a ^ b);
+    [0xEF, 0xAA, body[0], body[1], body[2], body[3], body[4], p]
+}
+
+/// Picks the module's small frames out of its UART stream (images and templates, longer than CAP, are skipped).
+pub struct FrameParser {
+    st: u8,
+    hdr: [u8; 3],
+    hn: usize,
+    len: usize,
+    n: usize,
+    pub buf: [u8; FrameParser::CAP],
+}
+
+impl FrameParser {
+    pub const CAP: usize = 64;
+    pub const fn new() -> Self {
+        Self { st: 0, hdr: [0; 3], hn: 0, len: 0, n: 0, buf: [0; Self::CAP] }
+    }
+
+    /// Feeds one byte; Some((mid, len)) when a whole frame of at most CAP data bytes has ended (its data in
+    /// buf[..len]; the parity isn't checked)
+    pub fn push(&mut self, b: u8) -> Option<(u8, usize)> {
+        match self.st {
+            0 => self.st = u8::from(b == 0xEF),
+            1 => self.st = if b == 0xAA { self.hn = 0; 2 } else { u8::from(b == 0xEF) },
+            2 => {
+                self.hdr[self.hn] = b;
+                self.hn += 1;
+                if self.hn == 3 {
+                    self.len = usize::from(u16::from_be_bytes([self.hdr[1], self.hdr[2]]));
+                    self.n = 0;
+                    self.st = 3;
+                }
+            }
+            _ => {
+                if self.n < self.len {
+                    if self.n < Self::CAP {
+                        self.buf[self.n] = b;
+                    }
+                    self.n += 1;
+                } else {
+                    self.st = 0; // the parity byte
+                    if self.len <= Self::CAP {
+                        return Some((self.hdr[0], self.len));
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// The REPLY to MID_VERIFY (data = [0x12, result, id:2, name:32, ...]) as `EVT VERIFY OK ID=<id> NAME=<name>` or
+/// `EVT VERIFY NG RESULT=<n>`; None for any other frame
+pub fn verify_evt(mid: u8, data: &[u8]) -> Option<Line> {
+    if mid != MID_REPLY || data.first() != Some(&MID_VERIFY) || data.len() < 2 {
+        return None;
+    }
+    if data[1] != 0 || data.len() < 4 {
+        return Some(fmt(format_args!("EVT VERIFY NG RESULT={}", data[1])));
+    }
+    let id = u16::from_be_bytes([data[2], data[3]]);
+    let name = data.get(4..36).unwrap_or(&[]);
+    let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    let name = core::str::from_utf8(&name[..end]).unwrap_or("?").trim();
+    Some(fmt(format_args!("EVT VERIFY OK ID={id} NAME={name}")))
 }
 
 pub fn pubkey_line(seed: &[u8; 32]) -> Line {
